@@ -94,6 +94,18 @@
 			<div class="preview-loading">
 				<div class="spinner"></div>
 				<p class="loading-title">Detecting project type...</p>
+				{#if preview.statusMessage}
+					<p class="loading-detail">{preview.statusMessage}</p>
+				{/if}
+			</div>
+		{:else if preview.status === 'installing'}
+			<div class="preview-loading">
+				<div class="spinner"></div>
+				<p class="loading-title">Installing dependencies...</p>
+				<p class="loading-detail">This may take a moment for first-time projects</p>
+				{#if preview.framework}
+					<p class="loading-detail">{preview.framework} project detected</p>
+				{/if}
 			</div>
 		{:else if preview.status === 'building'}
 			<div class="preview-loading">
@@ -107,7 +119,9 @@
 						Starting preview...
 					{/if}
 				</p>
-				{#if preview.framework}
+				{#if preview.statusMessage}
+					<p class="loading-detail">{preview.statusMessage}</p>
+				{:else if preview.framework}
 					<p class="loading-detail">{preview.framework} project detected</p>
 				{/if}
 			</div>

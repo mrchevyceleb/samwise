@@ -18,8 +18,9 @@
 		if (preview.url) {
 			return preview.url.replace('http://', '');
 		}
-		if (preview.status === 'detecting') return 'Detecting...';
-		if (preview.status === 'building') return 'Building...';
+		if (preview.status === 'detecting') return 'Detecting project...';
+		if (preview.status === 'installing') return 'Installing dependencies...';
+		if (preview.status === 'building') return preview.tier === 'managed' ? 'Starting dev server...' : 'Building...';
 		if (preview.status === 'error') return 'Error';
 		return 'No preview';
 	}

@@ -11,7 +11,7 @@ async function getListen() {
 }
 
 export type PreviewTier = 'direct' | 'esbuild' | 'managed' | null;
-export type PreviewStatus = 'idle' | 'detecting' | 'building' | 'ready' | 'error';
+export type PreviewStatus = 'idle' | 'detecting' | 'installing' | 'building' | 'ready' | 'error';
 
 interface TierDetection {
 	tier: 'direct_serve' | 'esbuild_bundle' | 'managed_process';
@@ -27,7 +27,9 @@ let status = $state<PreviewStatus>('idle');
 let error = $state<string | null>(null);
 let framework = $state<string | null>(null);
 let reason = $state<string>('');
+let statusMessage = $state<string>('');
 let watcherUnlisten: (() => void) | null = null;
+let statusUnlisten: (() => void) | null = null;
 
 function tierFromDetection(t: TierDetection['tier']): PreviewTier {
 	switch (t) {
@@ -47,30 +49,54 @@ export function getPreviewStore() {
 		get error() { return error; },
 		get framework() { return framework; },
 		get reason() { return reason; },
+		get statusMessage() { return statusMessage; },
 
 		async openProject(projectDir: string) {
 			const invoke = await getInvoke();
+			const listen = await getListen();
+
 			try {
 				status = 'detecting';
 				error = null;
 				tier = null;
 				framework = null;
 				url = '';
+				statusMessage = 'Analyzing project...';
+
+				// Listen for status updates from the backend
+				if (statusUnlisten) {
+					statusUnlisten();
+				}
+				statusUnlisten = await listen<{ phase: string; message: string; framework?: string }>('preview:status', (event) => {
+					const { phase, message } = event.payload;
+					statusMessage = message;
+					console.log('[preview] Status:', phase, message);
+					if (phase === 'installing') {
+						status = 'installing';
+					}
+				});
 
 				const detection = await invoke<TierDetection>('preview_open_project', {
 					projectDir
 				});
 
+				// By the time preview_open_project resolves, the server is already running.
+				// Go straight to getting the URL.
 				tier = tierFromDetection(detection.tier);
 				framework = detection.framework;
 				reason = detection.reason;
-				status = 'building';
 
 				// Get the URL from the backend
 				const previewUrl = await invoke<string | null>('preview_get_url');
 				if (previewUrl) {
 					url = previewUrl;
 					status = 'ready';
+					statusMessage = '';
+					// Clean up status listener - no longer needed once ready
+					if (statusUnlisten) {
+						statusUnlisten();
+						statusUnlisten = null;
+					}
 				} else {
 					status = 'error';
 					error = 'Preview server started but no URL available';
@@ -80,7 +106,9 @@ export function getPreviewStore() {
 				await this.listenForChanges();
 			} catch (e) {
 				status = 'error';
-				error = e instanceof Error ? e.message : String(e);
+				const errMsg = e instanceof Error ? e.message : String(e);
+				error = errMsg;
+				statusMessage = '';
 				console.error('[preview] Failed to open project:', e);
 			}
 		},
@@ -103,6 +131,11 @@ export function getPreviewStore() {
 				watcherUnlisten();
 				watcherUnlisten = null;
 			}
+			if (statusUnlisten) {
+				statusUnlisten();
+				statusUnlisten = null;
+			}
+			statusMessage = '';
 		},
 
 		async refresh() {

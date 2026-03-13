@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 
 use super::esbuild_runner::EsbuildRunner;
 use super::http_server::PreviewServer;
@@ -53,6 +53,18 @@ impl PreviewOrchestrator {
             detection.reason
         );
 
+        // Emit status so frontend can show progress
+        let _ = app.emit("preview:status", serde_json::json!({
+            "phase": "starting",
+            "tier": format!("{:?}", detection.tier),
+            "framework": &detection.framework,
+            "message": match detection.tier {
+                PreviewTier::DirectServe => "Starting static file server...",
+                PreviewTier::EsbuildBundle => "Bundling with esbuild...",
+                PreviewTier::ManagedProcess => "Starting dev server...",
+            }
+        }));
+
         // 3. Start the appropriate server based on tier
         let result = match detection.tier {
             PreviewTier::DirectServe => {
@@ -62,7 +74,7 @@ impl PreviewOrchestrator {
                 self.start_esbuild_bundle(&project_dir, &detection).await
             }
             PreviewTier::ManagedProcess => {
-                self.start_managed_process(&project_dir, &detection).await
+                self.start_managed_process(app, &project_dir, &detection).await
             }
         };
 
@@ -89,10 +101,44 @@ impl PreviewOrchestrator {
             self.detection = Some(fallback_detection.clone());
             self.project_dir = Some(project_dir.clone());
 
-            // Start watcher
             self.start_watcher(project_dir, app)?;
 
             return Ok(fallback_detection);
+        }
+
+        // If managed process fails, fall back to direct serve as last resort
+        if result.is_err() && detection.tier == PreviewTier::ManagedProcess {
+            let err_msg = result.as_ref().unwrap_err().clone();
+            log::warn!(
+                "[orchestrator] ManagedProcess failed, falling back to DirectServe: {}",
+                err_msg
+            );
+
+            // Try direct serve as last resort
+            match self.start_direct_serve(&project_dir).await {
+                Ok(_) => {
+                    let fallback_detection = TierDetection {
+                        tier: PreviewTier::DirectServe,
+                        framework: detection.framework.clone(),
+                        entry_point: detection.entry_point.clone(),
+                        dev_command: detection.dev_command.clone(),
+                        reason: format!(
+                            "Dev server failed ({}). Serving static files as fallback.",
+                            err_msg
+                        ),
+                    };
+
+                    self.current_tier = Some(PreviewTier::DirectServe);
+                    self.detection = Some(fallback_detection.clone());
+                    self.project_dir = Some(project_dir.clone());
+                    self.start_watcher(project_dir, app)?;
+                    return Ok(fallback_detection);
+                }
+                Err(_) => {
+                    // Even static serve failed, return the original error
+                    return Err(err_msg);
+                }
+            }
         }
 
         result?;
@@ -224,6 +270,7 @@ impl PreviewOrchestrator {
 
     async fn start_managed_process(
         &mut self,
+        app: &AppHandle,
         project_dir: &PathBuf,
         detection: &TierDetection,
     ) -> Result<(), String> {
@@ -239,7 +286,7 @@ impl PreviewOrchestrator {
         );
 
         let env = HashMap::new();
-        let process = ManagedProcess::start(project_dir, command, env).await?;
+        let process = ManagedProcess::start(project_dir, command, env, Some(app.clone())).await?;
         log::info!("[orchestrator] ManagedProcess running at {}", process.url());
 
         self.managed_process = Some(process);

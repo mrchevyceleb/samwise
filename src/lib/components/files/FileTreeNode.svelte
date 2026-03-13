@@ -111,7 +111,7 @@
 	<!-- Icon -->
 	{#if node.is_dir}
 		<span style="font-size: 13px; color: {getColor()}; flex-shrink: 0;">
-			{expanded ? '&#128194;' : '&#128193;'}
+			{expanded ? '📂' : '📁'}
 		</span>
 	{:else}
 		<svg width="13" height="13" viewBox="0 0 16 16" fill={getColor()} style="flex-shrink: 0; opacity: 0.8;">

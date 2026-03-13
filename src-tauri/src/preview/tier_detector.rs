@@ -72,7 +72,13 @@ pub fn detect_tier(project_dir: &Path) -> TierDetection {
         }
     }
 
-    // Check for managed frameworks first (Tier 3)
+    // Check if project has a dev script - this is the strongest signal
+    let has_dev_script = pkg.get("scripts")
+        .and_then(|s| s.as_object())
+        .map(|scripts| scripts.contains_key("dev") || scripts.contains_key("start"))
+        .unwrap_or(false);
+
+    // Check for managed frameworks first (Tier 3) - these ALWAYS need their own server
     for (dep, framework_name) in MANAGED_FRAMEWORKS {
         if all_deps.iter().any(|d| d == dep) {
             let dev_command = resolve_dev_command(&pkg, framework_name);
@@ -86,7 +92,40 @@ pub fn detect_tier(project_dir: &Path) -> TierDetection {
         }
     }
 
-    // Check for bundleable frameworks (Tier 2)
+    // If project has a dev script AND has framework deps, prefer ManagedProcess.
+    // Running `npm run dev` is the most reliable way to preview any real project.
+    if has_dev_script {
+        // Check if it has any framework dependency at all
+        let has_framework = BUNDLE_FRAMEWORKS.iter().any(|(dep, _)| all_deps.iter().any(|d| d == dep));
+
+        if has_framework {
+            let framework_name = BUNDLE_FRAMEWORKS.iter()
+                .find(|(dep, _)| all_deps.iter().any(|d| d == dep))
+                .map(|(_, name)| name.to_string());
+
+            let dev_command = resolve_dev_command(&pkg, framework_name.as_deref().unwrap_or("Unknown"));
+            return TierDetection {
+                tier: PreviewTier::ManagedProcess,
+                framework: framework_name,
+                entry_point: None,
+                dev_command: Some(dev_command),
+                reason: "Project has dev script and framework dependencies. Using dev server for best compatibility.".to_string(),
+            };
+        }
+
+        // Even without a known framework, if there's a dev script, prefer managed process
+        // This catches things like Vite, Parcel, Webpack projects
+        let dev_command = resolve_dev_command(&pkg, "Unknown");
+        return TierDetection {
+            tier: PreviewTier::ManagedProcess,
+            framework: None,
+            entry_point: None,
+            dev_command: Some(dev_command),
+            reason: "Project has dev script in package.json. Running dev server.".to_string(),
+        };
+    }
+
+    // No dev script - try esbuild bundle for framework projects
     for (dep, framework_name) in BUNDLE_FRAMEWORKS {
         if all_deps.iter().any(|d| d == dep) {
             let entry = find_entry_point(project_dir, framework_name);
@@ -95,7 +134,7 @@ pub fn detect_tier(project_dir: &Path) -> TierDetection {
                 framework: Some(framework_name.to_string()),
                 entry_point: Some(entry),
                 dev_command: None,
-                reason: format!("Found {} in dependencies. Can be bundled with esbuild.", framework_name),
+                reason: format!("Found {} in dependencies (no dev script). Bundling with esbuild.", framework_name),
             };
         }
     }

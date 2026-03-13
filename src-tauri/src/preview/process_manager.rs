@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
@@ -34,11 +35,36 @@ impl ManagedProcess {
     ///
     /// The `command` should be the full dev command (e.g., "next dev", "npm run dev").
     /// We inject PORT env so the server listens on our chosen port.
+    /// If node_modules is missing, we auto-run npm install first.
     pub async fn start(
         project_dir: &Path,
         command: &str,
         env: HashMap<String, String>,
+        app: Option<AppHandle>,
     ) -> Result<Self, String> {
+        // Auto-install deps if node_modules is missing
+        let node_modules = project_dir.join("node_modules");
+        if !node_modules.exists() {
+            log::info!("[process_manager] node_modules missing, running npm install...");
+            if let Some(ref app) = app {
+                let _ = app.emit("preview:status", serde_json::json!({
+                    "phase": "installing",
+                    "message": "Installing dependencies..."
+                }));
+            }
+            let install_result = run_package_install(project_dir).await;
+            match install_result {
+                Ok(_) => log::info!("[process_manager] npm install completed successfully"),
+                Err(e) => {
+                    log::error!("[process_manager] npm install failed: {}", e);
+                    return Err(format!(
+                        "Dependencies not installed and auto-install failed: {}. Try running 'npm install' in the project directory.",
+                        e
+                    ));
+                }
+            }
+        }
+
         let port = super::port_allocator::find_managed_port()?;
 
         log::info!(
@@ -193,11 +219,13 @@ fn parse_command(command: &str) -> (String, Vec<String>) {
     }
 }
 
-/// Wait for the dev server to output a "ready" pattern, with a timeout
+/// Wait for the dev server to output a "ready" pattern, with a timeout.
+/// Uses a multi-signal approach: ready pattern in stdout/stderr, or process exit.
 async fn wait_for_ready(child: &mut Child, port: u16) -> bool {
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
+    // Channel for ready signal OR process death
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<bool>();
     let ready_tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(ready_tx)));
 
@@ -214,6 +242,10 @@ async fn wait_for_ready(child: &mut Child, port: u16) -> bool {
                         let _ = tx.send(true);
                     }
                 }
+            }
+            // EOF means process closed stdout - signal not ready
+            if let Some(tx) = tx.lock().await.take() {
+                let _ = tx.send(false);
             }
         });
     }
@@ -241,6 +273,11 @@ async fn wait_for_ready(child: &mut Child, port: u16) -> bool {
             log::info!("[process_manager] Server ready on port {}", port);
             true
         }
+        Ok(Ok(false)) => {
+            // Process exited before ready signal
+            log::error!("[process_manager] Process exited before ready signal");
+            false
+        }
         _ => {
             // Timeout or channel closed. Check if port is actually listening.
             log::warn!("[process_manager] Timeout waiting for ready signal. Checking port...");
@@ -253,4 +290,56 @@ async fn wait_for_ready(child: &mut Child, port: u16) -> bool {
 fn is_ready_line(line: &str) -> bool {
     let lower = line.to_lowercase();
     READY_PATTERNS.iter().any(|pat| lower.contains(pat))
+}
+
+/// Detect the package manager and run install.
+/// Checks for lock files to determine which package manager to use.
+async fn run_package_install(project_dir: &Path) -> Result<(), String> {
+    let (program, args) = if project_dir.join("bun.lockb").exists() || project_dir.join("bun.lock").exists() {
+        ("bun", vec!["install"])
+    } else if project_dir.join("pnpm-lock.yaml").exists() {
+        ("pnpm", vec!["install"])
+    } else if project_dir.join("yarn.lock").exists() {
+        ("yarn", vec!["install"])
+    } else {
+        ("npm", vec!["install"])
+    };
+
+    log::info!("[process_manager] Running {} install in {}", program, project_dir.display());
+
+    let mut cmd = Command::new(program);
+    cmd.args(&args)
+        .current_dir(project_dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x00000008); // CREATE_NO_WINDOW
+    }
+
+    let mut child = cmd.spawn()
+        .map_err(|e| format!("Failed to run {} install: {}", program, e))?;
+
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        child.wait(),
+    ).await {
+        Ok(Ok(exit_status)) => {
+            if !exit_status.success() {
+                return Err(format!("{} install failed with exit code: {:?}", program, exit_status.code()));
+            }
+        }
+        Ok(Err(e)) => {
+            return Err(format!("{} install failed: {}", program, e));
+        }
+        Err(_) => {
+            // Timeout - kill the child process to prevent zombies
+            let _ = child.kill().await;
+            return Err(format!("{} install timed out after 120 seconds", program));
+        }
+    };
+
+    Ok(())
 }
