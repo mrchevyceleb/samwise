@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { getAgentStore } from '$lib/stores/agents';
+	import { getAgentStore } from '$lib/stores/agents.svelte';
 	import AgentSelector from './AgentSelector.svelte';
 	import AgentSplitView from './AgentSplitView.svelte';
 	import ChatInput from '$lib/components/chat/ChatInput.svelte';

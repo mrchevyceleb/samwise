@@ -1,4 +1,9 @@
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import type { UnlistenFn } from '@tauri-apps/api/event';
+
+async function getListen() {
+	const { listen } = await import('@tauri-apps/api/event');
+	return listen;
+}
 import { aiChatStreamOpenAICodex } from '$lib/utils/tauri';
 import type { AIChatSettings, ChatMessage, StreamChunk, ToolCall, ToolDefinition } from '../types';
 import { inferModelSettings } from '../model-registry';
@@ -276,6 +281,7 @@ export async function streamOpenAICodexCompletion(
   const bodyJson = JSON.stringify(body);
   const clientVersion = normalizeClientVersion(settings.openAICodexClientVersion);
   const cleanupFns: UnlistenFn[] = [];
+  const listen = await getListen();
 
   try {
     cleanupFns.push(

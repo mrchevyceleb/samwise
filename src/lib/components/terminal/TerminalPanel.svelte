@@ -1,14 +1,11 @@
 <script lang="ts">
   import { onMount, onDestroy, tick } from 'svelte';
-  import { getTerminals } from '$lib/stores/terminals';
-  import { getWorkspace } from '$lib/stores/workspace';
-  import { getSettings } from '$lib/stores/settings';
+  import { getTerminals } from '$lib/stores/terminals.svelte';
+  import { getWorkspace } from '$lib/stores/workspace.svelte';
+  import { getSettings } from '$lib/stores/settings.svelte';
   import { Terminal } from '@xterm/xterm';
   import { FitAddon } from '@xterm/addon-fit';
   import { WebLinksAddon } from '@xterm/addon-web-links';
-  import { listen } from '@tauri-apps/api/event';
-  import { invoke } from '@tauri-apps/api/core';
-
   const terminals = getTerminals();
   const workspace = getWorkspace();
   const settings = getSettings();
@@ -34,7 +31,7 @@
   }
 
   async function handleCloseTerminal(id: string) {
-    try { await invoke('kill_terminal', { id }); } catch {}
+    try { const { invoke } = await import('@tauri-apps/api/core'); await invoke('kill_terminal', { id }); } catch {}
     terminals.clearBuffer(id);
     spawnedIds.delete(id);
     const term = xtermMap.get(id);
@@ -48,6 +45,7 @@
 
   async function initTerminal(id: string, el: HTMLDivElement) {
     if (xtermMap.has(id)) return;
+    const { invoke } = await import('@tauri-apps/api/core');
 
     const term = new Terminal({
       theme: {
@@ -193,6 +191,7 @@
   });
 
   onMount(async () => {
+    const { listen } = await import('@tauri-apps/api/event');
     window.addEventListener('resize', fitActive);
 
     unlistenOutput = await listen<{ id: string; data: string }>('terminal-output', (event) => {

@@ -1,14 +1,11 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import { getTerminals } from '$lib/stores/terminals';
-  import { getWorkspace } from '$lib/stores/workspace';
-  import { getSettings } from '$lib/stores/settings';
+  import { getTerminals } from '$lib/stores/terminals.svelte';
+  import { getWorkspace } from '$lib/stores/workspace.svelte';
+  import { getSettings } from '$lib/stores/settings.svelte';
   import { Terminal } from '@xterm/xterm';
   import { FitAddon } from '@xterm/addon-fit';
   import { WebLinksAddon } from '@xterm/addon-web-links';
-  import { listen } from '@tauri-apps/api/event';
-  import { invoke } from '@tauri-apps/api/core';
-
   interface Props {
     terminalId: string;
   }
@@ -32,6 +29,9 @@
   }
 
   onMount(async () => {
+    const { invoke } = await import('@tauri-apps/api/core');
+    const { listen } = await import('@tauri-apps/api/event');
+
     term = new Terminal({
       theme: {
         background: '#0D1117',

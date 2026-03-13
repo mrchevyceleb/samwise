@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { getFileTreeStore, type FileNode } from '$lib/stores/file-tree';
+	import { getFileTreeStore, type FileNode } from '$lib/stores/file-tree.svelte';
 	import FileTreeNode from './FileTreeNode.svelte';
 
 	interface Props {

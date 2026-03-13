@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { getGitStore } from '$lib/stores/git';
-  import { getWorkspace } from '$lib/stores/workspace';
+  import { getGitStore } from '$lib/stores/git.svelte';
+  import { getWorkspace } from '$lib/stores/workspace.svelte';
   import GitStatus from './GitStatus.svelte';
   import CommitDialog from './CommitDialog.svelte';
   import BranchSelector from './BranchSelector.svelte';

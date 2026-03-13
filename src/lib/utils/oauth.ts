@@ -1,4 +1,4 @@
-import { getSettings, updateSetting } from '$lib/stores/settings';
+import { getSettings, updateSetting } from '$lib/stores/settings.svelte';
 import {
   aiExchangeOpenRouterOAuthCode,
   aiOpenAIDeviceStart,

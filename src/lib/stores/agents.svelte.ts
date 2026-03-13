@@ -3,7 +3,7 @@
 import { ChatEngine } from '$lib/ai/chat/chat-engine';
 import { ChatSession } from '$lib/ai/chat/session';
 import type { AIChatSettings, ToolCall as AIToolCall, ToolResult as AIToolResult } from '$lib/ai/types';
-import { getSettings, getActiveAIKey, getActiveAIBaseUrl } from '$lib/stores/settings';
+import { getSettings, getActiveAIKey, getActiveAIBaseUrl } from '$lib/stores/settings.svelte';
 
 export interface ToolCall {
 	id: string;

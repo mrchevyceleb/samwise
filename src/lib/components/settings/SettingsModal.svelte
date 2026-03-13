@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { getSettingsStore, updateSetting, type AppSettings } from '$lib/stores/settings';
+  import { getSettingsStore, updateSetting, type AppSettings } from '$lib/stores/settings.svelte';
   import AISettingsPage from './AISettingsPage.svelte';
   import DopplerTab from './DopplerTab.svelte';
 

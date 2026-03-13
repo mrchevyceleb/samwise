@@ -83,6 +83,7 @@
 			onmouseleave={() => sendHovered = false}
 			onclick={send}
 			{disabled}
+			aria-label="Send message"
 		>
 			<svg width="14" height="14" viewBox="0 0 16 16" fill="#0D1117">
 				<path d="M1.724 1.053a.5.5 0 0 1 .546-.065l13 6.5a.5.5 0 0 1 0 .894l-13 6.5a.5.5 0 0 1-.7-.58L3.39 8.5H8a.5.5 0 0 0 0-1H3.39L1.57 1.618a.5.5 0 0 1 .154-.565z"/>

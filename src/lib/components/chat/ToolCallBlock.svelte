@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { ToolCall } from '$lib/stores/agents';
+	import type { ToolCall } from '$lib/stores/agents.svelte';
 
 	interface Props {
 		toolCall: ToolCall;

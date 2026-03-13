@@ -139,7 +139,7 @@ pub fn spawn_terminal(
             match reader.read(&mut buf) {
                 Ok(0) => {
                     let _ = app_handle.emit(
-                        "terminal-output",
+                        "terminal-closed",
                         TerminalClosedPayload {
                             id: reader_id.clone(),
                             exit_code: None,

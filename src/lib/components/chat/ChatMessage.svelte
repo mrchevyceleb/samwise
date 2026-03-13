@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { AgentMessage } from '$lib/stores/agents';
+	import type { AgentMessage } from '$lib/stores/agents.svelte';
 	import ThinkingBlock from './ThinkingBlock.svelte';
 	import ToolCallBlock from './ToolCallBlock.svelte';
 

@@ -1,4 +1,9 @@
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import type { UnlistenFn } from '@tauri-apps/api/event';
+
+async function getListen() {
+	const { listen } = await import('@tauri-apps/api/event');
+	return listen;
+}
 import { aiChatStreamAnthropic } from '$lib/utils/tauri';
 import type { AIChatSettings, ChatMessage, StreamChunk, ToolCall, ToolDefinition } from '../types';
 import { inferModelSettings } from '../model-registry';
@@ -354,6 +359,7 @@ export async function streamAnthropicCompletion(
   const bodyJson = JSON.stringify(toAnthropicPayload(messages, settings, tools));
 
   const cleanupFns: UnlistenFn[] = [];
+  const listen = await getListen();
 
   try {
     cleanupFns.push(

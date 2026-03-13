@@ -1,6 +1,6 @@
 <script lang="ts">
-	import { getFileTreeStore, type FileNode } from '$lib/stores/file-tree';
-	import { getWorkspace } from '$lib/stores/workspace';
+	import { getFileTreeStore, type FileNode } from '$lib/stores/file-tree.svelte';
+	import { getWorkspace } from '$lib/stores/workspace.svelte';
 	import FileTree from './FileTree.svelte';
 	import GitPanel from '$lib/components/git/GitPanel.svelte';
 

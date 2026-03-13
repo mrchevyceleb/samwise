@@ -1,4 +1,4 @@
-import { getSettings, updateSetting, type MCPServerConfig } from '$lib/stores/settings';
+import { getSettings, updateSetting, type MCPServerConfig } from '$lib/stores/settings.svelte';
 import { stdioMcpStop } from '$lib/utils/tauri';
 import { refreshMcpToolDefinitions } from './mcp-registry';
 

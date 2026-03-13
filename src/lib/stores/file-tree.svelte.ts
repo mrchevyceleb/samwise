@@ -1,26 +1,8 @@
 /** File tree store using Svelte 5 runes */
 
-import { readDirectoryTree, type FileEntry } from '$lib/utils/tauri';
+import { readDirectoryTree, type FileNode } from '$lib/utils/tauri';
 
-export interface FileNode {
-	name: string;
-	path: string;
-	is_dir: boolean;
-	size?: number;
-	ext?: string;
-	children?: FileNode[];
-}
-
-function fileEntryToNode(entry: FileEntry): FileNode {
-	const ext = !entry.is_dir ? entry.name.split('.').pop() || undefined : undefined;
-	return {
-		name: entry.name,
-		path: entry.path,
-		is_dir: entry.is_dir,
-		ext,
-		children: entry.children?.map(fileEntryToNode)
-	};
-}
+export type { FileNode };
 
 let tree = $state<FileNode[]>([]);
 let expandedDirs = $state<Set<string>>(new Set());
@@ -53,8 +35,9 @@ export function getFileTreeStore() {
 			isLoading = true;
 			rootPath = path;
 			try {
-				const entries = await readDirectoryTree(path);
-				tree = entries.map(fileEntryToNode);
+				const rootNode = await readDirectoryTree(path);
+				// The backend returns the root directory as a single FileNode; use its children as tree roots
+				tree = rootNode.children ?? [];
 				// Auto-expand root level
 				for (const node of tree) {
 					if (node.is_dir) {

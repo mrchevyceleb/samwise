@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { getGitStore, type GitFileStatus } from '$lib/stores/git';
-  import { getWorkspace } from '$lib/stores/workspace';
+  import { getGitStore, type GitFileStatus } from '$lib/stores/git.svelte';
+  import { getWorkspace } from '$lib/stores/workspace.svelte';
 
   const git = getGitStore();
   const workspace = getWorkspace();

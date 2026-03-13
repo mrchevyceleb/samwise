@@ -1,12 +1,35 @@
-import { invoke } from '@tauri-apps/api/core';
-
 /** Typed wrapper for Tauri invoke calls */
+
+// Lazy-load invoke to avoid SSR crashes (SvelteKit processes module graph server-side)
+let _invoke: typeof import('@tauri-apps/api/core').invoke | null = null;
+
+async function getInvoke() {
+	if (!_invoke) {
+		const mod = await import('@tauri-apps/api/core');
+		_invoke = mod.invoke;
+	}
+	return _invoke;
+}
+
+async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+	const fn = await getInvoke();
+	return fn<T>(cmd, args);
+}
+
+export interface FileNode {
+	name: string;
+	path: string;
+	is_dir: boolean;
+	size?: number;
+	ext?: string;
+	children?: FileNode[];
+}
 
 export interface FileEntry {
 	name: string;
 	path: string;
-	is_dir: boolean;
-	children?: FileEntry[];
+	relative_path: string;
+	ext?: string;
 }
 
 export interface WorkspaceInfo {
@@ -25,12 +48,8 @@ export interface FileInfo {
 	path: string;
 	is_dir: boolean;
 	size: number;
-	modified: string;
-}
-
-export interface FlatFileEntry {
-	relative_path: string;
-	is_dir: boolean;
+	ext?: string;
+	modified?: number;
 }
 
 export interface CommandResult {
@@ -41,12 +60,12 @@ export interface CommandResult {
 
 // ── File Operations ────────────────────────────────────────────────
 
-export async function readDirectoryTree(path: string): Promise<FileEntry[]> {
-	return invoke<FileEntry[]>('read_directory_tree', { path });
+export async function readDirectoryTree(path: string, showHidden: boolean = false): Promise<FileNode> {
+	return invoke<FileNode>('read_directory_tree', { path, showHidden });
 }
 
-export async function readDirectoryChildren(path: string): Promise<FileEntry[]> {
-	return invoke<FileEntry[]>('read_directory_children', { path });
+export async function readDirectoryChildren(path: string, showHidden: boolean = false): Promise<FileNode[]> {
+	return invoke<FileNode[]>('read_directory_children', { path, showHidden });
 }
 
 export async function readFileText(path: string): Promise<string> {
@@ -57,8 +76,8 @@ export async function writeFileText(path: string, content: string): Promise<void
 	return invoke<void>('write_file_text', { path, content });
 }
 
-export async function createFile(path: string, isDirectory: boolean): Promise<void> {
-	return invoke<void>('create_file', { path, isDirectory });
+export async function createFile(path: string, isDir: boolean): Promise<void> {
+	return invoke<void>('create_file', { path, isDir });
 }
 
 export async function deletePath(path: string): Promise<void> {
@@ -69,16 +88,16 @@ export async function renamePath(oldPath: string, newPath: string): Promise<void
 	return invoke<void>('rename_path', { oldPath, newPath });
 }
 
-export async function searchFiles(path: string, query: string, caseSensitive: boolean): Promise<SearchResult[]> {
-	return invoke<SearchResult[]>('search_files', { path, query, caseSensitive });
+export async function searchFiles(root: string, query: string, caseSensitive: boolean, showHidden: boolean = false): Promise<SearchResult[]> {
+	return invoke<SearchResult[]>('search_files', { root, query, caseSensitive, showHidden });
 }
 
 export async function getFileInfo(path: string): Promise<FileInfo> {
 	return invoke<FileInfo>('get_file_info', { path });
 }
 
-export async function listAllFiles(path: string): Promise<FlatFileEntry[]> {
-	return invoke<FlatFileEntry[]>('list_all_files', { path });
+export async function listAllFiles(root: string, showHidden: boolean = false): Promise<FileEntry[]> {
+	return invoke<FileEntry[]>('list_all_files', { root, showHidden });
 }
 
 // ── Command Execution ──────────────────────────────────────────────

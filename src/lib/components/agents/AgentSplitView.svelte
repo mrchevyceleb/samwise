@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { getAgentStore } from '$lib/stores/agents';
+	import { getAgentStore } from '$lib/stores/agents.svelte';
 	import AgentChatView from './AgentChatView.svelte';
 
 	const store = getAgentStore();

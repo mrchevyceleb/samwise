@@ -1,4 +1,4 @@
-import { getWorkspace } from '$lib/stores/workspace';
+import { getWorkspace } from '$lib/stores/workspace.svelte';
 import { readFileText } from '$lib/utils/tauri';
 import { streamOpenAICompatibleCompletion } from '../providers/openrouter';
 import { streamOpenAICodexCompletion } from '../providers/openai-codex';

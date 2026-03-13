@@ -9,10 +9,10 @@
 	import TerminalPanel from '$lib/components/terminal/TerminalPanel.svelte';
 	import SettingsModal from '$lib/components/settings/SettingsModal.svelte';
 	import CommandPalette from '$lib/components/modals/CommandPalette.svelte';
-	import { getLayout } from '$lib/stores/layout';
-	import { getSettingsStore, initSettings } from '$lib/stores/settings';
-	import { getTerminals } from '$lib/stores/terminals';
-	import { getWorkspace } from '$lib/stores/workspace';
+	import { getLayout } from '$lib/stores/layout.svelte';
+	import { getSettingsStore, initSettings } from '$lib/stores/settings.svelte';
+	import { getTerminals } from '$lib/stores/terminals.svelte';
+	import { getWorkspace } from '$lib/stores/workspace.svelte';
 
 	const layout = getLayout();
 	const settingsStore = getSettingsStore();

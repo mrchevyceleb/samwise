@@ -1,6 +1,14 @@
 /** Preview store using Svelte 5 runes */
-import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
+
+async function getInvoke() {
+	const { invoke } = await import('@tauri-apps/api/core');
+	return invoke;
+}
+
+async function getListen() {
+	const { listen } = await import('@tauri-apps/api/event');
+	return listen;
+}
 
 export type PreviewTier = 'direct' | 'esbuild' | 'managed' | null;
 export type PreviewStatus = 'idle' | 'detecting' | 'building' | 'ready' | 'error';
@@ -41,6 +49,7 @@ export function getPreviewStore() {
 		get reason() { return reason; },
 
 		async openProject(projectDir: string) {
+			const invoke = await getInvoke();
 			try {
 				status = 'detecting';
 				error = null;
@@ -78,9 +87,10 @@ export function getPreviewStore() {
 
 		async stop() {
 			try {
+				const invoke = await getInvoke();
 				await invoke('preview_stop');
-			} catch (e) {
-				console.error('[preview] Failed to stop:', e);
+			} catch {
+				// Preview may not be active
 			}
 			url = '';
 			tier = null;
@@ -97,6 +107,7 @@ export function getPreviewStore() {
 
 		async refresh() {
 			if (!url) return;
+			const invoke = await getInvoke();
 			try {
 				await invoke('reload_preview_webview');
 			} catch (e) {
@@ -105,6 +116,8 @@ export function getPreviewStore() {
 		},
 
 		async listenForChanges() {
+			const invoke = await getInvoke();
+			const listen = await getListen();
 			if (watcherUnlisten) {
 				watcherUnlisten();
 			}

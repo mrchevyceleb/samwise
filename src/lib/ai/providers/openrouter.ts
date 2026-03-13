@@ -1,4 +1,9 @@
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import type { UnlistenFn } from '@tauri-apps/api/event';
+
+async function getListen() {
+	const { listen } = await import('@tauri-apps/api/event');
+	return listen;
+}
 import { aiChatStream } from '$lib/utils/tauri';
 import { StreamProcessor } from '../chat/stream-processor';
 import type { ChatMessage, StreamChunk, ToolDefinition, AIChatSettings } from '../types';
@@ -169,6 +174,7 @@ export async function streamOpenAICompatibleCompletion(
   const bodyJson = JSON.stringify(body);
 
   const cleanupFns: UnlistenFn[] = [];
+  const listen = await getListen();
 
   try {
     cleanupFns.push(await listen<{ request_id: string; data: string }>(

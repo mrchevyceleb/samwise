@@ -45,7 +45,7 @@ export function getWorkspace() {
 
 			// Load file tree
 			try {
-				const { getFileTreeStore } = await import('$lib/stores/file-tree');
+				const { getFileTreeStore } = await import('$lib/stores/file-tree.svelte');
 				const fileTree = getFileTreeStore();
 				await fileTree.loadTree(folderPath);
 			} catch (e) {
@@ -54,7 +54,7 @@ export function getWorkspace() {
 
 			// Initialize git status (non-blocking)
 			try {
-				const { getGitStore } = await import('$lib/stores/git');
+				const { getGitStore } = await import('$lib/stores/git.svelte');
 				const git = getGitStore();
 				git.refresh(folderPath).catch((e: unknown) => {
 					console.warn('[workspace] Git refresh failed (may not be a repo):', e);

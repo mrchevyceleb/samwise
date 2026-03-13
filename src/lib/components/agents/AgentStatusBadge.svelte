@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { Agent } from '$lib/stores/agents';
+	import type { Agent } from '$lib/stores/agents.svelte';
 
 	interface Props {
 		status: Agent['status'];

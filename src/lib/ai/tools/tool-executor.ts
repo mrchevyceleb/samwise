@@ -1,4 +1,4 @@
-import { getWorkspace } from '$lib/stores/workspace';
+import { getWorkspace } from '$lib/stores/workspace.svelte';
 import {
   readFileText, writeFileText, createFile, deletePath, renamePath,
   searchFiles, getFileInfo, readDirectoryTree, listAllFiles, runCommandSync, mcpCallTool,

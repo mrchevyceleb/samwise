@@ -1,4 +1,4 @@
-import { getSettings, type MCPServerConfig } from '$lib/stores/settings';
+import { getSettings, type MCPServerConfig } from '$lib/stores/settings.svelte';
 import { mcpListTools, stdioMcpSpawn, stdioMcpListTools, stdioMcpStop, stdioMcpStatus } from '$lib/utils/tauri';
 import type { ToolDefinition } from '../types';
 import { setDynamicToolDefinitions } from './tool-definitions';

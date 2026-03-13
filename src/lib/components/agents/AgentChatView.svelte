@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { getAgentStore, type Agent, type AgentMessage } from '$lib/stores/agents';
+	import { getAgentStore, type Agent, type AgentMessage } from '$lib/stores/agents.svelte';
 	import AgentStatusBadge from './AgentStatusBadge.svelte';
 	import ChatMessage from '$lib/components/chat/ChatMessage.svelte';
 

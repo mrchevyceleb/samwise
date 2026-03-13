@@ -1,6 +1,6 @@
 <script lang="ts">
-	import { getLayout } from '$lib/stores/layout';
-	import { getWorkspace } from '$lib/stores/workspace';
+	import { getLayout } from '$lib/stores/layout.svelte';
+	import { getWorkspace } from '$lib/stores/workspace.svelte';
 
 	const layout = getLayout();
 	const workspace = getWorkspace();

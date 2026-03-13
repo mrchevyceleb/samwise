@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { getSettingsStore, updateSetting, type AppSettings } from '$lib/stores/settings';
+  import { getSettingsStore, updateSetting, type AppSettings } from '$lib/stores/settings.svelte';
 
   const settingsStore = getSettingsStore();
 
@@ -7,19 +7,19 @@
   let keyToggleHovered = $state(false);
 
   let providerKey = $derived(
-    settingsStore.value.aiProvider === 'anthropic' ? 'aiAnthropicApiKey' :
-    settingsStore.value.aiProvider === 'openai' ? 'aiOpenAIApiKey' :
+    settingsStore.value.aiProvider === 'anthropic' ? 'aiAnthropicApiKey' as const :
+    settingsStore.value.aiProvider === 'openai' ? 'aiOpenAIApiKey' as const :
     settingsStore.value.aiProvider === 'lmstudio' ? null :
-    'aiOpenRouterApiKey'
+    'aiOpenRouterApiKey' as const
   );
 
   let currentKey = $derived(
-    providerKey ? settingsStore.value[providerKey] as string : ''
+    providerKey ? (settingsStore.value[providerKey] as string) : ''
   );
 
   function setKey(value: string) {
     if (providerKey) {
-      updateSetting(providerKey, value);
+      updateSetting(providerKey as keyof AppSettings, value);
     }
   }
 

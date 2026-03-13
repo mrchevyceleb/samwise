@@ -1,7 +1,5 @@
 <script lang="ts">
-	import { getPreviewStore } from '$lib/stores/preview';
-	import { invoke } from '@tauri-apps/api/core';
-
+	import { getPreviewStore } from '$lib/stores/preview.svelte';
 	const preview = getPreviewStore();
 
 	let refreshHovered = $state(false);
@@ -28,6 +26,7 @@
 
 	async function handleRefresh() {
 		try {
+			const { invoke } = await import('@tauri-apps/api/core');
 			await invoke('reload_preview_webview');
 		} catch {
 			// Webview might not exist

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { getWorkspace } from '$lib/stores/workspace';
+	import { getWorkspace } from '$lib/stores/workspace.svelte';
 
 	const workspace = getWorkspace();
 

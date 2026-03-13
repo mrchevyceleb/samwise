@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { getAgentStore, type Agent } from '$lib/stores/agents';
+	import { getAgentStore, type Agent } from '$lib/stores/agents.svelte';
 	import AgentStatusBadge from './AgentStatusBadge.svelte';
 
 	const store = getAgentStore();
@@ -30,7 +30,7 @@
 	{#each store.agents as agent (agent.id)}
 		{@const isFocused = store.focusedAgentId === agent.id}
 		{@const isHovered = hoveredId === agent.id}
-		<button
+		<div
 			style="
 				display: flex; align-items: center; gap: 6px;
 				padding: 3px 8px; border-radius: 6px;
@@ -41,28 +41,31 @@
 				font-weight: {isFocused ? '600' : '400'};
 				transition: all 0.12s ease; white-space: nowrap; flex-shrink: 0;
 			"
+			role="tab"
+			tabindex="0"
+			aria-selected={isFocused}
 			onclick={() => focusAgent(agent.id)}
+			onkeydown={(e: KeyboardEvent) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); focusAgent(agent.id); }}}
 			onmouseenter={() => hoveredId = agent.id}
 			onmouseleave={() => hoveredId = null}
 		>
 			<AgentStatusBadge status={agent.status} size="sm" />
 			<span>{agent.name}</span>
-			<span
+			<button
 				style="
 					display: flex; align-items: center; justify-content: center;
-					width: 14px; height: 14px; border-radius: 3px;
+					width: 14px; height: 14px; border-radius: 3px; border: none; padding: 0;
 					font-size: 10px; line-height: 1; color: var(--text-muted);
 					background: {closeHoveredId === agent.id ? 'rgba(248, 81, 73, 0.2)' : 'transparent'};
-					transition: all 0.1s ease; cursor: pointer;
+					transition: all 0.1s ease; cursor: pointer; font-family: var(--font-ui);
 				"
-				role="button"
-				tabindex="-1"
+				aria-label="Close agent"
 				onclick={(e: MouseEvent) => closeAgent(e, agent.id)}
 				onmouseenter={() => closeHoveredId = agent.id}
 				onmouseleave={() => closeHoveredId = null}
 			>
 				x
-			</span>
-		</button>
+			</button>
+		</div>
 	{/each}
 </div>

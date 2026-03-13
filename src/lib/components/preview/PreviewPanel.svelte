@@ -1,10 +1,8 @@
 <script lang="ts">
 	import PreviewToolbar from './PreviewToolbar.svelte';
 	import PreviewPlaceholder from './PreviewPlaceholder.svelte';
-	import { getPreviewStore } from '$lib/stores/preview';
-	import { getWorkspace } from '$lib/stores/workspace';
-	import { invoke } from '@tauri-apps/api/core';
-
+	import { getPreviewStore } from '$lib/stores/preview.svelte';
+	import { getWorkspace } from '$lib/stores/workspace.svelte';
 	const preview = getPreviewStore();
 	const workspace = getWorkspace();
 
@@ -34,6 +32,7 @@
 		if (!containerRef) return;
 
 		try {
+			const { invoke } = await import('@tauri-apps/api/core');
 			const rect = containerRef.getBoundingClientRect();
 			const scaleFactor = window.devicePixelRatio || 1;
 
@@ -58,6 +57,7 @@
 		if (!containerRef || !webviewCreated) return;
 
 		const observer = new ResizeObserver(async (entries) => {
+			const { invoke } = await import('@tauri-apps/api/core');
 			for (const entry of entries) {
 				const rect = entry.target.getBoundingClientRect();
 				const scaleFactor = window.devicePixelRatio || 1;
