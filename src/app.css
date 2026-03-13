@@ -1,0 +1,122 @@
+@import 'tailwindcss';
+
+@font-face {
+  font-family: 'Space Grotesk';
+  src: url('/fonts/SpaceGrotesk-Variable.woff2') format('woff2');
+  font-weight: 300 700;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('/fonts/JetBrainsMono-Variable.woff2') format('woff2');
+  font-weight: 100 800;
+  font-display: swap;
+}
+
+:root {
+  --banana-yellow: #FFD60A;
+  --banana-yellow-hover: #FFE347;
+  --banana-yellow-dim: #B89B00;
+  --bg-primary: #0D1117;
+  --bg-surface: #161B22;
+  --bg-elevated: #1C2129;
+  --border-default: #30363D;
+  --border-bright: #484F58;
+  --text-primary: #E6EDF3;
+  --text-secondary: #8B949E;
+  --text-muted: #6E7681;
+  --accent-green: #3FB950;
+  --accent-red: #F85149;
+  --accent-blue: #58A6FF;
+  --accent-purple: #BC8CFF;
+  --accent-orange: #D29922;
+  --font-ui: 'Space Grotesk', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', monospace;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body {
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-default);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--border-bright);
+}
+
+[data-tauri-drag-region] {
+  -webkit-app-region: drag;
+}
+
+button, input, textarea, select, a, [role="button"] {
+  -webkit-app-region: no-drag;
+}
+
+::selection {
+  background: rgba(255, 214, 10, 0.3);
+  color: var(--text-primary);
+}
+
+/* Bobbing animation for the banana logo */
+@keyframes bob {
+  0%, 100% { transform: translateY(0) rotate(0deg); }
+  25% { transform: translateY(-3px) rotate(-3deg); }
+  75% { transform: translateY(2px) rotate(2deg); }
+}
+
+/* Breathing glow for accent elements */
+@keyframes breathe-glow {
+  0%, 100% { filter: drop-shadow(0 0 2px rgba(255, 214, 10, 0.2)); }
+  50% { filter: drop-shadow(0 0 8px rgba(255, 214, 10, 0.5)); }
+}
+
+/* Floating animation for background bananas */
+@keyframes float-drift {
+  0% { transform: translate(0, 0) rotate(0deg); opacity: var(--float-opacity, 0.06); }
+  25% { transform: translate(calc(var(--drift-x, 30px)), calc(var(--drift-y, -40px))) rotate(15deg); }
+  50% { transform: translate(calc(var(--drift-x, 30px) * 1.5), calc(var(--drift-y, -40px) * 0.5)) rotate(-10deg); opacity: calc(var(--float-opacity, 0.06) * 1.3); }
+  75% { transform: translate(calc(var(--drift-x, 30px) * 0.5), calc(var(--drift-y, -40px) * 1.3)) rotate(8deg); }
+  100% { transform: translate(0, 0) rotate(0deg); opacity: var(--float-opacity, 0.06); }
+}
+
+/* Click emoji burst */
+@keyframes emoji-rise {
+  0% {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1) translateY(0);
+  }
+  100% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.5) translateY(-80px);
+  }
+}
+
+/* Pulse for status indicators */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
