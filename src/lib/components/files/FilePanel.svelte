@@ -2,6 +2,7 @@
 	import { getFileTreeStore, type FileNode } from '$lib/stores/file-tree';
 	import { getWorkspace } from '$lib/stores/workspace';
 	import FileTree from './FileTree.svelte';
+	import GitPanel from '$lib/components/git/GitPanel.svelte';
 
 	const fileTree = getFileTreeStore();
 	const workspace = getWorkspace();
@@ -16,16 +17,7 @@
 	let fileCount = $derived(fileTree.fileCount);
 
 	async function openFolder() {
-		try {
-			const { open } = await import('@tauri-apps/plugin-dialog');
-			const selected = await open({ directory: true, multiple: false, title: 'Open Folder' });
-			if (selected && typeof selected === 'string') {
-				workspace.path = selected;
-				await fileTree.loadTree(selected);
-			}
-		} catch {
-			console.warn('Dialog not available in browser dev mode');
-		}
+		await workspace.openFolder();
 	}
 
 	function handleFileClick(node: FileNode) {
@@ -178,15 +170,7 @@
 			</div>
 		{/if}
 	{:else}
-		<!-- Git tab - coming soon -->
-		<div style="flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; gap: 12px; text-align: center;">
-			<svg width="40" height="40" viewBox="0 0 16 16" fill="var(--text-muted)" style="opacity: 0.4;">
-				<path d="M9.5 3.25a2.25 2.25 0 1 1 3 2.122V6A2.5 2.5 0 0 1 10 8.5H6a1 1 0 0 0-1 1v1.128a2.251 2.251 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.5 0v1.836A2.492 2.492 0 0 1 6 7h4a1 1 0 0 0 1-1v-.628A2.25 2.25 0 0 1 9.5 3.25z"/>
-			</svg>
-			<p style="font-size: 14px; font-weight: 600; color: var(--text-primary); margin-bottom: 0;">
-				Git Integration
-			</p>
-			<p style="font-size: 12px; color: var(--text-muted);">Coming soon</p>
-		</div>
+		<!-- Git tab -->
+		<GitPanel />
 	{/if}
 </div>

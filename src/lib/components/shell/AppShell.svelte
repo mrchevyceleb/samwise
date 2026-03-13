@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import TitleBar from './TitleBar.svelte';
 	import StatusBar from './StatusBar.svelte';
 	import ResizeHandle from './ResizeHandle.svelte';
@@ -9,7 +10,7 @@
 	import SettingsModal from '$lib/components/settings/SettingsModal.svelte';
 	import CommandPalette from '$lib/components/modals/CommandPalette.svelte';
 	import { getLayout } from '$lib/stores/layout';
-	import { getSettingsStore } from '$lib/stores/settings';
+	import { getSettingsStore, initSettings } from '$lib/stores/settings';
 	import { getTerminals } from '$lib/stores/terminals';
 	import { getWorkspace } from '$lib/stores/workspace';
 
@@ -19,6 +20,17 @@
 	const workspace = getWorkspace();
 
 	let commandPaletteVisible = $state(false);
+
+	onMount(async () => {
+		// 1. Load persisted settings from disk
+		await initSettings();
+
+		// 2. Restore last workspace if restoreSession is enabled
+		const s = settingsStore.value;
+		if (s.restoreSession && workspace.lastPath) {
+			await workspace.setWorkspace(workspace.lastPath);
+		}
+	});
 
 	function handleGlobalKeyDown(e: KeyboardEvent) {
 		// Ctrl+Shift+P -> Command Palette
@@ -39,6 +51,17 @@
 		if ((e.ctrlKey || e.metaKey) && e.key === ',') {
 			e.preventDefault();
 			settingsStore.settingsVisible = !settingsStore.settingsVisible;
+		}
+		// Ctrl+O -> Open Folder
+		if ((e.ctrlKey || e.metaKey) && e.key === 'o' && !e.shiftKey) {
+			e.preventDefault();
+			workspace.openFolder();
+		}
+		// Ctrl+Shift+N -> New Terminal
+		if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'N') {
+			e.preventDefault();
+			layout.terminalVisible = true;
+			terminals.add(workspace.path || '');
 		}
 	}
 </script>

@@ -141,6 +141,30 @@ export const DEFAULT_SETTINGS: AppSettings = {
 let currentSettings = $state<AppSettings>({ ...DEFAULT_SETTINGS });
 let settingsVisible = $state(false);
 let aiSettingsVisible = $state(false);
+let settingsLoaded = $state(false);
+
+// Debounce timer for auto-saving
+let saveTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** Persist current settings to disk via Tauri */
+async function persistSettings(): Promise<void> {
+  try {
+    const { saveSettings } = await import('$lib/utils/tauri');
+    await saveSettings(JSON.stringify(currentSettings));
+  } catch (e) {
+    console.warn('[settings] Failed to save:', e);
+  }
+}
+
+/** Schedule a debounced save (300ms) */
+function scheduleSave(): void {
+  if (!settingsLoaded) return; // Don't save during initial load
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    persistSettings();
+    saveTimer = null;
+  }, 300);
+}
 
 // ---- Accessors ----
 
@@ -150,18 +174,21 @@ export function getSettings(): AppSettings {
 
 export function setSettings(s: AppSettings): void {
   currentSettings = { ...s };
+  scheduleSave();
 }
 
 export function getSettingsStore() {
   return {
     get value() { return currentSettings; },
-    set value(s: AppSettings) { currentSettings = { ...s }; },
+    set value(s: AppSettings) { currentSettings = { ...s }; scheduleSave(); },
 
     get settingsVisible() { return settingsVisible; },
     set settingsVisible(v: boolean) { settingsVisible = v; },
 
     get aiSettingsVisible() { return aiSettingsVisible; },
     set aiSettingsVisible(v: boolean) { aiSettingsVisible = v; },
+
+    get loaded() { return settingsLoaded; },
   };
 }
 
@@ -173,6 +200,24 @@ export function updateSetting<K extends keyof AppSettings>(
   value: AppSettings[K],
 ) {
   currentSettings = { ...currentSettings, [key]: value };
+  scheduleSave();
+}
+
+/** Load settings from disk on app startup. Merges with defaults for any missing keys. */
+export async function initSettings(): Promise<void> {
+  try {
+    const { loadSettings } = await import('$lib/utils/tauri');
+    const json = await loadSettings();
+    if (json) {
+      const loaded = JSON.parse(json) as Partial<AppSettings>;
+      // Merge with defaults so new keys are always present
+      currentSettings = { ...DEFAULT_SETTINGS, ...loaded };
+    }
+  } catch (e) {
+    console.warn('[settings] Failed to load (using defaults):', e);
+  } finally {
+    settingsLoaded = true;
+  }
 }
 
 export function getActiveAIKey(s: AppSettings): string {
