@@ -316,6 +316,80 @@ pub async fn ai_chat_stream_openai_codex(
     stream_sse_response(&app, &request_id, response).await
 }
 
+// ── Non-streaming AI completion (used by preview recovery) ──────────
+
+#[tauri::command]
+pub async fn ai_chat_complete(
+    base_url: String,
+    api_key: String,
+    body_json: String,
+    provider: String,
+) -> Result<String, String> {
+    let api_key = api_key.trim().to_string();
+
+    let body: serde_json::Value = serde_json::from_str(&body_json)
+        .map_err(|e| format!("Invalid request body: {}", e))?;
+
+    let mut headers = HeaderMap::new();
+
+    if provider == "anthropic" {
+        headers.insert(
+            "x-api-key",
+            HeaderValue::from_str(&api_key)
+                .map_err(|e| format!("Invalid API key format: {}", e))?,
+        );
+        headers.insert(
+            "anthropic-version",
+            HeaderValue::from_static("2023-06-01"),
+        );
+    } else {
+        // OpenRouter / OpenAI compatible
+        headers.insert(
+            "HTTP-Referer",
+            HeaderValue::from_static("https://bananacode.app"),
+        );
+        headers.insert("X-Title", HeaderValue::from_static("Banana Code"));
+        if !api_key.is_empty() && api_key != "lm-studio" {
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {}", api_key))
+                    .map_err(|e| format!("Invalid API key format: {}", e))?,
+            );
+        }
+    }
+
+    let url = if provider == "anthropic" {
+        format!("{}/messages", base_url.trim_end_matches('/'))
+    } else {
+        format!("{}/chat/completions", base_url.trim_end_matches('/'))
+    };
+
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+
+    let response = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("AI recovery request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("AI API error {}: {}", status, body));
+    }
+
+    response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read AI response: {}", e))
+}
+
 // ── Model Fetching ──────────────────────────────────────────────────
 
 #[tauri::command]

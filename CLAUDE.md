@@ -6,6 +6,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Banana Code IDE. A desktop code editor (like VS Code/Cursor) built with Tauri v2 + SvelteKit + Rust. It has an AI chat panel, integrated terminal (PTY), file explorer, git integration, live preview, and MCP tool support.
 
+## THE VISION ##
+
+*NEVER FORGET THIS*
+
+This is the world's FIRST vibe coding first IDE. Vibe coding for real developers. It combines the best of modern web tech with Rust's performance, creating a seamless coding experience that feels like magic. The preview JUST WORKS EVERY TIME no matter what app you are in. You are the quarterback and your agents are your wide receivers. The visual and agent chat are ALWAYS side by side. This is not about directly writing code (you could if you want but its not the core experience), it's about taking the ease of use that made Base44 and Lovable so popular and making it WAY more powerful, on your desktop. 
+
+## Preview Engine Rules (NON-NEGOTIABLE)
+
+1. **User NEVER sees dev servers.** No "Starting dev server", no "Installing dependencies", no "Detecting project type" spinners. Ever.
+2. **Tier 2 (esbuild sidecar) is the primary approach.** Ship esbuild as a Tauri sidecar binary (~9MB). Bundle JSX/TSX/React/Vue/etc ourselves. No npm install needed. Instant.
+3. **Tier 3 (ManagedProcess) is a SILENT last resort.** Only for frameworks that absolutely require their own server (Next.js SSR, etc.). Runs invisibly in the background. User never knows it exists.
+4. **Preview must feel instant.** Open a project, see it rendered. Like a browser opening a webpage - you don't see "starting HTTP server."
+5. **No npm install as a blocking step.** esbuild sidecar handles bundling without node_modules for most projects.
+
+## Testing Changes
+
+When testing changes, always kill any running Banana Code instances and restart:
+```bash
+# Kill via PowerShell (bash mangles taskkill flags)
+powershell.exe -Command "Get-Process -Name 'banana-code' -ErrorAction SilentlyContinue | Stop-Process -Force"
+# Then start fresh
+cd /c/PERSONAL-PROJECTS/banana-ide && npx tauri dev
+```
+Never ask the user to restart manually. Do it yourself.
+
 ## Commands
 
 ### Development

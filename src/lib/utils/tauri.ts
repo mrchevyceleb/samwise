@@ -263,6 +263,12 @@ export async function loadSettings(): Promise<string> {
 	return invoke<string>('load_settings');
 }
 
+// ── Preview Env Vars ──────────────────────────────────────────────
+
+export async function previewScanEnvKeys(projectDir: string): Promise<string[]> {
+	return invoke<string[]>('preview_scan_env_keys', { projectDir });
+}
+
 /** Safe invoke that catches errors when Tauri is not available (e.g. browser dev) */
 export async function safeInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T | null> {
 	try {

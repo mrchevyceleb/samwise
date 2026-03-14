@@ -1,10 +1,33 @@
 <script lang="ts">
 	import PreviewToolbar from './PreviewToolbar.svelte';
+	import EnvVarsPanel from './EnvVarsPanel.svelte';
 	import PreviewPlaceholder from './PreviewPlaceholder.svelte';
+	import PreviewLoading from './PreviewLoading.svelte';
 	import { getPreviewStore } from '$lib/stores/preview.svelte';
 	import { getWorkspace } from '$lib/stores/workspace.svelte';
 	const preview = getPreviewStore();
 	const workspace = getWorkspace();
+
+	let showOverlay = $derived(preview.status === 'ready' && preview.missingSecretsOverlay);
+	let bananaRotation = $state(0);
+
+	// Gentle banana wobble animation
+	$effect(() => {
+		if (!showOverlay) return;
+		const interval = setInterval(() => {
+			bananaRotation = Math.sin(Date.now() / 600) * 12;
+		}, 50);
+		return () => clearInterval(interval);
+	});
+
+	function openSecretsPanel() {
+		preview.envPanelOpen = true;
+		preview.missingSecretsOverlay = false;
+	}
+
+	function skipOverlay() {
+		preview.missingSecretsOverlay = false;
+	}
 
 	let containerRef = $state<HTMLDivElement | null>(null);
 	let webviewCreated = $state(false);
@@ -13,6 +36,7 @@
 	$effect(() => {
 		const path = workspace.path;
 		if (path) {
+			webviewCreated = false;
 			preview.openProject(path);
 		} else {
 			preview.stop();
@@ -21,9 +45,11 @@
 	});
 
 	// Watch for URL becoming available and create the webview
+	// DON'T create if the missing secrets overlay is showing
 	$effect(() => {
 		const currentUrl = preview.url;
-		if (currentUrl && containerRef && !webviewCreated) {
+		const overlayActive = preview.missingSecretsOverlay;
+		if (currentUrl && containerRef && !webviewCreated && !overlayActive) {
 			createWebview(currentUrl);
 		}
 	});
@@ -84,51 +110,56 @@
 
 <div style="display: flex; flex-direction: column; height: 100%; background: var(--bg-primary);">
 	<PreviewToolbar />
+	<EnvVarsPanel />
 	<div
 		bind:this={containerRef}
 		style="flex: 1; overflow: hidden; position: relative;"
 	>
-		{#if preview.status === 'idle'}
-			<PreviewPlaceholder />
-		{:else if preview.status === 'detecting'}
-			<div class="preview-loading">
-				<div class="spinner"></div>
-				<p class="loading-title">Detecting project type...</p>
-				{#if preview.statusMessage}
-					<p class="loading-detail">{preview.statusMessage}</p>
-				{/if}
-			</div>
-		{:else if preview.status === 'installing'}
-			<div class="preview-loading">
-				<div class="spinner"></div>
-				<p class="loading-title">Installing dependencies...</p>
-				<p class="loading-detail">This may take a moment for first-time projects</p>
-				{#if preview.framework}
-					<p class="loading-detail">{preview.framework} project detected</p>
-				{/if}
-			</div>
-		{:else if preview.status === 'building'}
-			<div class="preview-loading">
-				<div class="spinner"></div>
-				<p class="loading-title">
-					{#if preview.tier === 'esbuild'}
-						Bundling with esbuild...
-					{:else if preview.tier === 'managed'}
-						Starting dev server...
-					{:else}
-						Starting preview...
+		{#if showOverlay}
+			<!-- Friendly "missing secrets" overlay - shown instead of the webview -->
+			<div class="secrets-overlay">
+				<div class="secrets-card">
+					<div class="banana-wobble" style="transform: rotate({bananaRotation}deg);">
+						🍌
+					</div>
+					<h2 class="secrets-title">Almost ready to peel!</h2>
+					<p class="secrets-subtitle">Your app needs a few secrets to get started.</p>
+
+					{#if preview.suggestedKeys.length > 0}
+						<div class="secrets-keys">
+							<p class="keys-label">We found these in your project:</p>
+							<ul class="keys-list">
+								{#each preview.suggestedKeys as key}
+									<li class="key-item">
+										<span class="key-bullet">&#x2022;</span>
+										<code class="key-name">{key}</code>
+									</li>
+								{/each}
+							</ul>
+						</div>
 					{/if}
-				</p>
-				{#if preview.statusMessage}
-					<p class="loading-detail">{preview.statusMessage}</p>
-				{:else if preview.framework}
-					<p class="loading-detail">{preview.framework} project detected</p>
-				{/if}
+
+					<button class="secrets-btn" onclick={openSecretsPanel}>
+						Open Secrets Panel
+					</button>
+
+					<div class="arrow-hint">
+						<div class="arrow-up">&#x2191;</div>
+					</div>
+
+					<button class="skip-link" onclick={skipOverlay}>
+						Skip, I don't need env vars
+					</button>
+				</div>
 			</div>
+		{:else if preview.status === 'idle'}
+			<PreviewPlaceholder />
+		{:else if preview.status === 'loading'}
+			<PreviewLoading />
 		{:else if preview.status === 'error'}
 			<div class="preview-error">
 				<div class="error-icon">!</div>
-				<p class="error-title">Preview failed</p>
+				<p class="error-title">Something went wrong</p>
 				<p class="error-detail">{preview.error}</p>
 				<button
 					class="retry-btn"
@@ -138,46 +169,12 @@
 				</button>
 			</div>
 		{:else if preview.status === 'ready' && !webviewCreated}
-			<div class="preview-loading">
-				<div class="spinner"></div>
-				<p class="loading-title">Loading preview...</p>
-			</div>
+			<PreviewLoading />
 		{/if}
-		<!-- When status is 'ready' and webviewCreated, the native webview is rendered in this container -->
 	</div>
 </div>
 
 <style>
-	.preview-loading {
-		display: flex;
-		flex-direction: column;
-		align-items: center;
-		justify-content: center;
-		height: 100%;
-		gap: 12px;
-		padding: 32px;
-	}
-
-	.spinner {
-		width: 32px;
-		height: 32px;
-		border: 3px solid var(--border-default);
-		border-top-color: var(--banana-yellow);
-		border-radius: 50%;
-		animation: spin 0.8s linear infinite;
-	}
-
-	.loading-title {
-		font-size: 14px;
-		font-weight: 600;
-		color: var(--text-primary);
-	}
-
-	.loading-detail {
-		font-size: 12px;
-		color: var(--text-muted);
-	}
-
 	.preview-error {
 		display: flex;
 		flex-direction: column;
@@ -234,7 +231,149 @@
 		box-shadow: 0 4px 12px rgba(255, 214, 10, 0.3);
 	}
 
-	@keyframes spin {
-		to { transform: rotate(360deg); }
+	/* Missing Secrets Overlay */
+	.secrets-overlay {
+		position: absolute;
+		inset: 0;
+		z-index: 100;
+		background: var(--bg-primary, #1a1a1a);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		animation: fadeIn 0.3s ease;
 	}
+
+	@keyframes fadeIn {
+		from { opacity: 0; }
+		to { opacity: 1; }
+	}
+
+	.secrets-card {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: 12px;
+		padding: 40px 36px;
+		max-width: 380px;
+		text-align: center;
+	}
+
+	.banana-wobble {
+		font-size: 48px;
+		transition: transform 0.1s ease;
+		user-select: none;
+	}
+
+	.secrets-title {
+		font-size: 18px;
+		font-weight: 700;
+		color: var(--text-primary, #f0f0f0);
+		margin: 0;
+	}
+
+	.secrets-subtitle {
+		font-size: 13px;
+		color: var(--text-muted, #888);
+		margin: 0;
+		line-height: 1.5;
+	}
+
+	.secrets-keys {
+		width: 100%;
+		background: rgba(255, 255, 255, 0.04);
+		border-radius: 8px;
+		padding: 12px 16px;
+		margin-top: 4px;
+	}
+
+	.keys-label {
+		font-size: 11px;
+		color: var(--text-muted, #888);
+		margin: 0 0 8px 0;
+		text-align: left;
+	}
+
+	.keys-list {
+		list-style: none;
+		padding: 0;
+		margin: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+
+	.key-item {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		text-align: left;
+	}
+
+	.key-bullet {
+		color: var(--banana-yellow, #ffd60a);
+		font-size: 14px;
+	}
+
+	.key-name {
+		font-size: 12px;
+		font-family: 'JetBrains Mono', monospace;
+		color: var(--text-primary, #f0f0f0);
+		background: rgba(255, 255, 255, 0.06);
+		padding: 2px 6px;
+		border-radius: 4px;
+	}
+
+	.secrets-btn {
+		margin-top: 8px;
+		padding: 10px 24px;
+		background: var(--banana-yellow, #ffd60a);
+		color: #1a1a1a;
+		border: none;
+		border-radius: 8px;
+		font-size: 13px;
+		font-weight: 700;
+		cursor: pointer;
+		transition: transform 0.15s ease, box-shadow 0.15s ease;
+	}
+
+	.secrets-btn:hover {
+		transform: scale(1.06);
+		box-shadow: 0 6px 20px rgba(255, 214, 10, 0.35);
+	}
+
+	.secrets-btn:active {
+		transform: scale(0.97);
+	}
+
+	.arrow-hint {
+		margin-top: 4px;
+		animation: arrowBounce 1.2s ease-in-out infinite;
+	}
+
+	.arrow-up {
+		font-size: 20px;
+		color: var(--banana-yellow, #ffd60a);
+		opacity: 0.7;
+	}
+
+	@keyframes arrowBounce {
+		0%, 100% { transform: translateY(0); }
+		50% { transform: translateY(-6px); }
+	}
+
+	.skip-link {
+		background: none;
+		border: none;
+		color: var(--text-muted, #888);
+		font-size: 11px;
+		cursor: pointer;
+		padding: 4px 8px;
+		border-radius: 4px;
+		transition: color 0.15s ease;
+	}
+
+	.skip-link:hover {
+		color: var(--text-primary, #f0f0f0);
+	}
+
 </style>

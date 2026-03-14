@@ -11,8 +11,6 @@ pub struct PreviewServer {
 
 impl PreviewServer {
     pub async fn start(serve_dir: PathBuf) -> Result<Self, String> {
-        let port = super::port_allocator::find_preview_port()?;
-
         let app = Router::new()
             .fallback_service(
                 ServeDir::new(&serve_dir).append_index_html_on_directories(true),
@@ -21,9 +19,16 @@ impl PreviewServer {
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-        let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
+        // Bind to port 0 and let the OS assign a free port.
+        // This guarantees no conflicts even with multiple app windows.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|e| format!("Failed to bind preview server: {}", e))?;
+
+        let port = listener
+            .local_addr()
+            .map_err(|e| format!("Failed to get assigned port: {}", e))?
+            .port();
 
         log::info!("Preview server starting on port {}", port);
 

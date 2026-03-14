@@ -4,6 +4,7 @@ mod preview;
 mod models;
 
 use state::{AppState, StdioMcpState, TerminalState};
+use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -55,6 +56,7 @@ pub fn run() {
             commands::ai::ai_chat_stream,
             commands::ai::ai_chat_stream_anthropic,
             commands::ai::ai_chat_stream_openai_codex,
+            commands::ai::ai_chat_complete,
             commands::ai::ai_fetch_models,
             // AI OAuth
             commands::ai::ai_exchange_openrouter_oauth_code,
@@ -109,7 +111,23 @@ pub fn run() {
             commands::orchestrator::preview_get_tier,
             commands::orchestrator::preview_rebuild,
             commands::orchestrator::preview_detect_tier,
+            commands::orchestrator::preview_scan_env_keys,
+            commands::orchestrator::preview_save_env_file,
+            commands::orchestrator::preview_load_env_file,
         ])
+        .on_window_event(|window, event| {
+            // When the main window is destroyed, clean up preview processes
+            if let tauri::WindowEvent::Destroyed = event {
+                if window.label() == "main" {
+                    log::info!("[app] Main window destroyed, cleaning up preview");
+                    let state = window.state::<parking_lot::Mutex<preview::orchestrator::PreviewOrchestrator>>();
+                    let mut orchestrator = state.lock();
+                    // Replace with a fresh orchestrator to trigger Drop on the old one
+                    // Drop will kill any managed processes
+                    *orchestrator = preview::orchestrator::PreviewOrchestrator::new();
+                }
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running Banana Code");
 }

@@ -23,42 +23,41 @@ const READY_PATTERNS: &[&str] = &[
     "local:",
     "localhost:",
     "127.0.0.1:",
+    "0.0.0.0:",
     "server running",
     "compiled successfully",
     "compiled client",
     "webpack compiled",
     "built in",
+    "vite",
+    "➜",
+    "▲ next",
+    "ready started server",
+    "app is running",
+    "serving on",
+    "dev server running",
+    "press h + enter",
 ];
 
 impl ManagedProcess {
     /// Start a managed dev server process.
-    ///
-    /// The `command` should be the full dev command (e.g., "next dev", "npm run dev").
-    /// We inject PORT env so the server listens on our chosen port.
-    /// If node_modules is missing, we auto-run npm install first.
+    /// Silently installs deps if missing, spawns the dev command, waits for ready.
     pub async fn start(
         project_dir: &Path,
         command: &str,
         env: HashMap<String, String>,
         app: Option<AppHandle>,
     ) -> Result<Self, String> {
-        // Auto-install deps if node_modules is missing
+        // Auto-install deps if node_modules is missing (silently)
         let node_modules = project_dir.join("node_modules");
         if !node_modules.exists() {
-            log::info!("[process_manager] node_modules missing, running npm install...");
-            if let Some(ref app) = app {
-                let _ = app.emit("preview:status", serde_json::json!({
-                    "phase": "installing",
-                    "message": "Installing dependencies..."
-                }));
-            }
-            let install_result = run_package_install(project_dir).await;
-            match install_result {
-                Ok(_) => log::info!("[process_manager] npm install completed successfully"),
+            log::info!("[process_manager] node_modules missing, running install silently...");
+            match run_package_install(project_dir).await {
+                Ok(_) => log::info!("[process_manager] Install completed"),
                 Err(e) => {
-                    log::error!("[process_manager] npm install failed: {}", e);
+                    log::error!("[process_manager] Install failed: {}", e);
                     return Err(format!(
-                        "Dependencies not installed and auto-install failed: {}. Try running 'npm install' in the project directory.",
+                        "Dependencies not installed: {}",
                         e
                     ));
                 }
@@ -68,47 +67,52 @@ impl ManagedProcess {
         let port = super::port_allocator::find_managed_port()?;
 
         log::info!(
-            "[process_manager] Starting managed process: '{}' on port {} in {}",
+            "[process_manager] Starting: '{}' on port {} in {}",
             command,
             port,
             project_dir.display()
         );
 
-        // Parse command into program and args
-        let (program, args) = parse_command(command);
+        let (program, args) = parse_command_platform(command);
 
         let mut cmd = Command::new(&program);
         cmd.args(&args)
             .current_dir(project_dir)
             .env("PORT", port.to_string())
-            .env("BROWSER", "none") // Prevent auto-opening browser
-            .env("FORCE_COLOR", "0") // Clean output
+            .env("BROWSER", "none")
+            .env("FORCE_COLOR", "0")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
-        // Inject custom environment variables
         for (key, value) in &env {
             cmd.env(key, value);
         }
 
-        // On Windows, create a new process group so we can kill the tree
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x00000008); // CREATE_NO_WINDOW
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
         }
 
         let mut child = cmd.spawn().map_err(|e| {
-            format!("Failed to start managed process '{}': {}", program, e)
+            format!("Failed to start '{}': {}", program, e)
         })?;
 
-        // Wait for the server to be ready by watching stdout/stderr
-        let ready = wait_for_ready(&mut child, port).await;
+        let ready = wait_for_ready(&mut child, port, &[]).await;
 
         if !ready {
-            log::warn!(
-                "[process_manager] Server may not be fully ready. Proceeding anyway after timeout."
-            );
+            match child.try_wait() {
+                Ok(Some(exit_status)) => {
+                    return Err(format!(
+                        "Process exited with code {:?} before ready. Command: '{}'",
+                        exit_status.code(),
+                        command
+                    ));
+                }
+                _ => {
+                    log::warn!("[process_manager] Server may not be fully ready, proceeding.");
+                }
+            }
         }
 
         Ok(Self {
@@ -219,11 +223,38 @@ fn parse_command(command: &str) -> (String, Vec<String>) {
     }
 }
 
+/// Platform-aware command parsing. On Windows, wraps shell commands through
+/// cmd.exe /C so that .cmd/.bat scripts (npm, npx, yarn, pnpm) resolve correctly.
+fn parse_command_platform(command: &str) -> (String, Vec<String>) {
+    #[cfg(windows)]
+    {
+        let (program, args) = parse_command(command);
+        let shell_commands = ["npm", "npx", "yarn", "pnpm", "bun"];
+        if shell_commands.contains(&program.as_str()) {
+            // On Windows, npm/npx/etc. are .cmd files. Use cmd /C for reliable resolution.
+            let mut full_cmd = program;
+            for arg in &args {
+                full_cmd.push(' ');
+                full_cmd.push_str(arg);
+            }
+            return ("cmd".to_string(), vec!["/C".to_string(), full_cmd]);
+        }
+        (program, args)
+    }
+    #[cfg(not(windows))]
+    {
+        parse_command(command)
+    }
+}
+
 /// Wait for the dev server to output a "ready" pattern, with a timeout.
-/// Uses a multi-signal approach: ready pattern in stdout/stderr, or process exit.
-async fn wait_for_ready(child: &mut Child, port: u16) -> bool {
+/// Uses a multi-signal approach: ready pattern in stdout/stderr, port polling, or process exit.
+async fn wait_for_ready(child: &mut Child, port: u16, extra_patterns: &[&str]) -> bool {
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+
+    // Collect extra patterns into owned strings for the async tasks
+    let extra_owned: Vec<String> = extra_patterns.iter().map(|s| s.to_string()).collect();
 
     // Channel for ready signal OR process death
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<bool>();
@@ -232,12 +263,13 @@ async fn wait_for_ready(child: &mut Child, port: u16) -> bool {
     // Spawn stdout reader
     if let Some(stdout) = stdout {
         let tx = ready_tx.clone();
+        let extra = extra_owned.clone();
         tokio::spawn(async move {
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 log::info!("[managed:stdout] {}", line);
-                if is_ready_line(&line) {
+                if is_ready_line(&line, &extra) {
                     if let Some(tx) = tx.lock().await.take() {
                         let _ = tx.send(true);
                     }
@@ -253,12 +285,13 @@ async fn wait_for_ready(child: &mut Child, port: u16) -> bool {
     // Spawn stderr reader
     if let Some(stderr) = stderr {
         let tx = ready_tx.clone();
+        let extra = extra_owned.clone();
         tokio::spawn(async move {
             let reader = BufReader::new(stderr);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 log::info!("[managed:stderr] {}", line);
-                if is_ready_line(&line) {
+                if is_ready_line(&line, &extra) {
                     if let Some(tx) = tx.lock().await.take() {
                         let _ = tx.send(true);
                     }
@@ -267,10 +300,28 @@ async fn wait_for_ready(child: &mut Child, port: u16) -> bool {
         });
     }
 
-    // Wait with timeout
-    match tokio::time::timeout(std::time::Duration::from_secs(30), ready_rx).await {
+    // Spawn port poller as a parallel fallback - checks every 2s if port is listening
+    let poll_tx = ready_tx.clone();
+    let poll_port = port;
+    tokio::spawn(async move {
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            if tokio::net::TcpStream::connect(format!("127.0.0.1:{}", poll_port)).await.is_ok() {
+                log::info!("[process_manager] Port {} detected open via polling", poll_port);
+                if let Some(tx) = poll_tx.lock().await.take() {
+                    let _ = tx.send(true);
+                }
+                return;
+            }
+        }
+    });
+
+    // Wait with timeout (45s to give install/compile time)
+    match tokio::time::timeout(std::time::Duration::from_secs(45), ready_rx).await {
         Ok(Ok(true)) => {
             log::info!("[process_manager] Server ready on port {}", port);
+            // Give the server a moment to fully initialize after the ready signal
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             true
         }
         Ok(Ok(false)) => {
@@ -279,35 +330,55 @@ async fn wait_for_ready(child: &mut Child, port: u16) -> bool {
             false
         }
         _ => {
-            // Timeout or channel closed. Check if port is actually listening.
-            log::warn!("[process_manager] Timeout waiting for ready signal. Checking port...");
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            // Timeout or channel closed. Final port check.
+            log::warn!("[process_manager] Timeout waiting for ready signal. Final port check...");
             std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok()
         }
     }
 }
 
-fn is_ready_line(line: &str) -> bool {
+fn is_ready_line(line: &str, extra_patterns: &[String]) -> bool {
     let lower = line.to_lowercase();
-    READY_PATTERNS.iter().any(|pat| lower.contains(pat))
+    if READY_PATTERNS.iter().any(|pat| lower.contains(pat)) {
+        return true;
+    }
+    extra_patterns.iter().any(|pat| lower.contains(&pat.to_lowercase()))
 }
 
 /// Detect the package manager and run install.
 /// Checks for lock files to determine which package manager to use.
 async fn run_package_install(project_dir: &Path) -> Result<(), String> {
-    let (program, args) = if project_dir.join("bun.lockb").exists() || project_dir.join("bun.lock").exists() {
-        ("bun", vec!["install"])
+    let command = if project_dir.join("bun.lockb").exists() || project_dir.join("bun.lock").exists() {
+        "bun install"
     } else if project_dir.join("pnpm-lock.yaml").exists() {
-        ("pnpm", vec!["install"])
+        "pnpm install"
     } else if project_dir.join("yarn.lock").exists() {
-        ("yarn", vec!["install"])
+        "yarn install"
     } else {
-        ("npm", vec!["install"])
+        "npm install"
     };
 
-    log::info!("[process_manager] Running {} install in {}", program, project_dir.display());
+    log::info!("[process_manager] Running '{}' in {}", command, project_dir.display());
+    run_install_command(project_dir, command).await
+}
 
-    let mut cmd = Command::new(program);
+/// Execute an install command string in the project directory.
+async fn run_install_command(project_dir: &Path, command: &str) -> Result<(), String> {
+    let (program, args) = {
+        #[cfg(windows)]
+        {
+            ("cmd".to_string(), vec!["/C".to_string(), command.to_string()])
+        }
+        #[cfg(not(windows))]
+        {
+            let parts: Vec<&str> = command.split_whitespace().collect();
+            let prog = parts.first().unwrap_or(&"npm").to_string();
+            let a: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+            (prog, a)
+        }
+    };
+
+    let mut cmd = Command::new(&program);
     cmd.args(&args)
         .current_dir(project_dir)
         .stdout(std::process::Stdio::piped())
@@ -316,28 +387,27 @@ async fn run_package_install(project_dir: &Path) -> Result<(), String> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x00000008); // CREATE_NO_WINDOW
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
 
     let mut child = cmd.spawn()
-        .map_err(|e| format!("Failed to run {} install: {}", program, e))?;
+        .map_err(|e| format!("Failed to run '{}': {}", command, e))?;
 
     match tokio::time::timeout(
-        std::time::Duration::from_secs(120),
+        std::time::Duration::from_secs(180),
         child.wait(),
     ).await {
         Ok(Ok(exit_status)) => {
             if !exit_status.success() {
-                return Err(format!("{} install failed with exit code: {:?}", program, exit_status.code()));
+                return Err(format!("'{}' failed with exit code: {:?}", command, exit_status.code()));
             }
         }
         Ok(Err(e)) => {
-            return Err(format!("{} install failed: {}", program, e));
+            return Err(format!("'{}' failed: {}", command, e));
         }
         Err(_) => {
-            // Timeout - kill the child process to prevent zombies
             let _ = child.kill().await;
-            return Err(format!("{} install timed out after 120 seconds", program));
+            return Err(format!("'{}' timed out after 180 seconds", command));
         }
     };
 

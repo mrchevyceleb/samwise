@@ -16,6 +16,8 @@ pub struct PreviewOrchestrator {
     managed_process: Option<ManagedProcess>,
     watcher: Option<PreviewWatcher>,
     project_dir: Option<PathBuf>,
+    esbuild_sidecar_path: Option<PathBuf>,
+    env_vars: HashMap<String, String>,
 }
 
 impl PreviewOrchestrator {
@@ -28,44 +30,43 @@ impl PreviewOrchestrator {
             managed_process: None,
             watcher: None,
             project_dir: None,
+            esbuild_sidecar_path: None,
+            env_vars: HashMap::new(),
         }
     }
 
+    /// Set the esbuild sidecar binary path (resolved from Tauri resource dir)
+    pub fn set_esbuild_sidecar(&mut self, path: PathBuf) {
+        self.esbuild_sidecar_path = Some(path);
+    }
+
+    /// Set environment variables to inject into the preview process
+    pub fn set_env_vars(&mut self, vars: HashMap<String, String>) {
+        self.env_vars = vars;
+    }
+
     /// Open a project for preview. Detects tier and starts the appropriate server.
+    /// All tiers are silent - no user-facing status messages about infrastructure.
     pub async fn open_project(
         &mut self,
         app: &AppHandle,
         project_dir: PathBuf,
     ) -> Result<TierDetection, String> {
-        // 1. Stop any existing preview
         self.stop().await?;
 
         log::info!(
-            "[orchestrator] Opening project for preview: {}",
+            "[orchestrator] Opening project: {}",
             project_dir.display()
         );
 
-        // 2. Detect tier
         let detection = tier_detector::detect_tier(&project_dir);
         log::info!(
-            "[orchestrator] Detected tier: {:?} ({})",
+            "[orchestrator] Tier: {:?} ({})",
             detection.tier,
             detection.reason
         );
 
-        // Emit status so frontend can show progress
-        let _ = app.emit("preview:status", serde_json::json!({
-            "phase": "starting",
-            "tier": format!("{:?}", detection.tier),
-            "framework": &detection.framework,
-            "message": match detection.tier {
-                PreviewTier::DirectServe => "Starting static file server...",
-                PreviewTier::EsbuildBundle => "Bundling with esbuild...",
-                PreviewTier::ManagedProcess => "Starting dev server...",
-            }
-        }));
-
-        // 3. Start the appropriate server based on tier
+        // Start the appropriate server
         let result = match detection.tier {
             PreviewTier::DirectServe => {
                 self.start_direct_serve(&project_dir).await
@@ -78,76 +79,36 @@ impl PreviewOrchestrator {
             }
         };
 
-        // If esbuild fails, fall back to direct serve
-        if result.is_err() && detection.tier == PreviewTier::EsbuildBundle {
-            log::warn!(
-                "[orchestrator] Esbuild bundle failed, falling back to DirectServe: {}",
-                result.as_ref().unwrap_err()
-            );
-            self.start_direct_serve(&project_dir).await?;
+        // Fallback: if esbuild or managed process fails, try direct serve
+        if result.is_err() && detection.tier != PreviewTier::DirectServe {
+            let err = result.as_ref().unwrap_err().clone();
+            log::warn!("[orchestrator] {:?} failed ({}), falling back to DirectServe", detection.tier, err);
 
-            let fallback_detection = TierDetection {
-                tier: PreviewTier::DirectServe,
-                framework: detection.framework.clone(),
-                entry_point: detection.entry_point.clone(),
-                dev_command: None,
-                reason: format!(
-                    "Esbuild unavailable, serving static files. Original: {}",
-                    detection.reason
-                ),
-            };
-
-            self.current_tier = Some(PreviewTier::DirectServe);
-            self.detection = Some(fallback_detection.clone());
-            self.project_dir = Some(project_dir.clone());
-
-            self.start_watcher(project_dir, app)?;
-
-            return Ok(fallback_detection);
-        }
-
-        // If managed process fails, fall back to direct serve as last resort
-        if result.is_err() && detection.tier == PreviewTier::ManagedProcess {
-            let err_msg = result.as_ref().unwrap_err().clone();
-            log::warn!(
-                "[orchestrator] ManagedProcess failed, falling back to DirectServe: {}",
-                err_msg
-            );
-
-            // Try direct serve as last resort
             match self.start_direct_serve(&project_dir).await {
                 Ok(_) => {
-                    let fallback_detection = TierDetection {
+                    let fallback = TierDetection {
                         tier: PreviewTier::DirectServe,
                         framework: detection.framework.clone(),
                         entry_point: detection.entry_point.clone(),
                         dev_command: detection.dev_command.clone(),
-                        reason: format!(
-                            "Dev server failed ({}). Serving static files as fallback.",
-                            err_msg
-                        ),
+                        reason: format!("Fallback: {}", err),
                     };
 
                     self.current_tier = Some(PreviewTier::DirectServe);
-                    self.detection = Some(fallback_detection.clone());
+                    self.detection = Some(fallback.clone());
                     self.project_dir = Some(project_dir.clone());
                     self.start_watcher(project_dir, app)?;
-                    return Ok(fallback_detection);
+                    return Ok(fallback);
                 }
-                Err(_) => {
-                    // Even static serve failed, return the original error
-                    return Err(err_msg);
-                }
+                Err(_) => return Err(err),
             }
         }
 
         result?;
 
-        // 4. Start file watcher
         self.current_tier = Some(detection.tier.clone());
         self.detection = Some(detection.clone());
         self.project_dir = Some(project_dir.clone());
-
         self.start_watcher(project_dir, app)?;
 
         Ok(detection)
@@ -157,25 +118,21 @@ impl PreviewOrchestrator {
     pub async fn stop(&mut self) -> Result<(), String> {
         log::info!("[orchestrator] Stopping preview");
 
-        // Stop watcher
         if let Some(ref mut watcher) = self.watcher {
             watcher.stop();
         }
         self.watcher = None;
 
-        // Stop HTTP server
         if let Some(ref mut server) = self.http_server {
             server.shutdown();
         }
         self.http_server = None;
 
-        // Stop esbuild (cleanup output)
         if let Some(ref esbuild) = self.esbuild {
             esbuild.cleanup();
         }
         self.esbuild = None;
 
-        // Stop managed process
         if let Some(ref mut process) = self.managed_process {
             process.stop().await?;
         }
@@ -188,7 +145,6 @@ impl PreviewOrchestrator {
         Ok(())
     }
 
-    /// Get the current preview URL
     pub fn current_url(&self) -> Option<String> {
         if let Some(ref server) = self.http_server {
             return Some(server.url());
@@ -199,18 +155,12 @@ impl PreviewOrchestrator {
         None
     }
 
-    /// Get the current tier as a string
     pub fn current_tier_name(&self) -> Option<String> {
         self.current_tier.as_ref().map(|t| match t {
             PreviewTier::DirectServe => "direct".to_string(),
             PreviewTier::EsbuildBundle => "esbuild".to_string(),
             PreviewTier::ManagedProcess => "managed".to_string(),
         })
-    }
-
-    /// Get the current detection result
-    pub fn current_detection(&self) -> Option<&TierDetection> {
-        self.detection.as_ref()
     }
 
     /// Rebuild the esbuild bundle (called on file change for Tier 2)
@@ -225,20 +175,24 @@ impl PreviewOrchestrator {
                 let entry = detection.entry_point.as_deref().unwrap_or("src/index.tsx");
 
                 log::info!("[orchestrator] Rebuilding esbuild bundle");
-                let runner = EsbuildRunner::build(&project_dir, entry).await?;
+                let runner = EsbuildRunner::build(
+                    &project_dir,
+                    entry,
+                    self.esbuild_sidecar_path.as_deref(),
+                    &self.env_vars,
+                ).await?;
                 self.esbuild = Some(runner);
                 Ok(())
             }
-            _ => Ok(()), // Other tiers handle their own rebuilds
+            _ => Ok(()),
         }
     }
 
     // -- Private helpers --
 
     async fn start_direct_serve(&mut self, project_dir: &PathBuf) -> Result<(), String> {
-        log::info!("[orchestrator] Starting DirectServe for {}", project_dir.display());
         let server = PreviewServer::start(project_dir.clone()).await?;
-        log::info!("[orchestrator] DirectServe running at {}", server.url());
+        log::info!("[orchestrator] DirectServe at {}", server.url());
         self.http_server = Some(server);
         Ok(())
     }
@@ -249,19 +203,18 @@ impl PreviewOrchestrator {
         detection: &TierDetection,
     ) -> Result<(), String> {
         let entry = detection.entry_point.as_deref().unwrap_or("src/index.tsx");
+        log::info!("[orchestrator] esbuild bundle: {}", entry);
 
-        log::info!(
-            "[orchestrator] Starting EsbuildBundle for {} (entry: {})",
-            project_dir.display(),
-            entry
-        );
-
-        let runner = EsbuildRunner::build(project_dir, entry).await?;
+        let runner = EsbuildRunner::build(
+            project_dir,
+            entry,
+            self.esbuild_sidecar_path.as_deref(),
+            &self.env_vars,
+        ).await?;
         let output_dir = runner.output_dir().to_path_buf();
 
-        // Serve the esbuild output
         let server = PreviewServer::start(output_dir).await?;
-        log::info!("[orchestrator] EsbuildBundle serving at {}", server.url());
+        log::info!("[orchestrator] esbuild serving at {}", server.url());
 
         self.esbuild = Some(runner);
         self.http_server = Some(server);
@@ -279,15 +232,11 @@ impl PreviewOrchestrator {
             .as_deref()
             .unwrap_or("npm run dev");
 
-        log::info!(
-            "[orchestrator] Starting ManagedProcess for {} (command: {})",
-            project_dir.display(),
-            command
-        );
+        log::info!("[orchestrator] ManagedProcess: {}", command);
 
-        let env = HashMap::new();
+        let env = self.env_vars.clone();
         let process = ManagedProcess::start(project_dir, command, env, Some(app.clone())).await?;
-        log::info!("[orchestrator] ManagedProcess running at {}", process.url());
+        log::info!("[orchestrator] ManagedProcess at {}", process.url());
 
         self.managed_process = Some(process);
         Ok(())
@@ -300,8 +249,7 @@ impl PreviewOrchestrator {
                 Ok(())
             }
             Err(e) => {
-                // Watcher failure is non-fatal
-                log::warn!("[orchestrator] File watcher failed to start: {}", e);
+                log::warn!("[orchestrator] File watcher failed: {}", e);
                 Ok(())
             }
         }
