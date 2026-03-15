@@ -1,4 +1,5 @@
 pub mod ai;
+pub mod claude_code;
 pub mod files;
 pub mod git;
 pub mod mcp;

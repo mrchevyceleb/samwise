@@ -180,6 +180,27 @@ export async function aiOpenAIRefreshOAuthToken(
 	return invoke<string>('ai_openai_refresh_oauth_token', { issuer, clientId, refreshToken });
 }
 
+// ── Claude Code ───────────────────────────────────────────────────
+
+export async function spawnClaudeCode(
+	id: string,
+	cwd: string,
+	args: string[] = [],
+): Promise<void> {
+	return invoke<void>('spawn_claude_code', { id, cwd, args });
+}
+
+export async function closeClaudeCode(id: string): Promise<void> {
+	return invoke<void>('close_claude_code', { id });
+}
+
+export async function writeClaudeCode(
+	id: string,
+	message: string,
+): Promise<void> {
+	return invoke<void>('write_claude_code', { id, message });
+}
+
 // ── Chat Session Persistence ───────────────────────────────────────
 
 export async function saveChatSession(sessionId: string, data: string): Promise<void> {

@@ -4,6 +4,7 @@ let agentPanelWidth = $state(350);
 let filePanelWidth = $state(280);
 let terminalHeight = $state(200);
 let terminalVisible = $state(false);
+let chatMode = $state<'agent' | 'claude-code'>('agent');
 
 export function getLayout() {
 	return {
@@ -18,6 +19,9 @@ export function getLayout() {
 
 		get terminalVisible() { return terminalVisible; },
 		set terminalVisible(v: boolean) { terminalVisible = v; },
+
+		get chatMode() { return chatMode; },
+		set chatMode(v: 'agent' | 'claude-code') { chatMode = v; },
 
 		toggleTerminal() { terminalVisible = !terminalVisible; }
 	};

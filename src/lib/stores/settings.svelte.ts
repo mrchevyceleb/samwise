@@ -54,6 +54,10 @@ export interface AppSettings {
   aiBasePrompt: string;
   aiThinkingMode: 'all' | 'preview' | 'none';
   mcpServers: MCPServerConfig[];
+  dopplerToken: string;
+  dopplerProject: string;
+  dopplerConfig: string;
+  dopplerEnabled: boolean;
 }
 
 export interface MCPServerConfig {
@@ -134,13 +138,17 @@ export const DEFAULT_SETTINGS: AppSettings = {
     'google/gemini-2.5-pro-preview',
   ],
   mcpServers: [],
+  dopplerToken: '',
+  dopplerProject: '',
+  dopplerConfig: '',
+  dopplerEnabled: false,
 };
 
 // ---- Svelte 5 Runes State ----
 
 let currentSettings = $state<AppSettings>({ ...DEFAULT_SETTINGS });
 let settingsVisible = $state(false);
-let aiSettingsVisible = $state(false);
+let activeSettingsTab = $state<string>('general');
 let settingsLoaded = $state(false);
 
 // Debounce timer for auto-saving
@@ -185,8 +193,8 @@ export function getSettingsStore() {
     get settingsVisible() { return settingsVisible; },
     set settingsVisible(v: boolean) { settingsVisible = v; },
 
-    get aiSettingsVisible() { return aiSettingsVisible; },
-    set aiSettingsVisible(v: boolean) { aiSettingsVisible = v; },
+    get activeSettingsTab() { return activeSettingsTab; },
+    set activeSettingsTab(v: string) { activeSettingsTab = v; },
 
     get loaded() { return settingsLoaded; },
   };

@@ -1,11 +1,15 @@
 <script lang="ts">
 	import { getLayout } from '$lib/stores/layout.svelte';
 	import { getWorkspace } from '$lib/stores/workspace.svelte';
+	import { getSettingsStore } from '$lib/stores/settings.svelte';
 
 	const layout = getLayout();
 	const workspace = getWorkspace();
+	const settingsStore = getSettingsStore();
 
 	let termBtnHovered = $state(false);
+	let gearHovered = $state(false);
+	let aiSettingsHovered = $state(false);
 </script>
 
 <div class="statusbar" style="display: flex; align-items: center; height: 24px; padding: 0 12px; background: var(--bg-surface); border-top: 1px solid var(--border-default); font-size: 11px; font-family: var(--font-mono); gap: 12px;">
@@ -40,6 +44,35 @@
 
 	<!-- Right section -->
 	<div style="display: flex; align-items: center; gap: 10px;">
+		<!-- Gear icon (settings) -->
+		<button
+			title="Settings (Ctrl+,)"
+			aria-label="Settings"
+			style="display: flex; align-items: center; background: none; border: none; color: {gearHovered ? 'var(--banana-yellow)' : 'var(--text-secondary)'}; cursor: pointer; padding: 0; transition: color 0.12s ease; transform: {gearHovered ? 'scale(1.05)' : 'scale(1)'};"
+			onclick={() => settingsStore.settingsVisible = !settingsStore.settingsVisible}
+			onmouseenter={() => gearHovered = true}
+			onmouseleave={() => gearHovered = false}
+		>
+			<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+				<circle cx="12" cy="12" r="3"/>
+				<path d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/>
+			</svg>
+		</button>
+
+		<!-- AI settings (sparkle) - opens settings modal to AI tab -->
+		<button
+			title="AI & Tools Settings"
+			aria-label="AI Settings"
+			style="display: flex; align-items: center; background: none; border: none; color: {aiSettingsHovered ? 'var(--banana-yellow)' : 'var(--text-secondary)'}; cursor: pointer; padding: 0; transition: color 0.12s ease; transform: {aiSettingsHovered ? 'scale(1.05)' : 'scale(1)'};"
+			onclick={() => { settingsStore.activeSettingsTab = 'ai'; settingsStore.settingsVisible = true; }}
+			onmouseenter={() => aiSettingsHovered = true}
+			onmouseleave={() => aiSettingsHovered = false}
+		>
+			<svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+				<path d="M12 2L9 12l-7 4 7 4 3 10 3-10 7-4-7-4z"/>
+			</svg>
+		</button>
+
 		<div style="display: flex; align-items: center; gap: 4px;">
 			<span style="width: 6px; height: 6px; border-radius: 50%; background: var(--accent-green); display: inline-block; animation: pulse-dot 2s ease-in-out infinite;"></span>
 			<span style="color: var(--text-muted);">Ready</span>

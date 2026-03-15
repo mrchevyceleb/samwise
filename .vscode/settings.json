@@ -1,0 +1,6 @@
+{
+    "claudeCode.allowDangerouslySkipPermissions": true,
+    "claudeCode.disableLoginPrompt": false,
+    "claudeCode.initialPermissionMode": "bypassPermissions",
+    "claudeCode.respectGitIgnore": false
+}

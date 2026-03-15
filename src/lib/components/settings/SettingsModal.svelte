@@ -5,15 +5,17 @@
 
   const settingsStore = getSettingsStore();
 
-  type Tab = 'general' | 'ai' | 'mcp' | 'doppler' | 'about';
-  let activeTab = $state<Tab>('general');
+  type Tab = 'general' | 'ai' | 'doppler' | 'about';
   let closeBtnHovered = $state(false);
   let hoveredTab = $state<string | null>(null);
 
+  // Use store-level tab state so external buttons (e.g. StatusBar) can control which tab opens
+  let activeTab = $derived(settingsStore.activeSettingsTab as Tab);
+  function setActiveTab(tab: Tab) { settingsStore.activeSettingsTab = tab; }
+
   const tabs: { id: Tab; label: string; icon: string }[] = [
     { id: 'general', label: 'General', icon: 'M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm0 0' },
-    { id: 'ai', label: 'AI Models', icon: 'M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z' },
-    { id: 'mcp', label: 'Tools & MCP', icon: 'M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z' },
+    { id: 'ai', label: 'AI & Tools', icon: 'M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z' },
     { id: 'doppler', label: 'Doppler', icon: 'M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z' },
     { id: 'about', label: 'About', icon: 'M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z' },
   ];
@@ -50,7 +52,7 @@
         <div style="flex: 1; display: flex; flex-direction: column; gap: 2px; padding: 0 8px;">
           {#each tabs as tab (tab.id)}
             <button
-              onclick={() => activeTab = tab.id}
+              onclick={() => setActiveTab(tab.id)}
               onmouseenter={() => hoveredTab = tab.id}
               onmouseleave={() => hoveredTab = null}
               style="display: flex; align-items: center; gap: 10px; padding: 8px 12px; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; font-family: var(--font-ui); transition: all 0.12s ease; text-align: left; background: {activeTab === tab.id ? 'rgba(255, 214, 10, 0.1)' : hoveredTab === tab.id ? 'var(--bg-elevated)' : 'transparent'}; color: {activeTab === tab.id ? 'var(--banana-yellow)' : 'var(--text-secondary)'}; border-left: {activeTab === tab.id ? '2px solid var(--banana-yellow)' : '2px solid transparent'};"
@@ -181,6 +183,22 @@
                     <option value="underline">Underline</option>
                   </select>
                 </div>
+                <div style="display: flex; align-items: center; gap: 16px; padding: 4px 0;">
+                  <div style="flex: 1;">
+                    <div style="font-size: 13px; color: var(--text-primary);">Style Preset</div>
+                    <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">Terminal visual theme</div>
+                  </div>
+                  <select
+                    value={settingsStore.value.terminalStylePreset}
+                    onchange={(e) => updateSetting('terminalStylePreset', (e.target as HTMLSelectElement).value as any)}
+                    style="padding: 6px 10px; background: var(--bg-primary); border: 1px solid var(--border-default); border-radius: 6px; color: var(--text-primary); font-size: 12px; outline: none; cursor: pointer;"
+                  >
+                    <option value="metal">Metal</option>
+                    <option value="minimal">Minimal</option>
+                    <option value="retro">Retro</option>
+                    <option value="high-contrast">High Contrast</option>
+                  </select>
+                </div>
               </div>
 
               <!-- Files -->
@@ -200,6 +218,18 @@
                 </div>
                 <div style="display: flex; align-items: center; gap: 16px; padding: 4px 0;">
                   <div style="flex: 1;">
+                    <div style="font-size: 13px; color: var(--text-primary);">File Tree Font Size</div>
+                    <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">Font size in the file explorer</div>
+                  </div>
+                  <input
+                    type="number" min="10" max="24"
+                    value={settingsStore.value.fileTreeFontSize}
+                    onchange={(e) => updateSetting('fileTreeFontSize', parseInt((e.target as HTMLInputElement).value) || 14)}
+                    style="width: 64px; padding: 6px 10px; background: var(--bg-primary); border: 1px solid var(--border-default); border-radius: 6px; color: var(--text-primary); font-size: 12px; outline: none; text-align: center;"
+                  />
+                </div>
+                <div style="display: flex; align-items: center; gap: 16px; padding: 4px 0;">
+                  <div style="flex: 1;">
                     <div style="font-size: 13px; color: var(--text-primary);">Word Wrap</div>
                     <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">Wrap long lines in the editor</div>
                   </div>
@@ -211,18 +241,55 @@
                   </label>
                 </div>
               </div>
+
+              <!-- Behavior -->
+              <div style="display: flex; flex-direction: column; gap: 12px;">
+                <div style="font-size: 13px; font-weight: 600; color: var(--text-primary); padding-bottom: 4px; border-bottom: 1px solid var(--border-default);">Behavior</div>
+                <div style="display: flex; align-items: center; gap: 16px; padding: 4px 0;">
+                  <div style="flex: 1;">
+                    <div style="font-size: 13px; color: var(--text-primary);">Restore Session</div>
+                    <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">Reopen last workspace on startup</div>
+                  </div>
+                  <label style="position: relative; display: inline-block; width: 36px; height: 20px; cursor: pointer;">
+                    <input type="checkbox" checked={settingsStore.value.restoreSession} onchange={(e) => updateSetting('restoreSession', (e.target as HTMLInputElement).checked)} style="opacity: 0; width: 0; height: 0;" />
+                    <span style="position: absolute; inset: 0; background: {settingsStore.value.restoreSession ? 'var(--banana-yellow)' : 'var(--border-default)'}; border-radius: 10px; transition: background 0.2s ease;">
+                      <span style="position: absolute; top: 2px; left: {settingsStore.value.restoreSession ? '18px' : '2px'}; width: 16px; height: 16px; background: white; border-radius: 50%; transition: left 0.2s ease;"></span>
+                    </span>
+                  </label>
+                </div>
+                <div style="display: flex; align-items: center; gap: 16px; padding: 4px 0;">
+                  <div style="flex: 1;">
+                    <div style="font-size: 13px; color: var(--text-primary);">Confirm Close Unsaved</div>
+                    <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">Prompt before closing unsaved files</div>
+                  </div>
+                  <label style="position: relative; display: inline-block; width: 36px; height: 20px; cursor: pointer;">
+                    <input type="checkbox" checked={settingsStore.value.confirmCloseUnsaved} onchange={(e) => updateSetting('confirmCloseUnsaved', (e.target as HTMLInputElement).checked)} style="opacity: 0; width: 0; height: 0;" />
+                    <span style="position: absolute; inset: 0; background: {settingsStore.value.confirmCloseUnsaved ? 'var(--banana-yellow)' : 'var(--border-default)'}; border-radius: 10px; transition: background 0.2s ease;">
+                      <span style="position: absolute; top: 2px; left: {settingsStore.value.confirmCloseUnsaved ? '18px' : '2px'}; width: 16px; height: 16px; background: white; border-radius: 50%; transition: left 0.2s ease;"></span>
+                    </span>
+                  </label>
+                </div>
+                <div style="display: flex; align-items: center; gap: 16px; padding: 4px 0;">
+                  <div style="flex: 1;">
+                    <div style="font-size: 13px; color: var(--text-primary);">Auto-Save Delay</div>
+                    <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">Milliseconds before auto-saving (0 = off)</div>
+                  </div>
+                  <select
+                    value={String(settingsStore.value.autoSaveDelay)}
+                    onchange={(e) => updateSetting('autoSaveDelay', parseInt((e.target as HTMLSelectElement).value))}
+                    style="padding: 6px 10px; background: var(--bg-primary); border: 1px solid var(--border-default); border-radius: 6px; color: var(--text-primary); font-size: 12px; outline: none; cursor: pointer;"
+                  >
+                    <option value="0">Off</option>
+                    <option value="1000">1 second</option>
+                    <option value="2000">2 seconds</option>
+                    <option value="5000">5 seconds</option>
+                  </select>
+                </div>
+              </div>
             </div>
 
           {:else if activeTab === 'ai'}
             <AISettingsPage />
-
-          {:else if activeTab === 'mcp'}
-            <div style="display: flex; flex-direction: column; gap: 16px;">
-              <p style="color: var(--text-secondary); font-size: 13px;">Configure MCP (Model Context Protocol) servers for extended tool capabilities.</p>
-              <div style="padding: 24px; border: 1px dashed var(--border-default); border-radius: 8px; text-align: center;">
-                <span style="color: var(--text-muted); font-size: 12px;">MCP server configuration is managed in the AI Settings panel.</span>
-              </div>
-            </div>
 
           {:else if activeTab === 'doppler'}
             <DopplerTab />

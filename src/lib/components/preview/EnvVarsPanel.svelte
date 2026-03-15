@@ -1,13 +1,23 @@
 <script lang="ts">
 	import { getPreviewStore } from '$lib/stores/preview.svelte';
 	import { getWorkspace } from '$lib/stores/workspace.svelte';
+	import { getSettingsStore } from '$lib/stores/settings.svelte';
+	import { fetchSecrets } from '$lib/services/doppler';
 	const preview = getPreviewStore();
 	const workspace = getWorkspace();
+	const settings = getSettingsStore();
 
 	let showValues: Record<number, boolean> = $state({});
 	let addHovered = $state(false);
 	let applyHovered = $state(false);
 	let applying = $state(false);
+	let syncHovered = $state(false);
+	let syncing = $state(false);
+	let syncError = $state('');
+
+	let dopplerConfigured = $derived(
+		settings.value.dopplerEnabled && settings.value.dopplerToken.trim() && settings.value.dopplerProject && settings.value.dopplerConfig
+	);
 
 	// Known public prefixes per framework
 	const FRAMEWORK_PREFIXES: Record<string, string> = {
@@ -69,6 +79,31 @@
 		preview.saveEnvVars(workspace.path);
 		await preview.openProject(workspace.path);
 		applying = false;
+	}
+
+	async function handleDopplerSync() {
+		if (!workspace.path || !dopplerConfigured) return;
+		syncing = true;
+		syncError = '';
+		try {
+			const secrets = await fetchSecrets(settings.value.dopplerToken, settings.value.dopplerProject, settings.value.dopplerConfig);
+			const existing = [...preview.envVars];
+			for (const [key, value] of Object.entries(secrets)) {
+				const idx = existing.findIndex(v => v.key === key);
+				if (idx >= 0) {
+					existing[idx] = { key, value };
+				} else {
+					existing.push({ key, value });
+				}
+			}
+			preview.envVars = existing;
+			await preview.saveEnvVars(workspace.path);
+			await preview.openProject(workspace.path);
+		} catch (e) {
+			syncError = e instanceof Error ? e.message : String(e);
+		} finally {
+			syncing = false;
+		}
 	}
 
 	// Filter suggested keys to only show ones not already added
@@ -214,6 +249,26 @@
 				Add Variable
 			</button>
 
+			{#if dopplerConfigured}
+				<button
+					style="display: flex; align-items: center; gap: 4px; height: 26px; padding: 0 10px; background: {syncHovered ? 'rgba(108, 71, 255, 0.2)' : 'var(--bg-elevated)'}; border: 1px solid {syncHovered ? '#6C47FF' : 'var(--border-default)'}; border-radius: 5px; color: {syncHovered ? '#6C47FF' : 'var(--text-secondary)'}; cursor: pointer; font-family: var(--font-ui); font-size: 11px; font-weight: 500; transition: all 0.12s ease; opacity: {syncing ? 0.7 : 1};"
+					onmouseenter={() => syncHovered = true}
+					onmouseleave={() => syncHovered = false}
+					onclick={handleDopplerSync}
+					disabled={syncing}
+				>
+					{#if syncing}
+						Syncing...
+					{:else}
+						<svg width="10" height="10" viewBox="0 0 10 10" fill="currentColor">
+							<path d="M5 1.5a3.5 3.5 0 1 0 2.84 1.46.5.5 0 0 1 .82-.57A4.5 4.5 0 1 1 5 .5v1z"/>
+							<path d="M5 0a.5.5 0 0 1 .354.146l1.5 1.5a.5.5 0 0 1-.708.708L5 1.207 3.854 2.354a.5.5 0 1 1-.708-.708l1.5-1.5A.5.5 0 0 1 5 0z"/>
+						</svg>
+						Sync Doppler
+					{/if}
+				</button>
+			{/if}
+
 			{#if preview.envVars.some(v => v.key.trim())}
 				<button
 					style="display: flex; align-items: center; gap: 4px; height: 26px; padding: 0 12px; background: {applyHovered ? 'var(--banana-yellow)' : 'rgba(255, 214, 10, 0.2)'}; border: 1px solid var(--banana-yellow); border-radius: 5px; color: {applyHovered ? '#0D1117' : 'var(--banana-yellow)'}; cursor: pointer; font-family: var(--font-ui); font-size: 11px; font-weight: 600; transition: all 0.12s ease; opacity: {applying ? 0.7 : 1};"
@@ -234,6 +289,12 @@
 				</button>
 			{/if}
 		</div>
+
+		{#if syncError}
+			<div style="font-family: var(--font-ui); font-size: 11px; color: var(--accent-red); margin-top: 4px;">
+				Doppler sync failed: {syncError}
+			</div>
+		{/if}
 
 		<!-- Empty state hint -->
 		{#if preview.envVars.length === 0}

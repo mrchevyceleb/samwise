@@ -3,6 +3,7 @@ mod commands;
 mod preview;
 mod models;
 
+use commands::claude_code::ClaudeCodeState;
 use state::{AppState, StdioMcpState, TerminalState};
 use tauri::Manager;
 
@@ -12,6 +13,7 @@ pub fn run() {
         .manage(AppState::new())
         .manage(StdioMcpState::default())
         .manage(TerminalState::default())
+        .manage(ClaudeCodeState::default())
         .manage(parking_lot::Mutex::new(preview::orchestrator::PreviewOrchestrator::new()))
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_fs::init())
@@ -104,6 +106,10 @@ pub fn run() {
             commands::git::git_stash_pop,
             commands::git::git_push,
             commands::git::git_pull,
+            // Claude Code
+            commands::claude_code::spawn_claude_code,
+            commands::claude_code::write_claude_code,
+            commands::claude_code::close_claude_code,
             // Preview Orchestrator
             commands::orchestrator::preview_open_project,
             commands::orchestrator::preview_stop,
@@ -116,15 +122,27 @@ pub fn run() {
             commands::orchestrator::preview_load_env_file,
         ])
         .on_window_event(|window, event| {
-            // When the main window is destroyed, clean up preview processes
+            // When the main window is destroyed, clean up all managed processes
             if let tauri::WindowEvent::Destroyed = event {
                 if window.label() == "main" {
                     log::info!("[app] Main window destroyed, cleaning up preview");
                     let state = window.state::<parking_lot::Mutex<preview::orchestrator::PreviewOrchestrator>>();
                     let mut orchestrator = state.lock();
-                    // Replace with a fresh orchestrator to trigger Drop on the old one
-                    // Drop will kill any managed processes
                     *orchestrator = preview::orchestrator::PreviewOrchestrator::new();
+
+                    // Kill all Claude Code processes
+                    log::info!("[app] Main window destroyed, cleaning up Claude Code processes");
+                    let cc_state = window.state::<ClaudeCodeState>();
+                    let drained: Vec<_> = {
+                        let mut processes = cc_state.processes.lock();
+                        processes.drain().collect()
+                    };
+                    for (_, mut proc) in drained {
+                        proc.alive.store(false, std::sync::atomic::Ordering::Relaxed);
+                        drop(proc.stdin.take());
+                        let _ = proc.child.kill();
+                        let _ = proc.child.wait();
+                    }
                 }
             }
         })
