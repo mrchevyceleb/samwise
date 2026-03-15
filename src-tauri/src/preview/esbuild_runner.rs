@@ -72,8 +72,10 @@ impl EsbuildRunner {
             cmd.arg(format!("--define:import.meta.env.{}={}", key, escaped));
         }
 
-        // Catch-all for any unset process.env references
+        // Catch-all for any unset process.env / import.meta.env references
+        // (specific per-key defines above take precedence over these catch-alls)
         cmd.arg("--define:process.env={}");
+        cmd.arg("--define:import.meta.env={}");
 
         // esbuild resolves node_modules automatically when run from project dir
         cmd.current_dir(project_dir);

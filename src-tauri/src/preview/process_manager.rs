@@ -98,7 +98,7 @@ impl ManagedProcess {
             format!("Failed to start '{}': {}", program, e)
         })?;
 
-        let ready = wait_for_ready(&mut child, port, &[]).await;
+        let (ready, actual_port) = wait_for_ready(&mut child, port, &[]).await;
 
         if !ready {
             match child.try_wait() {
@@ -115,9 +115,11 @@ impl ManagedProcess {
             }
         }
 
+        log::info!("[process_manager] Using port {} (allocated: {})", actual_port, port);
+
         Ok(Self {
             child: Some(child),
-            port,
+            port: actual_port,
             project_dir: project_dir.to_path_buf(),
         })
     }
@@ -248,36 +250,44 @@ fn parse_command_platform(command: &str) -> (String, Vec<String>) {
 }
 
 /// Wait for the dev server to output a "ready" pattern, with a timeout.
-/// Uses a multi-signal approach: ready pattern in stdout/stderr, port polling, or process exit.
-async fn wait_for_ready(child: &mut Child, port: u16, extra_patterns: &[&str]) -> bool {
+/// Returns (is_ready, actual_port) - actual_port is parsed from stdout if possible,
+/// otherwise falls back to hint_port (the pre-allocated port).
+async fn wait_for_ready(child: &mut Child, hint_port: u16, extra_patterns: &[&str]) -> (bool, u16) {
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    // Collect extra patterns into owned strings for the async tasks
     let extra_owned: Vec<String> = extra_patterns.iter().map(|s| s.to_string()).collect();
 
-    // Channel for ready signal OR process death
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<bool>();
-    let ready_tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(ready_tx)));
+    let ready_tx = Arc::new(Mutex::new(Some(ready_tx)));
+    // Shared slot for the port detected from stdout/stderr
+    let detected_port: Arc<Mutex<Option<u16>>> = Arc::new(Mutex::new(None));
 
     // Spawn stdout reader
     if let Some(stdout) = stdout {
         let tx = ready_tx.clone();
         let extra = extra_owned.clone();
+        let port_slot = detected_port.clone();
         tokio::spawn(async move {
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 log::info!("[managed:stdout] {}", line);
+                if let Some(p) = parse_port_from_line(&line) {
+                    *port_slot.lock().await = Some(p);
+                }
                 if is_ready_line(&line, &extra) {
-                    if let Some(tx) = tx.lock().await.take() {
-                        let _ = tx.send(true);
+                    if let Some(sender) = tx.lock().await.take() {
+                        let _ = sender.send(true);
                     }
                 }
             }
-            // EOF means process closed stdout - signal not ready
-            if let Some(tx) = tx.lock().await.take() {
-                let _ = tx.send(false);
+            // EOF - process closed stdout
+            if let Some(sender) = tx.lock().await.take() {
+                let _ = sender.send(false);
             }
         });
     }
@@ -286,55 +296,79 @@ async fn wait_for_ready(child: &mut Child, port: u16, extra_patterns: &[&str]) -
     if let Some(stderr) = stderr {
         let tx = ready_tx.clone();
         let extra = extra_owned.clone();
+        let port_slot = detected_port.clone();
         tokio::spawn(async move {
             let reader = BufReader::new(stderr);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 log::info!("[managed:stderr] {}", line);
+                if let Some(p) = parse_port_from_line(&line) {
+                    *port_slot.lock().await = Some(p);
+                }
                 if is_ready_line(&line, &extra) {
-                    if let Some(tx) = tx.lock().await.take() {
-                        let _ = tx.send(true);
+                    if let Some(sender) = tx.lock().await.take() {
+                        let _ = sender.send(true);
                     }
                 }
             }
         });
     }
 
-    // Spawn port poller as a parallel fallback - checks every 2s if port is listening
+    // Port poller fallback - checks hint_port (works for apps that DO use PORT env var)
     let poll_tx = ready_tx.clone();
-    let poll_port = port;
     tokio::spawn(async move {
         for _ in 0..20 {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            if tokio::net::TcpStream::connect(format!("127.0.0.1:{}", poll_port)).await.is_ok() {
-                log::info!("[process_manager] Port {} detected open via polling", poll_port);
-                if let Some(tx) = poll_tx.lock().await.take() {
-                    let _ = tx.send(true);
+            if tokio::net::TcpStream::connect(format!("127.0.0.1:{}", hint_port)).await.is_ok() {
+                log::info!("[process_manager] Port {} open via polling", hint_port);
+                if let Some(sender) = poll_tx.lock().await.take() {
+                    let _ = sender.send(true);
                 }
                 return;
             }
         }
     });
 
-    // Wait with timeout (45s to give install/compile time)
     match tokio::time::timeout(std::time::Duration::from_secs(45), ready_rx).await {
         Ok(Ok(true)) => {
-            log::info!("[process_manager] Server ready on port {}", port);
-            // Give the server a moment to fully initialize after the ready signal
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            true
+            let port = detected_port.lock().await.unwrap_or(hint_port);
+            log::info!("[process_manager] Server ready on port {}", port);
+            (true, port)
         }
         Ok(Ok(false)) => {
-            // Process exited before ready signal
             log::error!("[process_manager] Process exited before ready signal");
-            false
+            (false, hint_port)
         }
         _ => {
-            // Timeout or channel closed. Final port check.
-            log::warn!("[process_manager] Timeout waiting for ready signal. Final port check...");
-            std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok()
+            log::warn!("[process_manager] Timeout waiting for ready. Final check...");
+            let port = detected_port.lock().await.unwrap_or(hint_port);
+            let ready = std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok();
+            (ready, port)
         }
     }
+}
+
+/// Extract a port number from a dev server log line.
+/// Handles patterns like:
+///   http://localhost:5173/
+///   http://127.0.0.1:3000
+///   Local:   http://localhost:5173/
+fn parse_port_from_line(line: &str) -> Option<u16> {
+    for marker in &["localhost:", "127.0.0.1:", "0.0.0.0:"] {
+        if let Some(pos) = line.find(marker) {
+            let after = &line[pos + marker.len()..];
+            let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !digits.is_empty() {
+                if let Ok(port) = digits.parse::<u16>() {
+                    if port > 1023 {
+                        return Some(port);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn is_ready_line(line: &str, extra_patterns: &[String]) -> bool {

@@ -36,6 +36,8 @@ let envVars = $state<EnvVar[]>([]);
 let envPanelOpen = $state(false);
 let suggestedKeys = $state<string[]>([]);
 let missingSecretsOverlay = $state(false);
+let envSetupPending = $state(false);
+let sessionKey = $state(0);
 
 /** Storage key for env vars, scoped per project */
 function envStorageKey(projectPath: string): string {
@@ -128,6 +130,9 @@ export function getPreviewStore() {
 		get suggestedKeys() { return suggestedKeys; },
 		get missingSecretsOverlay() { return missingSecretsOverlay; },
 		set missingSecretsOverlay(v: boolean) { missingSecretsOverlay = v; },
+		get envSetupPending() { return envSetupPending; },
+		set envSetupPending(v: boolean) { envSetupPending = v; },
+		get sessionKey() { return sessionKey; },
 
 		async openProject(projectDir: string) {
 			const invoke = await getInvoke();
@@ -163,6 +168,7 @@ export function getPreviewStore() {
 				tier = null;
 				framework = null;
 				url = '';
+				envSetupPending = false;
 
 				const envMap = envVarsToMap(envVars);
 				const detection = await invoke<TierDetection>('preview_open_project', {
@@ -187,6 +193,7 @@ export function getPreviewStore() {
 
 					url = previewUrl;
 					status = 'ready';
+					sessionKey += 1;
 				} else {
 					status = 'error';
 					error = 'Preview could not start';
@@ -213,6 +220,7 @@ export function getPreviewStore() {
 			error = null;
 			framework = null;
 			missingSecretsOverlay = false;
+			envSetupPending = false;
 
 			if (watcherUnlisten) {
 				watcherUnlisten();

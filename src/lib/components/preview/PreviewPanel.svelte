@@ -23,38 +23,53 @@
 	function openSecretsPanel() {
 		preview.envPanelOpen = true;
 		preview.missingSecretsOverlay = false;
+		preview.envSetupPending = true;
 	}
 
 	function skipOverlay() {
 		preview.missingSecretsOverlay = false;
+		preview.envSetupPending = false;
 	}
 
 	let containerRef = $state<HTMLDivElement | null>(null);
 	let webviewCreated = $state(false);
+	let appliedUrl = $state('');
+	let appliedSession = $state(-1);
 
 	// Watch for workspace changes and auto-open preview
 	$effect(() => {
 		const path = workspace.path;
 		if (path) {
 			webviewCreated = false;
+			appliedUrl = '';
+			appliedSession = -1;
 			preview.openProject(path);
 		} else {
 			preview.stop();
 			webviewCreated = false;
+			appliedUrl = '';
+			appliedSession = -1;
 		}
 	});
 
-	// Watch for URL becoming available and create the webview
-	// DON'T create if the missing secrets overlay is showing
+	// Watch for URL/session becoming available and create or navigate the webview
+	// DON'T act if the overlay is showing or env setup is in progress
 	$effect(() => {
 		const currentUrl = preview.url;
 		const overlayActive = preview.missingSecretsOverlay;
-		if (currentUrl && containerRef && !webviewCreated && !overlayActive) {
-			createWebview(currentUrl);
+		const setupPending = preview.envSetupPending;
+		const session = preview.sessionKey;
+
+		if (!currentUrl || !containerRef || overlayActive || setupPending) return;
+
+		if (!webviewCreated) {
+			createWebview(currentUrl, session);
+		} else if (currentUrl !== appliedUrl || session !== appliedSession) {
+			navigateWebview(currentUrl, session);
 		}
 	});
 
-	async function createWebview(url: string) {
+	async function createWebview(url: string, session: number) {
 		if (!containerRef) return;
 
 		try {
@@ -73,8 +88,21 @@
 				}
 			});
 			webviewCreated = true;
+			appliedUrl = url;
+			appliedSession = session;
 		} catch (e) {
 			console.error('[preview] Failed to create webview:', e);
+		}
+	}
+
+	async function navigateWebview(url: string, session: number) {
+		try {
+			const { invoke } = await import('@tauri-apps/api/core');
+			await invoke('navigate_preview_webview', { url });
+			appliedUrl = url;
+			appliedSession = session;
+		} catch (e) {
+			console.error('[preview] Failed to navigate webview:', e);
 		}
 	}
 

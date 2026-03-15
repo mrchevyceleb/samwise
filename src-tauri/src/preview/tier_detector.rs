@@ -120,9 +120,26 @@ pub fn detect_tier(project_dir: &Path) -> TierDetection {
         }
     }
 
-    // --- Priority 2: Client-side frameworks → Tier 2 (esbuild) ---
-    // This is the key change: React/Solid/Preact/Lit go to esbuild
-    // REGARDLESS of whether a dev script exists.
+    // --- Priority 2a: Vite projects → Tier 3 (managed process) ---
+    // Vite projects MUST use their dev server. esbuild alone can't handle
+    // PostCSS, Tailwind plugins, CSS modules, HMR, or Vite-specific imports.
+    let has_vite_config = ["vite.config.ts", "vite.config.js", "vite.config.mts", "vite.config.mjs"]
+        .iter()
+        .any(|f| project_dir.join(f).exists())
+        || all_deps.iter().any(|d| d == "vite");
+    if has_vite_config {
+        let dev_command = resolve_dev_command(&pkg, "Vite");
+        return make_detection(
+            PreviewTier::ManagedProcess,
+            Some("Vite".to_string()),
+            None,
+            Some(dev_command),
+            "Vite project - using dev server for plugins and CSS processing.".to_string(),
+        );
+    }
+
+    // --- Priority 2b: Client-side frameworks without a bundler → Tier 2 (esbuild) ---
+    // Only use esbuild for projects that DON'T have Vite/Webpack/Parcel.
     for (dep, framework_name) in ESBUILD_CAPABLE {
         if all_deps.iter().any(|d| d == dep) {
             let entry = find_entry_point(project_dir, framework_name);
@@ -232,6 +249,7 @@ fn resolve_dev_command(pkg: &serde_json::Value, framework: &str) -> String {
         "Express" | "Fastify" | "NestJS" | "Hono" | "Koa" => "node .".to_string(),
         "Astro" => "astro dev".to_string(),
         "Gatsby" => "gatsby develop".to_string(),
+        "Vite" => "npm run dev".to_string(),
         "Svelte" => "npm run dev".to_string(),
         "Vue" => "npm run dev".to_string(),
         _ => "npm run dev".to_string(),
