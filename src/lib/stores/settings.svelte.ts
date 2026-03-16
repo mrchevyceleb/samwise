@@ -61,6 +61,11 @@ export interface AppSettings {
   dopplerConfig: string;
   dopplerEnabled: boolean;
   workspaceThemes: Record<string, string>;
+  // Agent One settings
+  supabaseUrl: string;
+  supabaseAnonKey: string;
+  agentMachineName: string;
+  autoStartWorker: boolean;
 }
 
 export interface MCPServerConfig {
@@ -148,6 +153,10 @@ export const DEFAULT_SETTINGS: AppSettings = {
   dopplerConfig: '',
   dopplerEnabled: false,
   workspaceThemes: {},
+  supabaseUrl: '',
+  supabaseAnonKey: '',
+  agentMachineName: '',
+  autoStartWorker: false,
 };
 
 // ---- Svelte 5 Runes State ----

@@ -38,33 +38,10 @@ export function getWorkspace() {
 			return null;
 		},
 
-		/** Set workspace path and initialize file tree, git, and preview. */
+		/** Set workspace path. */
 		async setWorkspace(folderPath: string): Promise<void> {
 			workspacePath = folderPath;
 			lastWorkspacePath = folderPath;
-
-			// Load file tree
-			try {
-				const { getFileTreeStore } = await import('$lib/stores/file-tree.svelte');
-				const fileTree = getFileTreeStore();
-				await fileTree.loadTree(folderPath);
-			} catch (e) {
-				console.warn('[workspace] Failed to load file tree:', e);
-			}
-
-			// Initialize git status (non-blocking)
-			try {
-				const { getGitStore } = await import('$lib/stores/git.svelte');
-				const git = getGitStore();
-				git.refresh(folderPath).catch((e: unknown) => {
-					console.warn('[workspace] Git refresh failed (may not be a repo):', e);
-				});
-			} catch (e) {
-				console.warn('[workspace] Git init failed:', e);
-			}
-
-			// Preview is handled reactively by PreviewPanel watching workspace.path
-			// No additional action needed here.
 		},
 	};
 }

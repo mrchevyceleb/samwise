@@ -1,7 +1,6 @@
 <script lang="ts">
   import { getLayout } from '$lib/stores/layout.svelte';
   import { getSettingsStore } from '$lib/stores/settings.svelte';
-  import { getTerminals } from '$lib/stores/terminals.svelte';
   import { getWorkspace } from '$lib/stores/workspace.svelte';
 
   interface Props {
@@ -13,7 +12,6 @@
 
   const layout = getLayout();
   const settingsStore = getSettingsStore();
-  const terminals = getTerminals();
   const workspace = getWorkspace();
 
   let query = $state('');
@@ -30,24 +28,6 @@
 
   const allCommands: Command[] = [
     {
-      id: 'toggle-terminal',
-      label: 'Toggle Terminal',
-      shortcut: 'Ctrl+`',
-      category: 'View',
-      action: () => { layout.toggleTerminal(); close(); },
-    },
-    {
-      id: 'new-terminal',
-      label: 'New Terminal',
-      category: 'Terminal',
-      action: () => {
-        const cwd = workspace.path || '';
-        terminals.add(cwd);
-        layout.terminalVisible = true;
-        close();
-      },
-    },
-    {
       id: 'settings',
       label: 'Open Settings',
       shortcut: 'Ctrl+,',
@@ -59,18 +39,6 @@
       label: 'AI Model Settings',
       category: 'Preferences',
       action: () => { settingsStore.settingsVisible = true; close(); },
-    },
-    {
-      id: 'toggle-file-panel',
-      label: 'Toggle File Explorer',
-      category: 'View',
-      action: () => { close(); },
-    },
-    {
-      id: 'refresh-preview',
-      label: 'Refresh Preview',
-      category: 'Preview',
-      action: () => { close(); },
     },
     {
       id: 'git-commit',

@@ -1,11 +1,7 @@
-pub mod ai;
 pub mod claude_code;
-pub mod doppler;
 pub mod files;
 pub mod git;
-pub mod mcp;
-pub mod orchestrator;
-pub mod preview;
+pub mod playwright;
 pub mod settings;
-pub mod terminal;
-pub mod window;
+pub mod supabase;
+pub mod worker;

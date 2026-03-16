@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Banana Code",
+  "productName": "Agent One",
   "version": "0.1.0",
-  "identifier": "ai.bananacode.ide",
+  "identifier": "com.mattjohnston.agent-one",
   "build": {
     "frontendDist": "../build",
     "devUrl": "http://localhost:5173",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Banana Code",
+        "title": "Agent One",
         "label": "main",
         "width": 1440,
         "height": 900,
@@ -31,7 +31,6 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "externalBin": ["binaries/esbuild"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

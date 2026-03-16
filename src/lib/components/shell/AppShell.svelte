@@ -2,109 +2,29 @@
 	import { onMount } from 'svelte';
 	import TitleBar from './TitleBar.svelte';
 	import StatusBar from './StatusBar.svelte';
-	import ResizeHandle from './ResizeHandle.svelte';
-	import AgentPanel from '$lib/components/agents/AgentPanel.svelte';
-	import PreviewPanel from '$lib/components/preview/PreviewPanel.svelte';
-	import FilePanel from '$lib/components/files/FilePanel.svelte';
-	import TerminalPanel from '$lib/components/terminal/TerminalPanel.svelte';
+	import KanbanBoard from '$lib/components/kanban/KanbanBoard.svelte';
+	import ChatPanel from '$lib/components/chat/ChatPanel.svelte';
 	import SettingsModal from '$lib/components/settings/SettingsModal.svelte';
-	import CommandPalette from '$lib/components/modals/CommandPalette.svelte';
 	import { getLayout } from '$lib/stores/layout.svelte';
 	import { getSettingsStore, initSettings } from '$lib/stores/settings.svelte';
-	import { getTerminals } from '$lib/stores/terminals.svelte';
-	import { getWorkspace } from '$lib/stores/workspace.svelte';
 
 	const layout = getLayout();
 	const settingsStore = getSettingsStore();
-	const terminals = getTerminals();
-	const workspace = getWorkspace();
 
-	let commandPaletteVisible = $state(false);
-	let leftExpandHovered = $state(false);
-	let rightExpandHovered = $state(false);
+	let chatToggleHovered = $state(false);
 
 	onMount(async () => {
-		// 1. Load persisted settings from disk
 		await initSettings();
-
-		// 2. Read query params (for multi-window support)
-		const params = new URLSearchParams(window.location.search);
-		const workspaceParam = params.get('workspace');
-		const themeParam = params.get('theme');
-
-		// Apply theme if provided
-		if (themeParam && themeParam !== 'banana') {
-			document.documentElement.setAttribute('data-theme', themeParam);
-		}
-
-		// Open workspace from query param, or restore session
-		if (workspaceParam) {
-			await workspace.setWorkspace(workspaceParam);
-		} else {
-			const s = settingsStore.value;
-			if (s.restoreSession && workspace.lastPath) {
-				await workspace.setWorkspace(workspace.lastPath);
-			}
-		}
-	});
-
-	// Apply saved theme when workspace changes
-	$effect(() => {
-		if (workspace.path) {
-			const savedTheme = settingsStore.value.workspaceThemes?.[workspace.path];
-			if (savedTheme && savedTheme !== 'banana') {
-				document.documentElement.setAttribute('data-theme', savedTheme);
-			} else {
-				document.documentElement.removeAttribute('data-theme');
-			}
-		}
 	});
 
 	async function handleGlobalKeyDown(e: KeyboardEvent) {
-		// Ctrl+Shift+P -> Command Palette
-		if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'P') {
-			e.preventDefault();
-			commandPaletteVisible = !commandPaletteVisible;
-		}
-		// Ctrl+` -> Toggle Terminal
-		if ((e.ctrlKey || e.metaKey) && e.key === '`') {
-			e.preventDefault();
-			layout.toggleTerminal();
-			// Auto-create a terminal if none exist and we're opening
-			if (layout.terminalVisible && terminals.instances.length === 0) {
-				terminals.add(workspace.path || '');
-			}
-		}
 		// Ctrl+, -> Settings
 		if ((e.ctrlKey || e.metaKey) && e.key === ',') {
 			e.preventDefault();
 			settingsStore.settingsVisible = !settingsStore.settingsVisible;
 		}
-		// Ctrl+O -> Open Folder (new window if workspace already open)
-		if ((e.ctrlKey || e.metaKey) && e.key === 'o' && !e.shiftKey) {
-			e.preventDefault();
-			if (workspace.isOpen) {
-				try {
-					const { invoke } = await import('@tauri-apps/api/core');
-					await invoke('open_folder_in_new_window');
-				} catch { workspace.openFolder(); }
-			} else {
-				workspace.openFolder();
-			}
-		}
-		// Ctrl+Shift+N -> New Terminal
-		if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'N') {
-			e.preventDefault();
-			layout.terminalVisible = true;
-			terminals.add(workspace.path || '');
-		}
-		// Ctrl+B -> Toggle Left Panel (Agent)
-		if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key === 'b') {
-			e.preventDefault();
-			layout.toggleLeftPanel();
-		}
-		// Ctrl+Shift+B -> Toggle Right Panel (Files)
-		if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'B') {
+		// Ctrl+/ -> Toggle Chat Panel
+		if ((e.ctrlKey || e.metaKey) && e.key === '/') {
 			e.preventDefault();
 			layout.toggleRightPanel();
 		}
@@ -117,89 +37,66 @@
 	<!-- Title Bar -->
 	<TitleBar />
 
-	<!-- Main Content Area -->
+	<!-- Main Content: Kanban | Chat -->
 	<div style="display: flex; flex: 1; overflow: hidden; gap: var(--panel-gap); padding: 0 var(--panel-gap) var(--panel-gap);">
-		<!-- Left: Agent Panel -->
-		{#if layout.leftPanelVisible}
-			<div style="width: {layout.agentPanelWidth}px; min-width: 280px; max-width: 600px; display: flex; flex-direction: column; overflow: hidden; border-radius: var(--panel-radius); box-shadow: var(--shadow-panel); border: var(--panel-border); border-top: 1px solid color-mix(in srgb, var(--accent-primary) 8%, transparent); background: linear-gradient(180deg, #161C26 0%, #11161E 100%);">
-				<AgentPanel />
-			</div>
-
-			<ResizeHandle direction="vertical" onResize={(d) => layout.agentPanelWidth = layout.agentPanelWidth + d} />
-		{:else}
-			<!-- Left panel expand tab -->
-			<button
-				title="Show Agent Panel (Ctrl+B)"
-				style="
-					width: 24px; flex-shrink: 0; display: flex; align-items: center; justify-content: center;
-					background: {leftExpandHovered ? 'color-mix(in srgb, var(--accent-primary) 8%, transparent)' : 'var(--bg-surface)'};
-					border: none; border-radius: 0 var(--panel-radius) var(--panel-radius) 0;
-					box-shadow: var(--shadow-sm);
-					color: {leftExpandHovered ? 'var(--accent-primary)' : 'var(--text-muted)'};
-					cursor: pointer; transition: all 0.15s ease; writing-mode: vertical-rl;
-					font-family: var(--font-ui); font-size: 11px; letter-spacing: 0.5px;
-				"
-				onclick={() => layout.toggleLeftPanel()}
-				onmouseenter={() => leftExpandHovered = true}
-				onmouseleave={() => leftExpandHovered = false}
-			>
-				<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" style="margin-bottom: 6px; transform: rotate(0deg);">
-					<path d="M6 4l4 4-4 4"/>
-				</svg>
-				Agent
-			</button>
-		{/if}
-
-		<!-- Middle: Preview Panel + Terminal -->
-		<div style="flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 300px; border-radius: var(--panel-radius); box-shadow: var(--shadow-panel); border: var(--panel-border); border-top: 1px solid color-mix(in srgb, var(--accent-primary) 8%, transparent); background: linear-gradient(180deg, #161C26 0%, #0F1318 100%);">
-			<div style="flex: 1; overflow: hidden;">
-				<PreviewPanel />
-			</div>
-
-			{#if layout.terminalVisible}
-				<ResizeHandle direction="horizontal" onResize={(d) => layout.terminalHeight = layout.terminalHeight - d} />
-				<div style="height: {layout.terminalHeight}px; min-height: 100px; background: var(--bg-surface); display: flex; flex-direction: column; overflow: hidden;">
-					<TerminalPanel />
-				</div>
-			{/if}
+		<!-- Left: Kanban Board (primary, fills available space) -->
+		<div style="
+			flex: 1; min-width: 400px;
+			display: flex; flex-direction: column; overflow: hidden;
+			border-radius: var(--panel-radius);
+			box-shadow: var(--shadow-panel);
+			border: var(--panel-border);
+			border-top: 1px solid rgba(99, 102, 241, 0.08);
+			background: linear-gradient(180deg, #161b22 0%, #0f1419 100%);
+		">
+			<KanbanBoard />
 		</div>
 
-		<!-- Right: File Panel -->
+		<!-- Right: Chat Panel (collapsible sidebar) -->
 		{#if layout.rightPanelVisible}
-			<ResizeHandle direction="vertical" onResize={(d) => layout.filePanelWidth = layout.filePanelWidth - d} />
-
-			<div style="width: {layout.filePanelWidth}px; min-width: 200px; max-width: 500px; display: flex; flex-direction: column; overflow: hidden; border-radius: var(--panel-radius); box-shadow: var(--shadow-panel); border: var(--panel-border); border-top: 1px solid color-mix(in srgb, var(--accent-primary) 8%, transparent); background: linear-gradient(180deg, #161C26 0%, #11161E 100%);">
-				<FilePanel />
+			<div style="
+				width: 400px; min-width: 320px; max-width: 500px; flex-shrink: 0;
+				display: flex; flex-direction: column; overflow: hidden;
+				border-radius: var(--panel-radius);
+				box-shadow: var(--shadow-panel);
+				border: var(--panel-border);
+				border-top: 1px solid rgba(99, 102, 241, 0.08);
+				background: linear-gradient(180deg, #161b22 0%, #0d1117 100%);
+				animation: sidebar-slide-in 0.2s ease;
+			">
+				<ChatPanel />
 			</div>
-		{:else}
-			<!-- Right panel expand tab -->
-			<button
-				title="Show Files Panel (Ctrl+Shift+B)"
-				style="
-					width: 24px; flex-shrink: 0; display: flex; align-items: center; justify-content: center;
-					background: {rightExpandHovered ? 'color-mix(in srgb, var(--accent-primary) 8%, transparent)' : 'var(--bg-surface)'};
-					border: none; border-radius: var(--panel-radius) 0 0 var(--panel-radius);
-					box-shadow: var(--shadow-sm);
-					color: {rightExpandHovered ? 'var(--accent-primary)' : 'var(--text-muted)'};
-					cursor: pointer; transition: all 0.15s ease; writing-mode: vertical-rl;
-					font-family: var(--font-ui); font-size: 11px; letter-spacing: 0.5px;
-				"
-				onclick={() => layout.toggleRightPanel()}
-				onmouseenter={() => rightExpandHovered = true}
-				onmouseleave={() => rightExpandHovered = false}
-			>
-				<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" style="margin-bottom: 6px; transform: rotate(180deg);">
-					<path d="M6 4l4 4-4 4"/>
-				</svg>
-				Files
-			</button>
 		{/if}
 	</div>
+
+	<!-- Chat toggle button (floating, bottom-right when chat is hidden) -->
+	{#if !layout.rightPanelVisible}
+		<button
+			title="Open Chat (Ctrl+/)"
+			style="
+				position: fixed; bottom: 40px; right: 16px; z-index: 100;
+				width: 48px; height: 48px; border-radius: 50%;
+				display: flex; align-items: center; justify-content: center;
+				background: {chatToggleHovered ? 'var(--accent-hover)' : 'var(--accent-primary)'};
+				border: none; cursor: pointer;
+				box-shadow: 0 4px 20px rgba(99, 102, 241, 0.4), 0 0 40px rgba(99, 102, 241, 0.15);
+				transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+				transform: {chatToggleHovered ? 'scale(1.1) rotate(-5deg)' : 'scale(1)'};
+				animation: breathe-glow 3s ease-in-out infinite;
+			"
+			onclick={() => layout.toggleRightPanel()}
+			onmouseenter={() => chatToggleHovered = true}
+			onmouseleave={() => chatToggleHovered = false}
+		>
+			<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+				<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+			</svg>
+		</button>
+	{/if}
 
 	<!-- Status Bar -->
 	<StatusBar />
 </div>
 
-<!-- Modals (rendered outside main layout) -->
+<!-- Modals -->
 <SettingsModal />
-<CommandPalette visible={commandPaletteVisible} onClose={() => commandPaletteVisible = false} />
