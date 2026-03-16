@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, onDestroy } from 'svelte';
 	import TitleBar from './TitleBar.svelte';
 	import StatusBar from './StatusBar.svelte';
 	import KanbanBoard from '$lib/components/kanban/KanbanBoard.svelte';
@@ -7,15 +7,84 @@
 	import SettingsModal from '$lib/components/settings/SettingsModal.svelte';
 	import { getLayout } from '$lib/stores/layout.svelte';
 	import { getSettingsStore, initSettings } from '$lib/stores/settings.svelte';
+	import { getTaskStore } from '$lib/stores/tasks.svelte';
+	import { getChatStore } from '$lib/stores/chat.svelte';
+	import { getCommentStore } from '$lib/stores/comments.svelte';
+	import { safeInvoke } from '$lib/utils/tauri';
+	import { subscribeToTable } from '$lib/supabase';
+	import type { AeMessage, AeComment } from '$lib/types';
 
 	const layout = getLayout();
 	const settingsStore = getSettingsStore();
+	const taskStore = getTaskStore();
+	const chatStore = getChatStore();
+	const commentStore = getCommentStore();
 
 	let chatToggleHovered = $state(false);
+	let realtimeChannels: any[] = [];
 
 	onMount(async () => {
 		await initSettings();
+
+		// Try to load Supabase config from Doppler
+		const config = await safeInvoke<{ url: string; anon_key: string; service_role_key: string | null }>('supabase_load_doppler');
+		if (!config || !config.url) {
+			// Doppler not available, try getting existing config
+			const existing = await safeInvoke<{ url: string; anon_key: string }>('supabase_get_config');
+			if (!existing || !existing.url) {
+				console.warn('[app] Supabase not configured. Open Settings to connect.');
+				return;
+			}
+		}
+
+		// Fetch initial data
+		await Promise.all([
+			taskStore.fetchTasks(),
+			chatStore.fetchMessages(),
+		]);
+
+		// Start realtime subscriptions
+		initRealtime();
 	});
+
+	onDestroy(() => {
+		for (const ch of realtimeChannels) {
+			ch.unsubscribe();
+		}
+	});
+
+	async function initRealtime() {
+		const config = await safeInvoke<{ url: string; anon_key: string }>('supabase_get_config');
+		if (!config || !config.url || !config.anon_key) return;
+
+		// Subscribe to task changes
+		const taskChannel = subscribeToTable(config.url, config.anon_key, 'ae_tasks', (payload) => {
+			const { eventType } = payload;
+			if (eventType === 'INSERT' || eventType === 'UPDATE') {
+				// Refetch all tasks (simple approach)
+				taskStore.fetchTasks();
+			} else if (eventType === 'DELETE') {
+				taskStore.fetchTasks();
+			}
+		});
+		realtimeChannels.push(taskChannel);
+
+		// Subscribe to new messages
+		const msgChannel = subscribeToTable(config.url, config.anon_key, 'ae_messages', (payload) => {
+			if (payload.eventType === 'INSERT') {
+				chatStore.applyRealtimeMessage(payload.new as AeMessage);
+			}
+		});
+		realtimeChannels.push(msgChannel);
+
+		// Subscribe to new comments
+		const commentChannel = subscribeToTable(config.url, config.anon_key, 'ae_comments', (payload) => {
+			if (payload.eventType === 'INSERT') {
+				commentStore.applyRealtimeComment(payload.new as AeComment);
+			}
+		});
+		realtimeChannels.push(commentChannel);
+	}
 
 	async function handleGlobalKeyDown(e: KeyboardEvent) {
 		// Ctrl+, -> Settings
