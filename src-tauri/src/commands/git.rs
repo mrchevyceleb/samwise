@@ -126,6 +126,11 @@ pub fn git_status(project_dir: String) -> Result<GitStatus, String> {
 }
 
 #[tauri::command]
+pub fn git_diff_staged(project_dir: String) -> Result<String, String> {
+    run_git(&["diff", "--cached"], &project_dir, "Staged diff")
+}
+
+#[tauri::command]
 pub fn git_diff(project_dir: String, file_path: String, staged: bool) -> Result<String, String> {
     let mut args = vec!["diff"];
     if staged {

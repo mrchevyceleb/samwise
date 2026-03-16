@@ -2,7 +2,7 @@
 	import { getPreviewStore } from '$lib/stores/preview.svelte';
 	import { getWorkspace } from '$lib/stores/workspace.svelte';
 	import { getSettingsStore } from '$lib/stores/settings.svelte';
-	import { fetchSecrets } from '$lib/services/doppler';
+	import { fetchSecrets, fetchProjects, fetchConfigs, type DopplerProject, type DopplerConfig } from '$lib/services/doppler';
 	const preview = getPreviewStore();
 	const workspace = getWorkspace();
 	const settings = getSettingsStore();
@@ -14,10 +14,85 @@
 	let syncHovered = $state(false);
 	let syncing = $state(false);
 	let syncError = $state('');
+	let dopplerLinkOpen = $state(false);
+	let dopplerProjects = $state<DopplerProject[]>([]);
+	let dopplerConfigs = $state<DopplerConfig[]>([]);
+	let dopplerLinking = $state(false);
+	let dopplerLinkError = $state('');
+	let linkBtnHovered = $state(false);
+	let isServiceToken = $state(false);
+	let manualProject = $state('');
+	let manualConfig = $state('');
 
+	let hasToken = $derived(settings.value.dopplerToken.trim().length >= 10);
 	let dopplerConfigured = $derived(
-		settings.value.dopplerEnabled && settings.value.dopplerToken.trim() && settings.value.dopplerProject && settings.value.dopplerConfig
+		hasToken && preview.dopplerProject && preview.dopplerConfig
 	);
+	let dopplerPartial = $derived(
+		hasToken && (!preview.dopplerProject || !preview.dopplerConfig)
+	);
+
+	async function openDopplerLink() {
+		dopplerLinkOpen = true;
+		dopplerLinkError = '';
+		dopplerLinking = true;
+		isServiceToken = false;
+		const token = settings.value.dopplerToken;
+		console.log('[doppler] openDopplerLink, token prefix:', token?.substring(0, 5));
+		try {
+			const result = await fetchProjects(token);
+			console.log('[doppler] fetchProjects returned:', result?.length, 'projects');
+			dopplerProjects = result;
+			if (result.length === 0) {
+				// Service tokens can't list projects - switch to manual mode
+				isServiceToken = true;
+			} else if (preview.dopplerProject) {
+				dopplerConfigs = await fetchConfigs(token, preview.dopplerProject);
+			}
+		} catch (e) {
+			console.error('[doppler] fetchProjects failed:', e);
+			const msg = e instanceof Error ? e.message : String(e);
+			// 403/401 likely means service token
+			if (msg.includes('403') || msg.includes('401') || msg.includes('Unauthorized')) {
+				isServiceToken = true;
+			} else {
+				dopplerLinkError = msg;
+			}
+		} finally {
+			dopplerLinking = false;
+		}
+	}
+
+	async function handleDopplerProjectPick(slug: string) {
+		preview.dopplerProject = slug;
+		preview.dopplerConfig = '';
+		dopplerConfigs = [];
+		if (!slug) return;
+		dopplerLinking = true;
+		try {
+			dopplerConfigs = await fetchConfigs(settings.value.dopplerToken, slug);
+		} catch (e) {
+			dopplerLinkError = e instanceof Error ? e.message : String(e);
+		} finally {
+			dopplerLinking = false;
+		}
+	}
+
+	function handleDopplerConfigPick(name: string) {
+		if (!workspace.path) return;
+		preview.saveDopplerLink(workspace.path, preview.dopplerProject, name);
+		dopplerLinkOpen = false;
+		handleDopplerSync();
+	}
+
+	function handleManualLink() {
+		const proj = manualProject.trim();
+		const conf = manualConfig.trim();
+		if (!proj || !conf || !workspace.path) return;
+		preview.saveDopplerLink(workspace.path, proj, conf);
+		dopplerLinkOpen = false;
+		handleDopplerSync();
+	}
 
 	// Known public prefixes per framework
 	const FRAMEWORK_PREFIXES: Record<string, string> = {
@@ -86,7 +161,7 @@
 		syncing = true;
 		syncError = '';
 		try {
-			const secrets = await fetchSecrets(settings.value.dopplerToken, settings.value.dopplerProject, settings.value.dopplerConfig);
+			const secrets = await fetchSecrets(settings.value.dopplerToken, preview.dopplerProject, preview.dopplerConfig);
 			const existing = [...preview.envVars];
 			for (const [key, value] of Object.entries(secrets)) {
 				const idx = existing.findIndex(v => v.key === key);
@@ -296,8 +371,123 @@
 			</div>
 		{/if}
 
+		<!-- Doppler section -->
+		{#if !hasToken}
+			<div style="margin-top: 8px; padding: 8px 10px; background: rgba(108, 71, 255, 0.06); border: 1px dashed rgba(108, 71, 255, 0.2); border-radius: 6px; display: flex; align-items: center; gap: 8px;">
+				<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#6C47FF" stroke-width="1.5"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+				<span style="font-family: var(--font-ui); font-size: 11px; color: var(--text-muted);">
+					Use <span style="color: #6C47FF; font-weight: 600;">Doppler</span> to auto-fill secrets.
+					<button
+						style="background: none; border: none; color: #6C47FF; cursor: pointer; font-size: 11px; font-family: var(--font-ui); text-decoration: underline; padding: 0;"
+						onclick={() => { settings.settingsVisible = true; settings.activeSettingsTab = 'doppler'; }}
+					>Add token in Settings</button>
+				</span>
+			</div>
+		{:else if dopplerPartial && !dopplerLinkOpen}
+			<div style="margin-top: 8px;">
+				<button
+					style="display: flex; align-items: center; gap: 6px; width: 100%; height: 30px; padding: 0 10px; background: {linkBtnHovered ? 'rgba(108, 71, 255, 0.12)' : 'rgba(108, 71, 255, 0.06)'}; border: 1px solid {linkBtnHovered ? '#6C47FF' : 'rgba(108, 71, 255, 0.2)'}; border-radius: 6px; color: {linkBtnHovered ? '#6C47FF' : 'var(--text-secondary)'}; cursor: pointer; font-family: var(--font-ui); font-size: 11px; font-weight: 500; transition: all 0.12s ease;"
+					onmouseenter={() => linkBtnHovered = true}
+					onmouseleave={() => linkBtnHovered = false}
+					onclick={openDopplerLink}
+				>
+					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+					Link Doppler Project
+				</button>
+			</div>
+		{/if}
+
+		<!-- Inline Doppler linker -->
+		{#if dopplerLinkOpen && !dopplerConfigured}
+			<div style="margin-top: 8px; padding: 8px 10px; background: rgba(108, 71, 255, 0.06); border: 1px solid rgba(108, 71, 255, 0.15); border-radius: 6px; display: flex; flex-direction: column; gap: 8px;">
+				<div style="display: flex; align-items: center; justify-content: space-between;">
+					<div style="display: flex; align-items: center; gap: 6px;">
+						<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#6C47FF" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+						<span style="font-family: var(--font-ui); font-size: 11px; font-weight: 600; color: #6C47FF;">Link Doppler</span>
+					</div>
+					<button
+						style="width: 18px; height: 18px; display: flex; align-items: center; justify-content: center; background: transparent; border: none; color: var(--text-muted); cursor: pointer; border-radius: 3px;"
+						onclick={() => dopplerLinkOpen = false}
+						aria-label="Close Doppler linker"
+					>
+						<svg width="10" height="10" viewBox="0 0 12 12" fill="currentColor"><path d="M3.05 3.05a.5.5 0 0 1 .707 0L6 5.293l2.243-2.243a.5.5 0 0 1 .707.707L6.707 6l2.243 2.243a.5.5 0 0 1-.707.707L6 6.707 3.757 8.95a.5.5 0 0 1-.707-.707L5.293 6 3.05 3.757a.5.5 0 0 1 0-.707z"/></svg>
+					</button>
+				</div>
+
+				{#if dopplerLinking}
+					<div style="padding: 6px 0; font-size: 12px; color: var(--banana-yellow); font-family: var(--font-ui);">Loading projects from Doppler...</div>
+				{:else if dopplerLinkError}
+					<div style="padding: 6px 8px; font-size: 12px; color: #ff6b6b; background: rgba(255, 107, 107, 0.1); border-radius: 4px; font-family: var(--font-ui);">{dopplerLinkError}</div>
+				{:else if isServiceToken || (!dopplerLinking && dopplerProjects.length === 0)}
+					<div style="padding: 8px 10px; font-size: 11px; color: var(--text-secondary); background: rgba(255, 107, 107, 0.06); border: 1px solid rgba(255, 107, 107, 0.15); border-radius: 5px; font-family: var(--font-ui); line-height: 1.6;">
+						No projects found. You likely have a <span style="font-weight: 600;">service token</span> (dp.st.) instead of a <span style="font-weight: 600;">personal token</span> (dp.pt.).
+						<button
+							style="display: block; margin-top: 6px; background: none; border: none; color: #6C47FF; cursor: pointer; font-size: 11px; font-family: var(--font-ui); text-decoration: underline; padding: 0;"
+							onclick={() => { settings.settingsVisible = true; settings.activeSettingsTab = 'doppler'; }}
+						>Open Settings to fix your token</button>
+					</div>
+					<div style="padding: 6px 0; font-size: 10px; color: var(--text-muted); font-family: var(--font-ui);">
+						Or enter project details manually:
+					</div>
+					<div style="display: flex; gap: 4px; align-items: center;">
+						<input
+							type="text"
+							placeholder="project-slug"
+							bind:value={manualProject}
+							style="flex: 1; height: 28px; padding: 0 8px; background: var(--bg-elevated); border: 1px solid var(--border-default); border-radius: 5px; color: var(--text-primary); font-family: var(--font-mono); font-size: 11px; outline: none;"
+							onfocus={(e) => (e.currentTarget as HTMLElement).style.borderColor = 'var(--banana-yellow)'}
+							onblur={(e) => (e.currentTarget as HTMLElement).style.borderColor = 'var(--border-default)'}
+						/>
+						<input
+							type="text"
+							placeholder="dev"
+							bind:value={manualConfig}
+							style="width: 80px; height: 28px; padding: 0 8px; background: var(--bg-elevated); border: 1px solid var(--border-default); border-radius: 5px; color: var(--text-primary); font-family: var(--font-mono); font-size: 11px; outline: none;"
+							onfocus={(e) => (e.currentTarget as HTMLElement).style.borderColor = 'var(--banana-yellow)'}
+							onblur={(e) => (e.currentTarget as HTMLElement).style.borderColor = 'var(--border-default)'}
+						/>
+						<button
+							onclick={handleManualLink}
+							disabled={!manualProject.trim() || !manualConfig.trim()}
+							style="height: 28px; padding: 0 12px; background: var(--banana-yellow); border: none; border-radius: 5px; color: #0D1117; font-size: 11px; font-weight: 600; font-family: var(--font-ui); cursor: pointer; opacity: {!manualProject.trim() || !manualConfig.trim() ? 0.5 : 1};"
+						>
+							Sync
+						</button>
+					</div>
+				{/if}
+
+				{#if dopplerProjects.length > 0}
+					<select
+						value={preview.dopplerProject}
+						onchange={(e) => handleDopplerProjectPick((e.target as HTMLSelectElement).value)}
+						style="height: 28px; padding: 0 8px; background: var(--bg-elevated); border: 1px solid var(--border-default); border-radius: 5px; color: var(--text-primary); font-size: 11px; font-family: var(--font-mono); outline: none; cursor: pointer;"
+					>
+						<option value="">Select project...</option>
+						{#each dopplerProjects as p}
+							<option value={p.slug}>{p.name}</option>
+						{/each}
+					</select>
+				{/if}
+
+				{#if dopplerConfigs.length > 0}
+					<div style="display: flex; gap: 4px; flex-wrap: wrap;">
+						{#each dopplerConfigs as c}
+							<button
+								onclick={() => handleDopplerConfigPick(c.name)}
+								style="padding: 4px 12px; border: 1px solid {preview.dopplerConfig === c.name ? '#6C47FF' : 'var(--border-default)'}; border-radius: 5px; cursor: pointer; font-size: 11px; font-family: var(--font-ui); transition: all 0.12s ease; background: {preview.dopplerConfig === c.name ? 'rgba(108, 71, 255, 0.15)' : 'var(--bg-elevated)'}; color: {preview.dopplerConfig === c.name ? '#6C47FF' : 'var(--text-secondary)'};"
+								onmouseenter={(e) => (e.currentTarget as HTMLElement).style.borderColor = '#6C47FF'}
+								onmouseleave={(e) => { if (preview.dopplerConfig !== c.name) (e.currentTarget as HTMLElement).style.borderColor = 'var(--border-default)'; }}
+							>
+								{c.name}
+							</button>
+						{/each}
+					</div>
+				{/if}
+			</div>
+		{/if}
+
 		<!-- Empty state hint -->
-		{#if preview.envVars.length === 0}
+		{#if preview.envVars.length === 0 && !dopplerLinkOpen}
 			<div style="text-align: center; padding: 12px 0 4px; font-family: var(--font-ui); font-size: 11px; color: var(--text-muted);">
 				Add your API keys and secrets here.<br/>
 				<span style="font-size: 10px; opacity: 0.7;">Just type the key name (e.g. SUPABASE_URL). Prefixes are added automatically.</span>

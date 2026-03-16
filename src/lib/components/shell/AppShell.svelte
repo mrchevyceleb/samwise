@@ -63,6 +63,16 @@
 			layout.terminalVisible = true;
 			terminals.add(workspace.path || '');
 		}
+		// Ctrl+B -> Toggle Left Panel (Agent)
+		if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key === 'b') {
+			e.preventDefault();
+			layout.toggleLeftPanel();
+		}
+		// Ctrl+Shift+B -> Toggle Right Panel (Files)
+		if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'B') {
+			e.preventDefault();
+			layout.toggleRightPanel();
+		}
 	}
 </script>
 
@@ -75,11 +85,13 @@
 	<!-- Main Content Area -->
 	<div style="display: flex; flex: 1; overflow: hidden;">
 		<!-- Left: Agent Panel -->
-		<div style="width: {layout.agentPanelWidth}px; min-width: 280px; max-width: 600px; display: flex; flex-direction: column; overflow: hidden;">
-			<AgentPanel />
-		</div>
+		{#if layout.leftPanelVisible}
+			<div style="width: {layout.agentPanelWidth}px; min-width: 280px; max-width: 600px; display: flex; flex-direction: column; overflow: hidden;">
+				<AgentPanel />
+			</div>
 
-		<ResizeHandle direction="vertical" onResize={(d) => layout.agentPanelWidth = layout.agentPanelWidth + d} />
+			<ResizeHandle direction="vertical" onResize={(d) => layout.agentPanelWidth = layout.agentPanelWidth + d} />
+		{/if}
 
 		<!-- Middle: Preview Panel + Terminal -->
 		<div style="flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 300px;">
@@ -95,12 +107,14 @@
 			{/if}
 		</div>
 
-		<ResizeHandle direction="vertical" onResize={(d) => layout.filePanelWidth = layout.filePanelWidth - d} />
-
 		<!-- Right: File Panel -->
-		<div style="width: {layout.filePanelWidth}px; min-width: 200px; max-width: 500px; display: flex; flex-direction: column; overflow: hidden;">
-			<FilePanel />
-		</div>
+		{#if layout.rightPanelVisible}
+			<ResizeHandle direction="vertical" onResize={(d) => layout.filePanelWidth = layout.filePanelWidth - d} />
+
+			<div style="width: {layout.filePanelWidth}px; min-width: 200px; max-width: 500px; display: flex; flex-direction: column; overflow: hidden;">
+				<FilePanel />
+			</div>
+		{/if}
 	</div>
 
 	<!-- Status Bar -->

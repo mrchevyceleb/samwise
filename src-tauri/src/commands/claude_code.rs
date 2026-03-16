@@ -227,6 +227,48 @@ pub fn spawn_claude_code(
     Ok(())
 }
 
+/// Run a one-shot Claude Code prompt and return the text output.
+#[tauri::command]
+pub fn claude_code_prompt(prompt: String, cwd: String) -> Result<String, String> {
+    let (claude_exe, use_cmd_wrapper) = find_claude_exe();
+
+    let mut cmd = if use_cmd_wrapper {
+        let mut c = std::process::Command::new("cmd.exe");
+        c.arg("/C").arg(&claude_exe);
+        c
+    } else {
+        std::process::Command::new(&claude_exe)
+    };
+
+    cmd.arg("-p")
+        .arg(&prompt)
+        .arg("--output-format").arg("text")
+        .arg("--max-turns").arg("1")
+        .arg("--no-input");
+
+    let cwd_path = std::path::PathBuf::from(&cwd);
+    if cwd_path.exists() && cwd_path.is_dir() {
+        cmd.current_dir(&cwd_path);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+
+    let output = cmd
+        .output()
+        .map_err(|e| format!("Claude Code not available: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Claude Code failed: {}", stderr.trim()));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// Kill the Claude Code process for a given session.
 #[tauri::command]
 pub fn close_claude_code(

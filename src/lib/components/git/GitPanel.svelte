@@ -4,6 +4,7 @@
   import GitStatus from './GitStatus.svelte';
   import CommitDialog from './CommitDialog.svelte';
   import BranchSelector from './BranchSelector.svelte';
+  import CommitHistory from './CommitHistory.svelte';
 
   const git = getGitStore();
   const workspace = getWorkspace();
@@ -114,9 +115,10 @@
     <!-- Commit dialog -->
     <CommitDialog />
 
-    <!-- Changed files -->
+    <!-- Changed files + commit history -->
     <div style="flex: 1; overflow-y: auto;">
       <GitStatus />
+      <CommitHistory />
     </div>
   {/if}
 </div>

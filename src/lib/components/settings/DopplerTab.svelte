@@ -1,98 +1,48 @@
 <script lang="ts">
   import { getSettingsStore, updateSetting } from '$lib/stores/settings.svelte';
-  import { fetchProjects, fetchConfigs, type DopplerProject, type DopplerConfig } from '$lib/services/doppler';
-  import { untrack } from 'svelte';
+  import { fetchProjects, type DopplerProject } from '$lib/services/doppler';
 
   const settings = getSettingsStore();
 
   let projects = $state<DopplerProject[]>([]);
-  let configs = $state<DopplerConfig[]>([]);
   let loadingProjects = $state(false);
-  let loadingConfigs = $state(false);
   let error = $state('');
   let tokenVisible = $state(false);
   let fetchDebounce: ReturnType<typeof setTimeout> | null = null;
 
-  // Auto-fetch projects when token changes (only tracks token)
+  // Load projects on mount if token exists
+  let initialized = false;
   $effect(() => {
     const token = settings.value.dopplerToken;
-    if (fetchDebounce) clearTimeout(fetchDebounce);
-    if (!token || token.trim().length < 10) {
-      projects = [];
-      configs = [];
-      error = '';
-      untrack(() => {
-        updateSetting('dopplerEnabled', false);
-      });
-      return;
+    if (!initialized && token && token.trim().length >= 10) {
+      initialized = true;
+      loadProjects(token);
     }
-    fetchDebounce = setTimeout(async () => {
-      loadingProjects = true;
-      error = '';
-      try {
-        projects = await fetchProjects(token);
-        // If previously selected project no longer exists, clear it
-        const currentProject = untrack(() => settings.value.dopplerProject);
-        if (currentProject && !projects.some(p => p.slug === currentProject)) {
-          updateSetting('dopplerProject', '');
-          updateSetting('dopplerConfig', '');
-          configs = [];
-        }
-      } catch (e) {
-        error = e instanceof Error ? e.message : String(e);
-        projects = [];
-      } finally {
-        loadingProjects = false;
-      }
-    }, 500);
   });
 
-  // Auto-fetch configs when project changes (only tracks project)
-  $effect(() => {
-    const project = settings.value.dopplerProject;
-    if (!project) {
-      configs = [];
-      return;
-    }
-    const token = untrack(() => settings.value.dopplerToken);
-    if (!token) {
-      configs = [];
-      return;
-    }
-    loadingConfigs = true;
-    configs = [];
-    fetchConfigs(token, project)
-      .then(c => {
-        configs = c;
-        // If previously selected config no longer exists, clear it
-        const currentConfig = untrack(() => settings.value.dopplerConfig);
-        if (currentConfig && !c.some(cfg => cfg.name === currentConfig)) {
-          updateSetting('dopplerConfig', '');
-        }
-      })
-      .catch(e => {
-        error = e instanceof Error ? e.message : String(e);
-        configs = [];
-      })
-      .finally(() => { loadingConfigs = false; });
-  });
-
-  function handleProjectChange(slug: string) {
-    updateSetting('dopplerProject', slug);
-    updateSetting('dopplerConfig', '');
-  }
-
-  function handleConfigChange(name: string) {
-    updateSetting('dopplerConfig', name);
-  }
-
-  function handleTokenChange(value: string) {
+  function handleTokenInput(value: string) {
     updateSetting('dopplerToken', value);
+    if (fetchDebounce) clearTimeout(fetchDebounce);
+    if (!value || value.trim().length < 10) {
+      projects = [];
+      error = '';
+      return;
+    }
+    fetchDebounce = setTimeout(() => loadProjects(value), 500);
   }
 
-  let isConfigured = $derived(
-    settings.value.dopplerToken && settings.value.dopplerProject && settings.value.dopplerConfig
-  );
+  async function loadProjects(token: string) {
+    loadingProjects = true;
+    error = '';
+    try {
+      projects = await fetchProjects(token);
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+      projects = [];
+    } finally {
+      loadingProjects = false;
+    }
+  }
 </script>
 
 <div style="display: flex; flex-direction: column; gap: 20px;">
@@ -102,11 +52,17 @@
     <div style="font-size: 12px; color: var(--text-secondary); line-height: 1.6;">
       Pull secrets from Doppler directly into your preview. No more .env files.
     </div>
-    <div style="font-size: 11px; color: var(--text-muted); margin-top: 8px; padding: 8px 10px; background: var(--bg-primary); border-radius: 6px; font-family: var(--font-mono); line-height: 1.8;">
-      1. Go to <span style="color: var(--banana-yellow);">dashboard.doppler.com</span><br/>
-      2. Click your avatar (bottom-left) > <span style="color: var(--text-primary);">Access Tokens</span><br/>
-      3. Click <span style="color: var(--text-primary);">Generate Personal Token</span><br/>
-      4. Paste the token below
+    <div style="font-size: 11px; color: var(--text-muted); margin-top: 8px; padding: 8px 10px; background: var(--bg-primary); border-radius: 6px; line-height: 2;">
+      <span style="font-family: var(--font-ui);">
+        1. Open <span style="color: var(--banana-yellow); font-family: var(--font-mono);">dashboard.doppler.com</span><br/>
+        2. Click your avatar (bottom-left)<br/>
+        3. Select <span style="color: var(--text-primary); font-weight: 600;">Personal Tokens</span> (NOT service tokens)<br/>
+        4. Click <span style="color: var(--text-primary); font-weight: 600;">+ Generate</span>, name it anything (e.g. "Banana Code")<br/>
+        5. Copy the token (starts with <span style="font-family: var(--font-mono); color: var(--banana-yellow);">dp.pt.</span>) and paste below
+      </span>
+    </div>
+    <div style="font-size: 10px; color: var(--text-muted); margin-top: 6px; opacity: 0.7; font-family: var(--font-ui);">
+      Personal tokens let Banana Code list your projects. Service tokens (dp.st.) won't work here.
     </div>
   </div>
 
@@ -115,7 +71,8 @@
     <div style="display: flex; align-items: center; gap: 8px;">
       <span style="font-size: 13px; font-weight: 600; color: var(--text-primary);">Personal Token</span>
       {#if projects.length > 0}
-        <span style="width: 8px; height: 8px; border-radius: 50%; background: var(--accent-green); display: inline-block;" title="Connected"></span>
+        <span style="width: 8px; height: 8px; border-radius: 50%; background: var(--accent-green); display: inline-block;" title="Connected - {projects.length} projects found"></span>
+        <span style="font-size: 11px; color: var(--accent-green);">Connected ({projects.length} projects)</span>
       {:else if error}
         <span style="width: 8px; height: 8px; border-radius: 50%; background: var(--accent-red); display: inline-block;" title={error}></span>
       {/if}
@@ -124,7 +81,7 @@
       <input
         type={tokenVisible ? 'text' : 'password'}
         value={settings.value.dopplerToken}
-        oninput={(e) => handleTokenChange((e.currentTarget as HTMLInputElement).value)}
+        oninput={(e) => handleTokenInput((e.currentTarget as HTMLInputElement).value)}
         placeholder="dp.pt.xxxxxxxxxxxxxxxxxxxx"
         style="width: 100%; padding: 8px 36px 8px 12px; background: var(--bg-primary); border: 1px solid var(--border-default); border-radius: 6px; color: var(--text-primary); font-size: 12px; font-family: var(--font-mono); outline: none; transition: border-color 0.15s ease;"
         onfocus={(e) => (e.currentTarget as HTMLElement).style.borderColor = 'var(--banana-yellow)'}
@@ -159,65 +116,21 @@
     {/if}
   </div>
 
-  <!-- Project Selector -->
+  <!-- Next steps -->
   {#if projects.length > 0}
-    <div style="display: flex; flex-direction: column; gap: 6px;">
-      <span style="font-size: 13px; font-weight: 600; color: var(--text-primary);">Project</span>
-      <select
-        value={settings.value.dopplerProject}
-        onchange={(e) => handleProjectChange((e.target as HTMLSelectElement).value)}
-        style="padding: 8px 12px; background: var(--bg-primary); border: 1px solid var(--border-default); border-radius: 6px; color: var(--text-primary); font-size: 12px; font-family: var(--font-mono); outline: none; cursor: pointer;"
-      >
-        <option value="">Select a project...</option>
-        {#each projects as project}
-          <option value={project.slug}>{project.name}</option>
-        {/each}
-      </select>
-    </div>
-  {/if}
-
-  <!-- Config Selector -->
-  {#if configs.length > 0}
-    <div style="display: flex; flex-direction: column; gap: 6px;">
-      <span style="font-size: 13px; font-weight: 600; color: var(--text-primary);">Config</span>
-      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-        {#each configs as config}
-          <button
-            onclick={() => handleConfigChange(config.name)}
-            style="padding: 6px 16px; border: 1px solid {settings.value.dopplerConfig === config.name ? 'var(--banana-yellow)' : 'var(--border-default)'}; border-radius: 6px; cursor: pointer; font-size: 12px; font-family: var(--font-ui); transition: all 0.15s ease; background: {settings.value.dopplerConfig === config.name ? 'rgba(255, 214, 10, 0.1)' : 'var(--bg-primary)'}; color: {settings.value.dopplerConfig === config.name ? 'var(--banana-yellow)' : 'var(--text-secondary)'};"
-            onmouseenter={(e) => { if (settings.value.dopplerConfig !== config.name) (e.currentTarget as HTMLElement).style.borderColor = 'var(--banana-yellow-dim)'; }}
-            onmouseleave={(e) => { if (settings.value.dopplerConfig !== config.name) (e.currentTarget as HTMLElement).style.borderColor = 'var(--border-default)'; }}
-          >
-            {config.name}
-          </button>
-        {/each}
+    <div style="padding: 12px 16px; background: var(--bg-primary); border: 1px solid var(--border-default); border-radius: 8px;">
+      <div style="font-size: 12px; color: var(--text-secondary); font-family: var(--font-ui); line-height: 1.6;">
+        Token is working. To link a Doppler project to your workspace:
       </div>
-      {#if loadingConfigs}
-        <span style="font-size: 11px; color: var(--text-muted);">Loading configs...</span>
-      {/if}
-    </div>
-  {/if}
-
-  <!-- Enable Toggle -->
-  {#if isConfigured}
-    <div style="display: flex; align-items: center; gap: 16px; padding: 12px 16px; background: var(--bg-primary); border: 1px solid var(--border-default); border-radius: 8px;">
-      <div style="flex: 1;">
-        <div style="font-size: 13px; color: var(--text-primary); font-weight: 500;">Enable Doppler Sync</div>
-        <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">
-          Pull secrets from <span style="color: var(--banana-yellow); font-family: var(--font-mono);">{settings.value.dopplerProject}/{settings.value.dopplerConfig}</span> into your preview
-        </div>
+      <div style="font-size: 11px; color: var(--text-muted); margin-top: 6px; font-family: var(--font-ui); line-height: 1.8;">
+        1. Open a project in Banana Code<br/>
+        2. Click the lock icon in the preview toolbar to open Environment Variables<br/>
+        3. Click <span style="color: #6C47FF; font-weight: 600;">Link Doppler Project</span><br/>
+        4. Select your project and config. Secrets sync automatically.
       </div>
-      <label style="position: relative; display: inline-block; width: 36px; height: 20px; cursor: pointer;">
-        <input
-          type="checkbox"
-          checked={settings.value.dopplerEnabled}
-          onchange={(e) => updateSetting('dopplerEnabled', (e.target as HTMLInputElement).checked)}
-          style="opacity: 0; width: 0; height: 0;"
-        />
-        <span style="position: absolute; inset: 0; background: {settings.value.dopplerEnabled ? 'var(--banana-yellow)' : 'var(--border-default)'}; border-radius: 10px; transition: background 0.2s ease;">
-          <span style="position: absolute; top: 2px; left: {settings.value.dopplerEnabled ? '18px' : '2px'}; width: 16px; height: 16px; background: white; border-radius: 50%; transition: left 0.2s ease;"></span>
-        </span>
-      </label>
+      <div style="font-size: 10px; color: var(--text-muted); margin-top: 6px; opacity: 0.7; font-family: var(--font-ui);">
+        Each workspace remembers its own Doppler project link.
+      </div>
     </div>
   {/if}
 </div>

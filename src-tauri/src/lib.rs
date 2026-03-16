@@ -91,6 +91,7 @@ pub fn run() {
             // Git
             commands::git::git_status,
             commands::git::git_diff,
+            commands::git::git_diff_staged,
             commands::git::git_stage_file,
             commands::git::git_unstage_file,
             commands::git::git_stage_all,
@@ -110,6 +111,7 @@ pub fn run() {
             commands::claude_code::spawn_claude_code,
             commands::claude_code::write_claude_code,
             commands::claude_code::close_claude_code,
+            commands::claude_code::claude_code_prompt,
             // Preview Orchestrator
             commands::orchestrator::preview_open_project,
             commands::orchestrator::preview_stop,
@@ -120,6 +122,10 @@ pub fn run() {
             commands::orchestrator::preview_scan_env_keys,
             commands::orchestrator::preview_save_env_file,
             commands::orchestrator::preview_load_env_file,
+            // Doppler
+            commands::doppler::doppler_fetch_projects,
+            commands::doppler::doppler_fetch_configs,
+            commands::doppler::doppler_fetch_secrets,
         ])
         .on_window_event(|window, event| {
             // When the main window is destroyed, clean up all managed processes

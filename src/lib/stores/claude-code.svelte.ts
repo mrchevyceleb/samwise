@@ -37,6 +37,11 @@ export interface ClaudeCodeSession {
 	slashCommands: string[];
 	error?: string;
 	cwd: string;
+	// Sidebar metadata
+	title: string;
+	lastMessageAt: number;
+	lastActivity: string;
+	archived: boolean;
 }
 
 export interface ImageAttachment {
@@ -289,6 +294,12 @@ function initListeners() {
 				if (parsed.type === 'result') {
 					updates.totalCost = (s.totalCost || 0) + (parsed.total_cost_usd || 0);
 					updates.status = 'ready';
+					updates.lastMessageAt = Date.now();
+					// Set lastActivity from result text
+					const resultText = (parsed.result || '').replace(/\s+/g, ' ').trim();
+					if (resultText) {
+						updates.lastActivity = resultText.slice(0, 60) + (resultText.length > 60 ? '...' : '');
+					}
 					streamingState.delete(id);
 					const resultUsage = parsed.usage;
 					if (resultUsage) {
@@ -406,6 +417,10 @@ export function getClaudeCodeStore() {
 				cwd,
 				processAlive: false,
 				pendingModelRestart: false,
+				title: 'Claude Code',
+				lastMessageAt: Date.now(),
+				lastActivity: '',
+				archived: false,
 			};
 			const next = new Map(sessions);
 			next.set(id, session);
@@ -419,7 +434,15 @@ export function getClaudeCodeStore() {
 			if (!session) throw new Error('Session not found');
 			if (session.status === 'running') throw new Error('Already running');
 
+			// Auto-title from first user message
+			const isFirstMessage = session.messages.filter(m => m.type === 'user').length === 0;
+			const titleUpdate = isFirstMessage && session.title === 'Claude Code'
+				? { title: message.replace(/\s+/g, ' ').trim().slice(0, 40) + (message.length > 40 ? '...' : '') }
+				: {};
+
 			updateSession(id, (s) => ({
+				...titleUpdate,
+				lastMessageAt: Date.now(),
 				messages: [...s.messages, {
 					type: 'user' as const,
 					raw: { text: message, images: images?.map((img) => ({ base64: img.base64, mediaType: img.mediaType })) },
@@ -512,6 +535,26 @@ export function getClaudeCodeStore() {
 
 		clearMessages(id: string): void {
 			updateSession(id, () => ({ messages: [] }));
+		},
+
+		get allSessions(): ClaudeCodeSession[] {
+			return Array.from(sessions.values());
+		},
+
+		archiveSession(id: string): void {
+			updateSession(id, () => ({ archived: true }));
+		},
+
+		unarchiveSession(id: string): void {
+			updateSession(id, () => ({ archived: false }));
+		},
+
+		renameSession(id: string, title: string): void {
+			updateSession(id, () => ({ title }));
+		},
+
+		updateSessionMeta(id: string, updates: Partial<Pick<ClaudeCodeSession, 'title' | 'lastMessageAt' | 'lastActivity'>>): void {
+			updateSession(id, () => updates);
 		},
 	};
 }

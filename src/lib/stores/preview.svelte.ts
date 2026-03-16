@@ -38,10 +38,31 @@ let suggestedKeys = $state<string[]>([]);
 let missingSecretsOverlay = $state(false);
 let envSetupPending = $state(false);
 let sessionKey = $state(0);
+let dopplerProject = $state('');
+let dopplerConfig = $state('');
 
 /** Storage key for env vars, scoped per project */
 function envStorageKey(projectPath: string): string {
 	return `banana_env_vars_${projectPath.replace(/[\\/]/g, '_')}`;
+}
+
+/** Storage key for Doppler link, scoped per project */
+function dopplerLinkKey(projectPath: string): string {
+	return `banana_doppler_${projectPath.replace(/[\\/]/g, '_')}`;
+}
+
+function loadDopplerLink(projectPath: string): { project: string; config: string } {
+	try {
+		const raw = localStorage.getItem(dopplerLinkKey(projectPath));
+		if (raw) return JSON.parse(raw);
+	} catch { /* ignore */ }
+	return { project: '', config: '' };
+}
+
+function saveDopplerLink(projectPath: string, project: string, config: string) {
+	try {
+		localStorage.setItem(dopplerLinkKey(projectPath), JSON.stringify({ project, config }));
+	} catch { /* ignore */ }
 }
 
 /** Load env vars from localStorage for a project */
@@ -133,6 +154,17 @@ export function getPreviewStore() {
 		get envSetupPending() { return envSetupPending; },
 		set envSetupPending(v: boolean) { envSetupPending = v; },
 		get sessionKey() { return sessionKey; },
+		get dopplerProject() { return dopplerProject; },
+		set dopplerProject(v: string) { dopplerProject = v; },
+		get dopplerConfig() { return dopplerConfig; },
+		set dopplerConfig(v: string) { dopplerConfig = v; },
+
+		/** Save the Doppler project/config link for the current workspace */
+		saveDopplerLink(projectDir: string, project: string, config: string) {
+			dopplerProject = project;
+			dopplerConfig = config;
+			saveDopplerLink(projectDir, project, config);
+		},
 
 		async openProject(projectDir: string) {
 			const invoke = await getInvoke();
@@ -152,6 +184,11 @@ export function getPreviewStore() {
 				loaded = loadEnvVars(projectDir);
 			}
 			envVars = loaded;
+
+			// Load per-project Doppler link
+			const dopplerLink = loadDopplerLink(projectDir);
+			dopplerProject = dopplerLink.project;
+			dopplerConfig = dopplerLink.config;
 
 			// Scan for suggested keys from .env files
 			try {

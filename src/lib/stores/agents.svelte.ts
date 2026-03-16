@@ -1,5 +1,15 @@
 /** Multi-agent store using Svelte 5 runes */
 
+export interface ConversationRef {
+	id: string;
+	type: 'agent' | 'claude-code';
+	title: string;
+	status: string;
+	lastMessageAt: number;
+	lastActivity: string;
+	archived: boolean;
+}
+
 import { ChatEngine } from '$lib/ai/chat/chat-engine';
 import { ChatSession } from '$lib/ai/chat/session';
 import type { AIChatSettings, ToolCall as AIToolCall, ToolResult as AIToolResult } from '$lib/ai/types';
@@ -34,20 +44,23 @@ export interface AgentMessage {
 export interface Agent {
 	id: string;
 	name: string;
+	title: string;
 	status: 'idle' | 'thinking' | 'writing' | 'running_tool' | 'done' | 'error';
 	model: string;
 	provider: string;
 	currentActivity?: string;
 	lastError?: string;
+	lastMessageAt: number;
+	lastActivity: string;
+	archived: boolean;
 	createdAt: number;
 }
 
 let agents = $state<Agent[]>([]);
-let activeAgentIds = $state<string[]>([]);
-let viewMode = $state<'stacked' | 'split'>('stacked');
 let agentMessages = $state<Record<string, AgentMessage[]>>({});
 let agentLoading = $state<Record<string, boolean>>({});
 let focusedAgentId = $state<string | null>(null);
+let searchQuery = $state('');
 
 let nextAgentNum = 1;
 
@@ -56,6 +69,15 @@ const chatEngines = new Map<string, ChatEngine>();
 
 function generateId(): string {
 	return crypto.randomUUID();
+}
+
+/** Auto-generate title from first user message */
+function autoTitle(content: string): string {
+	const cleaned = content.replace(/\s+/g, ' ').trim();
+	if (cleaned.length <= 40) return cleaned;
+	const truncated = cleaned.slice(0, 40);
+	const lastSpace = truncated.lastIndexOf(' ');
+	return (lastSpace > 20 ? truncated.slice(0, lastSpace) : truncated) + '...';
 }
 
 /** Build AIChatSettings from the current app settings */
@@ -86,8 +108,6 @@ function getOrCreateEngine(agentId: string): ChatEngine {
 		const session = new ChatSession(`agent-${agentId}`);
 		const settings = buildAIChatSettings();
 
-		// We need a reference to the store to update messages, but we can't use
-		// `this` from a module function. We'll capture the store functions we need.
 		const store = getAgentStore();
 
 		let streamingMsgId: string | null = null;
@@ -134,14 +154,12 @@ function getOrCreateEngine(agentId: string): ChatEngine {
 					startedAt: Date.now(),
 				}));
 
-				// If there was a streaming message with content, finalize it
 				if (streamingMsgId && streamedContent) {
 					store.updateMessage(agentId, streamingMsgId, {
 						content: streamedContent,
 						toolCalls: uiToolCalls,
 					});
 				} else {
-					// Create a new message for tool calls
 					const msgId = generateId();
 					store.addMessage(agentId, {
 						id: msgId,
@@ -154,11 +172,13 @@ function getOrCreateEngine(agentId: string): ChatEngine {
 				}
 
 				store.setStatus(agentId, 'running_tool');
-				store.setActivity(agentId, `Running ${toolCalls.map(tc => tc.function.name).join(', ')}...`);
+				const toolNames = toolCalls.map(tc => tc.function.name).join(', ');
+				store.setActivity(agentId, `Running ${toolNames}...`);
+				// Update lastActivity for sidebar display
+				store.updateAgentMeta(agentId, { lastActivity: toolNames });
 			},
 
 			onToolResult(results: AIToolResult[]) {
-				// Update tool call statuses in the current message
 				if (streamingMsgId) {
 					const msgs = store.getMessages(agentId);
 					const currentMsg = msgs.find(m => m.id === streamingMsgId);
@@ -186,7 +206,6 @@ function getOrCreateEngine(agentId: string): ChatEngine {
 					}
 				}
 
-				// Reset for next iteration
 				streamingMsgId = null;
 				streamedContent = '';
 				streamedThinking = '';
@@ -195,7 +214,6 @@ function getOrCreateEngine(agentId: string): ChatEngine {
 			},
 
 			async onToolConfirmation(_toolCall: AIToolCall): Promise<boolean> {
-				// For now, auto-confirm. Can add a UI dialog later.
 				return true;
 			},
 
@@ -206,6 +224,11 @@ function getOrCreateEngine(agentId: string): ChatEngine {
 				store.setStatus(agentId, 'idle');
 				store.setActivity(agentId, undefined);
 				store.setLoading(agentId, false);
+				// Update lastActivity with a preview of the response
+				const preview = _fullContent.replace(/\s+/g, ' ').trim().slice(0, 60);
+				if (preview) {
+					store.updateAgentMeta(agentId, { lastActivity: preview + (preview.length >= 60 ? '...' : '') });
+				}
 			},
 
 			onError(errorMsg: string) {
@@ -249,7 +272,6 @@ function getOrCreateEngine(agentId: string): ChatEngine {
 		chatEngines.set(agentId, engine);
 	}
 
-	// Always update settings to pick up latest API key, model, etc.
 	engine.updateSettings(buildAIChatSettings());
 	return engine;
 }
@@ -257,15 +279,39 @@ function getOrCreateEngine(agentId: string): ChatEngine {
 export function getAgentStore() {
 	return {
 		get agents() { return agents; },
-		get activeAgentIds() { return activeAgentIds; },
-		get viewMode() { return viewMode; },
-		set viewMode(v: 'stacked' | 'split') { viewMode = v; },
 		get focusedAgentId() { return focusedAgentId; },
 		set focusedAgentId(id: string | null) { focusedAgentId = id; },
+		get searchQuery() { return searchQuery; },
+		set searchQuery(q: string) { searchQuery = q; },
 
-		get visibleAgents(): Agent[] {
-			if (activeAgentIds.length === 0) return agents;
-			return agents.filter(a => activeAgentIds.includes(a.id));
+		get activeConversations(): Agent[] {
+			return agents
+				.filter(a => !a.archived)
+				.sort((a, b) => b.lastMessageAt - a.lastMessageAt);
+		},
+
+		get archivedConversations(): Agent[] {
+			return agents
+				.filter(a => a.archived)
+				.sort((a, b) => b.lastMessageAt - a.lastMessageAt);
+		},
+
+		get filteredActiveConversations(): Agent[] {
+			const q = searchQuery.toLowerCase().trim();
+			const active = agents.filter(a => !a.archived).sort((a, b) => b.lastMessageAt - a.lastMessageAt);
+			if (!q) return active;
+			return active.filter(a => a.title.toLowerCase().includes(q) || a.lastActivity.toLowerCase().includes(q));
+		},
+
+		get filteredArchivedConversations(): Agent[] {
+			const q = searchQuery.toLowerCase().trim();
+			const archived = agents.filter(a => a.archived).sort((a, b) => b.lastMessageAt - a.lastMessageAt);
+			if (!q) return archived;
+			return archived.filter(a => a.title.toLowerCase().includes(q) || a.lastActivity.toLowerCase().includes(q));
+		},
+
+		get focusedAgent(): Agent | undefined {
+			return focusedAgentId ? agents.find(a => a.id === focusedAgentId) : undefined;
 		},
 
 		addAgent(name?: string, model?: string, provider?: string): string {
@@ -274,23 +320,23 @@ export function getAgentStore() {
 			const agent: Agent = {
 				id,
 				name: name || `Agent ${nextAgentNum++}`,
+				title: 'New Chat',
 				status: 'idle',
 				model: model || s.aiModel || 'anthropic/claude-sonnet-4-6',
 				provider: provider || s.aiProvider || 'openrouter',
+				lastMessageAt: Date.now(),
+				lastActivity: '',
+				archived: false,
 				createdAt: Date.now()
 			};
 			agents = [...agents, agent];
-			activeAgentIds = [...activeAgentIds, id];
 			agentMessages[id] = [];
 			agentLoading[id] = false;
-			if (!focusedAgentId) {
-				focusedAgentId = id;
-			}
+			focusedAgentId = id;
 			return id;
 		},
 
 		removeAgent(id: string): void {
-			// Clean up the ChatEngine
 			const engine = chatEngines.get(id);
 			if (engine) {
 				engine.abort();
@@ -298,12 +344,32 @@ export function getAgentStore() {
 			}
 
 			agents = agents.filter(a => a.id !== id);
-			activeAgentIds = activeAgentIds.filter(aid => aid !== id);
 			delete agentMessages[id];
 			delete agentLoading[id];
 			if (focusedAgentId === id) {
-				focusedAgentId = agents.length > 0 ? agents[0].id : null;
+				const remaining = agents.filter(a => !a.archived);
+				focusedAgentId = remaining.length > 0 ? remaining[0].id : null;
 			}
+		},
+
+		archiveAgent(id: string): void {
+			agents = agents.map(a => a.id === id ? { ...a, archived: true } : a);
+			if (focusedAgentId === id) {
+				const remaining = agents.filter(a => !a.archived);
+				focusedAgentId = remaining.length > 0 ? remaining[0].id : null;
+			}
+		},
+
+		unarchiveAgent(id: string): void {
+			agents = agents.map(a => a.id === id ? { ...a, archived: false } : a);
+		},
+
+		renameAgent(id: string, title: string): void {
+			agents = agents.map(a => a.id === id ? { ...a, title } : a);
+		},
+
+		updateAgentMeta(id: string, updates: Partial<Pick<Agent, 'lastActivity' | 'lastMessageAt' | 'title'>>): void {
+			agents = agents.map(a => a.id === id ? { ...a, ...updates } : a);
 		},
 
 		getMessages(agentId: string): AgentMessage[] {
@@ -315,6 +381,8 @@ export function getAgentStore() {
 				agentMessages[agentId] = [];
 			}
 			agentMessages[agentId] = [...agentMessages[agentId], message];
+			// Update lastMessageAt
+			agents = agents.map(a => a.id === agentId ? { ...a, lastMessageAt: Date.now() } : a);
 		},
 
 		updateMessage(agentId: string, messageId: string, updates: Partial<AgentMessage>): void {
@@ -357,14 +425,12 @@ export function getAgentStore() {
 
 		clearMessages(agentId: string): void {
 			agentMessages[agentId] = [];
-			// Also reset the ChatEngine session
 			const engine = chatEngines.get(agentId);
 			if (engine) {
 				engine.getSession().clear();
 			}
 		},
 
-		/** Abort a running agent */
 		abortAgent(agentId: string): void {
 			const engine = chatEngines.get(agentId);
 			if (engine) {
@@ -375,9 +441,7 @@ export function getAgentStore() {
 			this.setLoading(agentId, false);
 		},
 
-		/** Send a user message to an agent via the real ChatEngine */
 		async sendMessage(agentId: string, content: string): Promise<void> {
-			// Add user message to the UI
 			const userMsg: AgentMessage = {
 				id: generateId(),
 				role: 'user',
@@ -385,11 +449,17 @@ export function getAgentStore() {
 				timestamp: Date.now()
 			};
 			this.addMessage(agentId, userMsg);
+
+			// Auto-title from first user message
+			const agent = agents.find(a => a.id === agentId);
+			if (agent && agent.title === 'New Chat') {
+				this.updateAgentMeta(agentId, { title: autoTitle(content) });
+			}
+
 			this.setStatus(agentId, 'thinking');
 			this.setLoading(agentId, true);
 			this.setActivity(agentId, 'Thinking...');
 
-			// Check for API key
 			const s = getSettings();
 			const apiKey = getActiveAIKey(s);
 			if (!apiKey) {
@@ -406,12 +476,10 @@ export function getAgentStore() {
 				return;
 			}
 
-			// Get or create the ChatEngine and send the message
 			const engine = getOrCreateEngine(agentId);
 			try {
 				await engine.sendMessage(content);
 			} catch (err) {
-				// Error handling is done in the onError callback, but catch any unhandled ones
 				console.error('[agent] sendMessage error:', err);
 			}
 		}

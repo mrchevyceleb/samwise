@@ -1,5 +1,7 @@
 /** Git store using Svelte 5 runes */
 
+import { getSettings } from './settings.svelte';
+
 async function getInvoke() {
 	const { invoke } = await import('@tauri-apps/api/core');
 	return invoke;
@@ -151,6 +153,107 @@ export function getGitStore() {
       const invoke = await getInvoke();
       await invoke('git_pull', { projectDir });
       await this.refresh(projectDir);
+    },
+
+    async getStagedDiff(projectDir: string): Promise<string> {
+      const invoke = await getInvoke();
+      return invoke<string>('git_diff_staged', { projectDir });
+    },
+
+    async generateCommitMessage(projectDir: string): Promise<string> {
+      const diff = await this.getStagedDiff(projectDir);
+      if (!diff.trim()) {
+        throw new Error('No staged changes to summarize.');
+      }
+
+      const truncated = diff.length > 8000 ? diff.slice(0, 8000) + '\n... (truncated)' : diff;
+      const systemPrompt = 'You write concise git commit messages. Output ONLY the commit message, nothing else. Use conventional commit format (feat:, fix:, refactor:, docs:, chore:, style:, test:). Keep the first line under 72 chars. Add a blank line and brief body only if the change is complex.';
+      const userPrompt = `Write a commit message for this diff:\n\n${truncated}`;
+
+      const settings = getSettings();
+
+      // Fallback 1: OpenAI (OAuth token or API key)
+      const openaiKey = (settings.aiOpenAIOAuthAccessToken || '').trim() || (settings.aiOpenAIApiKey || '').trim();
+      if (openaiKey) {
+        return this._callOpenAI(openaiKey, systemPrompt, userPrompt);
+      }
+
+      // Fallback 2: Anthropic API key
+      const anthropicKey = (settings.aiAnthropicApiKey || '').trim();
+      if (anthropicKey) {
+        return this._callAnthropic(anthropicKey, systemPrompt, userPrompt);
+      }
+
+      // Fallback 3: OpenRouter API key
+      const openrouterKey = (settings.aiOpenRouterApiKey || '').trim();
+      if (openrouterKey) {
+        return this._callOpenRouter(openrouterKey, systemPrompt, userPrompt);
+      }
+
+      // Fallback 4: Claude Code CLI
+      try {
+        const invoke = await getInvoke();
+        const result = await invoke<string>('claude_code_prompt', {
+          prompt: `${systemPrompt}\n\n${userPrompt}`,
+          cwd: projectDir,
+        });
+        return result.trim();
+      } catch (ccErr: any) {
+        throw new Error('No API key found and Claude Code CLI unavailable. Add an OpenAI, Anthropic, or OpenRouter key in Settings > AI & Tools.');
+      }
+    },
+
+    async _callOpenAI(apiKey: string, system: string, user: string): Promise<string> {
+      const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+        body: JSON.stringify({
+          model: 'gpt-4o-mini',
+          max_tokens: 120,
+          temperature: 0.3,
+          messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+        }),
+      });
+      if (!resp.ok) throw new Error(`OpenAI error: ${resp.status} ${await resp.text()}`);
+      const data = await resp.json();
+      return (data.choices?.[0]?.message?.content || '').trim();
+    },
+
+    async _callAnthropic(apiKey: string, system: string, user: string): Promise<string> {
+      const resp = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true',
+        },
+        body: JSON.stringify({
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 120,
+          system,
+          messages: [{ role: 'user', content: user }],
+        }),
+      });
+      if (!resp.ok) throw new Error(`Anthropic error: ${resp.status} ${await resp.text()}`);
+      const data = await resp.json();
+      return (data.content?.[0]?.text || '').trim();
+    },
+
+    async _callOpenRouter(apiKey: string, system: string, user: string): Promise<string> {
+      const resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+        body: JSON.stringify({
+          model: 'openai/gpt-4o-mini',
+          max_tokens: 120,
+          temperature: 0.3,
+          messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+        }),
+      });
+      if (!resp.ok) throw new Error(`OpenRouter error: ${resp.status} ${await resp.text()}`);
+      const data = await resp.json();
+      return (data.choices?.[0]?.message?.content || '').trim();
     },
   };
 }
