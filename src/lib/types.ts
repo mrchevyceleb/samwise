@@ -97,6 +97,7 @@ export const KANBAN_COLUMNS: KanbanColumn[] = [
   { status: 'in_progress', label: 'In Progress', color: '#6366f1', glowColor: 'rgba(99, 102, 241, 0.2)', icon: '>>' },
   { status: 'testing', label: 'Testing', color: '#f59e0b', glowColor: 'rgba(245, 158, 11, 0.15)', icon: '??' },
   { status: 'review', label: 'Review', color: '#3fb950', glowColor: 'rgba(63, 185, 80, 0.15)', icon: 'PR' },
+  { status: 'approved', label: 'Approved', color: '#58a6ff', glowColor: 'rgba(88, 166, 255, 0.15)', icon: '++' },
   { status: 'done', label: 'Done', color: '#8b949e', glowColor: 'rgba(139, 148, 158, 0.1)', icon: 'ok' },
 ];
 

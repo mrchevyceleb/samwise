@@ -166,6 +166,11 @@ async fn worker_loop(
             }
         }
 
+        // Evaluate crons every 60 seconds (every 12th tick)
+        if tick % 12 == 0 {
+            let _ = evaluate_crons(&config, &app).await;
+        }
+
         // Check for new chat messages every 5 seconds
         if tick % 1 == 0 {
             let _ = check_chat_messages(&config, &app).await;
@@ -179,6 +184,89 @@ async fn worker_loop(
     let config = sb_config_arc.read().await.clone();
     let _ = supabase::worker_offline(&config, &machine_name).await;
     emit_worker_event(&app, "stopped", "Worker stopped. Going offline.", None);
+}
+
+// ── Cron Evaluation ─────────────────────────────────────────────────
+
+async fn evaluate_crons(config: &SupabaseConfig, app: &tauri::AppHandle) -> Result<(), String> {
+    let crons = supabase::fetch_crons(config).await?;
+    let Some(arr) = crons.as_array() else { return Ok(()); };
+
+    let now = chrono::Utc::now();
+
+    for cron_entry in arr {
+        let enabled = cron_entry.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !enabled { continue; }
+
+        let cron_id = cron_entry.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+        let schedule_str = cron_entry.get("schedule").and_then(|v| v.as_str()).unwrap_or_default();
+        let cron_name = cron_entry.get("name").and_then(|v| v.as_str()).unwrap_or("Unnamed cron");
+
+        // Parse next_run (if set)
+        let next_run = cron_entry.get("next_run")
+            .and_then(|v| v.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+
+        // If next_run is in the future, skip
+        if let Some(nr) = next_run {
+            if nr > now { continue; }
+        }
+
+        // Parse cron schedule
+        let schedule = match schedule_str.parse::<cron::Schedule>() {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("[worker] Invalid cron schedule '{}' for '{}': {}", schedule_str, cron_name, e);
+                continue;
+            }
+        };
+
+        // Get task template
+        let template = match cron_entry.get("task_template") {
+            Some(t) if t.is_object() => t.clone(),
+            _ => {
+                log::warn!("[worker] Cron '{}' has no valid task_template", cron_name);
+                continue;
+            }
+        };
+
+        // Create task from template
+        let mut task = template.clone();
+        if let Some(obj) = task.as_object_mut() {
+            obj.insert("source".to_string(), serde_json::json!("cron"));
+            obj.insert("cron_id".to_string(), serde_json::json!(cron_id));
+            if !obj.contains_key("status") {
+                obj.insert("status".to_string(), serde_json::json!("queued"));
+            }
+            if !obj.contains_key("priority") {
+                obj.insert("priority".to_string(), serde_json::json!("medium"));
+            }
+        }
+
+        match supabase::create_task(config, &task).await {
+            Ok(_) => {
+                log::info!("[worker] Cron '{}' created task", cron_name);
+                emit_worker_event(app, "cron_fired", &format!("Cron '{}' created a new task", cron_name), None);
+            }
+            Err(e) => {
+                log::error!("[worker] Cron '{}' failed to create task: {}", cron_name, e);
+            }
+        }
+
+        // Compute next run from schedule
+        let next = schedule.upcoming(chrono::Utc).next();
+        let next_run_str = next.map(|dt| dt.to_rfc3339());
+
+        // Update cron last_run and next_run
+        let update = serde_json::json!({
+            "last_run": now.to_rfc3339(),
+            "next_run": next_run_str,
+        });
+        let _ = supabase::update_cron(config, cron_id, &update).await;
+    }
+
+    Ok(())
 }
 
 // ── Task Execution ──────────────────────────────────────────────────
@@ -326,10 +414,80 @@ async fn execute_task(
 
 // ── Chat Message Processing ─────────────────────────────────────────
 
-async fn check_chat_messages(config: &SupabaseConfig, _app: &tauri::AppHandle) {
-    // TODO: Check for unprocessed user messages in ae_messages
-    // For now, chat processing will be triggered by realtime on the frontend
-    // The worker will respond to messages that the frontend marks as needing a response
+/// Check for unprocessed user messages and respond via Claude Code CLI.
+async fn check_chat_messages(config: &SupabaseConfig, app: &tauri::AppHandle) {
+    // Fetch recent messages
+    let messages = match supabase::fetch_messages(config).await {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+
+    let Some(arr) = messages.as_array() else { return; };
+
+    // Find the last user message and last agent message
+    let last_user = arr.iter().rev().find(|m| {
+        m.get("role").and_then(|v| v.as_str()) == Some("user")
+    });
+    let last_agent = arr.iter().rev().find(|m| {
+        m.get("role").and_then(|v| v.as_str()) == Some("agent")
+    });
+
+    // If no user message, nothing to do
+    let Some(user_msg) = last_user else { return; };
+
+    // If the last agent message is newer than the last user message, already responded
+    let user_ts = user_msg.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+    let agent_ts = last_agent.map(|m| m.get("created_at").and_then(|v| v.as_str()).unwrap_or("")).unwrap_or("");
+
+    if !agent_ts.is_empty() && agent_ts >= user_ts {
+        return; // Already responded to the latest user message
+    }
+
+    let user_content = user_msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    if user_content.is_empty() { return; }
+
+    // Build context for Claude Code
+    let recent_messages: Vec<String> = arr.iter().rev().take(10).rev().map(|m| {
+        let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        format!("{}: {}", role, content)
+    }).collect();
+
+    let context = recent_messages.join("\n");
+
+    let prompt = format!(
+        r#"You are Agent One, Matt's AI developer. You work 24/7. You are proactive, communicative, and competent. You talk like a senior developer on Slack - casual but professional. You never say "I'm an AI" or "As an AI." You are a teammate.
+
+Recent chat:
+{}
+
+Matt's latest message: {}
+
+Respond naturally. If Matt asks you to do something that requires creating a task (coding work, fixing bugs, building features), respond and mention you'll create a task for it. Keep it brief and conversational."#,
+        context, user_content
+    );
+
+    // Run Claude Code for the response
+    match run_claude_code(".", &prompt).await {
+        Ok(response) => {
+            let trimmed = response.trim();
+            if !trimmed.is_empty() {
+                let _ = supabase::send_message(config, &serde_json::json!({
+                    "role": "agent",
+                    "content": trimmed,
+                })).await;
+
+                emit_worker_event(app, "chat_response", "Responded to chat message", None);
+            }
+        }
+        Err(e) => {
+            log::warn!("[worker] Chat response failed: {}", e);
+            let _ = supabase::send_message(config, &serde_json::json!({
+                "role": "agent",
+                "content": format!("Sorry, I hit a snag trying to process that: {}. Try again?", e),
+            })).await;
+        }
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────

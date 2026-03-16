@@ -1,9 +1,20 @@
 <script lang="ts">
 	import { getWorkerStore } from '$lib/stores/worker.svelte';
-	import { getSettingsStore } from '$lib/stores/settings.svelte';
+	import { getTaskStore } from '$lib/stores/tasks.svelte';
 
 	const worker = getWorkerStore();
-	const settingsStore = getSettingsStore();
+	const taskStore = getTaskStore();
+
+	// Look up the current task title from the task store by worker's currentTaskId
+	let currentTaskTitle = $derived(() => {
+		// Try the full task object first, then look up by workerId
+		if (worker.currentTask) return worker.currentTask.title;
+		if (worker.workerId) {
+			const task = taskStore.getTask(worker.workerId);
+			return task?.title ?? null;
+		}
+		return null;
+	});
 
 	let minimizeHovered = $state(false);
 	let maximizeHovered = $state(false);
@@ -76,9 +87,9 @@
 			<span data-tauri-drag-region style="font-size: 11px; color: var(--text-muted);">
 				{worker.statusLabel}
 			</span>
-			{#if worker.currentTask}
+			{#if currentTaskTitle()}
 				<span data-tauri-drag-region style="font-size: 11px; color: var(--text-muted);">
-					- {worker.currentTask.title}
+					- {currentTaskTitle()}
 				</span>
 			{/if}
 		</div>

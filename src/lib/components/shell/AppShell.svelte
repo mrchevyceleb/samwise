@@ -23,6 +23,8 @@
 	let chatToggleHovered = $state(false);
 	let realtimeChannels: any[] = [];
 
+	let workerUnlisten: (() => void) | null = null;
+
 	onMount(async () => {
 		await initSettings();
 
@@ -45,12 +47,27 @@
 
 		// Start realtime subscriptions
 		initRealtime();
+
+		// Listen for worker events from Rust backend
+		try {
+			const { listen } = await import('@tauri-apps/api/event');
+			workerUnlisten = await listen('worker-event', (event: any) => {
+				const { event_type, message, task_id } = event.payload;
+				console.log(`[worker] ${event_type}: ${message}`);
+				if (event_type === 'task_completed' || event_type === 'task_failed') {
+					taskStore.fetchTasks();
+				}
+			});
+		} catch {
+			// Not in Tauri environment (browser dev mode)
+		}
 	});
 
 	onDestroy(() => {
 		for (const ch of realtimeChannels) {
 			ch.unsubscribe();
 		}
+		workerUnlisten?.();
 	});
 
 	async function initRealtime() {

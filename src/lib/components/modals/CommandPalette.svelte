@@ -1,7 +1,5 @@
 <script lang="ts">
-  import { getLayout } from '$lib/stores/layout.svelte';
   import { getSettingsStore } from '$lib/stores/settings.svelte';
-  import { getWorkspace } from '$lib/stores/workspace.svelte';
 
   interface Props {
     visible?: boolean;
@@ -10,9 +8,7 @@
 
   let { visible = false, onClose }: Props = $props();
 
-  const layout = getLayout();
   const settingsStore = getSettingsStore();
-  const workspace = getWorkspace();
 
   let query = $state('');
   let selectedIndex = $state(0);

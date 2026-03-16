@@ -1,7 +1,6 @@
 <script lang="ts">
   import { getSettingsStore } from '$lib/stores/settings.svelte';
   import { safeInvoke } from '$lib/utils/tauri';
-  import DopplerTab from './DopplerTab.svelte';
   import AutomationPanel from '$lib/components/automation/AutomationPanel.svelte';
 
   const settingsStore = getSettingsStore();
@@ -40,8 +39,8 @@
   async function saveConfig() {
     await safeInvoke('supabase_set_config', {
       url: supabaseUrl,
-      anonKey,
-      serviceRoleKey: serviceRoleKey || null,
+      anon_key: anonKey,
+      service_role_key: serviceRoleKey || null,
     });
   }
 

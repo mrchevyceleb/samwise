@@ -142,6 +142,12 @@ pub async fn worker_heartbeat(config: &SupabaseConfig, machine_name: &str) -> Re
     handle_response(resp).await
 }
 
+pub async fn update_cron(config: &SupabaseConfig, id: &str, updates: &Value) -> Result<Value, String> {
+    let client = build_client(config)?;
+    let url = format!("{}?id=eq.{}", rest_url(config, "ae_crons"), id);
+    handle_response(client.patch(&url).json(updates).send().await.map_err(|e| e.to_string())?).await
+}
+
 pub async fn worker_offline(config: &SupabaseConfig, machine_name: &str) -> Result<(), String> {
     let client = build_client(config)?;
     let url = format!("{}?machine_name=eq.{}", rest_url(config, "ae_workers"), machine_name);

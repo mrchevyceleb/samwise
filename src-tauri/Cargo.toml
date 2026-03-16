@@ -31,13 +31,16 @@ serde_json = "1"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
-# HTTP client for AI streaming
+# HTTP client for Supabase REST
 reqwest = { version = "0.12", features = ["stream", "json"] }
 urlencoding = "2"
 futures-util = "0.3"
 
 # Directory traversal
 walkdir = "2"
+
+# Cron scheduling
+cron = "0.15"
 
 # Utilities
 uuid = { version = "1", features = ["v4"] }

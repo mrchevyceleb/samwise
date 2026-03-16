@@ -75,6 +75,7 @@ export function getTaskStore() {
       description?: string;
       priority?: TaskPriority;
       source?: TaskSource;
+      project?: string;
       repo_url?: string;
       repo_path?: string;
       context?: Record<string, unknown>;
@@ -87,6 +88,7 @@ export function getTaskStore() {
             priority: data.priority || 'medium',
             source: data.source || 'manual',
             status: 'queued',
+            project: data.project || null,
             repo_url: data.repo_url || null,
             repo_path: data.repo_path || null,
             context: data.context || null,
@@ -112,6 +114,15 @@ export function getTaskStore() {
         tasks = tasks.map(t => t.id === id ? { ...t, ...updates, updated_at: new Date().toISOString() } : t);
       } catch (e) {
         console.warn('[tasks] update failed:', e);
+      }
+    },
+
+    async deleteTask(id: string) {
+      try {
+        await safeInvoke('supabase_delete_task', { id });
+        tasks = tasks.filter(t => t.id !== id);
+      } catch (e) {
+        console.warn('[tasks] delete failed:', e);
       }
     },
 

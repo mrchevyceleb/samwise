@@ -28,8 +28,8 @@
 				title: title.trim(),
 				description: description.trim() || undefined,
 				priority,
+				project: project.trim() || undefined,
 				repo_url: repoUrl.trim() || undefined,
-				context: project.trim() ? { project: project.trim() } : undefined,
 			});
 			onClose();
 		} finally {
