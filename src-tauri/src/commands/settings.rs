@@ -1,39 +1,23 @@
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AppSettings {
-    pub ai_provider: String,
-    pub ai_api_key: String,
-    pub theme: String,
-}
-
-impl Default for AppSettings {
-    fn default() -> Self {
-        Self {
-            ai_provider: "anthropic".to_string(),
-            ai_api_key: String::new(),
-            theme: "dark".to_string(),
-        }
-    }
-}
-
+/// Save settings as a raw JSON string.
+/// The frontend owns the schema; we just persist the blob.
 #[tauri::command]
-pub async fn save_settings(app: AppHandle, settings: AppSettings) -> Result<(), String> {
+pub async fn save_settings(app: AppHandle, data: String) -> Result<(), String> {
     let path = settings_path(&app)?;
-    let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| e.to_string())
+    std::fs::write(&path, data).map_err(|e| e.to_string())
 }
 
+/// Load settings as a raw JSON string.
+/// Returns the stored JSON or an empty string if no file exists.
 #[tauri::command]
-pub async fn load_settings(app: AppHandle) -> Result<AppSettings, String> {
+pub async fn load_settings(app: AppHandle) -> Result<String, String> {
     let path = settings_path(&app)?;
     if path.exists() {
-        let json = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        serde_json::from_str(&json).map_err(|e| e.to_string())
+        std::fs::read_to_string(&path).map_err(|e| e.to_string())
     } else {
-        Ok(AppSettings::default())
+        Ok(String::new())
     }
 }
 

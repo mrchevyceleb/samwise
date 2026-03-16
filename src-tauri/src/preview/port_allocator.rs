@@ -1,8 +1,22 @@
 use std::net::TcpListener;
 
+/// Check if a port is truly free on all interfaces (IPv4 + IPv6).
+/// Returns true only if no existing process holds the port.
+fn is_port_free(port: u16) -> bool {
+    // Check IPv4 all-interfaces
+    if TcpListener::bind(("0.0.0.0", port)).is_err() {
+        return false;
+    }
+    // Check IPv6 all-interfaces (Next.js binds to :: by default)
+    if TcpListener::bind(("[::]", port)).is_err() {
+        return false;
+    }
+    true
+}
+
 pub fn find_free_port(range: std::ops::Range<u16>) -> Result<u16, String> {
     for port in range {
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+        if is_port_free(port) {
             return Ok(port);
         }
     }
@@ -33,8 +47,8 @@ pub fn find_preview_port() -> Result<u16, String> {
 }
 
 /// Find a free port for managed dev server processes.
-/// Uses a wide range (3000-4000) so multiple Banana Code windows
-/// can run simultaneously without conflicts.
+/// Uses high ephemeral range (9100-9999) to avoid conflicts with
+/// common dev ports (3000, 5173, 8080, etc.).
 pub fn find_managed_port() -> Result<u16, String> {
-    find_free_port(3000..4000)
+    find_free_port(9100..10000)
 }

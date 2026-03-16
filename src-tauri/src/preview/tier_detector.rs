@@ -1,5 +1,5 @@
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -7,6 +7,7 @@ pub enum PreviewTier {
     DirectServe,
     EsbuildBundle,
     ManagedProcess,
+    Unsupported,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -16,6 +17,7 @@ pub struct TierDetection {
     pub entry_point: Option<String>,
     pub dev_command: Option<String>,
     pub reason: String,
+    pub message: Option<String>,
 }
 
 /// Frameworks that MUST have their own dev server (SSR, server-side, backend).
@@ -61,7 +63,18 @@ fn make_detection(
     dev_command: Option<String>,
     reason: String,
 ) -> TierDetection {
-    TierDetection { tier, framework, entry_point, dev_command, reason }
+    TierDetection { tier, framework, entry_point, dev_command, reason, message: None }
+}
+
+fn make_unsupported(framework: &str, message: &str, reason: &str) -> TierDetection {
+    TierDetection {
+        tier: PreviewTier::Unsupported,
+        framework: Some(framework.to_string()),
+        entry_point: None,
+        dev_command: None,
+        reason: reason.to_string(),
+        message: Some(message.to_string()),
+    }
 }
 
 pub fn detect_tier(project_dir: &Path) -> TierDetection {
@@ -91,6 +104,44 @@ pub fn detect_tier(project_dir: &Path) -> TierDetection {
                 all_deps.push(dep_name.clone());
             }
         }
+    }
+
+    // --- Priority 0: React Native / Expo detection ---
+    let has_expo = all_deps.iter().any(|d| d == "expo");
+    let has_react_native = all_deps.iter().any(|d| d == "react-native");
+    let has_react_native_web = all_deps.iter().any(|d| d == "react-native-web");
+    let has_react_dom = all_deps.iter().any(|d| d == "react-dom");
+    let has_expo_webpack = all_deps.iter().any(|d| d == "@expo/webpack-config");
+
+    if has_expo {
+        // Check app.json for web platform support as additional signal
+        let app_json_has_web = check_expo_web_support(project_dir);
+        let can_web = has_react_native_web || has_react_dom || has_expo_webpack || app_json_has_web;
+
+        if can_web {
+            let dev_command = resolve_dev_command(&pkg, "Expo");
+            return make_detection(
+                PreviewTier::ManagedProcess,
+                Some("Expo".to_string()),
+                None,
+                Some(dev_command),
+                "Expo project with web support.".to_string(),
+            );
+        } else {
+            return make_unsupported(
+                "Expo",
+                "Mobile-only Expo project. Add react-native-web for web preview, or use Expo Go on your device.",
+                "Expo project without web dependencies.",
+            );
+        }
+    }
+
+    if has_react_native && !has_react_dom && !has_react_native_web {
+        return make_unsupported(
+            "React Native",
+            "React Native project without web support. Use a device emulator to preview.",
+            "React Native project without react-dom or react-native-web.",
+        );
     }
 
     // --- Priority 1: SSR/Backend frameworks → Tier 3 (silent managed process) ---
@@ -179,11 +230,12 @@ pub fn detect_tier(project_dir: &Path) -> TierDetection {
         );
     }
 
-    // --- Priority 5: Has index.html → Tier 1 (instant static serve) ---
+    // --- Priority 5: Has index.html (or public/index.html) → Tier 1 (instant static serve) ---
     // If a project has an index.html, serve it directly. This handles
     // Vite/Parcel/plain projects that have a working index.html entry point.
     // This is FASTER than spinning up a dev server.
-    let has_index_html = project_dir.join("index.html").exists();
+    let has_index_html = project_dir.join("index.html").exists()
+        || project_dir.join("public").join("index.html").exists();
     if has_index_html {
         return make_detection(
             PreviewTier::DirectServe,
@@ -217,10 +269,22 @@ pub fn detect_tier(project_dir: &Path) -> TierDetection {
 
 fn detect_static_tier(project_dir: &Path) -> TierDetection {
     let index_path = project_dir.join("index.html");
-    let entry = if index_path.exists() {
-        Some("index.html".to_string())
+    let public_index = project_dir.join("public").join("index.html");
+
+    let (serve_dir, entry) = if index_path.exists() {
+        (None, Some("index.html".to_string()))
+    } else if public_index.exists() {
+        // Serve the public/ subdirectory directly (common for static sites)
+        (Some("public"), Some("index.html".to_string()))
     } else {
-        find_first_file(project_dir, "html")
+        (None, find_first_file(project_dir, "html"))
+    };
+
+    // If the real content is in public/, update the reason to note it
+    let reason = if serve_dir.is_some() {
+        "Static project (public/ directory).".to_string()
+    } else {
+        "Static project.".to_string()
     };
 
     make_detection(
@@ -228,8 +292,20 @@ fn detect_static_tier(project_dir: &Path) -> TierDetection {
         None,
         entry,
         None,
-        "Static project.".to_string(),
+        reason,
     )
+}
+
+/// Determine the actual directory to serve for a project.
+/// If the static tier detected a public/ subdirectory, serve that instead.
+pub fn resolve_serve_dir(project_dir: &Path) -> PathBuf {
+    // If there's no index.html at root but public/index.html exists, serve public/
+    if !project_dir.join("index.html").exists()
+        && project_dir.join("public").join("index.html").exists()
+    {
+        return project_dir.join("public");
+    }
+    project_dir.to_path_buf()
 }
 
 fn resolve_dev_command(pkg: &serde_json::Value, framework: &str) -> String {
@@ -249,6 +325,7 @@ fn resolve_dev_command(pkg: &serde_json::Value, framework: &str) -> String {
         "Express" | "Fastify" | "NestJS" | "Hono" | "Koa" => "node .".to_string(),
         "Astro" => "astro dev".to_string(),
         "Gatsby" => "gatsby develop".to_string(),
+        "Expo" => "npx expo start --web".to_string(),
         "Vite" => "npm run dev".to_string(),
         "Svelte" => "npm run dev".to_string(),
         "Vue" => "npm run dev".to_string(),
@@ -314,4 +391,283 @@ fn find_first_file(dir: &Path, extension: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Check app.json / app.config.json for Expo web platform support
+fn check_expo_web_support(project_dir: &Path) -> bool {
+    for filename in &["app.json", "app.config.json"] {
+        let path = project_dir.join(filename);
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                // Check expo.platforms contains "web"
+                if let Some(platforms) = json.get("expo")
+                    .and_then(|e| e.get("platforms"))
+                    .and_then(|p| p.as_array())
+                {
+                    if platforms.iter().any(|v| v.as_str() == Some("web")) {
+                        return true;
+                    }
+                }
+                // Check expo.web key exists
+                if json.get("expo").and_then(|e| e.get("web")).is_some() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Resolve the best previewable directory in a monorepo.
+/// If the root has workspaces, find the most web-friendly package.
+/// Returns (resolved_dir, is_monorepo) - is_monorepo is true if resolved_dir != root.
+pub fn resolve_project_dir(root: &Path) -> PathBuf {
+    let candidates = collect_workspace_candidates(root);
+    if candidates.is_empty() {
+        return root.to_path_buf();
+    }
+
+    let mut best_path = root.to_path_buf();
+    let mut best_score: i32 = 0;
+
+    for candidate in &candidates {
+        let score = score_web_previewability(candidate);
+        log::debug!(
+            "[tier_detector] Workspace candidate: {} (score: {})",
+            candidate.display(),
+            score
+        );
+        if score > best_score {
+            best_score = score;
+            best_path = candidate.clone();
+        }
+    }
+
+    // Only use a candidate if it scored positively
+    if best_score > 0 {
+        best_path
+    } else {
+        root.to_path_buf()
+    }
+}
+
+/// Collect workspace package directories from package.json workspaces or pnpm-workspace.yaml
+fn collect_workspace_candidates(root: &Path) -> Vec<PathBuf> {
+    let mut globs: Vec<String> = Vec::new();
+
+    // Check package.json workspaces
+    let pkg_path = root.join("package.json");
+    if let Ok(content) = std::fs::read_to_string(&pkg_path) {
+        if let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(workspaces) = pkg.get("workspaces") {
+                // Format: "workspaces": ["apps/*", "packages/*"]
+                if let Some(arr) = workspaces.as_array() {
+                    for item in arr {
+                        if let Some(s) = item.as_str() {
+                            globs.push(s.to_string());
+                        }
+                    }
+                }
+                // Format: "workspaces": { "packages": ["apps/*", "packages/*"] }
+                if let Some(obj) = workspaces.as_object() {
+                    if let Some(pkgs) = obj.get("packages").and_then(|p| p.as_array()) {
+                        for item in pkgs {
+                            if let Some(s) = item.as_str() {
+                                globs.push(s.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Check pnpm-workspace.yaml
+    let pnpm_path = root.join("pnpm-workspace.yaml");
+    if let Ok(content) = std::fs::read_to_string(&pnpm_path) {
+        // Simple YAML parsing for packages list - avoid adding a yaml dep
+        // Format:
+        // packages:
+        //   - 'apps/*'
+        //   - 'packages/*'
+        let mut in_packages = false;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("packages:") {
+                in_packages = true;
+                continue;
+            }
+            if in_packages {
+                if trimmed.starts_with('-') {
+                    let val = trimmed.trim_start_matches('-').trim()
+                        .trim_matches('\'').trim_matches('"');
+                    if !val.is_empty() {
+                        globs.push(val.to_string());
+                    }
+                } else if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                    // New top-level key, stop
+                    break;
+                }
+            }
+        }
+    }
+
+    // Heuristic fallback: if no workspaces field found, scan common monorepo dirs
+    // for subdirectories that could be previewable (have package.json, index.html, or web content)
+    if globs.is_empty() {
+        let heuristic_dirs = ["apps", "packages", "projects", "services", "libs"];
+        let mut heuristic_candidates: Vec<PathBuf> = Vec::new();
+
+        for dir_name in &heuristic_dirs {
+            let dir = root.join(dir_name);
+            if dir.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(&dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_dir() && is_previewable_dir(&path) {
+                            heuristic_candidates.push(path);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Also check top-level dirs that could be previewable
+        // (e.g., root/web/, root/website/)
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() { continue; }
+                let name = path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+                // Skip node_modules, hidden dirs, and dirs already scanned above
+                if name == "node_modules" || name.starts_with('.')
+                    || heuristic_dirs.contains(&name) {
+                    continue;
+                }
+                if is_previewable_dir(&path) && !heuristic_candidates.contains(&path) {
+                    heuristic_candidates.push(path);
+                }
+            }
+        }
+
+        if !heuristic_candidates.is_empty() {
+            log::info!(
+                "[tier_detector] No workspaces field, found {} heuristic candidates",
+                heuristic_candidates.len()
+            );
+            return heuristic_candidates;
+        }
+
+        return Vec::new();
+    }
+
+    // Expand simple globs (e.g., "apps/*") to actual directories
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for pattern in &globs {
+        if let Some(star_pos) = pattern.find('*') {
+            // "apps/*" -> list directories under "apps/"
+            let prefix = &pattern[..star_pos];
+            let parent = root.join(prefix);
+            if let Ok(entries) = std::fs::read_dir(&parent) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        candidates.push(path);
+                    }
+                }
+            }
+        } else {
+            // Exact path
+            let path = root.join(pattern);
+            if path.is_dir() {
+                candidates.push(path);
+            }
+        }
+    }
+
+    candidates
+}
+
+/// Check if a directory has any web-previewable content
+/// (package.json, index.html, or HTML files in a public/ subfolder)
+fn is_previewable_dir(dir: &Path) -> bool {
+    if dir.join("package.json").exists() {
+        return true;
+    }
+    if dir.join("index.html").exists() {
+        return true;
+    }
+    // Check public/ subfolder (common for static sites, Expo web, etc.)
+    let public_dir = dir.join("public");
+    if public_dir.is_dir() && public_dir.join("index.html").exists() {
+        return true;
+    }
+    // Check for any HTML files directly in the dir
+    if has_files_with_extensions(dir, &["html"]) {
+        return true;
+    }
+    false
+}
+
+/// Score a directory for web-previewability (higher = more likely a web app)
+fn score_web_previewability(dir: &Path) -> i32 {
+    let mut score: i32 = 0;
+
+    let dir_name = dir.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    // Name-based scoring
+    for name in &["web", "frontend", "app", "client", "site", "website"] {
+        if dir_name.contains(name) {
+            score += 10;
+            break;
+        }
+    }
+    for name in &["api", "server", "backend", "mobile", "native"] {
+        if dir_name.contains(name) {
+            score -= 10;
+            break;
+        }
+    }
+
+    // Check package.json for web framework deps
+    let pkg_path = dir.join("package.json");
+    if let Ok(content) = std::fs::read_to_string(&pkg_path) {
+        if let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content) {
+            let mut all_deps: Vec<String> = Vec::new();
+            for key in &["dependencies", "devDependencies"] {
+                if let Some(deps) = pkg.get(key).and_then(|d| d.as_object()) {
+                    for dep_name in deps.keys() {
+                        all_deps.push(dep_name.clone());
+                    }
+                }
+            }
+
+            let web_deps = ["react-dom", "next", "vite", "svelte", "vue", "nuxt", "@sveltejs/kit"];
+            if all_deps.iter().any(|d| web_deps.contains(&d.as_str())) {
+                score += 5;
+            }
+
+            // Penalize mobile-only
+            let has_rn = all_deps.iter().any(|d| d == "react-native");
+            let has_rd = all_deps.iter().any(|d| d == "react-dom");
+            if has_rn && !has_rd {
+                score -= 10;
+            }
+        }
+    }
+
+    // Bonus for index.html (direct or in public/)
+    if dir.join("index.html").exists() {
+        score += 3;
+    }
+    if dir.join("public").join("index.html").exists() {
+        score += 3;
+    }
+
+    score
 }

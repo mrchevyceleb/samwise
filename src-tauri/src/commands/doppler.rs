@@ -4,6 +4,12 @@ use std::collections::HashMap;
 const BASE: &str = "https://api.doppler.com/v3";
 
 #[derive(Serialize, Deserialize, Clone)]
+pub struct DopplerWorkplace {
+    pub id: Option<String>,
+    pub name: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct DopplerProject {
     pub slug: String,
     pub name: String,
@@ -13,6 +19,11 @@ pub struct DopplerProject {
 pub struct DopplerConfig {
     pub name: String,
     pub environment: String,
+}
+
+#[derive(Deserialize)]
+struct WorkplaceResponse {
+    workplace: DopplerWorkplace,
 }
 
 #[derive(Deserialize)]
@@ -49,9 +60,36 @@ fn client(token: &str) -> Result<reqwest::Client, String> {
         .map_err(|e| format!("HTTP client error: {}", e))
 }
 
+/// Fetch the workplace (organization) that this token belongs to.
+/// Each Doppler personal token is scoped to exactly one organization.
 #[tauri::command]
-pub async fn doppler_fetch_projects(token: String) -> Result<Vec<DopplerProject>, String> {
-    let url = format!("{}/projects?per_page=100", BASE);
+pub async fn doppler_fetch_workplaces(token: String) -> Result<DopplerWorkplace, String> {
+    let url = format!("{}/workplace", BASE);
+    let resp = client(&token)?
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to connect to Doppler: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Doppler API error ({}): {}", status, body));
+    }
+
+    let data: WorkplaceResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse response: {}", e))?;
+    Ok(data.workplace)
+}
+
+#[tauri::command]
+pub async fn doppler_fetch_projects(token: String, workplace: Option<String>) -> Result<Vec<DopplerProject>, String> {
+    let mut url = format!("{}/projects?per_page=100", BASE);
+    if let Some(ref wp) = workplace {
+        url.push_str(&format!("&workplace={}", urlencoding::encode(wp)));
+    }
     let resp = client(&token)?
         .get(&url)
         .send()

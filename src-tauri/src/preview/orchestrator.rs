@@ -5,7 +5,7 @@ use tauri::{AppHandle, Emitter};
 use super::esbuild_runner::EsbuildRunner;
 use super::http_server::PreviewServer;
 use super::process_manager::ManagedProcess;
-use super::tier_detector::{self, PreviewTier, TierDetection};
+use super::tier_detector::{self, PreviewTier, TierDetection, resolve_project_dir, resolve_serve_dir};
 use super::watcher::PreviewWatcher;
 
 pub struct PreviewOrchestrator {
@@ -59,24 +59,68 @@ impl PreviewOrchestrator {
             project_dir.display()
         );
 
-        let detection = tier_detector::detect_tier(&project_dir);
+        // Resolve monorepo workspace to best web-previewable directory
+        let resolved_dir = resolve_project_dir(&project_dir);
+        if resolved_dir != project_dir {
+            log::info!(
+                "[orchestrator] Monorepo resolved: {} -> {}",
+                project_dir.display(),
+                resolved_dir.display()
+            );
+        }
+
+        let detection = tier_detector::detect_tier(&resolved_dir);
         log::info!(
             "[orchestrator] Tier: {:?} ({})",
             detection.tier,
             detection.reason
         );
 
+        // Unsupported tier: return detection as-is, skip server start
+        if detection.tier == PreviewTier::Unsupported {
+            self.current_tier = Some(detection.tier.clone());
+            self.detection = Some(detection.clone());
+            self.project_dir = Some(resolved_dir);
+            return Ok(detection);
+        }
+
+        // For monorepo subpackages, inject root node_modules/.bin into PATH
+        // so dev servers can find their binaries even when hoisted
+        let is_monorepo = resolved_dir != project_dir;
+        if is_monorepo {
+            let root_bin = project_dir.join("node_modules").join(".bin");
+            if root_bin.exists() {
+                let bin_str = root_bin.to_string_lossy().to_string();
+                if let Ok(current_path) = std::env::var("PATH") {
+                    let sep = if cfg!(windows) { ";" } else { ":" };
+                    self.env_vars.entry("PATH".to_string())
+                        .or_insert_with(|| current_path.clone());
+                    // Prepend root bin to PATH
+                    if let Some(path_val) = self.env_vars.get_mut("PATH") {
+                        if !path_val.contains(&bin_str) {
+                            *path_val = format!("{}{}{}", bin_str, sep, path_val);
+                        }
+                    }
+                }
+                log::info!(
+                    "[orchestrator] Monorepo: added root node_modules/.bin to PATH: {}",
+                    bin_str
+                );
+            }
+        }
+
         // Start the appropriate server
         let result = match detection.tier {
             PreviewTier::DirectServe => {
-                self.start_direct_serve(&project_dir).await
+                self.start_direct_serve(&resolved_dir).await
             }
             PreviewTier::EsbuildBundle => {
-                self.start_esbuild_bundle(&project_dir, &detection).await
+                self.start_esbuild_bundle(&resolved_dir, &detection).await
             }
             PreviewTier::ManagedProcess => {
-                self.start_managed_process(app, &project_dir, &detection).await
+                self.start_managed_process(app, &resolved_dir, &detection).await
             }
+            PreviewTier::Unsupported => unreachable!(),
         };
 
         // Fallback: if esbuild or managed process fails, try direct serve
@@ -84,7 +128,7 @@ impl PreviewOrchestrator {
             let err = result.as_ref().unwrap_err().clone();
             log::warn!("[orchestrator] {:?} failed ({}), falling back to DirectServe", detection.tier, err);
 
-            match self.start_direct_serve(&project_dir).await {
+            match self.start_direct_serve(&resolved_dir).await {
                 Ok(_) => {
                     let fallback = TierDetection {
                         tier: PreviewTier::DirectServe,
@@ -92,12 +136,13 @@ impl PreviewOrchestrator {
                         entry_point: detection.entry_point.clone(),
                         dev_command: detection.dev_command.clone(),
                         reason: format!("Fallback: {}", err),
+                        message: None,
                     };
 
                     self.current_tier = Some(PreviewTier::DirectServe);
                     self.detection = Some(fallback.clone());
-                    self.project_dir = Some(project_dir.clone());
-                    self.start_watcher(project_dir, app)?;
+                    self.project_dir = Some(resolved_dir.clone());
+                    self.start_watcher(resolved_dir, app)?;
                     return Ok(fallback);
                 }
                 Err(_) => return Err(err),
@@ -108,8 +153,8 @@ impl PreviewOrchestrator {
 
         self.current_tier = Some(detection.tier.clone());
         self.detection = Some(detection.clone());
-        self.project_dir = Some(project_dir.clone());
-        self.start_watcher(project_dir, app)?;
+        self.project_dir = Some(resolved_dir.clone());
+        self.start_watcher(resolved_dir, app)?;
 
         Ok(detection)
     }
@@ -160,6 +205,7 @@ impl PreviewOrchestrator {
             PreviewTier::DirectServe => "direct".to_string(),
             PreviewTier::EsbuildBundle => "esbuild".to_string(),
             PreviewTier::ManagedProcess => "managed".to_string(),
+            PreviewTier::Unsupported => "unsupported".to_string(),
         })
     }
 
@@ -191,7 +237,9 @@ impl PreviewOrchestrator {
     // -- Private helpers --
 
     async fn start_direct_serve(&mut self, project_dir: &PathBuf) -> Result<(), String> {
-        let server = PreviewServer::start(project_dir.clone()).await?;
+        let serve_dir = resolve_serve_dir(project_dir);
+        log::info!("[orchestrator] DirectServe dir: {}", serve_dir.display());
+        let server = PreviewServer::start(serve_dir).await?;
         log::info!("[orchestrator] DirectServe at {}", server.url());
         self.http_server = Some(server);
         Ok(())
@@ -235,8 +283,11 @@ impl PreviewOrchestrator {
         log::info!("[orchestrator] ManagedProcess: {}", command);
 
         let env = self.env_vars.clone();
-        let process = ManagedProcess::start(project_dir, command, env, Some(app.clone())).await?;
+        let mut process = ManagedProcess::start(project_dir, command, env, Some(app.clone())).await?;
         log::info!("[orchestrator] ManagedProcess at {}", process.url());
+
+        // Start health monitoring - emits preview:server-died if process exits
+        process.start_health_monitor(app.clone());
 
         self.managed_process = Some(process);
         Ok(())

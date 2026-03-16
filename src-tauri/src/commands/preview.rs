@@ -66,12 +66,16 @@ pub async fn create_preview_webview(
         .get_window("main")
         .ok_or_else(|| "Main window not found".to_string())?;
 
-    if window
+    // If a webview with this label already exists, navigate it to the new URL
+    // and update bounds instead of trying to close+recreate (which has timing issues).
+    if let Some(existing) = window
         .webviews()
-        .iter()
-        .any(|view| view.label() == PREVIEW_LABEL)
+        .into_iter()
+        .find(|view| view.label() == PREVIEW_LABEL)
     {
-        log::info!("[preview] Webview already exists, updating bounds");
+        log::info!("[preview] Webview already exists, navigating to new URL and updating bounds");
+        let parsed_url: url::Url = url.parse().map_err(|e: url::ParseError| e.to_string())?;
+        existing.navigate(parsed_url).map_err(|e| e.to_string())?;
         return set_preview_bounds(app, bounds).await;
     }
 
@@ -140,6 +144,20 @@ pub async fn set_preview_bounds(app: AppHandle, bounds: PreviewBounds) -> Result
 }
 
 #[tauri::command]
+pub async fn hide_preview_webview(app: AppHandle) -> Result<(), String> {
+    with_preview_webview(&app, |webview| {
+        webview.hide().map_err(|e: tauri::Error| e.to_string())
+    })
+}
+
+#[tauri::command]
+pub async fn show_preview_webview(app: AppHandle) -> Result<(), String> {
+    with_preview_webview(&app, |webview| {
+        webview.show().map_err(|e: tauri::Error| e.to_string())
+    })
+}
+
+#[tauri::command]
 pub async fn navigate_preview_webview(app: AppHandle, url: String) -> Result<(), String> {
     log::info!("[preview] navigate_preview_webview called with url: {}", url);
 
@@ -189,4 +207,19 @@ pub async fn close_preview_devtools(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub async fn close_preview_webview(app: AppHandle) -> Result<(), String> {
     with_preview_webview(&app, |webview| webview.close().map_err(|e| e.to_string()))
+}
+
+#[tauri::command]
+pub async fn preview_check_http(url: String) -> Result<u16, String> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(3))
+        .danger_accept_invalid_certs(true)
+        .no_proxy()
+        .build()
+        .map_err(|e| e.to_string())?;
+    match client.get(&url).send().await {
+        Ok(resp) => Ok(resp.status().as_u16()),
+        Err(e) => Err(e.to_string()),
+    }
 }

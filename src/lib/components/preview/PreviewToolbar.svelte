@@ -29,6 +29,21 @@
 		}
 	}
 
+	// Hide the native webview when viewport dropdown is open (native webview renders on top of HTML)
+	$effect(() => {
+		if (preview.status !== 'ready') return;
+		(async () => {
+			try {
+				const { invoke } = await import('@tauri-apps/api/core');
+				if (dropdownOpen) {
+					await invoke('hide_preview_webview');
+				} else {
+					await invoke('show_preview_webview');
+				}
+			} catch { /* webview may not exist */ }
+		})();
+	});
+
 	let devtoolsOpen = $state(false);
 	async function handleDevtools() {
 		try {

@@ -236,6 +236,17 @@
 			<PreviewPlaceholder />
 		{:else if preview.status === 'loading' || preview.status === 'warming'}
 			<PreviewLoading />
+		{:else if preview.status === 'error' && preview.tier === 'unsupported'}
+			<div class="preview-error">
+				<div class="mobile-icon">
+					<svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+						<rect x="5" y="2" width="14" height="20" rx="2" ry="2"/>
+						<line x1="12" y1="18" x2="12.01" y2="18"/>
+					</svg>
+				</div>
+				<p class="error-title">Mobile Project</p>
+				<p class="error-detail">{preview.error}</p>
+			</div>
 		{:else if preview.status === 'error'}
 			<div class="preview-error">
 				<div class="error-icon">!</div>
@@ -282,6 +293,17 @@
 		justify-content: center;
 		font-size: 20px;
 		font-weight: 700;
+	}
+
+	.mobile-icon {
+		width: 48px;
+		height: 48px;
+		border-radius: 12px;
+		background: rgba(255, 214, 10, 0.12);
+		color: var(--accent-primary, #ffd60a);
+		display: flex;
+		align-items: center;
+		justify-content: center;
 	}
 
 	.error-title {

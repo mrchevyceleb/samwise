@@ -10,8 +10,8 @@ async function getListen() {
 	return listen;
 }
 
-export type PreviewTier = 'direct' | 'esbuild' | 'managed' | null;
-export type PreviewStatus = 'idle' | 'loading' | 'ready' | 'error';
+export type PreviewTier = 'direct' | 'esbuild' | 'managed' | 'unsupported' | null;
+export type PreviewStatus = 'idle' | 'loading' | 'warming' | 'ready' | 'error';
 
 export interface EnvVar {
 	key: string;
@@ -19,11 +19,12 @@ export interface EnvVar {
 }
 
 interface TierDetection {
-	tier: 'direct_serve' | 'esbuild_bundle' | 'managed_process';
+	tier: 'direct_serve' | 'esbuild_bundle' | 'managed_process' | 'unsupported';
 	framework: string | null;
 	entry_point: string | null;
 	dev_command: string | null;
 	reason: string;
+	message: string | null;
 }
 
 let url = $state('');
@@ -38,6 +39,10 @@ let suggestedKeys = $state<string[]>([]);
 let missingSecretsOverlay = $state(false);
 let envSetupPending = $state(false);
 let sessionKey = $state(0);
+let serverLogs = $state<string[]>([]);
+let serverLogUnlisten: (() => void) | null = null;
+let serverDiedUnlisten: (() => void) | null = null;
+let openGeneration = 0;
 let dopplerProject = $state('');
 let dopplerConfig = $state('');
 
@@ -132,8 +137,26 @@ function tierFromDetection(t: TierDetection['tier']): PreviewTier {
 		case 'direct_serve': return 'direct';
 		case 'esbuild_bundle': return 'esbuild';
 		case 'managed_process': return 'managed';
+		case 'unsupported': return 'unsupported';
 		default: return null;
 	}
+}
+
+/** Poll the preview URL via the Rust HTTP checker until we get a 2xx/3xx response */
+async function pollHttpReady(invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown>, previewUrl: string, maxAttempts: number): Promise<boolean> {
+	for (let i = 0; i < maxAttempts; i++) {
+		try {
+			const statusCode = await invoke('preview_check_http', { url: previewUrl }) as number;
+			if (statusCode >= 200 && statusCode < 400) {
+				return true;
+			}
+			console.log(`[preview] HTTP poll ${i + 1}/${maxAttempts}: status ${statusCode}`);
+		} catch (e) {
+			console.log(`[preview] HTTP poll ${i + 1}/${maxAttempts}: ${e}`);
+		}
+		await new Promise(r => setTimeout(r, 1000));
+	}
+	return false;
 }
 
 export function getPreviewStore() {
@@ -154,6 +177,7 @@ export function getPreviewStore() {
 		get envSetupPending() { return envSetupPending; },
 		set envSetupPending(v: boolean) { envSetupPending = v; },
 		get sessionKey() { return sessionKey; },
+		get serverLogs() { return serverLogs; },
 		get dopplerProject() { return dopplerProject; },
 		set dopplerProject(v: string) { dopplerProject = v; },
 		get dopplerConfig() { return dopplerConfig; },
@@ -200,12 +224,14 @@ export function getPreviewStore() {
 
 			try {
 				// Silent loading - no infrastructure messages
+				const thisGeneration = ++openGeneration;
 				status = 'loading';
 				error = null;
 				tier = null;
 				framework = null;
 				url = '';
 				envSetupPending = false;
+				serverLogs = [];
 
 				const envMap = envVarsToMap(envVars);
 				const detection = await invoke<TierDetection>('preview_open_project', {
@@ -215,6 +241,13 @@ export function getPreviewStore() {
 
 				tier = tierFromDetection(detection.tier);
 				framework = detection.framework;
+
+				// Unsupported project (e.g. mobile-only RN/Expo): show message, no server
+				if (tier === 'unsupported') {
+					status = 'error';
+					error = detection.message || 'This project type cannot be previewed in the browser.';
+					return;
+				}
 
 				const previewUrl = await invoke<string | null>('preview_get_url');
 				if (previewUrl) {
@@ -228,9 +261,33 @@ export function getPreviewStore() {
 						missingSecretsOverlay = false;
 					}
 
-					url = previewUrl;
-					status = 'ready';
-					sessionKey += 1;
+					// For managed processes (Next.js, etc.), poll HTTP before declaring ready
+					// The port may be open but the app not yet serving content
+					// IMPORTANT: don't set url until server responds - setting url triggers webview creation
+					if (tier === 'managed') {
+						status = 'warming';
+						console.log('[preview] Warming: polling HTTP for', previewUrl);
+						const httpReady = await pollHttpReady(invoke, previewUrl, 30);
+						// Guard: if another openProject was called while polling, bail out
+						if (thisGeneration !== openGeneration) {
+							console.log('[preview] Stale poll result, ignoring (generation mismatch)');
+							return;
+						}
+						if (httpReady) {
+							url = previewUrl;
+							status = 'ready';
+							sessionKey += 1;
+							console.log('[preview] Server responded, going live');
+						} else {
+							status = 'error';
+							error = 'App is not responding. Check your project configuration.';
+							console.error('[preview] HTTP polling failed after 30 attempts');
+						}
+					} else {
+						url = previewUrl;
+						status = 'ready';
+						sessionKey += 1;
+					}
 				} else {
 					status = 'error';
 					error = 'Preview could not start';
@@ -258,10 +315,19 @@ export function getPreviewStore() {
 			framework = null;
 			missingSecretsOverlay = false;
 			envSetupPending = false;
+			serverLogs = [];
 
 			if (watcherUnlisten) {
 				watcherUnlisten();
 				watcherUnlisten = null;
+			}
+			if (serverLogUnlisten) {
+				serverLogUnlisten();
+				serverLogUnlisten = null;
+			}
+			if (serverDiedUnlisten) {
+				serverDiedUnlisten();
+				serverDiedUnlisten = null;
 			}
 		},
 
@@ -297,6 +363,25 @@ export function getPreviewStore() {
 				} catch {
 					// Webview might not exist yet
 				}
+			});
+
+			// Listen for server log lines (managed process stdout/stderr)
+			if (serverLogUnlisten) {
+				serverLogUnlisten();
+			}
+			serverLogUnlisten = await listen<{ stream: string; line: string }>('preview:server-log', (event) => {
+				const line = event.payload.line;
+				serverLogs = [...serverLogs.slice(-99), line]; // Cap at 100 lines
+			});
+
+			// Listen for server death events (health monitor)
+			if (serverDiedUnlisten) {
+				serverDiedUnlisten();
+			}
+			serverDiedUnlisten = await listen<{ port: number; message: string }>('preview:server-died', (event) => {
+				console.error('[preview] Server died:', event.payload.message);
+				status = 'error';
+				error = 'Dev server stopped unexpectedly. Check server logs below.';
 			});
 		},
 
@@ -348,6 +433,7 @@ export function getPreviewStore() {
 			error = null;
 			framework = null;
 			missingSecretsOverlay = false;
+			serverLogs = [];
 		}
 	};
 }

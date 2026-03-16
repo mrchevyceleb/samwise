@@ -20,18 +20,7 @@
 	let fileCount = $derived(fileTree.fileCount);
 
 	async function openFolder() {
-		if (workspace.isOpen) {
-			// If workspace already open, open folder in new window
-			try {
-				const { invoke } = await import('@tauri-apps/api/core');
-				await invoke('open_folder_in_new_window');
-			} catch {
-				// Fallback: replace current workspace
-				await workspace.openFolder();
-			}
-		} else {
-			await workspace.openFolder();
-		}
+		await workspace.openFolder();
 	}
 
 	function handleFileClick(node: FileNode) {

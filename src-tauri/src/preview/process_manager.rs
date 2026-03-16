@@ -8,10 +8,22 @@ pub struct ManagedProcess {
     child: Option<Child>,
     port: u16,
     project_dir: PathBuf,
+    health_monitor: Option<tokio::task::JoinHandle<()>>,
 }
 
-/// Patterns that indicate a dev server is ready
-const READY_PATTERNS: &[&str] = &[
+/// Patterns that indicate a dev server is ready AND contain a URL with the port.
+/// These are high-confidence: when matched, the port has already been parsed from this line.
+const READY_PATTERNS_WITH_URL: &[&str] = &[
+    "localhost:",
+    "127.0.0.1:",
+    "0.0.0.0:",
+    "local:",
+];
+
+/// Patterns that indicate a dev server is ready but the URL/port may appear on a
+/// DIFFERENT line (printed after). When these match, we delay briefly to let the
+/// port-bearing line be read before signaling ready.
+const READY_PATTERNS_NO_URL: &[&str] = &[
     "ready on",
     "ready at",
     "ready in",
@@ -20,10 +32,6 @@ const READY_PATTERNS: &[&str] = &[
     "started on",
     "started at",
     "started server on",
-    "local:",
-    "localhost:",
-    "127.0.0.1:",
-    "0.0.0.0:",
     "server running",
     "compiled successfully",
     "compiled client",
@@ -49,8 +57,20 @@ impl ManagedProcess {
         app: Option<AppHandle>,
     ) -> Result<Self, String> {
         // Auto-install deps if node_modules is missing (silently)
-        let node_modules = project_dir.join("node_modules");
-        if !node_modules.exists() {
+        // In monorepos, node_modules may be hoisted to a parent directory
+        let has_node_modules = {
+            let mut dir = project_dir.to_path_buf();
+            let mut found = false;
+            for _ in 0..5 {
+                if dir.join("node_modules").exists() {
+                    found = true;
+                    break;
+                }
+                if !dir.pop() { break; }
+            }
+            found
+        };
+        if !has_node_modules {
             log::info!("[process_manager] node_modules missing, running install silently...");
             match run_package_install(project_dir).await {
                 Ok(_) => log::info!("[process_manager] Install completed"),
@@ -65,6 +85,12 @@ impl ManagedProcess {
         }
 
         let port = super::port_allocator::find_managed_port()?;
+
+        // Pre-start: kill any orphan from a previous crash holding this port
+        #[cfg(windows)]
+        {
+            Self::kill_port_holder(port).await;
+        }
 
         log::info!(
             "[process_manager] Starting: '{}' on port {} in {}",
@@ -98,9 +124,12 @@ impl ManagedProcess {
             format!("Failed to start '{}': {}", program, e)
         })?;
 
-        let (ready, actual_port) = wait_for_ready(&mut child, port, &[]).await;
+        let (ready, actual_port) = wait_for_ready(&mut child, port, &[], app.clone()).await;
 
         if !ready {
+            // Give the process tree time to fully exit (cmd /C wrappers on Windows
+            // can linger briefly after the child npm/node process exits)
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             match child.try_wait() {
                 Ok(Some(exit_status)) => {
                     return Err(format!(
@@ -109,8 +138,12 @@ impl ManagedProcess {
                         command
                     ));
                 }
-                _ => {
-                    log::warn!("[process_manager] Server may not be fully ready, proceeding.");
+                Ok(None) => {
+                    // Process is running but didn't signal ready - let the frontend HTTP check handle it
+                    log::warn!("[process_manager] Server did not signal ready within timeout, proceeding to HTTP check.");
+                }
+                Err(e) => {
+                    return Err(format!("Failed to check process status: {}", e));
                 }
             }
         }
@@ -121,6 +154,7 @@ impl ManagedProcess {
             child: Some(child),
             port: actual_port,
             project_dir: project_dir.to_path_buf(),
+            health_monitor: None,
         })
     }
 
@@ -138,8 +172,10 @@ impl ManagedProcess {
 
     /// Stop the managed process gracefully
     pub async fn stop(&mut self) -> Result<(), String> {
+        self.stop_health_monitor();
+        let port = self.port;
         if let Some(mut child) = self.child.take() {
-            log::info!("[process_manager] Stopping managed process");
+            log::info!("[process_manager] Stopping managed process on port {}", port);
 
             // On Windows, we need to kill the process tree
             #[cfg(windows)]
@@ -167,7 +203,41 @@ impl ManagedProcess {
             .await;
         }
 
+        // Safety net: kill any orphan process still holding the port (e.g. child spawned via cmd /C)
+        #[cfg(windows)]
+        {
+            Self::kill_port_holder(port).await;
+        }
+
         Ok(())
+    }
+
+    /// Kill any process holding a specific port (Windows only).
+    /// This catches orphan child processes that survive after taskkill.
+    #[cfg(windows)]
+    async fn kill_port_holder(port: u16) {
+        let output = Command::new("cmd")
+            .args(["/C", &format!("netstat -ano | findstr \"LISTENING\" | findstr \":{port}\"")])
+            .output()
+            .await;
+
+        if let Ok(output) = output {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines() {
+                // netstat output: "  TCP    0.0.0.0:3000    0.0.0.0:0    LISTENING    12345"
+                if let Some(pid_str) = line.split_whitespace().last() {
+                    if let Ok(pid) = pid_str.parse::<u32>() {
+                        if pid > 0 {
+                            log::info!("[process_manager] Killing orphan PID {} on port {}", pid, port);
+                            let _ = Command::new("taskkill")
+                                .args(["/F", "/T", "/PID", &pid.to_string()])
+                                .output()
+                                .await;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub fn is_running(&mut self) -> bool {
@@ -180,10 +250,49 @@ impl ManagedProcess {
             false
         }
     }
+
+    /// Start a background health monitor that checks if the process is still alive.
+    /// Emits `preview:server-died` if the process exits unexpectedly.
+    pub fn start_health_monitor(&mut self, app: AppHandle) {
+        let pid = self.child.as_ref().and_then(|c| c.id());
+        if pid.is_none() {
+            return;
+        }
+        let port = self.port;
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                // Check if process is still alive by trying to connect to the port
+                match tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port)).await {
+                    Ok(_) => {} // Still alive
+                    Err(_) => {
+                        log::warn!("[health_monitor] Server on port {} is no longer responding", port);
+                        let _ = app.emit("preview:server-died", serde_json::json!({
+                            "port": port,
+                            "message": "Dev server stopped unexpectedly"
+                        }));
+                        break;
+                    }
+                }
+            }
+        });
+        self.health_monitor = Some(handle);
+    }
+
+    /// Stop the health monitor if running
+    pub fn stop_health_monitor(&mut self) {
+        if let Some(handle) = self.health_monitor.take() {
+            handle.abort();
+        }
+    }
 }
 
 impl Drop for ManagedProcess {
     fn drop(&mut self) {
+        // Abort health monitor
+        if let Some(handle) = self.health_monitor.take() {
+            handle.abort();
+        }
         // Best-effort synchronous kill
         if let Some(ref mut child) = self.child {
             #[cfg(windows)]
@@ -252,7 +361,8 @@ fn parse_command_platform(command: &str) -> (String, Vec<String>) {
 /// Wait for the dev server to output a "ready" pattern, with a timeout.
 /// Returns (is_ready, actual_port) - actual_port is parsed from stdout if possible,
 /// otherwise falls back to hint_port (the pre-allocated port).
-async fn wait_for_ready(child: &mut Child, hint_port: u16, extra_patterns: &[&str]) -> (bool, u16) {
+/// When an AppHandle is provided, emits `preview:server-log` events for each line.
+async fn wait_for_ready(child: &mut Child, hint_port: u16, extra_patterns: &[&str], app: Option<AppHandle>) -> (bool, u16) {
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -271,18 +381,41 @@ async fn wait_for_ready(child: &mut Child, hint_port: u16, extra_patterns: &[&st
         let tx = ready_tx.clone();
         let extra = extra_owned.clone();
         let port_slot = detected_port.clone();
+        let app_handle = app.clone();
         tokio::spawn(async move {
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 log::info!("[managed:stdout] {}", line);
+                if let Some(ref ah) = app_handle {
+                    let _ = ah.emit("preview:server-log", serde_json::json!({
+                        "stream": "stdout", "line": line
+                    }));
+                }
                 if let Some(p) = parse_port_from_line(&line) {
                     *port_slot.lock().await = Some(p);
                 }
-                if is_ready_line(&line, &extra) {
-                    if let Some(sender) = tx.lock().await.take() {
-                        let _ = sender.send(true);
+                match is_ready_line(&line, &extra) {
+                    Some(true) => {
+                        // URL-bearing pattern: port already parsed from this line
+                        if let Some(sender) = tx.lock().await.take() {
+                            let _ = sender.send(true);
+                        }
                     }
+                    Some(false) => {
+                        // Non-URL pattern (e.g. "vite", "▲ next"): delay to let the
+                        // URL line arrive so port detection can read the actual port
+                        let tx2 = tx.clone();
+                        let port_slot2 = port_slot.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            log::info!("[process_manager] Delayed ready signal (port: {:?})", *port_slot2.lock().await);
+                            if let Some(sender) = tx2.lock().await.take() {
+                                let _ = sender.send(true);
+                            }
+                        });
+                    }
+                    None => {}
                 }
             }
             // EOF - process closed stdout
@@ -297,19 +430,43 @@ async fn wait_for_ready(child: &mut Child, hint_port: u16, extra_patterns: &[&st
         let tx = ready_tx.clone();
         let extra = extra_owned.clone();
         let port_slot = detected_port.clone();
+        let app_handle = app.clone();
         tokio::spawn(async move {
             let reader = BufReader::new(stderr);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 log::info!("[managed:stderr] {}", line);
+                if let Some(ref ah) = app_handle {
+                    let _ = ah.emit("preview:server-log", serde_json::json!({
+                        "stream": "stderr", "line": line
+                    }));
+                }
                 if let Some(p) = parse_port_from_line(&line) {
                     *port_slot.lock().await = Some(p);
                 }
-                if is_ready_line(&line, &extra) {
-                    if let Some(sender) = tx.lock().await.take() {
-                        let _ = sender.send(true);
+                match is_ready_line(&line, &extra) {
+                    Some(true) => {
+                        if let Some(sender) = tx.lock().await.take() {
+                            let _ = sender.send(true);
+                        }
                     }
+                    Some(false) => {
+                        let tx2 = tx.clone();
+                        let port_slot2 = port_slot.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            log::info!("[process_manager] Delayed ready signal (port: {:?})", *port_slot2.lock().await);
+                            if let Some(sender) = tx2.lock().await.take() {
+                                let _ = sender.send(true);
+                            }
+                        });
+                    }
+                    None => {}
                 }
+            }
+            // EOF - process closed stderr
+            if let Some(sender) = tx.lock().await.take() {
+                let _ = sender.send(false);
             }
         });
     }
@@ -349,15 +506,23 @@ async fn wait_for_ready(child: &mut Child, hint_port: u16, extra_patterns: &[&st
     }
 }
 
+/// Strip ANSI escape codes from a string so port/pattern parsing works
+/// even when dev servers emit colored output (Vite, Next.js, etc.).
+fn strip_ansi(line: &str) -> String {
+    let stripped = strip_ansi_escapes::strip(line.as_bytes());
+    String::from_utf8_lossy(&stripped).to_string()
+}
+
 /// Extract a port number from a dev server log line.
 /// Handles patterns like:
 ///   http://localhost:5173/
 ///   http://127.0.0.1:3000
 ///   Local:   http://localhost:5173/
 fn parse_port_from_line(line: &str) -> Option<u16> {
+    let clean = strip_ansi(line);
     for marker in &["localhost:", "127.0.0.1:", "0.0.0.0:"] {
-        if let Some(pos) = line.find(marker) {
-            let after = &line[pos + marker.len()..];
+        if let Some(pos) = clean.find(marker) {
+            let after = &clean[pos + marker.len()..];
             let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
             if !digits.is_empty() {
                 if let Ok(port) = digits.parse::<u16>() {
@@ -371,12 +536,19 @@ fn parse_port_from_line(line: &str) -> Option<u16> {
     None
 }
 
-fn is_ready_line(line: &str, extra_patterns: &[String]) -> bool {
-    let lower = line.to_lowercase();
-    if READY_PATTERNS.iter().any(|pat| lower.contains(pat)) {
-        return true;
+/// Returns: None if not a ready line, Some(true) if URL-bearing, Some(false) if non-URL
+fn is_ready_line(line: &str, extra_patterns: &[String]) -> Option<bool> {
+    let lower = strip_ansi(line).to_lowercase();
+    if READY_PATTERNS_WITH_URL.iter().any(|pat| lower.contains(pat)) {
+        return Some(true);
     }
-    extra_patterns.iter().any(|pat| lower.contains(&pat.to_lowercase()))
+    if READY_PATTERNS_NO_URL.iter().any(|pat| lower.contains(pat)) {
+        return Some(false);
+    }
+    if extra_patterns.iter().any(|pat| lower.contains(&pat.to_lowercase())) {
+        return Some(false);
+    }
+    None
 }
 
 /// Detect the package manager and run install.
