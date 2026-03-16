@@ -52,6 +52,22 @@
 		}
 	});
 
+	// Reset webview state when preview goes back to loading (e.g. restart after Doppler sync)
+	$effect(() => {
+		if (preview.status === 'loading' && webviewCreated) {
+			// Close the old webview so we get a fresh one when the new URL arrives
+			(async () => {
+				try {
+					const { invoke } = await import('@tauri-apps/api/core');
+					await invoke('close_preview_webview');
+				} catch { /* may not exist */ }
+			})();
+			webviewCreated = false;
+			appliedUrl = '';
+			appliedSession = -1;
+		}
+	});
+
 	// Watch for URL/session becoming available and create or navigate the webview
 	// DON'T act if the overlay is showing or env setup is in progress
 	$effect(() => {
