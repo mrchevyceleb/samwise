@@ -75,10 +75,10 @@
         },
         '.cm-content': { padding: '8px 0' },
         '.cm-gutters': { background: '#0D1117', borderRight: '1px solid var(--border-default)' },
-        '.cm-activeLineGutter': { background: 'rgba(255, 214, 10, 0.08)' },
-        '.cm-activeLine': { background: 'rgba(255, 214, 10, 0.04)' },
-        '&.cm-focused .cm-cursor': { borderLeftColor: '#FFD60A' },
-        '&.cm-focused .cm-selectionBackground, ::selection': { background: 'rgba(255, 214, 10, 0.2) !important' },
+        '.cm-activeLineGutter': { background: 'color-mix(in srgb, var(--accent-primary) 8%, transparent)' },
+        '.cm-activeLine': { background: 'color-mix(in srgb, var(--accent-primary) 4%, transparent)' },
+        '&.cm-focused .cm-cursor': { borderLeftColor: 'var(--accent-primary)' },
+        '&.cm-focused .cm-selectionBackground, ::selection': { background: 'color-mix(in srgb, var(--accent-primary) 20%, transparent) !important' },
       }),
     ];
 

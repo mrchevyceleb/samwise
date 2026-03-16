@@ -89,9 +89,9 @@
 			{#if isRunning && visibleMessages.length > 0 && visibleMessages[visibleMessages.length - 1].type !== 'result'}
 				<div style="display: flex; align-items: center; gap: 8px; padding: 10px 14px;">
 					<div style="display: flex; align-items: center; gap: 4px;">
-						<div style="width: 6px; height: 6px; border-radius: 50%; background: var(--banana-yellow); opacity: 0.6; animation: cc-bounce 1.4s ease-in-out infinite;"></div>
-						<div style="width: 6px; height: 6px; border-radius: 50%; background: var(--banana-yellow); opacity: 0.6; animation: cc-bounce 1.4s ease-in-out 0.2s infinite;"></div>
-						<div style="width: 6px; height: 6px; border-radius: 50%; background: var(--banana-yellow); opacity: 0.6; animation: cc-bounce 1.4s ease-in-out 0.4s infinite;"></div>
+						<div style="width: 6px; height: 6px; border-radius: 50%; background: var(--accent-primary); opacity: 0.6; animation: cc-bounce 1.4s ease-in-out infinite;"></div>
+						<div style="width: 6px; height: 6px; border-radius: 50%; background: var(--accent-primary); opacity: 0.6; animation: cc-bounce 1.4s ease-in-out 0.2s infinite;"></div>
+						<div style="width: 6px; height: 6px; border-radius: 50%; background: var(--accent-primary); opacity: 0.6; animation: cc-bounce 1.4s ease-in-out 0.4s infinite;"></div>
 					</div>
 					<span style="font-size: 12px; color: var(--text-muted);">Thinking...</span>
 				</div>

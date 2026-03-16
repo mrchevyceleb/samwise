@@ -50,7 +50,7 @@
 
     <!-- Action buttons -->
     <button
-      style="display: flex; align-items: center; justify-content: center; width: 24px; height: 24px; border: none; border-radius: 4px; cursor: pointer; transition: all 0.15s ease; background: {refreshHovered ? 'var(--bg-elevated)' : 'transparent'}; color: {refreshHovered ? 'var(--banana-yellow)' : 'var(--text-muted)'}; transform: {refreshHovered ? 'rotate(180deg)' : 'rotate(0deg)'};"
+      style="display: flex; align-items: center; justify-content: center; width: 24px; height: 24px; border: none; border-radius: 4px; cursor: pointer; transition: all 0.15s ease; background: {refreshHovered ? 'var(--bg-elevated)' : 'transparent'}; color: {refreshHovered ? 'var(--accent-primary)' : 'var(--text-muted)'}; transform: {refreshHovered ? 'rotate(180deg)' : 'rotate(0deg)'};"
       onclick={handleRefresh}
       onmouseenter={() => refreshHovered = true}
       onmouseleave={() => refreshHovered = false}

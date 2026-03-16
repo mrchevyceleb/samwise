@@ -11,14 +11,14 @@
 
 	const borderColors: Record<ToolCall['status'], string> = {
 		pending: 'var(--text-muted)',
-		running: 'var(--banana-yellow)',
+		running: 'var(--accent-primary)',
 		complete: 'var(--accent-green)',
 		error: 'var(--accent-red)'
 	};
 
 	const bgColors: Record<ToolCall['status'], string> = {
 		pending: 'rgba(110, 118, 129, 0.05)',
-		running: 'rgba(255, 214, 10, 0.05)',
+		running: 'color-mix(in srgb, var(--accent-primary) 5%, transparent)',
 		complete: 'rgba(63, 185, 80, 0.05)',
 		error: 'rgba(248, 81, 73, 0.05)'
 	};

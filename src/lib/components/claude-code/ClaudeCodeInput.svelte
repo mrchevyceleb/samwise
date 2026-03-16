@@ -55,7 +55,7 @@
 			background: var(--bg-elevated); border: 1px solid var(--border-default);
 			border-radius: 10px; padding: 6px 10px;
 			transition: border-color 0.15s ease;
-			{isRunning ? 'border-color: var(--banana-yellow-dim);' : ''}
+			{isRunning ? 'border-color: var(--accent-dim);' : ''}
 			{disabled ? 'opacity: 0.6;' : ''}
 		"
 	>
@@ -73,8 +73,8 @@
 			"
 			oninput={autoResize}
 			onkeydown={handleKeydown}
-			onfocus={(e) => { const p = (e.currentTarget as HTMLElement).parentElement; if (p) p.style.borderColor = 'var(--banana-yellow)'; }}
-			onblur={(e) => { const p = (e.currentTarget as HTMLElement).parentElement; if (p) p.style.borderColor = isRunning ? 'var(--banana-yellow-dim)' : 'var(--border-default)'; }}
+			onfocus={(e) => { const p = (e.currentTarget as HTMLElement).parentElement; if (p) p.style.borderColor = 'var(--accent-primary)'; }}
+			onblur={(e) => { const p = (e.currentTarget as HTMLElement).parentElement; if (p) p.style.borderColor = isRunning ? 'var(--accent-dim)' : 'var(--border-default)'; }}
 		></textarea>
 
 		{#if isRunning}
@@ -103,7 +103,7 @@
 		<button
 			style="
 				width: 28px; height: 28px; display: flex; align-items: center; justify-content: center;
-				background: {disabled ? 'var(--text-muted)' : sendHovered ? 'var(--banana-yellow-hover)' : 'var(--banana-yellow)'};
+				background: {disabled ? 'var(--text-muted)' : sendHovered ? 'var(--accent-hover)' : 'var(--accent-primary)'};
 				border: none; border-radius: 6px;
 				cursor: {disabled ? 'not-allowed' : 'pointer'};
 				flex-shrink: 0; transition: all 0.12s ease;
@@ -122,6 +122,6 @@
 	</div>
 	<div style="display: flex; justify-content: space-between; padding: 4px 4px 0; font-size: 10px; color: var(--text-muted);">
 		<span>{isRunning ? 'Enter to steer, Stop to cancel' : 'Enter to send, Shift+Enter for new line'}</span>
-		<span style="color: var(--banana-yellow-dim);">Claude Code CLI</span>
+		<span style="color: var(--accent-dim);">Claude Code CLI</span>
 	</div>
 </div>

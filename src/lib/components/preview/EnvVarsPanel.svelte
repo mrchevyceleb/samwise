@@ -2,7 +2,7 @@
 	import { getPreviewStore } from '$lib/stores/preview.svelte';
 	import { getWorkspace } from '$lib/stores/workspace.svelte';
 	import { getSettingsStore } from '$lib/stores/settings.svelte';
-	import { fetchSecrets, fetchProjects, fetchConfigs, type DopplerProject, type DopplerConfig } from '$lib/services/doppler';
+	import { fetchSecrets, fetchProjects, fetchConfigs, type DopplerProject, type DopplerConfig, type DopplerTokenEntry } from '$lib/services/doppler';
 	const preview = getPreviewStore();
 	const workspace = getWorkspace();
 	const settings = getSettingsStore();
@@ -24,8 +24,10 @@
 	let isServiceToken = $state(false);
 	let manualProject = $state('');
 	let manualConfig = $state('');
+	let selectedOrgSlug = $state('');
+	let dopplerTokenEntries = $derived<DopplerTokenEntry[]>(settings.value.dopplerTokens || []);
 
-	let hasToken = $derived(settings.value.dopplerToken.trim().length >= 10);
+	let hasToken = $derived(dopplerTokenEntries.length > 0 || settings.value.dopplerToken.trim().length >= 10);
 	let dopplerConfigured = $derived(
 		hasToken && preview.dopplerProject && preview.dopplerConfig
 	);
@@ -33,32 +35,70 @@
 		hasToken && (!preview.dopplerProject || !preview.dopplerConfig)
 	);
 
+	/** Get the token for the selected org, or the first available, or the legacy single token */
+	function getActiveToken(): string {
+		if (selectedOrgSlug) {
+			const entry = dopplerTokenEntries.find(e => e.orgSlug === selectedOrgSlug);
+			if (entry) return entry.token;
+		}
+		if (dopplerTokenEntries.length > 0) return dopplerTokenEntries[0].token;
+		return settings.value.dopplerToken;
+	}
+
 	async function openDopplerLink() {
 		dopplerLinkOpen = true;
 		dopplerLinkError = '';
 		dopplerLinking = true;
 		isServiceToken = false;
-		const token = settings.value.dopplerToken;
+		dopplerProjects = [];
+		dopplerConfigs = [];
+
+		// Auto-select first org if only one
+		if (dopplerTokenEntries.length === 1) {
+			selectedOrgSlug = dopplerTokenEntries[0].orgSlug;
+		}
+
+		const token = getActiveToken();
 		console.log('[doppler] openDopplerLink, token prefix:', token?.substring(0, 5));
 		try {
-			const result = await fetchProjects(token);
-			console.log('[doppler] fetchProjects returned:', result?.length, 'projects');
-			dopplerProjects = result;
-			if (result.length === 0) {
-				// Service tokens can't list projects - switch to manual mode
-				isServiceToken = true;
-			} else if (preview.dopplerProject) {
-				dopplerConfigs = await fetchConfigs(token, preview.dopplerProject);
+			if (selectedOrgSlug || dopplerTokenEntries.length <= 1) {
+				const result = await fetchProjects(token);
+				console.log('[doppler] fetchProjects returned:', result?.length, 'projects');
+				dopplerProjects = result;
+				if (result.length === 0) {
+					isServiceToken = true;
+				} else if (preview.dopplerProject) {
+					dopplerConfigs = await fetchConfigs(token, preview.dopplerProject);
+				}
 			}
+			// If multiple orgs and none selected, wait for user to pick
 		} catch (e) {
-			console.error('[doppler] fetchProjects failed:', e);
+			console.error('[doppler] openDopplerLink failed:', e);
 			const msg = e instanceof Error ? e.message : String(e);
-			// 403/401 likely means service token
 			if (msg.includes('403') || msg.includes('401') || msg.includes('Unauthorized')) {
 				isServiceToken = true;
 			} else {
 				dopplerLinkError = msg;
 			}
+		} finally {
+			dopplerLinking = false;
+		}
+	}
+
+	async function handleOrgPick(orgSlug: string) {
+		selectedOrgSlug = orgSlug;
+		dopplerProjects = [];
+		dopplerConfigs = [];
+		preview.dopplerProject = '';
+		preview.dopplerConfig = '';
+		if (!orgSlug) return;
+		const entry = dopplerTokenEntries.find(e => e.orgSlug === orgSlug);
+		if (!entry) return;
+		dopplerLinking = true;
+		try {
+			dopplerProjects = await fetchProjects(entry.token);
+		} catch (e) {
+			dopplerLinkError = e instanceof Error ? e.message : String(e);
 		} finally {
 			dopplerLinking = false;
 		}
@@ -71,7 +111,7 @@
 		if (!slug) return;
 		dopplerLinking = true;
 		try {
-			dopplerConfigs = await fetchConfigs(settings.value.dopplerToken, slug);
+			dopplerConfigs = await fetchConfigs(getActiveToken(), slug);
 		} catch (e) {
 			dopplerLinkError = e instanceof Error ? e.message : String(e);
 		} finally {
@@ -160,7 +200,7 @@
 	async function handleDopplerSync() {
 		const proj = preview.dopplerProject;
 		const conf = preview.dopplerConfig;
-		const token = settings.value.dopplerToken;
+		const token = getActiveToken();
 		console.log('[doppler] handleDopplerSync called', { proj, conf, hasToken: !!token, workspacePath: workspace.path });
 		if (!workspace.path || !token || !proj || !conf) {
 			console.warn('[doppler] sync skipped - missing:', { path: !!workspace.path, token: !!token, proj, conf });
@@ -215,7 +255,7 @@
 		<!-- Header -->
 		<div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;">
 			<div style="display: flex; align-items: center; gap: 6px;">
-				<svg width="14" height="14" viewBox="0 0 16 16" fill="var(--banana-yellow)">
+				<svg width="14" height="14" viewBox="0 0 16 16" fill="var(--accent-primary)">
 					<path d="M8 1a2 2 0 0 1 2 2v4H6V3a2 2 0 0 1 2-2zm3 6V3a3 3 0 0 0-6 0v4a2 2 0 0 0-2 2v5a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2zM5 9h6a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-5a1 1 0 0 1 1-1z"/>
 				</svg>
 				<span style="font-family: var(--font-ui); font-size: 11px; font-weight: 600; color: var(--text-primary); text-transform: uppercase; letter-spacing: 0.5px;">
@@ -246,7 +286,7 @@
 					<button
 						style="padding: 2px 8px; font-family: var(--font-mono); font-size: 10px; color: var(--text-secondary); background: var(--bg-elevated); border: 1px dashed var(--border-default); border-radius: 4px; cursor: pointer; transition: all 0.1s ease;"
 						onclick={() => handleAddSuggested(key)}
-						onmouseenter={(e) => { (e.currentTarget as HTMLElement).style.borderColor = 'var(--banana-yellow)'; (e.currentTarget as HTMLElement).style.color = 'var(--banana-yellow)'; }}
+						onmouseenter={(e) => { (e.currentTarget as HTMLElement).style.borderColor = 'var(--accent-primary)'; (e.currentTarget as HTMLElement).style.color = 'var(--accent-primary)'; }}
 						onmouseleave={(e) => { (e.currentTarget as HTMLElement).style.borderColor = 'var(--border-default)'; (e.currentTarget as HTMLElement).style.color = 'var(--text-secondary)'; }}
 					>
 						+ {key}
@@ -267,7 +307,7 @@
 						value={envVar.key}
 						oninput={(e) => handleKeyChange(index, (e.currentTarget as HTMLInputElement).value)}
 						style="flex: 0 0 160px; height: 28px; padding: 0 8px; background: var(--bg-elevated); border: 1px solid var(--border-default); border-radius: 5px; color: var(--text-primary); font-family: var(--font-mono); font-size: 11px; outline: none; transition: border-color 0.1s ease;"
-						onfocus={(e) => (e.currentTarget as HTMLElement).style.borderColor = 'var(--banana-yellow)'}
+						onfocus={(e) => (e.currentTarget as HTMLElement).style.borderColor = 'var(--accent-primary)'}
 						onblur={(e) => (e.currentTarget as HTMLElement).style.borderColor = 'var(--border-default)'}
 					/>
 					<span style="color: var(--text-muted); font-family: var(--font-mono); font-size: 12px;">=</span>
@@ -279,7 +319,7 @@
 							value={envVar.value}
 							oninput={(e) => handleValueChange(index, (e.currentTarget as HTMLInputElement).value)}
 							style="width: 100%; height: 28px; padding: 0 30px 0 8px; background: var(--bg-elevated); border: 1px solid var(--border-default); border-radius: 5px; color: var(--text-primary); font-family: var(--font-mono); font-size: 11px; outline: none; transition: border-color 0.1s ease;"
-							onfocus={(e) => (e.currentTarget as HTMLElement).style.borderColor = 'var(--banana-yellow)'}
+							onfocus={(e) => (e.currentTarget as HTMLElement).style.borderColor = 'var(--accent-primary)'}
 							onblur={(e) => (e.currentTarget as HTMLElement).style.borderColor = 'var(--border-default)'}
 						/>
 						<!-- Show/hide toggle -->
@@ -318,7 +358,7 @@
 					</button>
 				</div>
 				{#if getPrefixHint(envVar.key)}
-					<div style="padding-left: 4px; font-family: var(--font-mono); font-size: 9px; color: rgba(255, 214, 10, 0.6);">
+					<div style="padding-left: 4px; font-family: var(--font-mono); font-size: 9px; color: color-mix(in srgb, var(--accent-primary) 60%, transparent);">
 						{getPrefixHint(envVar.key)}
 					</div>
 				{/if}
@@ -329,7 +369,7 @@
 		<!-- Action buttons -->
 		<div style="display: flex; align-items: center; gap: 6px; margin-top: 8px;">
 			<button
-				style="display: flex; align-items: center; gap: 4px; height: 26px; padding: 0 10px; background: {addHovered ? 'rgba(255, 214, 10, 0.15)' : 'var(--bg-elevated)'}; border: 1px solid {addHovered ? 'var(--banana-yellow)' : 'var(--border-default)'}; border-radius: 5px; color: {addHovered ? 'var(--banana-yellow)' : 'var(--text-secondary)'}; cursor: pointer; font-family: var(--font-ui); font-size: 11px; font-weight: 500; transition: all 0.12s ease;"
+				style="display: flex; align-items: center; gap: 4px; height: 26px; padding: 0 10px; background: {addHovered ? 'color-mix(in srgb, var(--accent-primary) 15%, transparent)' : 'var(--bg-elevated)'}; border: 1px solid {addHovered ? 'var(--accent-primary)' : 'var(--border-default)'}; border-radius: 5px; color: {addHovered ? 'var(--accent-primary)' : 'var(--text-secondary)'}; cursor: pointer; font-family: var(--font-ui); font-size: 11px; font-weight: 500; transition: all 0.12s ease;"
 				onmouseenter={() => addHovered = true}
 				onmouseleave={() => addHovered = false}
 				onclick={handleAddVar}
@@ -342,7 +382,7 @@
 
 			{#if preview.envVars.some(v => v.key.trim())}
 				<button
-					style="display: flex; align-items: center; gap: 4px; height: 26px; padding: 0 12px; background: {applyHovered ? 'var(--banana-yellow)' : 'rgba(255, 214, 10, 0.2)'}; border: 1px solid var(--banana-yellow); border-radius: 5px; color: {applyHovered ? '#0D1117' : 'var(--banana-yellow)'}; cursor: pointer; font-family: var(--font-ui); font-size: 11px; font-weight: 600; transition: all 0.12s ease; opacity: {applying ? 0.7 : 1};"
+					style="display: flex; align-items: center; gap: 4px; height: 26px; padding: 0 12px; background: {applyHovered ? 'var(--accent-primary)' : 'color-mix(in srgb, var(--accent-primary) 20%, transparent)'}; border: 1px solid var(--accent-primary); border-radius: 5px; color: {applyHovered ? '#0D1117' : 'var(--accent-primary)'}; cursor: pointer; font-family: var(--font-ui); font-size: 11px; font-weight: 600; transition: all 0.12s ease; opacity: {applying ? 0.7 : 1};"
 					onmouseenter={() => applyHovered = true}
 					onmouseleave={() => applyHovered = false}
 					onclick={handleApplyAndRestart}
@@ -402,7 +442,7 @@
 				</button>
 				<button
 					style="height: 24px; padding: 0 8px; background: transparent; border: 1px solid var(--border-default); border-radius: 4px; color: var(--text-muted); cursor: pointer; font-family: var(--font-ui); font-size: 10px; font-weight: 500; transition: all 0.12s ease; white-space: nowrap;"
-					onmouseenter={(e) => { (e.currentTarget as HTMLElement).style.borderColor = 'var(--banana-yellow)'; (e.currentTarget as HTMLElement).style.color = 'var(--text-primary)'; }}
+					onmouseenter={(e) => { (e.currentTarget as HTMLElement).style.borderColor = 'var(--accent-primary)'; (e.currentTarget as HTMLElement).style.color = 'var(--text-primary)'; }}
 					onmouseleave={(e) => { (e.currentTarget as HTMLElement).style.borderColor = 'var(--border-default)'; (e.currentTarget as HTMLElement).style.color = 'var(--text-muted)'; }}
 					onclick={openDopplerLink}
 				>
@@ -441,13 +481,13 @@
 				</div>
 
 				{#if dopplerLinking}
-					<div style="padding: 6px 0; font-size: 12px; color: var(--banana-yellow); font-family: var(--font-ui); display: flex; align-items: center; gap: 6px;">
+					<div style="padding: 6px 0; font-size: 12px; color: var(--accent-primary); font-family: var(--font-ui); display: flex; align-items: center; gap: 6px;">
 						<span class="sync-spinner"></span>
 						Loading projects from Doppler...
 					</div>
 				{:else if dopplerLinkError}
 					<div style="padding: 6px 8px; font-size: 12px; color: #ff6b6b; background: rgba(255, 107, 107, 0.1); border-radius: 4px; font-family: var(--font-ui);">{dopplerLinkError}</div>
-				{:else if isServiceToken || (!dopplerLinking && dopplerProjects.length === 0)}
+				{:else if isServiceToken || (!dopplerLinking && dopplerProjects.length === 0 && (dopplerTokenEntries.length <= 1 || selectedOrgSlug))}
 					<div style="padding: 8px 10px; font-size: 11px; color: var(--text-secondary); background: rgba(255, 107, 107, 0.06); border: 1px solid rgba(255, 107, 107, 0.15); border-radius: 5px; font-family: var(--font-ui); line-height: 1.6;">
 						No projects found. You likely have a <span style="font-weight: 600;">service token</span> (dp.st.) instead of a <span style="font-weight: 600;">personal token</span> (dp.pt.).
 						<button
@@ -464,7 +504,7 @@
 							placeholder="project-slug"
 							bind:value={manualProject}
 							style="flex: 1; height: 28px; padding: 0 8px; background: var(--bg-elevated); border: 1px solid var(--border-default); border-radius: 5px; color: var(--text-primary); font-family: var(--font-mono); font-size: 11px; outline: none;"
-							onfocus={(e) => (e.currentTarget as HTMLElement).style.borderColor = 'var(--banana-yellow)'}
+							onfocus={(e) => (e.currentTarget as HTMLElement).style.borderColor = 'var(--accent-primary)'}
 							onblur={(e) => (e.currentTarget as HTMLElement).style.borderColor = 'var(--border-default)'}
 						/>
 						<input
@@ -472,30 +512,56 @@
 							placeholder="dev"
 							bind:value={manualConfig}
 							style="width: 80px; height: 28px; padding: 0 8px; background: var(--bg-elevated); border: 1px solid var(--border-default); border-radius: 5px; color: var(--text-primary); font-family: var(--font-mono); font-size: 11px; outline: none;"
-							onfocus={(e) => (e.currentTarget as HTMLElement).style.borderColor = 'var(--banana-yellow)'}
+							onfocus={(e) => (e.currentTarget as HTMLElement).style.borderColor = 'var(--accent-primary)'}
 							onblur={(e) => (e.currentTarget as HTMLElement).style.borderColor = 'var(--border-default)'}
 						/>
 						<button
 							onclick={handleManualLink}
 							disabled={!manualProject.trim() || !manualConfig.trim()}
-							style="height: 28px; padding: 0 12px; background: var(--banana-yellow); border: none; border-radius: 5px; color: #0D1117; font-size: 11px; font-weight: 600; font-family: var(--font-ui); cursor: pointer; opacity: {!manualProject.trim() || !manualConfig.trim() ? 0.5 : 1};"
+							style="height: 28px; padding: 0 12px; background: var(--accent-primary); border: none; border-radius: 5px; color: #0D1117; font-size: 11px; font-weight: 600; font-family: var(--font-ui); cursor: pointer; opacity: {!manualProject.trim() || !manualConfig.trim() ? 0.5 : 1};"
 						>
 							Sync
 						</button>
 					</div>
 				{/if}
 
+				{#if dopplerTokenEntries.length > 1}
+					<div style="display: flex; flex-direction: column; gap: 4px;">
+						<span style="font-size: 10px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px;">Organization</span>
+						<select
+							value={selectedOrgSlug}
+							onchange={(e) => handleOrgPick((e.target as HTMLSelectElement).value)}
+							style="height: 28px; padding: 0 8px; background: var(--bg-elevated); border: 1px solid rgba(108, 71, 255, 0.3); border-radius: 5px; color: var(--text-primary); font-size: 11px; font-family: var(--font-ui); outline: none; cursor: pointer;"
+						>
+							<option value="">Select organization...</option>
+							{#each dopplerTokenEntries as entry}
+								<option value={entry.orgSlug}>{entry.orgName}</option>
+							{/each}
+						</select>
+					</div>
+				{:else if dopplerTokenEntries.length === 1}
+					<div style="display: flex; align-items: center; gap: 6px;">
+						<span style="font-size: 10px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px;">Org:</span>
+						<span style="font-size: 11px; color: #6C47FF; font-weight: 600;">{dopplerTokenEntries[0].orgName}</span>
+					</div>
+				{/if}
+
 				{#if dopplerProjects.length > 0}
-					<select
-						value={preview.dopplerProject}
-						onchange={(e) => handleDopplerProjectPick((e.target as HTMLSelectElement).value)}
-						style="height: 28px; padding: 0 8px; background: var(--bg-elevated); border: 1px solid var(--border-default); border-radius: 5px; color: var(--text-primary); font-size: 11px; font-family: var(--font-mono); outline: none; cursor: pointer;"
-					>
-						<option value="">Select project...</option>
-						{#each dopplerProjects as p}
-							<option value={p.slug}>{p.name}</option>
-						{/each}
-					</select>
+					<div style="display: flex; flex-direction: column; gap: 4px;">
+						{#if dopplerTokenEntries.length > 1}
+							<span style="font-size: 10px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px;">Project</span>
+						{/if}
+						<select
+							value={preview.dopplerProject}
+							onchange={(e) => handleDopplerProjectPick((e.target as HTMLSelectElement).value)}
+							style="height: 28px; padding: 0 8px; background: var(--bg-elevated); border: 1px solid var(--border-default); border-radius: 5px; color: var(--text-primary); font-size: 11px; font-family: var(--font-mono); outline: none; cursor: pointer;"
+						>
+							<option value="">Select project...</option>
+							{#each dopplerProjects as p}
+								<option value={p.slug}>{p.name}</option>
+							{/each}
+						</select>
+					</div>
 				{/if}
 
 				{#if dopplerConfigs.length > 0}
@@ -514,7 +580,7 @@
 						{/each}
 					</div>
 					{#if syncing}
-						<div style="padding: 4px 0; font-size: 11px; color: var(--banana-yellow); font-family: var(--font-ui); display: flex; align-items: center; gap: 6px;">
+						<div style="padding: 4px 0; font-size: 11px; color: var(--accent-primary); font-family: var(--font-ui); display: flex; align-items: center; gap: 6px;">
 							<span class="sync-spinner"></span>
 							Fetching secrets and restarting preview...
 						</div>
@@ -546,8 +612,8 @@
 		display: inline-block;
 		width: 12px;
 		height: 12px;
-		border: 2px solid rgba(255, 214, 10, 0.3);
-		border-top-color: var(--banana-yellow);
+		border: 2px solid color-mix(in srgb, var(--accent-primary) 30%, transparent);
+		border-top-color: var(--accent-primary);
 		border-radius: 50%;
 		animation: spin 0.6s linear infinite;
 	}

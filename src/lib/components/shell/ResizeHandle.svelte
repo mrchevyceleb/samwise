@@ -62,7 +62,7 @@
 	}
 	.resize-handle.hovered,
 	.resize-handle.active {
-		background: rgba(255, 214, 10, 0.15);
+		background: color-mix(in srgb, var(--accent-primary) 15%, transparent);
 	}
 	.handle-indicator {
 		position: absolute;
@@ -86,7 +86,7 @@
 	}
 	.resize-handle.hovered .handle-indicator,
 	.resize-handle.active .handle-indicator {
-		background: rgba(255, 214, 10, 0.4);
-		box-shadow: 0 0 8px rgba(255, 214, 10, 0.2);
+		background: color-mix(in srgb, var(--accent-primary) 40%, transparent);
+		box-shadow: 0 0 8px color-mix(in srgb, var(--accent-primary) 20%, transparent);
 	}
 </style>

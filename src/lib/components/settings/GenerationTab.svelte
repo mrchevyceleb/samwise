@@ -13,8 +13,8 @@
       <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">Controls randomness in AI responses (0 = deterministic, 2 = creative)</div>
     </div>
     <div style="display: flex; align-items: center; gap: 12px;">
-      <input type="range" min="0" max="2" step="0.1" value={settingsStore.value.aiTemperature} oninput={(e) => updateSetting('aiTemperature', parseFloat((e.target as HTMLInputElement).value))} style="width: 120px; accent-color: var(--banana-yellow); cursor: pointer;" />
-      <span style="font-size: 12px; color: var(--banana-yellow); font-family: var(--font-mono); min-width: 2rem; text-align: center;">{settingsStore.value.aiTemperature.toFixed(1)}</span>
+      <input type="range" min="0" max="2" step="0.1" value={settingsStore.value.aiTemperature} oninput={(e) => updateSetting('aiTemperature', parseFloat((e.target as HTMLInputElement).value))} style="width: 120px; accent-color: var(--accent-primary); cursor: pointer;" />
+      <span style="font-size: 12px; color: var(--accent-primary); font-family: var(--font-mono); min-width: 2rem; text-align: center;">{settingsStore.value.aiTemperature.toFixed(1)}</span>
     </div>
   </div>
 
@@ -60,7 +60,7 @@
     </div>
     <label style="position: relative; display: inline-block; width: 36px; height: 20px; cursor: pointer;">
       <input type="checkbox" checked={settingsStore.value.aiReasoningEnabled} onchange={(e) => updateSetting('aiReasoningEnabled', (e.target as HTMLInputElement).checked)} style="opacity: 0; width: 0; height: 0;" />
-      <span style="position: absolute; inset: 0; background: {settingsStore.value.aiReasoningEnabled ? 'var(--banana-yellow)' : 'var(--border-default)'}; border-radius: 10px; transition: background 0.2s ease;">
+      <span style="position: absolute; inset: 0; background: {settingsStore.value.aiReasoningEnabled ? 'var(--accent-primary)' : 'var(--border-default)'}; border-radius: 10px; transition: background 0.2s ease;">
         <span style="position: absolute; top: 2px; left: {settingsStore.value.aiReasoningEnabled ? '18px' : '2px'}; width: 16px; height: 16px; background: white; border-radius: 50%; transition: left 0.2s ease;"></span>
       </span>
     </label>
@@ -89,7 +89,7 @@
       </div>
       <label style="position: relative; display: inline-block; width: 36px; height: 20px; cursor: pointer;">
         <input type="checkbox" checked={settingsStore.value.aiReasoningExclude} onchange={(e) => updateSetting('aiReasoningExclude', (e.target as HTMLInputElement).checked)} style="opacity: 0; width: 0; height: 0;" />
-        <span style="position: absolute; inset: 0; background: {settingsStore.value.aiReasoningExclude ? 'var(--banana-yellow)' : 'var(--border-default)'}; border-radius: 10px; transition: background 0.2s ease;">
+        <span style="position: absolute; inset: 0; background: {settingsStore.value.aiReasoningExclude ? 'var(--accent-primary)' : 'var(--border-default)'}; border-radius: 10px; transition: background 0.2s ease;">
           <span style="position: absolute; top: 2px; left: {settingsStore.value.aiReasoningExclude ? '18px' : '2px'}; width: 16px; height: 16px; background: white; border-radius: 50%; transition: left 0.2s ease;"></span>
         </span>
       </label>
@@ -172,7 +172,7 @@
     </div>
     <label style="position: relative; display: inline-block; width: 36px; height: 20px; cursor: pointer;">
       <input type="checkbox" checked={settingsStore.value.aiReadInstructionsEveryMessage} onchange={(e) => updateSetting('aiReadInstructionsEveryMessage', (e.target as HTMLInputElement).checked)} style="opacity: 0; width: 0; height: 0;" />
-      <span style="position: absolute; inset: 0; background: {settingsStore.value.aiReadInstructionsEveryMessage ? 'var(--banana-yellow)' : 'var(--border-default)'}; border-radius: 10px; transition: background 0.2s ease;">
+      <span style="position: absolute; inset: 0; background: {settingsStore.value.aiReadInstructionsEveryMessage ? 'var(--accent-primary)' : 'var(--border-default)'}; border-radius: 10px; transition: background 0.2s ease;">
         <span style="position: absolute; top: 2px; left: {settingsStore.value.aiReadInstructionsEveryMessage ? '18px' : '2px'}; width: 16px; height: 16px; background: white; border-radius: 50%; transition: left 0.2s ease;"></span>
       </span>
     </label>
@@ -185,7 +185,7 @@
     </div>
     <label style="position: relative; display: inline-block; width: 36px; height: 20px; cursor: pointer;">
       <input type="checkbox" checked={settingsStore.value.aiEnableAtMentions} onchange={(e) => updateSetting('aiEnableAtMentions', (e.target as HTMLInputElement).checked)} style="opacity: 0; width: 0; height: 0;" />
-      <span style="position: absolute; inset: 0; background: {settingsStore.value.aiEnableAtMentions ? 'var(--banana-yellow)' : 'var(--border-default)'}; border-radius: 10px; transition: background 0.2s ease;">
+      <span style="position: absolute; inset: 0; background: {settingsStore.value.aiEnableAtMentions ? 'var(--accent-primary)' : 'var(--border-default)'}; border-radius: 10px; transition: background 0.2s ease;">
         <span style="position: absolute; top: 2px; left: {settingsStore.value.aiEnableAtMentions ? '18px' : '2px'}; width: 16px; height: 16px; background: white; border-radius: 50%; transition: left 0.2s ease;"></span>
       </span>
     </label>

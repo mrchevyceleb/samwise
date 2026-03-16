@@ -5,8 +5,10 @@
 	import PreviewLoading from './PreviewLoading.svelte';
 	import { getPreviewStore } from '$lib/stores/preview.svelte';
 	import { getWorkspace } from '$lib/stores/workspace.svelte';
+	import { getSettingsStore } from '$lib/stores/settings.svelte';
 	const preview = getPreviewStore();
 	const workspace = getWorkspace();
+	const settingsStore = getSettingsStore();
 
 	let showOverlay = $derived(preview.status === 'ready' && preview.missingSecretsOverlay);
 	let bananaRotation = $state(0);
@@ -89,14 +91,44 @@
 		}
 	});
 
+	// Hide the native webview when settings modal (or any overlay) is open
+	$effect(() => {
+		const modalOpen = settingsStore.settingsVisible;
+		if (!webviewCreated) return;
+		(async () => {
+			try {
+				const { invoke } = await import('@tauri-apps/api/core');
+				if (modalOpen) {
+					await invoke('hide_preview_webview');
+				} else {
+					await invoke('show_preview_webview');
+				}
+			} catch { /* webview may not exist */ }
+		})();
+	});
+
 	async function createWebview(url: string, session: number) {
 		if (!containerRef) return;
 
 		try {
 			const { invoke } = await import('@tauri-apps/api/core');
+
+			// Wait a frame for layout to settle before measuring bounds
+			await new Promise(r => requestAnimationFrame(r));
+
 			const rect = containerRef.getBoundingClientRect();
 			const scaleFactor = window.devicePixelRatio || 1;
 
+			// Don't create if container has no dimensions yet
+			if (rect.width < 2 || rect.height < 2) {
+				console.warn('[preview] Container too small, retrying in 200ms');
+				setTimeout(() => {
+					if (!webviewCreated) createWebview(url, session);
+				}, 200);
+				return;
+			}
+
+			console.log('[preview] Creating webview:', url, 'bounds:', Math.round(rect.width), 'x', Math.round(rect.height));
 			await invoke('create_preview_webview', {
 				url,
 				bounds: {
@@ -202,13 +234,19 @@
 			</div>
 		{:else if preview.status === 'idle'}
 			<PreviewPlaceholder />
-		{:else if preview.status === 'loading'}
+		{:else if preview.status === 'loading' || preview.status === 'warming'}
 			<PreviewLoading />
 		{:else if preview.status === 'error'}
 			<div class="preview-error">
 				<div class="error-icon">!</div>
 				<p class="error-title">Something went wrong</p>
 				<p class="error-detail">{preview.error}</p>
+				{#if preview.serverLogs.length > 0}
+					<div class="server-logs">
+						<p class="logs-label">Server output:</p>
+						<pre class="logs-content">{preview.serverLogs.slice(-8).join('\n')}</pre>
+					</div>
+				{/if}
 				<button
 					class="retry-btn"
 					onclick={() => workspace.path && preview.openProject(workspace.path)}
@@ -261,10 +299,37 @@
 		word-break: break-word;
 	}
 
+	.server-logs {
+		width: 100%;
+		max-width: 420px;
+		margin-top: 8px;
+	}
+
+	.logs-label {
+		font-size: 11px;
+		color: var(--text-muted);
+		margin: 0 0 4px 0;
+	}
+
+	.logs-content {
+		font-family: 'JetBrains Mono', monospace;
+		font-size: 11px;
+		line-height: 1.5;
+		color: var(--text-secondary, #ccc);
+		background: rgba(0, 0, 0, 0.3);
+		border-radius: 6px;
+		padding: 8px 10px;
+		margin: 0;
+		max-height: 160px;
+		overflow-y: auto;
+		white-space: pre-wrap;
+		word-break: break-all;
+	}
+
 	.retry-btn {
 		margin-top: 8px;
 		padding: 6px 16px;
-		background: var(--banana-yellow);
+		background: var(--accent-primary);
 		color: #1a1a1a;
 		border: none;
 		border-radius: 6px;
@@ -276,7 +341,7 @@
 
 	.retry-btn:hover {
 		transform: scale(1.05);
-		box-shadow: 0 4px 12px rgba(255, 214, 10, 0.3);
+		box-shadow: 0 4px 12px color-mix(in srgb, var(--accent-primary) 30%, transparent);
 	}
 
 	/* Missing Secrets Overlay */
@@ -358,7 +423,7 @@
 	}
 
 	.key-bullet {
-		color: var(--banana-yellow, #ffd60a);
+		color: var(--accent-primary, #ffd60a);
 		font-size: 14px;
 	}
 
@@ -374,7 +439,7 @@
 	.secrets-btn {
 		margin-top: 8px;
 		padding: 10px 24px;
-		background: var(--banana-yellow, #ffd60a);
+		background: var(--accent-primary, #ffd60a);
 		color: #1a1a1a;
 		border: none;
 		border-radius: 8px;
@@ -386,7 +451,7 @@
 
 	.secrets-btn:hover {
 		transform: scale(1.06);
-		box-shadow: 0 6px 20px rgba(255, 214, 10, 0.35);
+		box-shadow: 0 6px 20px color-mix(in srgb, var(--accent-primary) 35%, transparent);
 	}
 
 	.secrets-btn:active {
@@ -400,7 +465,7 @@
 
 	.arrow-up {
 		font-size: 20px;
-		color: var(--banana-yellow, #ffd60a);
+		color: var(--accent-primary, #ffd60a);
 		opacity: 0.7;
 	}
 

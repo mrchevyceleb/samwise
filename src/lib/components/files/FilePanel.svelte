@@ -20,7 +20,18 @@
 	let fileCount = $derived(fileTree.fileCount);
 
 	async function openFolder() {
-		await workspace.openFolder();
+		if (workspace.isOpen) {
+			// If workspace already open, open folder in new window
+			try {
+				const { invoke } = await import('@tauri-apps/api/core');
+				await invoke('open_folder_in_new_window');
+			} catch {
+				// Fallback: replace current workspace
+				await workspace.openFolder();
+			}
+		} else {
+			await workspace.openFolder();
+		}
 	}
 
 	function handleFileClick(node: FileNode) {
@@ -52,13 +63,13 @@
 		<button
 			style="
 				flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px;
-				background: {activeTab === 'files' ? 'rgba(255, 214, 10, 0.04)' : 'none'}; border: none;
-				border-bottom: 2px solid {activeTab === 'files' ? 'var(--banana-yellow)' : 'transparent'};
+				background: {activeTab === 'files' ? 'color-mix(in srgb, var(--accent-primary) 4%, transparent)' : 'none'}; border: none;
+				border-bottom: 2px solid {activeTab === 'files' ? 'var(--accent-primary)' : 'transparent'};
 				color: {activeTab === 'files' ? 'var(--text-primary)' : filesTabHovered ? 'var(--text-primary)' : 'var(--text-secondary)'};
 				cursor: pointer; font-family: var(--font-ui); font-size: 12px;
 				font-weight: {activeTab === 'files' ? '600' : '400'};
 				transition: all 0.15s ease;
-				box-shadow: {activeTab === 'files' ? '0 2px 8px rgba(255, 214, 10, 0.08)' : 'none'};
+				box-shadow: {activeTab === 'files' ? '0 2px 8px color-mix(in srgb, var(--accent-primary) 8%, transparent)' : 'none'};
 			"
 			onclick={() => activeTab = 'files'}
 			onmouseenter={() => filesTabHovered = true}
@@ -77,13 +88,13 @@
 		<button
 			style="
 				flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px;
-				background: {activeTab === 'git' ? 'rgba(255, 214, 10, 0.04)' : 'none'}; border: none;
-				border-bottom: 2px solid {activeTab === 'git' ? 'var(--banana-yellow)' : 'transparent'};
+				background: {activeTab === 'git' ? 'color-mix(in srgb, var(--accent-primary) 4%, transparent)' : 'none'}; border: none;
+				border-bottom: 2px solid {activeTab === 'git' ? 'var(--accent-primary)' : 'transparent'};
 				color: {activeTab === 'git' ? 'var(--text-primary)' : gitTabHovered ? 'var(--text-primary)' : 'var(--text-secondary)'};
 				cursor: pointer; font-family: var(--font-ui); font-size: 12px;
 				font-weight: {activeTab === 'git' ? '600' : '400'};
 				transition: all 0.15s ease;
-				box-shadow: {activeTab === 'git' ? '0 2px 8px rgba(255, 214, 10, 0.08)' : 'none'};
+				box-shadow: {activeTab === 'git' ? '0 2px 8px color-mix(in srgb, var(--accent-primary) 8%, transparent)' : 'none'};
 			"
 			onclick={() => activeTab = 'git'}
 			onmouseenter={() => gitTabHovered = true}
@@ -101,7 +112,7 @@
 				display: flex; align-items: center; justify-content: center;
 				width: 32px; flex-shrink: 0;
 				background: none; border: none;
-				color: {closePanelHovered ? 'var(--banana-yellow)' : 'var(--text-muted)'};
+				color: {closePanelHovered ? 'var(--accent-primary)' : 'var(--text-muted)'};
 				cursor: pointer; transition: all 0.12s ease;
 				transform: {closePanelHovered ? 'scale(1.1)' : 'scale(1)'};
 			"
@@ -168,8 +179,8 @@
 		{:else}
 			<!-- Empty state -->
 			<div style="flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; gap: 14px; text-align: center; position: relative;">
-				<div style="position: absolute; width: 160px; height: 160px; border-radius: 50%; background: radial-gradient(circle, rgba(255, 214, 10, 0.03) 0%, transparent 70%); pointer-events: none;"></div>
-				<svg width="36" height="36" viewBox="0 0 16 16" fill="var(--banana-yellow)" style="opacity: 0.35; filter: drop-shadow(0 0 10px rgba(255, 214, 10, 0.2));">
+				<div style="position: absolute; width: 160px; height: 160px; border-radius: 50%; background: radial-gradient(circle, color-mix(in srgb, var(--accent-primary) 3%, transparent) 0%, transparent 70%); pointer-events: none;"></div>
+				<svg width="36" height="36" viewBox="0 0 16 16" fill="var(--accent-primary)" style="opacity: 0.35; filter: drop-shadow(0 0 10px color-mix(in srgb, var(--accent-primary) 20%, transparent));">
 					<path d="M1.75 1A1.75 1.75 0 0 0 0 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0 0 16 13.25v-8.5A1.75 1.75 0 0 0 14.25 3H7.5a.25.25 0 0 1-.2-.1l-.9-1.2C6.07 1.26 5.55 1 5 1H1.75z"/>
 				</svg>
 				<p style="font-size: 12px; color: var(--text-muted); max-width: 160px; line-height: 1.5;">
@@ -179,14 +190,14 @@
 					style="
 						display: flex; align-items: center; gap: 6px;
 						padding: 8px 18px;
-						background: {openFolderHovered ? 'var(--banana-yellow)' : 'rgba(255, 214, 10, 0.08)'};
-						border: 1px solid {openFolderHovered ? 'var(--banana-yellow)' : 'rgba(255, 214, 10, 0.25)'}; border-radius: 10px;
-						color: {openFolderHovered ? '#0D1117' : 'var(--banana-yellow)'};
+						background: {openFolderHovered ? 'var(--accent-primary)' : 'color-mix(in srgb, var(--accent-primary) 8%, transparent)'};
+						border: 1px solid {openFolderHovered ? 'var(--accent-primary)' : 'color-mix(in srgb, var(--accent-primary) 25%, transparent)'}; border-radius: 10px;
+						color: {openFolderHovered ? '#0D1117' : 'var(--accent-primary)'};
 						cursor: pointer; font-family: var(--font-ui);
 						font-size: 12px; font-weight: 600;
 						transition: all 0.2s ease;
 						transform: {openFolderHovered ? 'scale(1.05) translateY(-1px)' : 'scale(1)'};
-						box-shadow: {openFolderHovered ? '0 4px 16px rgba(255, 214, 10, 0.3)' : '0 2px 8px rgba(0, 0, 0, 0.2)'};
+						box-shadow: {openFolderHovered ? '0 4px 16px color-mix(in srgb, var(--accent-primary) 30%, transparent)' : '0 2px 8px rgba(0, 0, 0, 0.2)'};
 					"
 					onmouseenter={() => openFolderHovered = true}
 					onmouseleave={() => openFolderHovered = false}

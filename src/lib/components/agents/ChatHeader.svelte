@@ -94,11 +94,11 @@
 		<!-- Type badge -->
 		<span style="
 			font-size: 9px; font-weight: 700; padding: 2px 5px; border-radius: 4px;
-			background: {isCC ? 'rgba(139,92,246,0.15)' : 'rgba(255,214,10,0.12)'};
-			color: {isCC ? 'rgba(139,92,246,0.8)' : 'var(--banana-yellow)'};
+			background: {isCC ? 'rgba(139,92,246,0.15)' : 'color-mix(in srgb, var(--accent-primary) 12%, transparent)'};
+			color: {isCC ? 'rgba(139,92,246,0.8)' : 'var(--accent-primary)'};
 			font-family: var(--font-mono); flex-shrink: 0;
 		">
-			{isCC ? 'CC' : 'A'}
+			{isCC ? 'CC' : '🐒'}
 		</span>
 
 		<!-- Title -->
@@ -185,8 +185,8 @@
 	{#if isAgent && modelDisplay}
 		<span style="
 			padding: 2px 8px; border-radius: 10px; font-size: 10px;
-			background: rgba(255, 214, 10, 0.08); color: var(--banana-yellow-dim);
-			font-family: var(--font-mono); border: 1px solid rgba(255, 214, 10, 0.1);
+			background: color-mix(in srgb, var(--accent-primary) 8%, transparent); color: var(--accent-dim);
+			font-family: var(--font-mono); border: 1px solid color-mix(in srgb, var(--accent-primary) 10%, transparent);
 		">
 			{modelDisplay}
 		</span>
@@ -213,10 +213,10 @@
 	<button
 		style="
 			width: 24px; height: 24px; display: flex; align-items: center; justify-content: center;
-			border: 1px solid {newChatHovered ? 'var(--banana-yellow)' : 'var(--border-default)'};
+			border: 1px solid {newChatHovered ? 'var(--accent-primary)' : 'var(--border-default)'};
 			border-radius: 5px; cursor: pointer; transition: all 0.12s ease;
-			background: {newChatHovered ? 'rgba(255, 214, 10, 0.12)' : 'transparent'};
-			color: {newChatHovered ? 'var(--banana-yellow)' : 'var(--text-muted)'};
+			background: {newChatHovered ? 'color-mix(in srgb, var(--accent-primary) 12%, transparent)' : 'transparent'};
+			color: {newChatHovered ? 'var(--accent-primary)' : 'var(--text-muted)'};
 		"
 		onmouseenter={() => newChatHovered = true}
 		onmouseleave={() => newChatHovered = false}

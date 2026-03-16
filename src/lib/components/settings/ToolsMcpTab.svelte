@@ -139,7 +139,7 @@
       </div>
       <label style="position: relative; display: inline-block; width: 36px; height: 20px; cursor: pointer;">
         <input type="checkbox" checked={settingsStore.value.aiEnableToolUse} onchange={(e) => updateSetting('aiEnableToolUse', (e.target as HTMLInputElement).checked)} style="opacity: 0; width: 0; height: 0;" />
-        <span style="position: absolute; inset: 0; background: {settingsStore.value.aiEnableToolUse ? 'var(--banana-yellow)' : 'var(--border-default)'}; border-radius: 10px; transition: background 0.2s ease;">
+        <span style="position: absolute; inset: 0; background: {settingsStore.value.aiEnableToolUse ? 'var(--accent-primary)' : 'var(--border-default)'}; border-radius: 10px; transition: background 0.2s ease;">
           <span style="position: absolute; top: 2px; left: {settingsStore.value.aiEnableToolUse ? '18px' : '2px'}; width: 16px; height: 16px; background: white; border-radius: 50%; transition: left 0.2s ease;"></span>
         </span>
       </label>
@@ -152,7 +152,7 @@
       </div>
       <label style="position: relative; display: inline-block; width: 36px; height: 20px; cursor: pointer;">
         <input type="checkbox" checked={settingsStore.value.aiConfirmWrites} onchange={(e) => updateSetting('aiConfirmWrites', (e.target as HTMLInputElement).checked)} style="opacity: 0; width: 0; height: 0;" />
-        <span style="position: absolute; inset: 0; background: {settingsStore.value.aiConfirmWrites ? 'var(--banana-yellow)' : 'var(--border-default)'}; border-radius: 10px; transition: background 0.2s ease;">
+        <span style="position: absolute; inset: 0; background: {settingsStore.value.aiConfirmWrites ? 'var(--accent-primary)' : 'var(--border-default)'}; border-radius: 10px; transition: background 0.2s ease;">
           <span style="position: absolute; top: 2px; left: {settingsStore.value.aiConfirmWrites ? '18px' : '2px'}; width: 16px; height: 16px; background: white; border-radius: 50%; transition: left 0.2s ease;"></span>
         </span>
       </label>
@@ -199,7 +199,7 @@
         <button
           onclick={() => applyPreset(preset)}
           style="padding: 4px 10px; border: 1px solid var(--border-default); border-radius: 6px; cursor: pointer; font-size: 11px; font-family: var(--font-ui); background: var(--bg-primary); color: var(--text-secondary); transition: all 0.15s ease;"
-          onmouseenter={(e) => { const t = e.currentTarget as HTMLElement; t.style.borderColor = 'var(--banana-yellow-dim)'; t.style.color = 'var(--banana-yellow)'; }}
+          onmouseenter={(e) => { const t = e.currentTarget as HTMLElement; t.style.borderColor = 'var(--accent-dim)'; t.style.color = 'var(--accent-primary)'; }}
           onmouseleave={(e) => { const t = e.currentTarget as HTMLElement; t.style.borderColor = 'var(--border-default)'; t.style.color = 'var(--text-secondary)'; }}
         >
           + {preset.name}
@@ -217,7 +217,7 @@
           </span>
           <label style="position: relative; display: inline-block; width: 32px; height: 18px; cursor: pointer;">
             <input type="checkbox" checked={server.enabled} onchange={() => toggleServer(server.id)} style="opacity: 0; width: 0; height: 0;" />
-            <span style="position: absolute; inset: 0; background: {server.enabled ? 'var(--banana-yellow)' : 'var(--border-default)'}; border-radius: 9px; transition: background 0.2s ease;">
+            <span style="position: absolute; inset: 0; background: {server.enabled ? 'var(--accent-primary)' : 'var(--border-default)'}; border-radius: 9px; transition: background 0.2s ease;">
               <span style="position: absolute; top: 2px; left: {server.enabled ? '16px' : '2px'}; width: 14px; height: 14px; background: white; border-radius: 50%; transition: left 0.2s ease;"></span>
             </span>
           </label>
@@ -263,7 +263,7 @@
       <button
         onclick={() => showAddForm = true}
         style="padding: 8px 16px; border: 1px dashed var(--border-default); border-radius: 8px; cursor: pointer; font-size: 12px; font-family: var(--font-ui); background: transparent; color: var(--text-secondary); transition: all 0.15s ease;"
-        onmouseenter={(e) => { const t = e.currentTarget as HTMLElement; t.style.borderColor = 'var(--banana-yellow-dim)'; t.style.color = 'var(--banana-yellow)'; }}
+        onmouseenter={(e) => { const t = e.currentTarget as HTMLElement; t.style.borderColor = 'var(--accent-dim)'; t.style.color = 'var(--accent-primary)'; }}
         onmouseleave={(e) => { const t = e.currentTarget as HTMLElement; t.style.borderColor = 'var(--border-default)'; t.style.color = 'var(--text-secondary)'; }}
       >
         + Add Server
@@ -272,20 +272,20 @@
 
     <!-- Add Server Form -->
     {#if showAddForm}
-      <div style="padding: 14px; background: var(--bg-primary); border: 1px solid var(--banana-yellow-dim); border-radius: 8px; display: flex; flex-direction: column; gap: 12px;">
-        <div style="font-size: 13px; font-weight: 600; color: var(--banana-yellow);">Add MCP Server</div>
+      <div style="padding: 14px; background: var(--bg-primary); border: 1px solid var(--accent-dim); border-radius: 8px; display: flex; flex-direction: column; gap: 12px;">
+        <div style="font-size: 13px; font-weight: 600; color: var(--accent-primary);">Add MCP Server</div>
 
         <!-- Transport tabs -->
         <div style="display: flex; gap: 4px;">
           <button
             onclick={() => transportTab = 'stdio'}
-            style="padding: 5px 14px; border: 1px solid {transportTab === 'stdio' ? 'var(--banana-yellow)' : 'var(--border-default)'}; border-radius: 6px; cursor: pointer; font-size: 11px; font-family: var(--font-mono); background: {transportTab === 'stdio' ? 'rgba(255, 214, 10, 0.1)' : 'transparent'}; color: {transportTab === 'stdio' ? 'var(--banana-yellow)' : 'var(--text-secondary)'}; transition: all 0.15s ease;"
+            style="padding: 5px 14px; border: 1px solid {transportTab === 'stdio' ? 'var(--accent-primary)' : 'var(--border-default)'}; border-radius: 6px; cursor: pointer; font-size: 11px; font-family: var(--font-mono); background: {transportTab === 'stdio' ? 'color-mix(in srgb, var(--accent-primary) 10%, transparent)' : 'transparent'}; color: {transportTab === 'stdio' ? 'var(--accent-primary)' : 'var(--text-secondary)'}; transition: all 0.15s ease;"
           >
             stdio (local)
           </button>
           <button
             onclick={() => transportTab = 'http'}
-            style="padding: 5px 14px; border: 1px solid {transportTab === 'http' ? 'var(--banana-yellow)' : 'var(--border-default)'}; border-radius: 6px; cursor: pointer; font-size: 11px; font-family: var(--font-mono); background: {transportTab === 'http' ? 'rgba(255, 214, 10, 0.1)' : 'transparent'}; color: {transportTab === 'http' ? 'var(--banana-yellow)' : 'var(--text-secondary)'}; transition: all 0.15s ease;"
+            style="padding: 5px 14px; border: 1px solid {transportTab === 'http' ? 'var(--accent-primary)' : 'var(--border-default)'}; border-radius: 6px; cursor: pointer; font-size: 11px; font-family: var(--font-mono); background: {transportTab === 'http' ? 'color-mix(in srgb, var(--accent-primary) 10%, transparent)' : 'transparent'}; color: {transportTab === 'http' ? 'var(--accent-primary)' : 'var(--text-secondary)'}; transition: all 0.15s ease;"
           >
             http (remote)
           </button>
@@ -338,7 +338,7 @@
           <button
             onclick={addServer}
             disabled={transportTab === 'stdio' ? !newCommand.trim() : !newUrl.trim()}
-            style="padding: 6px 14px; border: 1px solid var(--banana-yellow); border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 600; background: rgba(255, 214, 10, 0.1); color: var(--banana-yellow); transition: all 0.15s ease; opacity: {(transportTab === 'stdio' ? !newCommand.trim() : !newUrl.trim()) ? '0.4' : '1'};"
+            style="padding: 6px 14px; border: 1px solid var(--accent-primary); border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 600; background: color-mix(in srgb, var(--accent-primary) 10%, transparent); color: var(--accent-primary); transition: all 0.15s ease; opacity: {(transportTab === 'stdio' ? !newCommand.trim() : !newUrl.trim()) ? '0.4' : '1'};"
           >
             Add Server
           </button>

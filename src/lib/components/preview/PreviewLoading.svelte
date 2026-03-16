@@ -81,7 +81,7 @@
 		overflow: hidden;
 		background: radial-gradient(
 			ellipse at center,
-			rgba(255, 214, 10, 0.03) 0%,
+			color-mix(in srgb, var(--accent-primary) 3%, transparent) 0%,
 			transparent 70%
 		);
 	}
@@ -128,7 +128,7 @@
 		width: 100px;
 		height: 100px;
 		border-radius: 50%;
-		border: 2px solid rgba(255, 214, 10, 0.1);
+		border: 2px solid color-mix(in srgb, var(--accent-primary) 10%, transparent);
 		animation: ring-pulse 2.5s ease-in-out infinite;
 	}
 
@@ -136,12 +136,12 @@
 		0%, 100% {
 			transform: scale(0.8);
 			opacity: 0;
-			border-color: rgba(255, 214, 10, 0.05);
+			border-color: color-mix(in srgb, var(--accent-primary) 5%, transparent);
 		}
 		50% {
 			transform: scale(1.3);
 			opacity: 1;
-			border-color: rgba(255, 214, 10, 0.15);
+			border-color: color-mix(in srgb, var(--accent-primary) 15%, transparent);
 		}
 	}
 
@@ -154,7 +154,7 @@
 	.banana-emoji {
 		font-size: 64px;
 		display: block;
-		filter: drop-shadow(0 4px 20px rgba(255, 214, 10, 0.3));
+		filter: drop-shadow(0 4px 20px color-mix(in srgb, var(--accent-primary) 30%, transparent));
 		animation: banana-wiggle 1.8s ease-in-out infinite alternate;
 	}
 
@@ -186,7 +186,7 @@
 		width: 50px;
 		height: 10px;
 		border-radius: 50%;
-		background: rgba(255, 214, 10, 0.12);
+		background: color-mix(in srgb, var(--accent-primary) 12%, transparent);
 		filter: blur(6px);
 		animation: shadow-squish 1.8s cubic-bezier(0.36, 0, 0.66, -0.56) infinite alternate;
 	}
@@ -213,7 +213,7 @@
 		width: 6px;
 		height: 6px;
 		border-radius: 50%;
-		background: var(--banana-yellow, #FFD60A);
+		background: var(--accent-primary, #FFD60A);
 		animation: dot-bounce 1.2s ease-in-out infinite;
 	}
 

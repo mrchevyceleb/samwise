@@ -22,7 +22,7 @@
         onclick={() => activeTab = tab.id}
         onmouseenter={() => hoveredTab = tab.id}
         onmouseleave={() => hoveredTab = null}
-        style="padding: 8px 16px; border: none; cursor: pointer; font-size: 12px; font-family: var(--font-ui); font-weight: {activeTab === tab.id ? '600' : '400'}; transition: all 0.12s ease; background: transparent; color: {activeTab === tab.id ? 'var(--banana-yellow)' : hoveredTab === tab.id ? 'var(--text-primary)' : 'var(--text-secondary)'}; border-bottom: 2px solid {activeTab === tab.id ? 'var(--banana-yellow)' : 'transparent'}; margin-bottom: -1px;"
+        style="padding: 8px 16px; border: none; cursor: pointer; font-size: 12px; font-family: var(--font-ui); font-weight: {activeTab === tab.id ? '600' : '400'}; transition: all 0.12s ease; background: transparent; color: {activeTab === tab.id ? 'var(--accent-primary)' : hoveredTab === tab.id ? 'var(--text-primary)' : 'var(--text-secondary)'}; border-bottom: 2px solid {activeTab === tab.id ? 'var(--accent-primary)' : 'transparent'}; margin-bottom: -1px;"
       >
         {tab.label}
       </button>

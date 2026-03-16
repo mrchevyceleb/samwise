@@ -33,7 +33,7 @@
 		<!-- Left panel (Agent) toggle -->
 		<button
 			title="Toggle Agent Panel (Ctrl+B)"
-			style="display: flex; align-items: center; gap: 4px; background: none; border: none; color: {leftPanelBtnHovered ? 'var(--banana-yellow)' : layout.leftPanelVisible ? 'var(--text-secondary)' : 'var(--text-muted)'}; cursor: pointer; font-family: var(--font-mono); font-size: 11px; transition: color 0.12s ease; transform: {leftPanelBtnHovered ? 'scale(1.05)' : 'scale(1)'}; opacity: {layout.leftPanelVisible ? 1 : 0.6};"
+			style="display: flex; align-items: center; gap: 4px; background: none; border: none; color: {leftPanelBtnHovered ? 'var(--accent-primary)' : layout.leftPanelVisible ? 'var(--text-secondary)' : 'var(--text-muted)'}; cursor: pointer; font-family: var(--font-mono); font-size: 11px; transition: color 0.12s ease; transform: {leftPanelBtnHovered ? 'scale(1.05)' : 'scale(1)'}; opacity: {layout.leftPanelVisible ? 1 : 0.6};"
 			onclick={() => layout.toggleLeftPanel()}
 			onmouseenter={() => leftPanelBtnHovered = true}
 			onmouseleave={() => leftPanelBtnHovered = false}
@@ -47,7 +47,7 @@
 		<!-- Terminal toggle -->
 		<button
 			title="Toggle Terminal (Ctrl+`)"
-			style="display: flex; align-items: center; gap: 4px; background: none; border: none; color: {termBtnHovered ? 'var(--banana-yellow)' : layout.terminalVisible ? 'var(--text-secondary)' : 'var(--text-muted)'}; cursor: pointer; font-family: var(--font-mono); font-size: 11px; transition: color 0.12s ease; transform: {termBtnHovered ? 'scale(1.05)' : 'scale(1)'}; opacity: {layout.terminalVisible ? 1 : 0.6};"
+			style="display: flex; align-items: center; gap: 4px; background: none; border: none; color: {termBtnHovered ? 'var(--accent-primary)' : layout.terminalVisible ? 'var(--text-secondary)' : 'var(--text-muted)'}; cursor: pointer; font-family: var(--font-mono); font-size: 11px; transition: color 0.12s ease; transform: {termBtnHovered ? 'scale(1.05)' : 'scale(1)'}; opacity: {layout.terminalVisible ? 1 : 0.6};"
 			onclick={() => layout.toggleTerminal()}
 			onmouseenter={() => termBtnHovered = true}
 			onmouseleave={() => termBtnHovered = false}
@@ -61,7 +61,7 @@
 		<!-- Right panel (Files) toggle -->
 		<button
 			title="Toggle Files Panel (Ctrl+Shift+B)"
-			style="display: flex; align-items: center; gap: 4px; background: none; border: none; color: {rightPanelBtnHovered ? 'var(--banana-yellow)' : layout.rightPanelVisible ? 'var(--text-secondary)' : 'var(--text-muted)'}; cursor: pointer; font-family: var(--font-mono); font-size: 11px; transition: color 0.12s ease; transform: {rightPanelBtnHovered ? 'scale(1.05)' : 'scale(1)'}; opacity: {layout.rightPanelVisible ? 1 : 0.6};"
+			style="display: flex; align-items: center; gap: 4px; background: none; border: none; color: {rightPanelBtnHovered ? 'var(--accent-primary)' : layout.rightPanelVisible ? 'var(--text-secondary)' : 'var(--text-muted)'}; cursor: pointer; font-family: var(--font-mono); font-size: 11px; transition: color 0.12s ease; transform: {rightPanelBtnHovered ? 'scale(1.05)' : 'scale(1)'}; opacity: {layout.rightPanelVisible ? 1 : 0.6};"
 			onclick={() => layout.toggleRightPanel()}
 			onmouseenter={() => rightPanelBtnHovered = true}
 			onmouseleave={() => rightPanelBtnHovered = false}
@@ -79,7 +79,7 @@
 		<button
 			title="Settings (Ctrl+,)"
 			aria-label="Settings"
-			style="display: flex; align-items: center; background: none; border: none; color: {gearHovered ? 'var(--banana-yellow)' : 'var(--text-secondary)'}; cursor: pointer; padding: 0; transition: color 0.12s ease; transform: {gearHovered ? 'scale(1.05)' : 'scale(1)'};"
+			style="display: flex; align-items: center; background: none; border: none; color: {gearHovered ? 'var(--accent-primary)' : 'var(--text-secondary)'}; cursor: pointer; padding: 0; transition: color 0.12s ease; transform: {gearHovered ? 'scale(1.05)' : 'scale(1)'};"
 			onclick={() => settingsStore.settingsVisible = !settingsStore.settingsVisible}
 			onmouseenter={() => gearHovered = true}
 			onmouseleave={() => gearHovered = false}
@@ -94,7 +94,7 @@
 		<button
 			title="AI & Tools Settings"
 			aria-label="AI Settings"
-			style="display: flex; align-items: center; background: none; border: none; color: {aiSettingsHovered ? 'var(--banana-yellow)' : 'var(--text-secondary)'}; cursor: pointer; padding: 0; transition: color 0.12s ease; transform: {aiSettingsHovered ? 'scale(1.05)' : 'scale(1)'};"
+			style="display: flex; align-items: center; background: none; border: none; color: {aiSettingsHovered ? 'var(--accent-primary)' : 'var(--text-secondary)'}; cursor: pointer; padding: 0; transition: color 0.12s ease; transform: {aiSettingsHovered ? 'scale(1.05)' : 'scale(1)'};"
 			onclick={() => { settingsStore.activeSettingsTab = 'ai'; settingsStore.settingsVisible = true; }}
 			onmouseenter={() => aiSettingsHovered = true}
 			onmouseleave={() => aiSettingsHovered = false}
@@ -108,6 +108,6 @@
 			<span style="width: 6px; height: 6px; border-radius: 50%; background: var(--accent-green); display: inline-block; animation: pulse-dot 2s ease-in-out infinite; box-shadow: 0 0 6px rgba(63, 185, 80, 0.4);"></span>
 			<span style="color: var(--text-muted);">Ready</span>
 		</div>
-		<span style="color: var(--banana-yellow); font-weight: 600; font-size: 9px; background: rgba(255, 214, 10, 0.1); padding: 1px 8px; border-radius: 8px; box-shadow: 0 0 8px rgba(255, 214, 10, 0.1);">FREE</span>
+		<span style="color: var(--accent-primary); font-weight: 600; font-size: 9px; background: color-mix(in srgb, var(--accent-primary) 10%, transparent); padding: 1px 8px; border-radius: 8px; box-shadow: var(--glow-accent);">FREE</span>
 	</div>
 </div>

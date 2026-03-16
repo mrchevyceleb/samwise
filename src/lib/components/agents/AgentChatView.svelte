@@ -40,9 +40,9 @@
 				<div style="
 					width: 48px; height: 48px; display: flex; align-items: center; justify-content: center;
 					border-radius: 12px; font-size: 22px; font-weight: 700;
-					background: linear-gradient(135deg, rgba(255, 214, 10, 0.15), rgba(255, 214, 10, 0.05));
-					border: 1px solid rgba(255, 214, 10, 0.2);
-					color: var(--banana-yellow);
+					background: linear-gradient(135deg, color-mix(in srgb, var(--accent-primary) 15%, transparent), color-mix(in srgb, var(--accent-primary) 5%, transparent));
+					border: 1px solid color-mix(in srgb, var(--accent-primary) 20%, transparent);
+					color: var(--accent-primary);
 					animation: agent-bob 4s ease-in-out infinite;
 				">
 					A
@@ -61,11 +61,11 @@
 	{#if agent.currentActivity}
 		<div style="
 			padding: 4px 14px; box-shadow: 0 -1px 3px rgba(0, 0, 0, 0.1);
-			font-size: 11px; color: var(--banana-yellow-dim);
+			font-size: 11px; color: var(--accent-dim);
 			font-style: italic; flex-shrink: 0;
 			display: flex; align-items: center; gap: 6px;
 		">
-			<div style="width: 5px; height: 5px; border-radius: 50%; background: var(--banana-yellow); animation: agent-pulse 1.2s ease-in-out infinite;"></div>
+			<div style="width: 5px; height: 5px; border-radius: 50%; background: var(--accent-primary); animation: agent-pulse 1.2s ease-in-out infinite;"></div>
 			{agent.currentActivity}
 		</div>
 	{/if}

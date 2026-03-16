@@ -106,7 +106,7 @@
 				"
 				oninput={handleInput}
 				onkeydown={handleKeydown}
-				onfocus={(e) => { const p = (e.currentTarget as HTMLElement).closest('[style*="border-radius: 14px"]') as HTMLElement | null; if (p) { p.style.borderColor = 'rgba(255, 214, 10, 0.3)'; p.style.boxShadow = '0 4px 16px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(255, 214, 10, 0.1), inset 0 1px 0 rgba(255, 255, 255, 0.04)'; } }}
+				onfocus={(e) => { const p = (e.currentTarget as HTMLElement).closest('[style*="border-radius: 14px"]') as HTMLElement | null; if (p) { p.style.borderColor = 'color-mix(in srgb, var(--accent-primary) 30%, transparent)'; p.style.boxShadow = '0 4px 16px rgba(0, 0, 0, 0.3), 0 0 0 1px color-mix(in srgb, var(--accent-primary) 10%, transparent), inset 0 1px 0 rgba(255, 255, 255, 0.04)'; } }}
 				onblur={(e) => { const p = (e.currentTarget as HTMLElement).closest('[style*="border-radius: 14px"]') as HTMLElement | null; if (p) { p.style.borderColor = 'rgba(255, 255, 255, 0.07)'; p.style.boxShadow = '0 4px 16px rgba(0, 0, 0, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.04)'; } showAtHint = false; showSlashHint = false; }}
 			></textarea>
 		</div>
@@ -154,7 +154,7 @@
 			{#if modelName}
 				<span style="
 					padding: 2px 8px; border-radius: 10px; font-size: 10px;
-					background: rgba(255, 214, 10, 0.06); color: var(--text-muted);
+					background: color-mix(in srgb, var(--accent-primary) 6%, transparent); color: var(--text-muted);
 					font-family: var(--font-mono); white-space: nowrap;
 				">
 					{modelName}
@@ -178,12 +178,12 @@
 				style="
 					width: 30px; height: 30px; display: flex; align-items: center;
 					justify-content: center;
-					background: {disabled ? 'var(--text-muted)' : sendHovered ? 'var(--banana-yellow-hover)' : 'var(--banana-yellow)'};
+					background: {disabled ? 'var(--text-muted)' : sendHovered ? 'var(--accent-hover)' : 'var(--accent-primary)'};
 					border: none; border-radius: 10px;
 					cursor: {disabled ? 'not-allowed' : 'pointer'};
 					flex-shrink: 0; transition: all 0.15s ease;
 					transform: {sendHovered && !disabled ? 'scale(1.1) rotate(-5deg)' : 'scale(1)'};
-					box-shadow: {disabled ? 'none' : sendHovered ? '0 4px 16px rgba(255, 214, 10, 0.35)' : '0 2px 8px rgba(255, 214, 10, 0.2)'};
+					box-shadow: {disabled ? 'none' : sendHovered ? '0 4px 16px color-mix(in srgb, var(--accent-primary) 35%, transparent)' : '0 2px 8px color-mix(in srgb, var(--accent-primary) 20%, transparent)'};
 				"
 				onmouseenter={() => sendHovered = true}
 				onmouseleave={() => sendHovered = false}

@@ -227,7 +227,7 @@
   <div style="display: flex; align-items: center; height: 36px; padding: 0 8px; border-bottom: 1px solid var(--border-default); background: var(--bg-surface); gap: 2px;">
     {#each terminals.instances as inst (inst.id)}
       <button
-        style="display: flex; align-items: center; gap: 6px; padding: 4px 12px; font-size: 12px; font-family: var(--font-mono); border: none; border-radius: 4px 4px 0 0; cursor: pointer; transition: all 0.15s ease; white-space: nowrap; background: {terminals.activeId === inst.id ? 'var(--bg-elevated)' : 'transparent'}; color: {terminals.activeId === inst.id ? 'var(--banana-yellow)' : 'var(--text-secondary)'}; border-bottom: {terminals.activeId === inst.id ? '2px solid var(--banana-yellow)' : '2px solid transparent'};"
+        style="display: flex; align-items: center; gap: 6px; padding: 4px 12px; font-size: 12px; font-family: var(--font-mono); border: none; border-radius: 4px 4px 0 0; cursor: pointer; transition: all 0.15s ease; white-space: nowrap; background: {terminals.activeId === inst.id ? 'var(--bg-elevated)' : 'transparent'}; color: {terminals.activeId === inst.id ? 'var(--accent-primary)' : 'var(--text-secondary)'}; border-bottom: {terminals.activeId === inst.id ? '2px solid var(--accent-primary)' : '2px solid transparent'};"
         onclick={() => terminals.activeId = inst.id}
         onmouseenter={(e) => { if (terminals.activeId !== inst.id) { const t = e.currentTarget as HTMLElement; t.style.background = 'var(--bg-elevated)'; t.style.color = 'var(--text-primary)'; }}}
         onmouseleave={(e) => { if (terminals.activeId !== inst.id) { const t = e.currentTarget as HTMLElement; t.style.background = 'transparent'; t.style.color = 'var(--text-secondary)'; }}}
@@ -256,7 +256,7 @@
     <button
       style="display: flex; align-items: center; justify-content: center; width: 28px; height: 28px; border: none; border-radius: 4px; cursor: pointer; transition: all 0.15s ease; background: transparent; color: var(--text-muted);"
       onclick={handleNewTerminal}
-      onmouseenter={(e) => { const t = e.currentTarget as HTMLElement; t.style.color = 'var(--banana-yellow)'; t.style.background = 'var(--bg-elevated)'; t.style.transform = 'scale(1.15) rotate(90deg)'; }}
+      onmouseenter={(e) => { const t = e.currentTarget as HTMLElement; t.style.color = 'var(--accent-primary)'; t.style.background = 'var(--bg-elevated)'; t.style.transform = 'scale(1.15) rotate(90deg)'; }}
       onmouseleave={(e) => { const t = e.currentTarget as HTMLElement; t.style.color = 'var(--text-muted)'; t.style.background = 'transparent'; t.style.transform = 'scale(1) rotate(0deg)'; }}
       title="New Terminal"
     >
@@ -280,7 +280,7 @@
         <button
           style="display: flex; align-items: center; gap: 8px; color: var(--text-muted); font-size: 13px; font-family: var(--font-ui); padding: 12px 24px; border-radius: 8px; border: 1px dashed var(--border-default); background: transparent; cursor: pointer; transition: all 0.2s ease;"
           onclick={handleNewTerminal}
-          onmouseenter={(e) => { const t = e.currentTarget as HTMLElement; t.style.color = 'var(--banana-yellow)'; t.style.borderColor = 'var(--banana-yellow)'; t.style.background = 'rgba(255, 214, 10, 0.05)'; t.style.transform = 'scale(1.03)'; }}
+          onmouseenter={(e) => { const t = e.currentTarget as HTMLElement; t.style.color = 'var(--accent-primary)'; t.style.borderColor = 'var(--accent-primary)'; t.style.background = 'color-mix(in srgb, var(--accent-primary) 5%, transparent)'; t.style.transform = 'scale(1.03)'; }}
           onmouseleave={(e) => { const t = e.currentTarget as HTMLElement; t.style.color = 'var(--text-muted)'; t.style.borderColor = 'var(--border-default)'; t.style.background = 'transparent'; t.style.transform = 'scale(1)'; }}
         >
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">

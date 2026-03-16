@@ -117,8 +117,8 @@
       {#each ['openrouter', 'anthropic', 'openai', 'lmstudio'] as provider}
         <button
           onclick={() => updateSetting('aiProvider', provider as AppSettings['aiProvider'])}
-          style="padding: 8px 16px; border: 1px solid {settingsStore.value.aiProvider === provider ? 'var(--banana-yellow)' : 'var(--border-default)'}; border-radius: 8px; cursor: pointer; font-size: 12px; font-family: var(--font-ui); transition: all 0.15s ease; background: {settingsStore.value.aiProvider === provider ? 'rgba(255, 214, 10, 0.1)' : 'var(--bg-primary)'}; color: {settingsStore.value.aiProvider === provider ? 'var(--banana-yellow)' : 'var(--text-secondary)'};"
-          onmouseenter={(e) => { if (settingsStore.value.aiProvider !== provider) { const t = e.currentTarget as HTMLElement; t.style.borderColor = 'var(--banana-yellow-dim)'; t.style.background = 'var(--bg-elevated)'; }}}
+          style="padding: 8px 16px; border: 1px solid {settingsStore.value.aiProvider === provider ? 'var(--accent-primary)' : 'var(--border-default)'}; border-radius: 8px; cursor: pointer; font-size: 12px; font-family: var(--font-ui); transition: all 0.15s ease; background: {settingsStore.value.aiProvider === provider ? 'color-mix(in srgb, var(--accent-primary) 10%, transparent)' : 'var(--bg-primary)'}; color: {settingsStore.value.aiProvider === provider ? 'var(--accent-primary)' : 'var(--text-secondary)'};"
+          onmouseenter={(e) => { if (settingsStore.value.aiProvider !== provider) { const t = e.currentTarget as HTMLElement; t.style.borderColor = 'var(--accent-dim)'; t.style.background = 'var(--bg-elevated)'; }}}
           onmouseleave={(e) => { if (settingsStore.value.aiProvider !== provider) { const t = e.currentTarget as HTMLElement; t.style.borderColor = 'var(--border-default)'; t.style.background = 'var(--bg-primary)'; }}}
         >
           {providerLabel(provider)}
@@ -187,7 +187,7 @@
         <button
           onclick={handleOpenAIOAuthComplete}
           disabled={openAIDeviceBusy || !openAIDeviceState}
-          style="padding: 6px 12px; border-radius: 6px; font-size: 11px; font-family: var(--font-ui); font-weight: 700; transition: all 0.15s ease; background: {openAIDeviceBusy || !openAIDeviceState ? 'transparent' : 'rgba(255, 214, 10, 0.15)'}; border: 1px solid {openAIDeviceBusy || !openAIDeviceState ? 'var(--border-default)' : 'var(--banana-yellow-dim)'}; color: {openAIDeviceBusy || !openAIDeviceState ? 'var(--text-muted)' : 'var(--banana-yellow)'}; cursor: {openAIDeviceBusy || !openAIDeviceState ? 'not-allowed' : 'pointer'}; opacity: {openAIDeviceBusy || !openAIDeviceState ? '0.4' : '1'};"
+          style="padding: 6px 12px; border-radius: 6px; font-size: 11px; font-family: var(--font-ui); font-weight: 700; transition: all 0.15s ease; background: {openAIDeviceBusy || !openAIDeviceState ? 'transparent' : 'color-mix(in srgb, var(--accent-primary) 15%, transparent)'}; border: 1px solid {openAIDeviceBusy || !openAIDeviceState ? 'var(--border-default)' : 'var(--accent-dim)'}; color: {openAIDeviceBusy || !openAIDeviceState ? 'var(--text-muted)' : 'var(--accent-primary)'}; cursor: {openAIDeviceBusy || !openAIDeviceState ? 'not-allowed' : 'pointer'}; opacity: {openAIDeviceBusy || !openAIDeviceState ? '0.4' : '1'};"
         >
           Step 2: Complete OAuth
         </button>
@@ -213,9 +213,9 @@
           </div>
           <div>
             Verify at
-            <a href={openAIDeviceState.verificationUrl} target="_blank" rel="noreferrer" style="color: var(--banana-yellow); text-decoration: underline;">{openAIDeviceState.verificationUrl}</a>
+            <a href={openAIDeviceState.verificationUrl} target="_blank" rel="noreferrer" style="color: var(--accent-primary); text-decoration: underline;">{openAIDeviceState.verificationUrl}</a>
           </div>
-          <div style="color: var(--banana-yellow); font-weight: 700;">After approving in browser, click Step 2: Complete OAuth.</div>
+          <div style="color: var(--accent-primary); font-weight: 700;">After approving in browser, click Step 2: Complete OAuth.</div>
         </div>
       {/if}
 
@@ -254,7 +254,7 @@
         onclick={() => modelsStore.fetchAvailableModels()}
         disabled={modelsStore.isLoading}
         style="padding: 4px 10px; border: 1px solid var(--border-default); border-radius: 6px; cursor: {modelsStore.isLoading ? 'not-allowed' : 'pointer'}; font-size: 11px; font-family: var(--font-ui); background: var(--bg-primary); color: var(--text-secondary); opacity: {modelsStore.isLoading ? '0.5' : '1'}; transition: all 0.15s ease;"
-        onmouseenter={(e) => { if (!modelsStore.isLoading) { const t = e.currentTarget as HTMLElement; t.style.borderColor = 'var(--banana-yellow-dim)'; t.style.color = 'var(--banana-yellow)'; }}}
+        onmouseenter={(e) => { if (!modelsStore.isLoading) { const t = e.currentTarget as HTMLElement; t.style.borderColor = 'var(--accent-dim)'; t.style.color = 'var(--accent-primary)'; }}}
         onmouseleave={(e) => { const t = e.currentTarget as HTMLElement; t.style.borderColor = 'var(--border-default)'; t.style.color = 'var(--text-secondary)'; }}
       >
         {modelsStore.isLoading ? 'Fetching...' : 'Fetch Models'}
@@ -265,7 +265,7 @@
     {#if settingsStore.value.aiEnabledModels.length > 0}
       <div style="display: flex; flex-wrap: wrap; gap: 6px;">
         {#each settingsStore.value.aiEnabledModels as modelId}
-          <span style="display: flex; align-items: center; gap: 4px; padding: 3px 8px; background: rgba(255, 214, 10, 0.08); border: 1px solid rgba(255, 214, 10, 0.2); border-radius: 6px; font-size: 11px; color: var(--text-primary); font-family: var(--font-mono);">
+          <span style="display: flex; align-items: center; gap: 4px; padding: 3px 8px; background: color-mix(in srgb, var(--accent-primary) 8%, transparent); border: 1px solid color-mix(in srgb, var(--accent-primary) 20%, transparent); border-radius: 6px; font-size: 11px; color: var(--text-primary); font-family: var(--font-mono);">
             {modelId}
             <button
               onclick={() => removeModel(modelId)}
@@ -300,11 +300,11 @@
         {#each modelsStore.filteredModels.slice(0, 50) as model (model.id)}
           <button
             onclick={() => modelsStore.toggleModelEnabled(model.id)}
-            style="display: flex; align-items: center; gap: 8px; padding: 6px 8px; border: none; border-radius: 4px; cursor: pointer; font-size: 11px; font-family: var(--font-mono); text-align: left; transition: background 0.1s ease; background: {modelsStore.isModelEnabled(model.id) ? 'rgba(255, 214, 10, 0.08)' : 'transparent'}; color: var(--text-primary);"
-            onmouseenter={(e) => (e.currentTarget as HTMLElement).style.background = modelsStore.isModelEnabled(model.id) ? 'rgba(255, 214, 10, 0.12)' : 'var(--bg-elevated)'}
-            onmouseleave={(e) => (e.currentTarget as HTMLElement).style.background = modelsStore.isModelEnabled(model.id) ? 'rgba(255, 214, 10, 0.08)' : 'transparent'}
+            style="display: flex; align-items: center; gap: 8px; padding: 6px 8px; border: none; border-radius: 4px; cursor: pointer; font-size: 11px; font-family: var(--font-mono); text-align: left; transition: background 0.1s ease; background: {modelsStore.isModelEnabled(model.id) ? 'color-mix(in srgb, var(--accent-primary) 8%, transparent)' : 'transparent'}; color: var(--text-primary);"
+            onmouseenter={(e) => (e.currentTarget as HTMLElement).style.background = modelsStore.isModelEnabled(model.id) ? 'color-mix(in srgb, var(--accent-primary) 12%, transparent)' : 'var(--bg-elevated)'}
+            onmouseleave={(e) => (e.currentTarget as HTMLElement).style.background = modelsStore.isModelEnabled(model.id) ? 'color-mix(in srgb, var(--accent-primary) 8%, transparent)' : 'transparent'}
           >
-            <span style="width: 14px; height: 14px; border: 1px solid {modelsStore.isModelEnabled(model.id) ? 'var(--banana-yellow)' : 'var(--border-default)'}; border-radius: 3px; display: flex; align-items: center; justify-content: center; background: {modelsStore.isModelEnabled(model.id) ? 'var(--banana-yellow)' : 'transparent'}; flex-shrink: 0; transition: all 0.15s ease;">
+            <span style="width: 14px; height: 14px; border: 1px solid {modelsStore.isModelEnabled(model.id) ? 'var(--accent-primary)' : 'var(--border-default)'}; border-radius: 3px; display: flex; align-items: center; justify-content: center; background: {modelsStore.isModelEnabled(model.id) ? 'var(--accent-primary)' : 'transparent'}; flex-shrink: 0; transition: all 0.15s ease;">
               {#if modelsStore.isModelEnabled(model.id)}
                 <svg width="10" height="10" viewBox="0 0 16 16" fill="#0D1117">
                   <path d="M13.78 4.22a.75.75 0 010 1.06l-7.25 7.25a.75.75 0 01-1.06 0L2.22 9.28a.75.75 0 011.06-1.06L6 10.94l6.72-6.72a.75.75 0 011.06 0z"/>

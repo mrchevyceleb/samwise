@@ -27,14 +27,40 @@
 		// 1. Load persisted settings from disk
 		await initSettings();
 
-		// 2. Restore last workspace if restoreSession is enabled
-		const s = settingsStore.value;
-		if (s.restoreSession && workspace.lastPath) {
-			await workspace.setWorkspace(workspace.lastPath);
+		// 2. Read query params (for multi-window support)
+		const params = new URLSearchParams(window.location.search);
+		const workspaceParam = params.get('workspace');
+		const themeParam = params.get('theme');
+
+		// Apply theme if provided
+		if (themeParam && themeParam !== 'banana') {
+			document.documentElement.setAttribute('data-theme', themeParam);
+		}
+
+		// Open workspace from query param, or restore session
+		if (workspaceParam) {
+			await workspace.setWorkspace(workspaceParam);
+		} else {
+			const s = settingsStore.value;
+			if (s.restoreSession && workspace.lastPath) {
+				await workspace.setWorkspace(workspace.lastPath);
+			}
 		}
 	});
 
-	function handleGlobalKeyDown(e: KeyboardEvent) {
+	// Apply saved theme when workspace changes
+	$effect(() => {
+		if (workspace.path) {
+			const savedTheme = settingsStore.value.workspaceThemes?.[workspace.path];
+			if (savedTheme && savedTheme !== 'banana') {
+				document.documentElement.setAttribute('data-theme', savedTheme);
+			} else {
+				document.documentElement.removeAttribute('data-theme');
+			}
+		}
+	});
+
+	async function handleGlobalKeyDown(e: KeyboardEvent) {
 		// Ctrl+Shift+P -> Command Palette
 		if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'P') {
 			e.preventDefault();
@@ -54,10 +80,17 @@
 			e.preventDefault();
 			settingsStore.settingsVisible = !settingsStore.settingsVisible;
 		}
-		// Ctrl+O -> Open Folder
+		// Ctrl+O -> Open Folder (new window if workspace already open)
 		if ((e.ctrlKey || e.metaKey) && e.key === 'o' && !e.shiftKey) {
 			e.preventDefault();
-			workspace.openFolder();
+			if (workspace.isOpen) {
+				try {
+					const { invoke } = await import('@tauri-apps/api/core');
+					await invoke('open_folder_in_new_window');
+				} catch { workspace.openFolder(); }
+			} else {
+				workspace.openFolder();
+			}
 		}
 		// Ctrl+Shift+N -> New Terminal
 		if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'N') {
@@ -88,7 +121,7 @@
 	<div style="display: flex; flex: 1; overflow: hidden; gap: var(--panel-gap); padding: 0 var(--panel-gap) var(--panel-gap);">
 		<!-- Left: Agent Panel -->
 		{#if layout.leftPanelVisible}
-			<div style="width: {layout.agentPanelWidth}px; min-width: 280px; max-width: 600px; display: flex; flex-direction: column; overflow: hidden; border-radius: var(--panel-radius); box-shadow: var(--shadow-panel); border: var(--panel-border); border-top: 1px solid rgba(255, 214, 10, 0.08); background: linear-gradient(180deg, #161C26 0%, #11161E 100%);">
+			<div style="width: {layout.agentPanelWidth}px; min-width: 280px; max-width: 600px; display: flex; flex-direction: column; overflow: hidden; border-radius: var(--panel-radius); box-shadow: var(--shadow-panel); border: var(--panel-border); border-top: 1px solid color-mix(in srgb, var(--accent-primary) 8%, transparent); background: linear-gradient(180deg, #161C26 0%, #11161E 100%);">
 				<AgentPanel />
 			</div>
 
@@ -99,10 +132,10 @@
 				title="Show Agent Panel (Ctrl+B)"
 				style="
 					width: 24px; flex-shrink: 0; display: flex; align-items: center; justify-content: center;
-					background: {leftExpandHovered ? 'rgba(255, 214, 10, 0.08)' : 'var(--bg-surface)'};
+					background: {leftExpandHovered ? 'color-mix(in srgb, var(--accent-primary) 8%, transparent)' : 'var(--bg-surface)'};
 					border: none; border-radius: 0 var(--panel-radius) var(--panel-radius) 0;
 					box-shadow: var(--shadow-sm);
-					color: {leftExpandHovered ? 'var(--banana-yellow)' : 'var(--text-muted)'};
+					color: {leftExpandHovered ? 'var(--accent-primary)' : 'var(--text-muted)'};
 					cursor: pointer; transition: all 0.15s ease; writing-mode: vertical-rl;
 					font-family: var(--font-ui); font-size: 11px; letter-spacing: 0.5px;
 				"
@@ -118,7 +151,7 @@
 		{/if}
 
 		<!-- Middle: Preview Panel + Terminal -->
-		<div style="flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 300px; border-radius: var(--panel-radius); box-shadow: var(--shadow-panel); border: var(--panel-border); border-top: 1px solid rgba(255, 214, 10, 0.08); background: linear-gradient(180deg, #161C26 0%, #0F1318 100%);">
+		<div style="flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 300px; border-radius: var(--panel-radius); box-shadow: var(--shadow-panel); border: var(--panel-border); border-top: 1px solid color-mix(in srgb, var(--accent-primary) 8%, transparent); background: linear-gradient(180deg, #161C26 0%, #0F1318 100%);">
 			<div style="flex: 1; overflow: hidden;">
 				<PreviewPanel />
 			</div>
@@ -135,7 +168,7 @@
 		{#if layout.rightPanelVisible}
 			<ResizeHandle direction="vertical" onResize={(d) => layout.filePanelWidth = layout.filePanelWidth - d} />
 
-			<div style="width: {layout.filePanelWidth}px; min-width: 200px; max-width: 500px; display: flex; flex-direction: column; overflow: hidden; border-radius: var(--panel-radius); box-shadow: var(--shadow-panel); border: var(--panel-border); border-top: 1px solid rgba(255, 214, 10, 0.08); background: linear-gradient(180deg, #161C26 0%, #11161E 100%);">
+			<div style="width: {layout.filePanelWidth}px; min-width: 200px; max-width: 500px; display: flex; flex-direction: column; overflow: hidden; border-radius: var(--panel-radius); box-shadow: var(--shadow-panel); border: var(--panel-border); border-top: 1px solid color-mix(in srgb, var(--accent-primary) 8%, transparent); background: linear-gradient(180deg, #161C26 0%, #11161E 100%);">
 				<FilePanel />
 			</div>
 		{:else}
@@ -144,10 +177,10 @@
 				title="Show Files Panel (Ctrl+Shift+B)"
 				style="
 					width: 24px; flex-shrink: 0; display: flex; align-items: center; justify-content: center;
-					background: {rightExpandHovered ? 'rgba(255, 214, 10, 0.08)' : 'var(--bg-surface)'};
+					background: {rightExpandHovered ? 'color-mix(in srgb, var(--accent-primary) 8%, transparent)' : 'var(--bg-surface)'};
 					border: none; border-radius: var(--panel-radius) 0 0 var(--panel-radius);
 					box-shadow: var(--shadow-sm);
-					color: {rightExpandHovered ? 'var(--banana-yellow)' : 'var(--text-muted)'};
+					color: {rightExpandHovered ? 'var(--accent-primary)' : 'var(--text-muted)'};
 					cursor: pointer; transition: all 0.15s ease; writing-mode: vertical-rl;
 					font-family: var(--font-ui); font-size: 11px; letter-spacing: 0.5px;
 				"

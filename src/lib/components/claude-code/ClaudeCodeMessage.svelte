@@ -143,8 +143,8 @@
 		<div
 			style="
 				max-width: 85%; padding: 10px 14px; border-radius: 12px;
-				background: linear-gradient(135deg, rgba(255, 214, 10, 0.12), rgba(255, 214, 10, 0.06));
-				border: 1px solid rgba(255, 214, 10, 0.2);
+				background: linear-gradient(135deg, color-mix(in srgb, var(--accent-primary) 12%, transparent), color-mix(in srgb, var(--accent-primary) 6%, transparent));
+				border: 1px solid color-mix(in srgb, var(--accent-primary) 20%, transparent);
 				color: var(--text-primary); font-size: {fontSize}px; font-family: {fontFamily};
 				user-select: text;
 			"
@@ -188,7 +188,7 @@
 			<span style="color: var(--text-muted);">
 				Done
 				{#if costInfo}
-					<span style="color: var(--banana-yellow-dim);">
+					<span style="color: var(--accent-dim);">
 						{costInfo.duration != null ? `${(costInfo.duration / 1000).toFixed(1)}s` : ''}
 						{costInfo.cost != null ? ` $${costInfo.cost.toFixed(4)}` : ''}
 						{costInfo.turns ? ` ${costInfo.turns} turn${costInfo.turns > 1 ? 's' : ''}` : ''}
@@ -252,9 +252,9 @@
 			<div
 				style="
 					border-radius: 8px; overflow: hidden;
-					border: 1px solid rgba(255, 214, 10, 0.15);
-					border-left: 3px solid var(--banana-yellow);
-					background: rgba(255, 214, 10, 0.03);
+					border: 1px solid color-mix(in srgb, var(--accent-primary) 15%, transparent);
+					border-left: 3px solid var(--accent-primary);
+					background: color-mix(in srgb, var(--accent-primary) 3%, transparent);
 					font-size: {fontSize - 2}px;
 				"
 			>
@@ -269,7 +269,7 @@
 					onmouseleave={(e) => { (e.currentTarget as HTMLElement).style.background = 'none'; }}
 					onclick={() => toggleTool(idx)}
 				>
-					<div style="width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; background: {isStreaming ? 'var(--banana-yellow)' : 'rgba(255, 214, 10, 0.4)'}; {isStreaming ? 'animation: cc-pulse 1.5s ease-in-out infinite;' : ''}"></div>
+					<div style="width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; background: {isStreaming ? 'var(--accent-primary)' : 'color-mix(in srgb, var(--accent-primary) 40%, transparent)'}; {isStreaming ? 'animation: cc-pulse 1.5s ease-in-out infinite;' : ''}"></div>
 					<span style="flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{tool.name}</span>
 					<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink: 0; opacity: 0.4; transition: transform 0.15s; transform: {expandedTools.has(idx) ? 'rotate(90deg)' : 'rotate(0)'};">
 						<polyline points="9 18 15 12 9 6"/>
@@ -277,7 +277,7 @@
 				</button>
 
 				{#if expandedTools.has(idx)}
-					<div style="border-top: 1px solid rgba(255, 214, 10, 0.1); padding: 8px 10px;">
+					<div style="border-top: 1px solid color-mix(in srgb, var(--accent-primary) 10%, transparent); padding: 8px 10px;">
 						{#if tool.input}
 							<div>
 								<div style="font-size: {fontSize - 4}px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; font-weight: 500; margin-bottom: 4px;">Input</div>
@@ -329,9 +329,9 @@
 		transition: all 0.15s ease;
 	}
 	.cc-prose :global(.code-block-copy:hover) {
-		background: var(--banana-yellow);
+		background: var(--accent-primary);
 		color: var(--bg-primary);
-		border-color: var(--banana-yellow);
+		border-color: var(--accent-primary);
 	}
 	.cc-prose :global(pre.shiki) {
 		background: var(--bg-primary) !important;
@@ -357,7 +357,7 @@
 		padding: 0.1em 0.35em;
 		border-radius: 4px;
 		font-size: 0.9em;
-		color: var(--banana-yellow);
+		color: var(--accent-primary);
 	}
 	.cc-prose :global(pre code) {
 		background: none;
@@ -365,7 +365,7 @@
 		color: inherit;
 	}
 	.cc-prose :global(a) {
-		color: var(--banana-yellow);
+		color: var(--accent-primary);
 		text-decoration: none;
 		transition: color 0.15s ease;
 	}
@@ -376,13 +376,13 @@
 	.cc-prose :global(ul) { list-style-type: disc; padding-left: 1.5rem; margin: 0.4rem 0; }
 	.cc-prose :global(ol) { list-style-type: decimal; padding-left: 1.5rem; margin: 0.4rem 0; }
 	.cc-prose :global(li) { margin: 0.3rem 0; color: var(--text-secondary); }
-	.cc-prose :global(li::marker) { color: var(--banana-yellow); font-weight: 700; }
+	.cc-prose :global(li::marker) { color: var(--accent-primary); font-weight: 700; }
 	.cc-prose :global(h1) { font-size: 1.35em; font-weight: 800; margin: 1rem 0 0.4rem; color: #ffffff; border-bottom: 1px solid var(--border-default); padding-bottom: 0.3rem; }
-	.cc-prose :global(h2) { font-size: 1.2em; font-weight: 700; margin: 0.85rem 0 0.35rem; color: var(--banana-yellow); }
+	.cc-prose :global(h2) { font-size: 1.2em; font-weight: 700; margin: 0.85rem 0 0.35rem; color: var(--accent-primary); }
 	.cc-prose :global(h3) { font-size: 1.08em; font-weight: 700; margin: 0.75rem 0 0.3rem; color: rgb(34, 197, 94); }
 	.cc-prose :global(blockquote) {
-		border-left: 3px solid var(--banana-yellow);
-		background: rgba(255, 214, 10, 0.04);
+		border-left: 3px solid var(--accent-primary);
+		background: color-mix(in srgb, var(--accent-primary) 4%, transparent);
 		padding: 0.35rem 0.85rem;
 		margin: 0.5rem 0;
 		border-radius: 0 6px 6px 0;
@@ -390,8 +390,8 @@
 	}
 	.cc-prose :global(table) { width: 100%; border-collapse: collapse; margin: 0.5rem 0; font-size: 0.9em; }
 	.cc-prose :global(th), .cc-prose :global(td) { border: 1px solid var(--border-default); padding: 0.4rem 0.6rem; }
-	.cc-prose :global(th) { background: var(--bg-elevated); font-weight: 700; color: var(--banana-yellow); }
-	.cc-prose :global(strong) { font-weight: 700; color: var(--banana-yellow); }
-	.cc-prose :global(em) { color: rgba(255, 214, 10, 0.85); font-style: italic; }
+	.cc-prose :global(th) { background: var(--bg-elevated); font-weight: 700; color: var(--accent-primary); }
+	.cc-prose :global(strong) { font-weight: 700; color: var(--accent-primary); }
+	.cc-prose :global(em) { color: color-mix(in srgb, var(--accent-primary) 85%, transparent); font-style: italic; }
 	.cc-prose :global(hr) { border: none; border-top: 1px solid var(--border-default); margin: 0.85rem 0; opacity: 0.6; }
 </style>

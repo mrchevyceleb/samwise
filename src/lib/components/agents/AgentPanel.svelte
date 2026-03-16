@@ -60,6 +60,29 @@
 		});
 	}
 
+	let lottieContainer = $state<HTMLDivElement | null>(null);
+	let lottieAnim: any = null;
+
+	$effect(() => {
+		if (!lottieContainer || lottieAnim) return;
+		// Load lottie-web and start animation
+		import('lottie-web').then((lottie) => {
+			lottieAnim = lottie.default.loadAnimation({
+				container: lottieContainer!,
+				renderer: 'svg',
+				loop: true,
+				autoplay: true,
+				path: '/banana-anim.json'
+			});
+		});
+		return () => {
+			if (lottieAnim) {
+				lottieAnim.destroy();
+				lottieAnim = null;
+			}
+		};
+	});
+
 </script>
 
 <div style="display: flex; height: 100%; background: var(--bg-surface);">
@@ -94,11 +117,17 @@
 			/>
 		{:else}
 			<!-- Empty state -->
-			<div style="flex: 1; display: flex; align-items: center; justify-content: center; color: var(--text-muted); font-size: 13px; position: relative;">
-				<div style="position: absolute; width: 200px; height: 200px; border-radius: 50%; background: radial-gradient(circle, rgba(255, 214, 10, 0.04) 0%, transparent 70%); pointer-events: none;"></div>
+			<div style="flex: 1; display: flex; align-items: center; justify-content: center; color: var(--text-muted); font-size: 13px; position: relative; overflow: hidden;">
+				<!-- Radial glow -->
+				<div style="position: absolute; width: 300px; height: 300px; border-radius: 50%; background: radial-gradient(circle, color-mix(in srgb, var(--accent-primary) 5%, transparent) 0%, transparent 70%); pointer-events: none;"></div>
 				<div style="text-align: center; position: relative; z-index: 1;">
-					<div style="font-size: 36px; margin-bottom: 10px; animation: agent-bob 4s ease-in-out infinite; color: var(--banana-yellow); text-shadow: 0 0 20px rgba(255, 214, 10, 0.25); font-weight: 800; font-family: var(--font-ui);">A</div>
-					<div style="color: var(--text-muted); font-size: 12px; line-height: 1.5;">Create a new conversation<br/>to get started.</div>
+					<!-- Banana mascot lottie -->
+					<div
+						bind:this={lottieContainer}
+						style="width: 140px; height: 140px; margin: 0 auto 4px; filter: drop-shadow(0 0 20px color-mix(in srgb, var(--accent-primary) 15%, transparent));"
+					></div>
+					<div style="font-size: 14px; font-weight: 700; color: var(--text-primary); margin-bottom: 4px; letter-spacing: -0.3px;">Ready to vibe</div>
+					<div style="color: var(--text-muted); font-size: 12px; line-height: 1.5;">Start a conversation or just<br/>type below to get going.</div>
 				</div>
 			</div>
 			<ChatInput

@@ -64,7 +64,7 @@
       onblur={() => inputFocused = false}
       placeholder="Commit message..."
       rows="3"
-      style="width: 100%; padding: 8px 10px; background: var(--bg-primary); border: 1px solid {inputFocused ? 'var(--banana-yellow)' : 'var(--border-default)'}; border-radius: 6px; color: var(--text-primary); font-size: 12px; font-family: var(--font-ui); resize: vertical; min-height: 60px; outline: none; transition: border-color 0.15s ease; box-shadow: {inputFocused ? '0 0 0 2px rgba(255, 214, 10, 0.15)' : 'none'};"
+      style="width: 100%; padding: 8px 10px; background: var(--bg-primary); border: 1px solid {inputFocused ? 'var(--accent-primary)' : 'var(--border-default)'}; border-radius: 6px; color: var(--text-primary); font-size: 12px; font-family: var(--font-ui); resize: vertical; min-height: 60px; outline: none; transition: border-color 0.15s ease; box-shadow: {inputFocused ? '0 0 0 2px color-mix(in srgb, var(--accent-primary) 15%, transparent)' : 'none'};"
     ></textarea>
 
     <!-- AI generate button (top-right of textarea) -->
@@ -101,7 +101,7 @@
       disabled={!canCommit}
       onmouseenter={() => commitBtnHovered = true}
       onmouseleave={() => commitBtnHovered = false}
-      style="flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px; padding: 6px 12px; border: none; border-radius: 6px; cursor: {canCommit ? 'pointer' : 'not-allowed'}; font-size: 12px; font-weight: 600; font-family: var(--font-ui); transition: all 0.15s ease; background: {canCommit ? (commitBtnHovered ? 'var(--banana-yellow-hover)' : 'var(--banana-yellow)') : 'var(--bg-elevated)'}; color: {canCommit ? '#0D1117' : 'var(--text-muted)'}; transform: {commitBtnHovered && canCommit ? 'translateY(-1px)' : 'translateY(0)'}; box-shadow: {commitBtnHovered && canCommit ? '0 4px 12px rgba(255, 214, 10, 0.3)' : 'none'};"
+      style="flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px; padding: 6px 12px; border: none; border-radius: 6px; cursor: {canCommit ? 'pointer' : 'not-allowed'}; font-size: 12px; font-weight: 600; font-family: var(--font-ui); transition: all 0.15s ease; background: {canCommit ? (commitBtnHovered ? 'var(--accent-hover)' : 'var(--accent-primary)') : 'var(--bg-elevated)'}; color: {canCommit ? '#0D1117' : 'var(--text-muted)'}; transform: {commitBtnHovered && canCommit ? 'translateY(-1px)' : 'translateY(0)'}; box-shadow: {commitBtnHovered && canCommit ? '0 4px 12px color-mix(in srgb, var(--accent-primary) 30%, transparent)' : 'none'};"
     >
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <polyline points="20 6 9 17 4 12"/>

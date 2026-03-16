@@ -179,12 +179,12 @@
           <button
             onclick={() => cmd.action()}
             onmouseenter={() => selectedIndex = i}
-            style="display: flex; align-items: center; width: 100%; padding: 8px 12px; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; font-family: var(--font-ui); gap: 10px; transition: background 0.08s ease; background: {selectedIndex === i ? 'rgba(255, 214, 10, 0.08)' : 'transparent'}; color: {selectedIndex === i ? 'var(--text-primary)' : 'var(--text-secondary)'};"
+            style="display: flex; align-items: center; width: 100%; padding: 8px 12px; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; font-family: var(--font-ui); gap: 10px; transition: background 0.08s ease; background: {selectedIndex === i ? 'color-mix(in srgb, var(--accent-primary) 8%, transparent)' : 'transparent'}; color: {selectedIndex === i ? 'var(--text-primary)' : 'var(--text-secondary)'};"
           >
             <span style="flex: 1; text-align: left;">{cmd.label}</span>
             <span style="font-size: 10px; color: var(--text-muted); background: var(--bg-primary); padding: 2px 6px; border-radius: 3px;">{cmd.category}</span>
             {#if cmd.shortcut}
-              <span style="font-size: 10px; color: var(--banana-yellow-dim); font-family: var(--font-mono);">{cmd.shortcut}</span>
+              <span style="font-size: 10px; color: var(--accent-dim); font-family: var(--font-mono);">{cmd.shortcut}</span>
             {/if}
           </button>
         {/each}

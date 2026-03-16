@@ -69,7 +69,7 @@
 
 	<!-- Refresh button -->
 	<button
-		style="width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; background: {refreshHovered ? 'var(--bg-elevated)' : 'transparent'}; border: none; border-radius: 6px; cursor: pointer; color: {refreshHovered ? 'var(--banana-yellow)' : 'var(--text-secondary)'}; transition: all 0.12s ease; transform: {refreshHovered ? 'rotate(45deg) scale(1.1)' : 'rotate(0deg) scale(1)'};"
+		style="width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; background: {refreshHovered ? 'var(--bg-elevated)' : 'transparent'}; border: none; border-radius: 6px; cursor: pointer; color: {refreshHovered ? 'var(--accent-primary)' : 'var(--text-secondary)'}; transition: all 0.12s ease; transform: {refreshHovered ? 'rotate(45deg) scale(1.1)' : 'rotate(0deg) scale(1)'};"
 		onmouseenter={() => refreshHovered = true}
 		onmouseleave={() => refreshHovered = false}
 		onclick={handleRefresh}
@@ -85,7 +85,7 @@
 	<!-- DevTools button -->
 	{#if preview.status === 'ready'}
 		<button
-			style="width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; background: {devtoolsOpen ? 'var(--bg-elevated)' : 'transparent'}; border: none; border-radius: 6px; cursor: pointer; color: {devtoolsOpen ? 'var(--banana-yellow)' : 'var(--text-secondary)'}; transition: all 0.12s ease;"
+			style="width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; background: {devtoolsOpen ? 'var(--bg-elevated)' : 'transparent'}; border: none; border-radius: 6px; cursor: pointer; color: {devtoolsOpen ? 'var(--accent-primary)' : 'var(--text-secondary)'}; transition: all 0.12s ease;"
 			onclick={handleDevtools}
 			aria-label="Toggle DevTools"
 			title="Toggle DevTools"
@@ -98,7 +98,7 @@
 
 	<!-- Env vars button -->
 	<button
-		style="display: flex; align-items: center; gap: 3px; height: 28px; padding: 0 8px; background: {envHovered || preview.envPanelOpen ? 'var(--bg-elevated)' : 'transparent'}; border: 1px solid {preview.envPanelOpen ? 'var(--banana-yellow)' : 'transparent'}; border-radius: 6px; cursor: pointer; color: {envHovered || preview.envPanelOpen ? 'var(--banana-yellow)' : 'var(--text-secondary)'}; transition: all 0.12s ease; position: relative;"
+		style="display: flex; align-items: center; gap: 3px; height: 28px; padding: 0 8px; background: {envHovered || preview.envPanelOpen ? 'var(--bg-elevated)' : 'transparent'}; border: 1px solid {preview.envPanelOpen ? 'var(--accent-primary)' : 'transparent'}; border-radius: 6px; cursor: pointer; color: {envHovered || preview.envPanelOpen ? 'var(--accent-primary)' : 'var(--text-secondary)'}; transition: all 0.12s ease; position: relative;"
 		onmouseenter={() => envHovered = true}
 		onmouseleave={() => envHovered = false}
 		onclick={() => preview.envPanelOpen = !preview.envPanelOpen}
@@ -108,7 +108,7 @@
 			<path d="M8 1a2 2 0 0 1 2 2v4H6V3a2 2 0 0 1 2-2zm3 6V3a3 3 0 0 0-6 0v4a2 2 0 0 0-2 2v5a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2zM5 9h6a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-5a1 1 0 0 1 1-1z"/>
 		</svg>
 		{#if envCount > 0}
-			<span style="font-family: var(--font-mono); font-size: 9px; min-width: 14px; height: 14px; display: flex; align-items: center; justify-content: center; background: var(--banana-yellow); color: #0D1117; border-radius: 7px; font-weight: 700;">{envCount}</span>
+			<span style="font-family: var(--font-mono); font-size: 9px; min-width: 14px; height: 14px; display: flex; align-items: center; justify-content: center; background: var(--accent-primary); color: #0D1117; border-radius: 7px; font-weight: 700;">{envCount}</span>
 		{/if}
 	</button>
 
@@ -134,7 +134,7 @@
 			>
 				{#each viewports as vp}
 					<button
-						style="display: block; width: 100%; text-align: left; padding: 6px 12px; background: {vp === selectedViewport ? 'rgba(255, 214, 10, 0.1)' : 'transparent'}; border: none; color: {vp === selectedViewport ? 'var(--banana-yellow)' : 'var(--text-primary)'}; cursor: pointer; font-family: var(--font-ui); font-size: 12px; transition: background 0.1s ease;"
+						style="display: block; width: 100%; text-align: left; padding: 6px 12px; background: {vp === selectedViewport ? 'color-mix(in srgb, var(--accent-primary) 10%, transparent)' : 'transparent'}; border: none; color: {vp === selectedViewport ? 'var(--accent-primary)' : 'var(--text-primary)'}; cursor: pointer; font-family: var(--font-ui); font-size: 12px; transition: background 0.1s ease;"
 						onclick={() => { selectedViewport = vp; dropdownOpen = false; }}
 						onmouseenter={(e) => { if (vp !== selectedViewport) (e.currentTarget as HTMLElement).style.background = 'var(--bg-surface)'; }}
 						onmouseleave={(e) => { if (vp !== selectedViewport) (e.currentTarget as HTMLElement).style.background = 'transparent'; }}

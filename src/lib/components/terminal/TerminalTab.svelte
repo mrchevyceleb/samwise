@@ -110,7 +110,7 @@
 
 <div bind:this={wrapperEl} style="display: flex; flex-direction: column; height: 100%; background: var(--bg-primary);">
   <div style="display: flex; align-items: center; gap: 8px; padding: 6px 12px; background: var(--bg-surface); border-bottom: 1px solid var(--border-default);">
-    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--banana-yellow)" stroke-width="2" style="opacity: 0.7;">
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--accent-primary)" stroke-width="2" style="opacity: 0.7;">
       <polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>
     </svg>
     <span style="font-size: 12px; color: var(--text-muted);">Terminal</span>

@@ -184,7 +184,7 @@
 			pointer-events: none;
 			font-family: monospace;
 			font-size: 18px;
-			color: rgba(255, 214, 10, 0.7);
+			color: color-mix(in srgb, var(--accent-primary) 70%, transparent);
 			z-index: 9999;
 			animation: cc-float 1s ease-out forwards;
 		`;
@@ -230,7 +230,7 @@
 					left: {10 + i * 15}%;
 					top: {5 + (i * 17) % 80}%;
 					font-size: {10 + (i % 3) * 4}px;
-					color: rgba(255, 214, 10, 0.06);
+					color: color-mix(in srgb, var(--accent-primary) 6%, transparent);
 					font-family: monospace;
 					user-select: none;
 					animation: cc-drift {4 + i * 1.3}s ease-in-out infinite;
@@ -256,11 +256,11 @@
 			style="
 				width: 26px; height: 26px; display: flex; align-items: center; justify-content: center;
 				border-radius: 6px; flex-shrink: 0;
-				background: linear-gradient(135deg, rgba(255, 214, 10, 0.15), rgba(255, 214, 10, 0.05));
-				border: 1px solid rgba(255, 214, 10, 0.2);
+				background: linear-gradient(135deg, color-mix(in srgb, var(--accent-primary) 15%, transparent), color-mix(in srgb, var(--accent-primary) 5%, transparent));
+				border: 1px solid color-mix(in srgb, var(--accent-primary) 20%, transparent);
 			"
 		>
-			<span style="font-size: 11px; font-weight: 700; color: var(--banana-yellow); font-family: var(--font-mono);">CC</span>
+			<span style="font-size: 11px; font-weight: 700; color: var(--accent-primary); font-family: var(--font-mono);">CC</span>
 		</div>
 
 		<!-- Model switcher -->
@@ -299,12 +299,12 @@
 								width: 100%; display: flex; align-items: center; justify-content: space-between;
 								padding: 8px 12px; border: none; cursor: pointer; text-align: left;
 								font-family: var(--font-ui); font-size: 12px;
-								background: {(session?.selectedModel || '') === opt.id ? 'rgba(255, 214, 10, 0.1)' : 'transparent'};
-								color: {(session?.selectedModel || '') === opt.id ? 'var(--banana-yellow)' : 'var(--text-secondary)'};
+								background: {(session?.selectedModel || '') === opt.id ? 'color-mix(in srgb, var(--accent-primary) 10%, transparent)' : 'transparent'};
+								color: {(session?.selectedModel || '') === opt.id ? 'var(--accent-primary)' : 'var(--text-secondary)'};
 								transition: background 0.1s ease;
 							"
 							onmouseenter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.05)'; }}
-							onmouseleave={(e) => { (e.currentTarget as HTMLElement).style.background = (session?.selectedModel || '') === opt.id ? 'rgba(255, 214, 10, 0.1)' : 'transparent'; }}
+							onmouseleave={(e) => { (e.currentTarget as HTMLElement).style.background = (session?.selectedModel || '') === opt.id ? 'color-mix(in srgb, var(--accent-primary) 10%, transparent)' : 'transparent'; }}
 							onclick={() => selectModel(opt.id)}
 						>
 							<div>
@@ -312,7 +312,7 @@
 								<div style="font-size: 10px; color: var(--text-muted);">{opt.desc}</div>
 							</div>
 							{#if (session?.selectedModel || '') === opt.id}
-								<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--banana-yellow)" stroke-width="3">
+								<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--accent-primary)" stroke-width="3">
 									<polyline points="20 6 9 17 4 12"/>
 								</svg>
 							{/if}
@@ -337,8 +337,8 @@
 		<!-- Status -->
 		{#if isRunning}
 			<div style="display: flex; align-items: center; gap: 4px;">
-				<div style="width: 6px; height: 6px; border-radius: 50%; background: var(--banana-yellow); animation: cc-panel-pulse 1.5s ease-in-out infinite;"></div>
-				<span style="font-size: 11px; color: var(--banana-yellow); font-weight: 500;">Running</span>
+				<div style="width: 6px; height: 6px; border-radius: 50%; background: var(--accent-primary); animation: cc-panel-pulse 1.5s ease-in-out infinite;"></div>
+				<span style="font-size: 11px; color: var(--accent-primary); font-weight: 500;">Running</span>
 			</div>
 		{:else if session?.status === 'error'}
 			<span style="font-size: 11px; color: rgb(239, 68, 68); font-weight: 500;">Error</span>
@@ -435,9 +435,9 @@
 				{#if isRunning && visibleMessages.length > 0 && visibleMessages[visibleMessages.length - 1].type !== 'result'}
 					<div style="display: flex; align-items: center; gap: 8px; padding: 10px 14px;">
 						<div style="display: flex; align-items: center; gap: 4px;">
-							<div style="width: 6px; height: 6px; border-radius: 50%; background: var(--banana-yellow); opacity: 0.6; animation: cc-bounce 1.4s ease-in-out infinite;"></div>
-							<div style="width: 6px; height: 6px; border-radius: 50%; background: var(--banana-yellow); opacity: 0.6; animation: cc-bounce 1.4s ease-in-out 0.2s infinite;"></div>
-							<div style="width: 6px; height: 6px; border-radius: 50%; background: var(--banana-yellow); opacity: 0.6; animation: cc-bounce 1.4s ease-in-out 0.4s infinite;"></div>
+							<div style="width: 6px; height: 6px; border-radius: 50%; background: var(--accent-primary); opacity: 0.6; animation: cc-bounce 1.4s ease-in-out infinite;"></div>
+							<div style="width: 6px; height: 6px; border-radius: 50%; background: var(--accent-primary); opacity: 0.6; animation: cc-bounce 1.4s ease-in-out 0.2s infinite;"></div>
+							<div style="width: 6px; height: 6px; border-radius: 50%; background: var(--accent-primary); opacity: 0.6; animation: cc-bounce 1.4s ease-in-out 0.4s infinite;"></div>
 						</div>
 						<span style="font-size: 12px; color: var(--text-muted);">Thinking...</span>
 					</div>

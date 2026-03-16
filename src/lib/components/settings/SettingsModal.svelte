@@ -47,7 +47,7 @@
       <div style="width: 200px; background: var(--bg-primary); border-right: 1px solid var(--border-default); padding: 16px 0; display: flex; flex-direction: column;">
         <div style="padding: 0 16px 16px; display: flex; align-items: center; gap: 8px;">
           <span style="font-size: 18px;">🍌</span>
-          <span style="font-size: 14px; font-weight: 700; color: var(--banana-yellow);">Settings</span>
+          <span style="font-size: 14px; font-weight: 700; color: var(--accent-primary);">Settings</span>
         </div>
         <div style="flex: 1; display: flex; flex-direction: column; gap: 2px; padding: 0 8px;">
           {#each tabs as tab (tab.id)}
@@ -55,7 +55,7 @@
               onclick={() => setActiveTab(tab.id)}
               onmouseenter={() => hoveredTab = tab.id}
               onmouseleave={() => hoveredTab = null}
-              style="display: flex; align-items: center; gap: 10px; padding: 8px 12px; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; font-family: var(--font-ui); transition: all 0.12s ease; text-align: left; background: {activeTab === tab.id ? 'rgba(255, 214, 10, 0.1)' : hoveredTab === tab.id ? 'var(--bg-elevated)' : 'transparent'}; color: {activeTab === tab.id ? 'var(--banana-yellow)' : 'var(--text-secondary)'}; border-left: {activeTab === tab.id ? '2px solid var(--banana-yellow)' : '2px solid transparent'};"
+              style="display: flex; align-items: center; gap: 10px; padding: 8px 12px; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; font-family: var(--font-ui); transition: all 0.12s ease; text-align: left; background: {activeTab === tab.id ? 'color-mix(in srgb, var(--accent-primary) 10%, transparent)' : hoveredTab === tab.id ? 'var(--bg-elevated)' : 'transparent'}; color: {activeTab === tab.id ? 'var(--accent-primary)' : 'var(--text-secondary)'}; border-left: {activeTab === tab.id ? '2px solid var(--accent-primary)' : '2px solid transparent'};"
             >
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
                 <path d={tab.icon}/>
@@ -211,7 +211,7 @@
                   </div>
                   <label style="position: relative; display: inline-block; width: 36px; height: 20px; cursor: pointer;">
                     <input type="checkbox" checked={settingsStore.value.showHiddenFiles} onchange={(e) => updateSetting('showHiddenFiles', (e.target as HTMLInputElement).checked)} style="opacity: 0; width: 0; height: 0;" />
-                    <span style="position: absolute; inset: 0; background: {settingsStore.value.showHiddenFiles ? 'var(--banana-yellow)' : 'var(--border-default)'}; border-radius: 10px; transition: background 0.2s ease;">
+                    <span style="position: absolute; inset: 0; background: {settingsStore.value.showHiddenFiles ? 'var(--accent-primary)' : 'var(--border-default)'}; border-radius: 10px; transition: background 0.2s ease;">
                       <span style="position: absolute; top: 2px; left: {settingsStore.value.showHiddenFiles ? '18px' : '2px'}; width: 16px; height: 16px; background: white; border-radius: 50%; transition: left 0.2s ease;"></span>
                     </span>
                   </label>
@@ -235,7 +235,7 @@
                   </div>
                   <label style="position: relative; display: inline-block; width: 36px; height: 20px; cursor: pointer;">
                     <input type="checkbox" checked={settingsStore.value.wordWrap} onchange={(e) => updateSetting('wordWrap', (e.target as HTMLInputElement).checked)} style="opacity: 0; width: 0; height: 0;" />
-                    <span style="position: absolute; inset: 0; background: {settingsStore.value.wordWrap ? 'var(--banana-yellow)' : 'var(--border-default)'}; border-radius: 10px; transition: background 0.2s ease;">
+                    <span style="position: absolute; inset: 0; background: {settingsStore.value.wordWrap ? 'var(--accent-primary)' : 'var(--border-default)'}; border-radius: 10px; transition: background 0.2s ease;">
                       <span style="position: absolute; top: 2px; left: {settingsStore.value.wordWrap ? '18px' : '2px'}; width: 16px; height: 16px; background: white; border-radius: 50%; transition: left 0.2s ease;"></span>
                     </span>
                   </label>
@@ -252,7 +252,7 @@
                   </div>
                   <label style="position: relative; display: inline-block; width: 36px; height: 20px; cursor: pointer;">
                     <input type="checkbox" checked={settingsStore.value.restoreSession} onchange={(e) => updateSetting('restoreSession', (e.target as HTMLInputElement).checked)} style="opacity: 0; width: 0; height: 0;" />
-                    <span style="position: absolute; inset: 0; background: {settingsStore.value.restoreSession ? 'var(--banana-yellow)' : 'var(--border-default)'}; border-radius: 10px; transition: background 0.2s ease;">
+                    <span style="position: absolute; inset: 0; background: {settingsStore.value.restoreSession ? 'var(--accent-primary)' : 'var(--border-default)'}; border-radius: 10px; transition: background 0.2s ease;">
                       <span style="position: absolute; top: 2px; left: {settingsStore.value.restoreSession ? '18px' : '2px'}; width: 16px; height: 16px; background: white; border-radius: 50%; transition: left 0.2s ease;"></span>
                     </span>
                   </label>
@@ -264,7 +264,7 @@
                   </div>
                   <label style="position: relative; display: inline-block; width: 36px; height: 20px; cursor: pointer;">
                     <input type="checkbox" checked={settingsStore.value.confirmCloseUnsaved} onchange={(e) => updateSetting('confirmCloseUnsaved', (e.target as HTMLInputElement).checked)} style="opacity: 0; width: 0; height: 0;" />
-                    <span style="position: absolute; inset: 0; background: {settingsStore.value.confirmCloseUnsaved ? 'var(--banana-yellow)' : 'var(--border-default)'}; border-radius: 10px; transition: background 0.2s ease;">
+                    <span style="position: absolute; inset: 0; background: {settingsStore.value.confirmCloseUnsaved ? 'var(--accent-primary)' : 'var(--border-default)'}; border-radius: 10px; transition: background 0.2s ease;">
                       <span style="position: absolute; top: 2px; left: {settingsStore.value.confirmCloseUnsaved ? '18px' : '2px'}; width: 16px; height: 16px; background: white; border-radius: 50%; transition: left 0.2s ease;"></span>
                     </span>
                   </label>
@@ -298,12 +298,12 @@
             <div style="display: flex; flex-direction: column; align-items: center; gap: 16px; padding: 24px;">
               <div style="font-size: 48px; animation: bob 3s ease-in-out infinite;">🍌</div>
               <div style="text-align: center;">
-                <div style="font-size: 24px; font-weight: 700; color: var(--banana-yellow);">Banana Code</div>
+                <div style="font-size: 24px; font-weight: 700; color: var(--accent-primary);">Banana Code</div>
                 <div style="font-size: 13px; color: var(--text-secondary); margin-top: 4px;">Vibe coding for real developers</div>
                 <div style="font-size: 12px; color: var(--text-muted); margin-top: 8px;">Version 0.1.0</div>
               </div>
               <div style="display: flex; gap: 12px; margin-top: 8px;">
-                <a href="https://bananacode.ai" target="_blank" rel="noopener" style="padding: 8px 16px; background: var(--banana-yellow); color: #0D1117; border-radius: 6px; font-size: 12px; font-weight: 600; text-decoration: none; transition: all 0.15s ease;">
+                <a href="https://bananacode.ai" target="_blank" rel="noopener" style="padding: 8px 16px; background: var(--accent-primary); color: #0D1117; border-radius: 6px; font-size: 12px; font-weight: 600; text-decoration: none; transition: all 0.15s ease;">
                   bananacode.ai
                 </a>
               </div>

@@ -5,6 +5,9 @@
   --banana-yellow: #FFD60A;
   --banana-yellow-hover: #FFE347;
   --banana-yellow-dim: #B89B00;
+  --accent-primary: #FFD60A;
+  --accent-hover: #FFE347;
+  --accent-dim: #B89B00;
   --bg-canvas: #06080C;
   --bg-primary: #0B0F15;
   --bg-surface: #12171F;
@@ -29,6 +32,8 @@
   --shadow-toolbar: 0 1px 4px rgba(0, 0, 0, 0.25);
   --glow-banana: 0 0 16px rgba(255, 214, 10, 0.12);
   --glow-banana-strong: 0 0 20px rgba(255, 214, 10, 0.2), 0 0 40px rgba(255, 214, 10, 0.05);
+  --glow-accent: 0 0 16px rgba(255, 214, 10, 0.12);
+  --glow-accent-strong: 0 0 20px rgba(255, 214, 10, 0.2), 0 0 40px rgba(255, 214, 10, 0.05);
 
   /* Panel layout tokens */
   --panel-radius: 12px;
@@ -78,8 +83,44 @@ button, input, textarea, select, a, [role="button"] {
 }
 
 ::selection {
-  background: rgba(255, 214, 10, 0.3);
+  background: color-mix(in srgb, var(--accent-primary) 30%, transparent);
   color: var(--text-primary);
+}
+
+[data-theme="blue"] {
+  --accent-primary: #58A6FF;
+  --accent-hover: #79B8FF;
+  --accent-dim: #1F6FEB;
+  --glow-accent: 0 0 16px rgba(88, 166, 255, 0.12);
+  --glow-accent-strong: 0 0 20px rgba(88, 166, 255, 0.2), 0 0 40px rgba(88, 166, 255, 0.05);
+}
+[data-theme="green"] {
+  --accent-primary: #3FB950;
+  --accent-hover: #56D364;
+  --accent-dim: #238636;
+  --glow-accent: 0 0 16px rgba(63, 185, 80, 0.12);
+  --glow-accent-strong: 0 0 20px rgba(63, 185, 80, 0.2), 0 0 40px rgba(63, 185, 80, 0.05);
+}
+[data-theme="purple"] {
+  --accent-primary: #BC8CFF;
+  --accent-hover: #D2A8FF;
+  --accent-dim: #8957E5;
+  --glow-accent: 0 0 16px rgba(188, 140, 255, 0.12);
+  --glow-accent-strong: 0 0 20px rgba(188, 140, 255, 0.2), 0 0 40px rgba(188, 140, 255, 0.05);
+}
+[data-theme="red"] {
+  --accent-primary: #F85149;
+  --accent-hover: #FF7B72;
+  --accent-dim: #DA3633;
+  --glow-accent: 0 0 16px rgba(248, 81, 73, 0.12);
+  --glow-accent-strong: 0 0 20px rgba(248, 81, 73, 0.2), 0 0 40px rgba(248, 81, 73, 0.05);
+}
+[data-theme="orange"] {
+  --accent-primary: #D29922;
+  --accent-hover: #E3B341;
+  --accent-dim: #9E6A03;
+  --glow-accent: 0 0 16px rgba(210, 153, 34, 0.12);
+  --glow-accent-strong: 0 0 20px rgba(210, 153, 34, 0.2), 0 0 40px rgba(210, 153, 34, 0.05);
 }
 
 /* Bobbing animation for the banana logo */

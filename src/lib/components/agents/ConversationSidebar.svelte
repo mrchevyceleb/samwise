@@ -79,11 +79,11 @@
 	});
 
 	function typeIcon(type: string): string {
-		return type === 'claude-code' ? 'CC' : 'A';
+		return type === 'claude-code' ? 'CC' : '🐒';
 	}
 
 	function typeColor(type: string): string {
-		return type === 'claude-code' ? 'rgba(139, 92, 246, 0.8)' : 'var(--banana-yellow)';
+		return type === 'claude-code' ? 'rgba(139, 92, 246, 0.8)' : 'var(--accent-primary)';
 	}
 </script>
 
@@ -131,7 +131,7 @@
 		<div style="padding: 8px 10px 4px; flex-shrink: 0;">
 			<div style="
 				display: flex; align-items: center; gap: 6px; padding: 6px 8px;
-				background: var(--bg-primary); border: 1px solid {searchFocused ? 'var(--banana-yellow)' : 'var(--border-default)'};
+				background: var(--bg-primary); border: 1px solid {searchFocused ? 'var(--accent-primary)' : 'var(--border-default)'};
 				border-radius: 8px; transition: border-color 0.15s ease, box-shadow 0.15s ease;
 				box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.25);
 			">
@@ -153,13 +153,13 @@
 		<div style="padding: 6px 10px 10px; display: flex; gap: 6px; flex-shrink: 0;">
 			<button
 				style="
-					flex: 1; padding: 8px 0; border: 1px solid rgba(255, 214, 10, 0.15); border-radius: 10px;
+					flex: 1; padding: 8px 0; border: 1px solid color-mix(in srgb, var(--accent-primary) 15%, transparent); border-radius: 10px;
 					cursor: pointer; font-size: 11px; font-family: var(--font-ui); font-weight: 600;
-					transition: all 0.2s ease; background: rgba(255, 214, 10, 0.04); color: var(--text-secondary);
+					transition: all 0.2s ease; background: color-mix(in srgb, var(--accent-primary) 4%, transparent); color: var(--text-secondary);
 					box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15);
 				"
-				onmouseenter={(e) => { const t = e.currentTarget as HTMLElement; t.style.borderColor = 'rgba(255,214,10,0.4)'; t.style.color = 'var(--banana-yellow)'; t.style.background = 'rgba(255,214,10,0.1)'; t.style.boxShadow = '0 2px 8px rgba(255, 214, 10, 0.12)'; t.style.transform = 'translateY(-1px)'; }}
-				onmouseleave={(e) => { const t = e.currentTarget as HTMLElement; t.style.borderColor = 'rgba(255,214,10,0.15)'; t.style.color = 'var(--text-secondary)'; t.style.background = 'rgba(255,214,10,0.04)'; t.style.boxShadow = '0 1px 4px rgba(0,0,0,0.15)'; t.style.transform = 'translateY(0)'; }}
+				onmouseenter={(e) => { const t = e.currentTarget as HTMLElement; t.style.borderColor = 'color-mix(in srgb, var(--accent-primary) 40%, transparent)'; t.style.color = 'var(--accent-primary)'; t.style.background = 'color-mix(in srgb, var(--accent-primary) 10%, transparent)'; t.style.boxShadow = '0 2px 8px color-mix(in srgb, var(--accent-primary) 12%, transparent)'; t.style.transform = 'translateY(-1px)'; }}
+				onmouseleave={(e) => { const t = e.currentTarget as HTMLElement; t.style.borderColor = 'color-mix(in srgb, var(--accent-primary) 15%, transparent)'; t.style.color = 'var(--text-secondary)'; t.style.background = 'color-mix(in srgb, var(--accent-primary) 4%, transparent)'; t.style.boxShadow = '0 1px 4px rgba(0,0,0,0.15)'; t.style.transform = 'translateY(0)'; }}
 				onclick={handleNewAgent}
 			>
 				+ Agent
@@ -187,8 +187,8 @@
 					style="
 						padding: 8px 10px; margin: 2px 0; border-radius: 6px; cursor: pointer;
 						transition: all 0.12s ease;
-						background: {isFocused(ref) ? 'rgba(255, 214, 10, 0.1)' : 'transparent'};
-						border-left: 2px solid {isFocused(ref) ? 'var(--banana-yellow)' : 'transparent'};
+						background: {isFocused(ref) ? 'color-mix(in srgb, var(--accent-primary) 10%, transparent)' : 'transparent'};
+						border-left: 2px solid {isFocused(ref) ? 'var(--accent-primary)' : 'transparent'};
 						animation: sidebar-slide-in 0.2s ease-out both;
 						animation-delay: {Math.min(i * 0.03, 0.15)}s;
 					"
@@ -204,7 +204,7 @@
 						<!-- Type badge -->
 						<span style="
 							font-size: 9px; font-weight: 700; padding: 1px 4px; border-radius: 3px;
-							background: {ref.type === 'claude-code' ? 'rgba(139,92,246,0.15)' : 'rgba(255,214,10,0.12)'};
+							background: {ref.type === 'claude-code' ? 'rgba(139,92,246,0.15)' : 'color-mix(in srgb, var(--accent-primary) 12%, transparent)'};
 							color: {typeColor(ref.type)}; font-family: var(--font-mono); flex-shrink: 0;
 						">
 							{typeIcon(ref.type)}
@@ -218,7 +218,7 @@
 									onkeydown={(e) => { if (e.key === 'Enter') finishRename(); if (e.key === 'Escape') { renamingId = null; } }}
 									use:autofocusAction
 									style="
-										width: 100%; border: 1px solid var(--banana-yellow); background: var(--bg-primary);
+										width: 100%; border: 1px solid var(--accent-primary); background: var(--bg-primary);
 										border-radius: 4px; padding: 2px 4px; color: var(--text-primary);
 										font-size: 12px; font-family: var(--font-ui); font-weight: 600; outline: none;
 									"
@@ -309,18 +309,18 @@
 					style="
 						width: 100%; padding: 8px 0; border: none; cursor: pointer;
 						display: flex; align-items: center; justify-content: center;
-						background: {isFocused(ref) ? 'rgba(255, 214, 10, 0.1)' : 'transparent'};
-						border-left: 2px solid {isFocused(ref) ? 'var(--banana-yellow)' : 'transparent'};
+						background: {isFocused(ref) ? 'color-mix(in srgb, var(--accent-primary) 10%, transparent)' : 'transparent'};
+						border-left: 2px solid {isFocused(ref) ? 'var(--accent-primary)' : 'transparent'};
 						transition: all 0.12s ease;
 					"
 					onmouseenter={(e) => { if (!isFocused(ref)) (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.04)'; }}
-					onmouseleave={(e) => { if (!isFocused(ref)) (e.currentTarget as HTMLElement).style.background = isFocused(ref) ? 'rgba(255, 214, 10, 0.1)' : 'transparent'; }}
+					onmouseleave={(e) => { if (!isFocused(ref)) (e.currentTarget as HTMLElement).style.background = isFocused(ref) ? 'color-mix(in srgb, var(--accent-primary) 10%, transparent)' : 'transparent'; }}
 					onclick={() => focusConversation(ref)}
 					title={ref.title}
 				>
 					<span style="
 						font-size: 9px; font-weight: 700; padding: 2px 5px; border-radius: 4px;
-						background: {ref.type === 'claude-code' ? 'rgba(139,92,246,0.15)' : 'rgba(255,214,10,0.12)'};
+						background: {ref.type === 'claude-code' ? 'rgba(139,92,246,0.15)' : 'color-mix(in srgb, var(--accent-primary) 12%, transparent)'};
 						color: {typeColor(ref.type)}; font-family: var(--font-mono);
 					">
 						{typeIcon(ref.type)}
@@ -332,8 +332,8 @@
 		<!-- Collapsed: new buttons -->
 		<div style="padding: 4px 0 8px; display: flex; flex-direction: column; align-items: center; gap: 4px; flex-shrink: 0;">
 			<button
-				style="border: none; background: none; cursor: pointer; color: var(--banana-yellow); padding: 4px; border-radius: 4px; transition: background 0.12s;"
-				onmouseenter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,214,10,0.1)'; }}
+				style="border: none; background: none; cursor: pointer; color: var(--accent-primary); padding: 4px; border-radius: 4px; transition: background 0.12s;"
+				onmouseenter={(e) => { (e.currentTarget as HTMLElement).style.background = 'color-mix(in srgb, var(--accent-primary) 10%, transparent)'; }}
 				onmouseleave={(e) => { (e.currentTarget as HTMLElement).style.background = 'none'; }}
 				onclick={handleNewAgent}
 				title="New Agent"

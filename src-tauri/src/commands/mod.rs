@@ -8,3 +8,4 @@ pub mod orchestrator;
 pub mod preview;
 pub mod settings;
 pub mod terminal;
+pub mod window;

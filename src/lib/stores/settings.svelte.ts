@@ -55,9 +55,12 @@ export interface AppSettings {
   aiThinkingMode: 'all' | 'preview' | 'none';
   mcpServers: MCPServerConfig[];
   dopplerToken: string;
+  dopplerTokens: Array<{ token: string; orgName: string; orgSlug: string }>;
+  dopplerWorkplace: string;
   dopplerProject: string;
   dopplerConfig: string;
   dopplerEnabled: boolean;
+  workspaceThemes: Record<string, string>;
 }
 
 export interface MCPServerConfig {
@@ -139,9 +142,12 @@ export const DEFAULT_SETTINGS: AppSettings = {
   ],
   mcpServers: [],
   dopplerToken: '',
+  dopplerTokens: [],
+  dopplerWorkplace: '',
   dopplerProject: '',
   dopplerConfig: '',
   dopplerEnabled: false,
+  workspaceThemes: {},
 };
 
 // ---- Svelte 5 Runes State ----

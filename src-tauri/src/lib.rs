@@ -46,11 +46,14 @@ pub fn run() {
             // Preview
             commands::preview::create_preview_webview,
             commands::preview::set_preview_bounds,
+            commands::preview::hide_preview_webview,
+            commands::preview::show_preview_webview,
             commands::preview::navigate_preview_webview,
             commands::preview::reload_preview_webview,
             commands::preview::open_preview_devtools,
             commands::preview::close_preview_devtools,
             commands::preview::close_preview_webview,
+            commands::preview::preview_check_http,
             // Settings
             commands::settings::save_settings,
             commands::settings::load_settings,
@@ -123,14 +126,22 @@ pub fn run() {
             commands::orchestrator::preview_save_env_file,
             commands::orchestrator::preview_load_env_file,
             // Doppler
+            commands::doppler::doppler_fetch_workplaces,
             commands::doppler::doppler_fetch_projects,
             commands::doppler::doppler_fetch_configs,
             commands::doppler::doppler_fetch_secrets,
+            // Window management
+            commands::window::open_folder_in_new_window,
+            commands::window::open_path_in_new_window,
+            commands::window::git_clone_repo,
         ])
         .on_window_event(|window, event| {
             // When the main window is destroyed, clean up all managed processes
             if let tauri::WindowEvent::Destroyed = event {
-                if window.label() == "main" {
+                let label = window.label().to_string();
+                log::info!("[app] Window '{}' destroyed", label);
+
+                if label == "main" {
                     log::info!("[app] Main window destroyed, cleaning up preview");
                     let state = window.state::<parking_lot::Mutex<preview::orchestrator::PreviewOrchestrator>>();
                     let mut orchestrator = state.lock();
@@ -149,6 +160,8 @@ pub fn run() {
                         let _ = proc.child.kill();
                         let _ = proc.child.wait();
                     }
+                } else {
+                    log::info!("[app] Secondary window '{}' closed", label);
                 }
             }
         })

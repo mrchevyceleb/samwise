@@ -77,9 +77,9 @@
 		display: flex; align-items: center; gap: 4px;
 		padding: 3px 8px 3px {paddingLeft};
 		cursor: pointer; font-size: 12px; white-space: nowrap;
-		background: {isSelected ? 'rgba(255, 214, 10, 0.1)' : hovered ? 'rgba(255,255,255,0.04)' : 'transparent'};
+		background: {isSelected ? 'color-mix(in srgb, var(--accent-primary) 10%, transparent)' : hovered ? 'rgba(255,255,255,0.04)' : 'transparent'};
 		color: {isSelected ? 'var(--text-primary)' : 'var(--text-secondary)'};
-		border-left: {isSelected ? '2px solid var(--banana-yellow)' : '2px solid transparent'};
+		border-left: {isSelected ? '2px solid var(--accent-primary)' : '2px solid transparent'};
 		transition: background 0.1s ease, color 0.1s ease;
 		user-select: none;
 	"

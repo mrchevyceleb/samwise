@@ -48,7 +48,7 @@
     onclick={toggle}
     onmouseenter={() => hovered = true}
     onmouseleave={() => hovered = false}
-    style="display: flex; align-items: center; gap: 6px; width: 100%; padding: 5px 10px; border: 1px solid {hovered ? 'var(--banana-yellow-dim)' : 'var(--border-default)'}; border-radius: 6px; cursor: pointer; font-size: 12px; font-family: var(--font-mono); transition: all 0.15s ease; background: {hovered ? 'var(--bg-elevated)' : 'var(--bg-primary)'}; color: var(--text-primary);"
+    style="display: flex; align-items: center; gap: 6px; width: 100%; padding: 5px 10px; border: 1px solid {hovered ? 'var(--accent-dim)' : 'var(--border-default)'}; border-radius: 6px; cursor: pointer; font-size: 12px; font-family: var(--font-mono); transition: all 0.15s ease; background: {hovered ? 'var(--bg-elevated)' : 'var(--bg-primary)'}; color: var(--text-primary);"
   >
     <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" style="color: var(--accent-orange); flex-shrink: 0;">
       <path d="M9.5 3.25a2.25 2.25 0 1 1 3 2.122V6A2.5 2.5 0 0 1 10 8.5H6a1 1 0 0 0-1 1v1.128a2.251 2.251 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.5 0v1.836A2.492 2.492 0 0 1 6 7h4a1 1 0 0 0 1-1v-.628A2.25 2.25 0 0 1 9.5 3.25z"/>
@@ -77,13 +77,13 @@
     <div style="position: absolute; top: 100%; left: 12px; right: 12px; z-index: 100; background: var(--bg-elevated); border: 1px solid var(--border-default); border-radius: 8px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4); overflow: hidden; margin-top: 4px; max-height: 240px; overflow-y: auto;">
       {#each localBranches as branch (branch.name)}
         <button
-          style="display: flex; align-items: center; gap: 8px; width: 100%; padding: 6px 12px; border: none; cursor: pointer; font-size: 12px; font-family: var(--font-mono); transition: background 0.1s ease; background: {hoveredBranch === branch.name ? 'var(--bg-surface)' : 'transparent'}; color: {branch.name === currentBranch ? 'var(--banana-yellow)' : 'var(--text-primary)'};"
+          style="display: flex; align-items: center; gap: 8px; width: 100%; padding: 6px 12px; border: none; cursor: pointer; font-size: 12px; font-family: var(--font-mono); transition: background 0.1s ease; background: {hoveredBranch === branch.name ? 'var(--bg-surface)' : 'transparent'}; color: {branch.name === currentBranch ? 'var(--accent-primary)' : 'var(--text-primary)'};"
           onclick={() => handleCheckout(branch.name)}
           onmouseenter={() => hoveredBranch = branch.name}
           onmouseleave={() => hoveredBranch = null}
         >
           {#if branch.name === currentBranch}
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--banana-yellow)" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--accent-primary)" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
           {:else}
             <span style="width: 12px;"></span>
           {/if}
@@ -102,12 +102,12 @@
             />
             <button
               onclick={handleCreateBranch}
-              style="padding: 4px 8px; background: var(--banana-yellow); border: none; border-radius: 4px; color: #0D1117; font-size: 11px; font-weight: 600; cursor: pointer;"
+              style="padding: 4px 8px; background: var(--accent-primary); border: none; border-radius: 4px; color: #0D1117; font-size: 11px; font-weight: 600; cursor: pointer;"
             >Create</button>
           </div>
         {:else}
           <button
-            style="display: flex; align-items: center; gap: 8px; width: 100%; padding: 6px 12px; border: none; cursor: pointer; font-size: 12px; color: var(--banana-yellow); background: transparent; font-family: var(--font-ui); transition: background 0.1s ease;"
+            style="display: flex; align-items: center; gap: 8px; width: 100%; padding: 6px 12px; border: none; cursor: pointer; font-size: 12px; color: var(--accent-primary); background: transparent; font-family: var(--font-ui); transition: background 0.1s ease;"
             onmouseenter={(e) => { (e.currentTarget as HTMLElement).style.background = 'var(--bg-surface)'; }}
             onmouseleave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
             onclick={() => newBranchMode = true}
