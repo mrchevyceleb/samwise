@@ -157,11 +157,20 @@
 	}
 
 	async function handleDopplerSync() {
-		if (!workspace.path || !dopplerConfigured) return;
+		const proj = preview.dopplerProject;
+		const conf = preview.dopplerConfig;
+		const token = settings.value.dopplerToken;
+		console.log('[doppler] handleDopplerSync called', { proj, conf, hasToken: !!token, workspacePath: workspace.path });
+		if (!workspace.path || !token || !proj || !conf) {
+			console.warn('[doppler] sync skipped - missing:', { path: !!workspace.path, token: !!token, proj, conf });
+			return;
+		}
 		syncing = true;
 		syncError = '';
 		try {
-			const secrets = await fetchSecrets(settings.value.dopplerToken, preview.dopplerProject, preview.dopplerConfig);
+			console.log('[doppler] fetching secrets for', proj, conf);
+			const secrets = await fetchSecrets(token, proj, conf);
+			console.log('[doppler] got', Object.keys(secrets).length, 'secrets');
 			const existing = [...preview.envVars];
 			for (const [key, value] of Object.entries(secrets)) {
 				const idx = existing.findIndex(v => v.key === key);
@@ -173,8 +182,11 @@
 			}
 			preview.envVars = existing;
 			await preview.saveEnvVars(workspace.path);
+			console.log('[doppler] saved env vars, restarting preview');
 			await preview.openProject(workspace.path);
+			console.log('[doppler] preview restarted');
 		} catch (e) {
+			console.error('[doppler] sync failed:', e);
 			syncError = e instanceof Error ? e.message : String(e);
 		} finally {
 			syncing = false;
@@ -470,11 +482,12 @@
 				{/if}
 
 				{#if dopplerConfigs.length > 0}
+					<div style="font-size: 10px; color: var(--text-muted); font-family: var(--font-ui);">Pick a config to sync secrets and restart preview:</div>
 					<div style="display: flex; gap: 4px; flex-wrap: wrap;">
 						{#each dopplerConfigs as c}
 							<button
 								onclick={() => handleDopplerConfigPick(c.name)}
-								style="padding: 4px 12px; border: 1px solid {preview.dopplerConfig === c.name ? '#6C47FF' : 'var(--border-default)'}; border-radius: 5px; cursor: pointer; font-size: 11px; font-family: var(--font-ui); transition: all 0.12s ease; background: {preview.dopplerConfig === c.name ? 'rgba(108, 71, 255, 0.15)' : 'var(--bg-elevated)'}; color: {preview.dopplerConfig === c.name ? '#6C47FF' : 'var(--text-secondary)'};"
+								style="padding: 6px 14px; border: 1px solid {preview.dopplerConfig === c.name ? '#6C47FF' : 'var(--border-default)'}; border-radius: 5px; cursor: pointer; font-size: 11px; font-weight: 500; font-family: var(--font-ui); transition: all 0.12s ease; background: {preview.dopplerConfig === c.name ? 'rgba(108, 71, 255, 0.15)' : 'var(--bg-elevated)'}; color: {preview.dopplerConfig === c.name ? '#6C47FF' : 'var(--text-secondary)'};"
 								onmouseenter={(e) => (e.currentTarget as HTMLElement).style.borderColor = '#6C47FF'}
 								onmouseleave={(e) => { if (preview.dopplerConfig !== c.name) (e.currentTarget as HTMLElement).style.borderColor = 'var(--border-default)'; }}
 							>

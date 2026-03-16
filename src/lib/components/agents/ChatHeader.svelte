@@ -228,6 +228,23 @@
 		</svg>
 	</button>
 
+	<!-- Collapse panel -->
+	<button
+		style="
+			width: 24px; height: 24px; display: flex; align-items: center; justify-content: center;
+			border: none; border-radius: 5px; cursor: pointer; transition: all 0.12s ease;
+			background: none; color: var(--text-muted);
+		"
+		onmouseenter={(e) => { (e.currentTarget as HTMLElement).style.background = 'var(--bg-elevated)'; (e.currentTarget as HTMLElement).style.color = 'var(--text-primary)'; }}
+		onmouseleave={(e) => { (e.currentTarget as HTMLElement).style.background = 'none'; (e.currentTarget as HTMLElement).style.color = 'var(--text-muted)'; }}
+		onclick={() => layout.toggleLeftPanel()}
+		title="Collapse panel (Ctrl+B)"
+	>
+		<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+			<polyline points="11 17 6 12 11 7"/><line x1="6" y1="12" x2="20" y2="12"/>
+		</svg>
+	</button>
+
 	<!-- ... menu -->
 	{#if focused}
 		<div style="position: relative;">
