@@ -1,17 +1,20 @@
 <script lang="ts">
 	import { getFileTreeStore, type FileNode } from '$lib/stores/file-tree.svelte';
 	import { getWorkspace } from '$lib/stores/workspace.svelte';
+	import { getLayout } from '$lib/stores/layout.svelte';
 	import FileTree from './FileTree.svelte';
 	import GitPanel from '$lib/components/git/GitPanel.svelte';
 
 	const fileTree = getFileTreeStore();
 	const workspace = getWorkspace();
+	const layout = getLayout();
 
 	let activeTab = $state<'files' | 'git'>('files');
 	let filesTabHovered = $state(false);
 	let gitTabHovered = $state(false);
 	let openFolderHovered = $state(false);
 	let collapseHovered = $state(false);
+	let closePanelHovered = $state(false);
 
 	let hasFiles = $derived(fileTree.tree.length > 0);
 	let fileCount = $derived(fileTree.fileCount);
@@ -43,18 +46,19 @@
 	});
 </script>
 
-<div style="display: flex; flex-direction: column; height: 100%; background: var(--bg-surface); border-left: 1px solid var(--border-default);">
+<div style="display: flex; flex-direction: column; height: 100%; background: transparent;">
 	<!-- Tabs -->
-	<div style="display: flex; height: 36px; border-bottom: 1px solid var(--border-default); flex-shrink: 0;">
+	<div style="display: flex; height: 40px; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15), inset 0 -1px 0 rgba(255, 255, 255, 0.03); flex-shrink: 0; position: relative; z-index: 2; background: linear-gradient(180deg, rgba(25, 31, 40, 0.6) 0%, rgba(18, 23, 31, 0.4) 100%);">
 		<button
 			style="
 				flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px;
-				background: none; border: none;
+				background: {activeTab === 'files' ? 'rgba(255, 214, 10, 0.04)' : 'none'}; border: none;
 				border-bottom: 2px solid {activeTab === 'files' ? 'var(--banana-yellow)' : 'transparent'};
 				color: {activeTab === 'files' ? 'var(--text-primary)' : filesTabHovered ? 'var(--text-primary)' : 'var(--text-secondary)'};
 				cursor: pointer; font-family: var(--font-ui); font-size: 12px;
 				font-weight: {activeTab === 'files' ? '600' : '400'};
-				transition: all 0.12s ease;
+				transition: all 0.15s ease;
+				box-shadow: {activeTab === 'files' ? '0 2px 8px rgba(255, 214, 10, 0.08)' : 'none'};
 			"
 			onclick={() => activeTab = 'files'}
 			onmouseenter={() => filesTabHovered = true}
@@ -73,12 +77,13 @@
 		<button
 			style="
 				flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px;
-				background: none; border: none;
+				background: {activeTab === 'git' ? 'rgba(255, 214, 10, 0.04)' : 'none'}; border: none;
 				border-bottom: 2px solid {activeTab === 'git' ? 'var(--banana-yellow)' : 'transparent'};
 				color: {activeTab === 'git' ? 'var(--text-primary)' : gitTabHovered ? 'var(--text-primary)' : 'var(--text-secondary)'};
 				cursor: pointer; font-family: var(--font-ui); font-size: 12px;
 				font-weight: {activeTab === 'git' ? '600' : '400'};
-				transition: all 0.12s ease;
+				transition: all 0.15s ease;
+				box-shadow: {activeTab === 'git' ? '0 2px 8px rgba(255, 214, 10, 0.08)' : 'none'};
 			"
 			onclick={() => activeTab = 'git'}
 			onmouseenter={() => gitTabHovered = true}
@@ -89,13 +94,33 @@
 			</svg>
 			Git
 		</button>
+		<!-- Close panel button -->
+		<button
+			title="Close Panel (Ctrl+Shift+B)"
+			style="
+				display: flex; align-items: center; justify-content: center;
+				width: 32px; flex-shrink: 0;
+				background: none; border: none;
+				color: {closePanelHovered ? 'var(--banana-yellow)' : 'var(--text-muted)'};
+				cursor: pointer; transition: all 0.12s ease;
+				transform: {closePanelHovered ? 'scale(1.1)' : 'scale(1)'};
+			"
+			onclick={() => layout.toggleRightPanel()}
+			onmouseenter={() => closePanelHovered = true}
+			onmouseleave={() => closePanelHovered = false}
+		>
+			<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+				<path d="M9 4l4 4-4 4"/>
+				<line x1="13" y1="8" x2="4" y2="8"/>
+			</svg>
+		</button>
 	</div>
 
 	<!-- Content area -->
 	{#if activeTab === 'files'}
 		{#if hasFiles}
 			<!-- Toolbar -->
-			<div style="display: flex; align-items: center; gap: 4px; padding: 4px 8px; border-bottom: 1px solid var(--border-default); flex-shrink: 0;">
+			<div style="display: flex; align-items: center; gap: 4px; padding: 4px 8px; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08); flex-shrink: 0;">
 				<span style="flex: 1; font-size: 10px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
 					{workspace.name}
 				</span>
@@ -142,24 +167,26 @@
 			/>
 		{:else}
 			<!-- Empty state -->
-			<div style="flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; gap: 12px; text-align: center;">
-				<svg width="40" height="40" viewBox="0 0 16 16" fill="var(--text-muted)" style="opacity: 0.4;">
+			<div style="flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; gap: 14px; text-align: center; position: relative;">
+				<div style="position: absolute; width: 160px; height: 160px; border-radius: 50%; background: radial-gradient(circle, rgba(255, 214, 10, 0.03) 0%, transparent 70%); pointer-events: none;"></div>
+				<svg width="36" height="36" viewBox="0 0 16 16" fill="var(--banana-yellow)" style="opacity: 0.35; filter: drop-shadow(0 0 10px rgba(255, 214, 10, 0.2));">
 					<path d="M1.75 1A1.75 1.75 0 0 0 0 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0 0 16 13.25v-8.5A1.75 1.75 0 0 0 14.25 3H7.5a.25.25 0 0 1-.2-.1l-.9-1.2C6.07 1.26 5.55 1 5 1H1.75z"/>
 				</svg>
-				<p style="font-size: 13px; color: var(--text-muted); max-width: 180px; line-height: 1.5;">
+				<p style="font-size: 12px; color: var(--text-muted); max-width: 160px; line-height: 1.5;">
 					Open a folder to browse files
 				</p>
 				<button
 					style="
 						display: flex; align-items: center; gap: 6px;
-						padding: 6px 14px;
-						background: {openFolderHovered ? 'var(--banana-yellow)' : 'rgba(255, 214, 10, 0.12)'};
-						border: 1px solid var(--banana-yellow); border-radius: 8px;
+						padding: 8px 18px;
+						background: {openFolderHovered ? 'var(--banana-yellow)' : 'rgba(255, 214, 10, 0.08)'};
+						border: 1px solid {openFolderHovered ? 'var(--banana-yellow)' : 'rgba(255, 214, 10, 0.25)'}; border-radius: 10px;
 						color: {openFolderHovered ? '#0D1117' : 'var(--banana-yellow)'};
 						cursor: pointer; font-family: var(--font-ui);
 						font-size: 12px; font-weight: 600;
-						transition: all 0.15s ease;
-						transform: {openFolderHovered ? 'scale(1.05)' : 'scale(1)'};
+						transition: all 0.2s ease;
+						transform: {openFolderHovered ? 'scale(1.05) translateY(-1px)' : 'scale(1)'};
+						box-shadow: {openFolderHovered ? '0 4px 16px rgba(255, 214, 10, 0.3)' : '0 2px 8px rgba(0, 0, 0, 0.2)'};
 					"
 					onmouseenter={() => openFolderHovered = true}
 					onmouseleave={() => openFolderHovered = false}

@@ -45,17 +45,17 @@
 	}
 </script>
 
-<div style="display: flex; align-items: center; height: 36px; padding: 0 10px; border-bottom: 1px solid var(--border-default); background: var(--bg-surface); gap: 6px;">
+<div style="display: flex; align-items: center; height: 40px; padding: 0 12px; background: linear-gradient(180deg, rgba(25, 31, 40, 0.95) 0%, rgba(18, 23, 31, 0.9) 100%); box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2), inset 0 1px 0 rgba(255, 255, 255, 0.04); gap: 8px; position: relative; z-index: 2; backdrop-filter: blur(8px);">
 	<!-- Live indicator when ready -->
 	{#if preview.status === 'ready'}
-		<div style="display: flex; align-items: center; gap: 4px; height: 20px; padding: 0 6px; background: rgba(72, 199, 142, 0.12); border-radius: 4px; font-size: 10px; font-weight: 600; color: #48c78e; white-space: nowrap; letter-spacing: 0.3px; text-transform: uppercase;">
-			<div style="width: 6px; height: 6px; border-radius: 50%; background: #48c78e; animation: glow 2s ease-in-out infinite;"></div>
+		<div style="display: flex; align-items: center; gap: 5px; height: 22px; padding: 0 8px; background: rgba(72, 199, 142, 0.12); border: 1px solid rgba(72, 199, 142, 0.2); border-radius: 8px; font-size: 10px; font-weight: 700; color: #48c78e; white-space: nowrap; letter-spacing: 0.5px; text-transform: uppercase; box-shadow: 0 0 12px rgba(72, 199, 142, 0.1);">
+			<div style="width: 6px; height: 6px; border-radius: 50%; background: #48c78e; animation: glow 2s ease-in-out infinite; box-shadow: 0 0 6px rgba(72, 199, 142, 0.5);"></div>
 			Live
 		</div>
 	{/if}
 
 	<!-- URL bar -->
-	<div style="flex: 1; display: flex; align-items: center; height: 26px; background: var(--bg-elevated); border: 1px solid var(--border-default); border-radius: 6px; padding: 0 8px; gap: 6px;">
+	<div style="flex: 1; display: flex; align-items: center; height: 26px; background: var(--bg-primary); border: 1px solid rgba(255, 255, 255, 0.04); border-radius: 8px; padding: 0 8px; gap: 6px; box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.25);">
 		<svg width="12" height="12" viewBox="0 0 16 16" fill="var(--text-muted)">
 			<path d="M8 0C3.58 0 0 3.58 0 8s3.58 8 8 8 8-3.58 8-8-3.58-8-8-8zm6.5 8a6.47 6.47 0 0 1-.87 3.25l-.15-.22c-.22-.34-.52-.63-.85-.85l-.15-.1a5.03 5.03 0 0 0 .92-2.08h1.1zm-1.1-1h-1.1a5.03 5.03 0 0 0-.92-2.08l.15-.1c.33-.22.63-.51.85-.85l.15-.22A6.47 6.47 0 0 1 14.5 7z"/>
 		</svg>
@@ -115,7 +115,7 @@
 	<!-- Viewport selector -->
 	<div style="position: relative;">
 		<button
-			style="display: flex; align-items: center; gap: 4px; height: 26px; padding: 0 8px; background: {viewportHovered ? 'var(--bg-elevated)' : 'transparent'}; border: 1px solid {viewportHovered ? 'var(--border-bright)' : 'var(--border-default)'}; border-radius: 6px; color: {viewportHovered ? 'var(--text-primary)' : 'var(--text-secondary)'}; cursor: pointer; font-family: var(--font-ui); font-size: 11px; transition: all 0.12s ease;"
+			style="display: flex; align-items: center; gap: 4px; height: 28px; padding: 0 10px; background: {viewportHovered ? 'rgba(255, 255, 255, 0.06)' : 'rgba(255, 255, 255, 0.02)'}; border: 1px solid {viewportHovered ? 'rgba(255, 255, 255, 0.1)' : 'rgba(255, 255, 255, 0.05)'}; border-radius: 8px; color: {viewportHovered ? 'var(--text-primary)' : 'var(--text-secondary)'}; cursor: pointer; font-family: var(--font-ui); font-size: 11px; transition: all 0.15s ease; box-shadow: {viewportHovered ? '0 2px 6px rgba(0,0,0,0.2)' : 'none'};"
 			onmouseenter={() => viewportHovered = true}
 			onmouseleave={() => viewportHovered = false}
 			onclick={() => dropdownOpen = !dropdownOpen}

@@ -14,6 +14,7 @@
 	let syncHovered = $state(false);
 	let syncing = $state(false);
 	let syncError = $state('');
+	let syncSuccess = $state(false);
 	let dopplerLinkOpen = $state(false);
 	let dopplerProjects = $state<DopplerProject[]>([]);
 	let dopplerConfigs = $state<DopplerConfig[]>([]);
@@ -167,6 +168,7 @@
 		}
 		syncing = true;
 		syncError = '';
+		syncSuccess = false;
 		try {
 			console.log('[doppler] fetching secrets for', proj, conf);
 			const secrets = await fetchSecrets(token, proj, conf);
@@ -185,6 +187,8 @@
 			console.log('[doppler] saved env vars, restarting preview');
 			await preview.openProject(workspace.path);
 			console.log('[doppler] preview restarted');
+			syncSuccess = true;
+			setTimeout(() => { syncSuccess = false; }, 3000);
 		} catch (e) {
 			console.error('[doppler] sync failed:', e);
 			syncError = e instanceof Error ? e.message : String(e);
@@ -201,11 +205,11 @@
 
 {#if preview.envPanelOpen}
 	<div style="
-		border-bottom: 1px solid var(--border-default);
+		box-shadow: 0 2px 4px rgba(0, 0, 0, 0.15);
 		background: var(--bg-surface);
 		padding: 10px 12px;
 		animation: slideDown 0.15s ease-out;
-		max-height: 320px;
+		max-height: 400px;
 		overflow-y: auto;
 	">
 		<!-- Header -->
@@ -336,26 +340,6 @@
 				Add Variable
 			</button>
 
-			{#if dopplerConfigured}
-				<button
-					style="display: flex; align-items: center; gap: 4px; height: 26px; padding: 0 10px; background: {syncHovered ? 'rgba(108, 71, 255, 0.2)' : 'var(--bg-elevated)'}; border: 1px solid {syncHovered ? '#6C47FF' : 'var(--border-default)'}; border-radius: 5px; color: {syncHovered ? '#6C47FF' : 'var(--text-secondary)'}; cursor: pointer; font-family: var(--font-ui); font-size: 11px; font-weight: 500; transition: all 0.12s ease; opacity: {syncing ? 0.7 : 1};"
-					onmouseenter={() => syncHovered = true}
-					onmouseleave={() => syncHovered = false}
-					onclick={handleDopplerSync}
-					disabled={syncing}
-				>
-					{#if syncing}
-						Syncing...
-					{:else}
-						<svg width="10" height="10" viewBox="0 0 10 10" fill="currentColor">
-							<path d="M5 1.5a3.5 3.5 0 1 0 2.84 1.46.5.5 0 0 1 .82-.57A4.5 4.5 0 1 1 5 .5v1z"/>
-							<path d="M5 0a.5.5 0 0 1 .354.146l1.5 1.5a.5.5 0 0 1-.708.708L5 1.207 3.854 2.354a.5.5 0 1 1-.708-.708l1.5-1.5A.5.5 0 0 1 5 0z"/>
-						</svg>
-						Sync Doppler
-					{/if}
-				</button>
-			{/if}
-
 			{#if preview.envVars.some(v => v.key.trim())}
 				<button
 					style="display: flex; align-items: center; gap: 4px; height: 26px; padding: 0 12px; background: {applyHovered ? 'var(--banana-yellow)' : 'rgba(255, 214, 10, 0.2)'}; border: 1px solid var(--banana-yellow); border-radius: 5px; color: {applyHovered ? '#0D1117' : 'var(--banana-yellow)'}; cursor: pointer; font-family: var(--font-ui); font-size: 11px; font-weight: 600; transition: all 0.12s ease; opacity: {applying ? 0.7 : 1};"
@@ -371,7 +355,7 @@
 							<path d="M5 1.5a3.5 3.5 0 1 0 2.84 1.46.5.5 0 0 1 .82-.57A4.5 4.5 0 1 1 5 .5v1z"/>
 							<path d="M5 0a.5.5 0 0 1 .354.146l1.5 1.5a.5.5 0 0 1-.708.708L5 1.207 3.854 2.354a.5.5 0 1 1-.708-.708l1.5-1.5A.5.5 0 0 1 5 0z"/>
 						</svg>
-						Apply & Restart
+						Apply & Restart Preview
 					{/if}
 				</button>
 			{/if}
@@ -395,6 +379,36 @@
 					>Add token in Settings</button>
 				</span>
 			</div>
+		{:else if dopplerConfigured && !dopplerLinkOpen}
+			<!-- Connected state: show linked project/config with Sync and Change -->
+			<div style="margin-top: 8px; padding: 8px 10px; background: rgba(108, 71, 255, 0.08); border: 1px solid rgba(108, 71, 255, 0.25); border-radius: 6px; display: flex; align-items: center; gap: 8px;">
+				<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#6C47FF" stroke-width="1.5"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+				<div style="flex: 1; display: flex; align-items: center; gap: 6px; min-width: 0;">
+					<span style="font-family: var(--font-mono); font-size: 11px; color: #6C47FF; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{preview.dopplerProject}</span>
+					<span style="font-family: var(--font-ui); font-size: 10px; color: var(--text-muted);">/</span>
+					<span style="font-family: var(--font-mono); font-size: 11px; color: var(--text-primary); background: rgba(108, 71, 255, 0.15); padding: 1px 6px; border-radius: 3px; white-space: nowrap;">{preview.dopplerConfig}</span>
+					{#if syncSuccess}
+						<span style="font-family: var(--font-ui); font-size: 10px; color: #4ade80; font-weight: 500; animation: fadeIn 0.2s ease;">Synced</span>
+					{/if}
+				</div>
+				<button
+					style="height: 24px; padding: 0 10px; background: {syncHovered ? 'rgba(108, 71, 255, 0.2)' : 'transparent'}; border: 1px solid {syncHovered ? '#6C47FF' : 'rgba(108, 71, 255, 0.3)'}; border-radius: 4px; color: {syncHovered ? '#6C47FF' : 'var(--text-secondary)'}; cursor: pointer; font-family: var(--font-ui); font-size: 10px; font-weight: 500; transition: all 0.12s ease; opacity: {syncing ? 0.7 : 1}; white-space: nowrap;"
+					onmouseenter={() => syncHovered = true}
+					onmouseleave={() => syncHovered = false}
+					onclick={handleDopplerSync}
+					disabled={syncing}
+				>
+					{syncing ? 'Syncing...' : 'Sync & Restart'}
+				</button>
+				<button
+					style="height: 24px; padding: 0 8px; background: transparent; border: 1px solid var(--border-default); border-radius: 4px; color: var(--text-muted); cursor: pointer; font-family: var(--font-ui); font-size: 10px; font-weight: 500; transition: all 0.12s ease; white-space: nowrap;"
+					onmouseenter={(e) => { (e.currentTarget as HTMLElement).style.borderColor = 'var(--banana-yellow)'; (e.currentTarget as HTMLElement).style.color = 'var(--text-primary)'; }}
+					onmouseleave={(e) => { (e.currentTarget as HTMLElement).style.borderColor = 'var(--border-default)'; (e.currentTarget as HTMLElement).style.color = 'var(--text-muted)'; }}
+					onclick={openDopplerLink}
+				>
+					Change
+				</button>
+			</div>
 		{:else if dopplerPartial && !dopplerLinkOpen}
 			<div style="margin-top: 8px;">
 				<button
@@ -409,13 +423,13 @@
 			</div>
 		{/if}
 
-		<!-- Inline Doppler linker -->
-		{#if dopplerLinkOpen && !dopplerConfigured}
-			<div style="margin-top: 8px; padding: 8px 10px; background: rgba(108, 71, 255, 0.06); border: 1px solid rgba(108, 71, 255, 0.15); border-radius: 6px; display: flex; flex-direction: column; gap: 8px;">
+		<!-- Inline Doppler linker (shows for both new links AND changing existing config) -->
+		{#if dopplerLinkOpen}
+			<div style="margin-top: 8px; padding: 10px 12px; background: rgba(108, 71, 255, 0.06); border: 1px solid rgba(108, 71, 255, 0.2); border-radius: 6px; display: flex; flex-direction: column; gap: 8px;">
 				<div style="display: flex; align-items: center; justify-content: space-between;">
 					<div style="display: flex; align-items: center; gap: 6px;">
 						<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#6C47FF" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-						<span style="font-family: var(--font-ui); font-size: 11px; font-weight: 600; color: #6C47FF;">Link Doppler</span>
+						<span style="font-family: var(--font-ui); font-size: 11px; font-weight: 600; color: #6C47FF;">{dopplerConfigured ? 'Change Doppler Config' : 'Link Doppler'}</span>
 					</div>
 					<button
 						style="width: 18px; height: 18px; display: flex; align-items: center; justify-content: center; background: transparent; border: none; color: var(--text-muted); cursor: pointer; border-radius: 3px;"
@@ -427,7 +441,10 @@
 				</div>
 
 				{#if dopplerLinking}
-					<div style="padding: 6px 0; font-size: 12px; color: var(--banana-yellow); font-family: var(--font-ui);">Loading projects from Doppler...</div>
+					<div style="padding: 6px 0; font-size: 12px; color: var(--banana-yellow); font-family: var(--font-ui); display: flex; align-items: center; gap: 6px;">
+						<span class="sync-spinner"></span>
+						Loading projects from Doppler...
+					</div>
 				{:else if dopplerLinkError}
 					<div style="padding: 6px 8px; font-size: 12px; color: #ff6b6b; background: rgba(255, 107, 107, 0.1); border-radius: 4px; font-family: var(--font-ui);">{dopplerLinkError}</div>
 				{:else if isServiceToken || (!dopplerLinking && dopplerProjects.length === 0)}
@@ -482,19 +499,26 @@
 				{/if}
 
 				{#if dopplerConfigs.length > 0}
-					<div style="font-size: 10px; color: var(--text-muted); font-family: var(--font-ui);">Pick a config to sync secrets and restart preview:</div>
-					<div style="display: flex; gap: 4px; flex-wrap: wrap;">
+					<div style="font-size: 11px; color: var(--text-primary); font-family: var(--font-ui); font-weight: 500;">Click a config to sync secrets and restart preview:</div>
+					<div style="display: flex; gap: 6px; flex-wrap: wrap;">
 						{#each dopplerConfigs as c}
 							<button
 								onclick={() => handleDopplerConfigPick(c.name)}
-								style="padding: 6px 14px; border: 1px solid {preview.dopplerConfig === c.name ? '#6C47FF' : 'var(--border-default)'}; border-radius: 5px; cursor: pointer; font-size: 11px; font-weight: 500; font-family: var(--font-ui); transition: all 0.12s ease; background: {preview.dopplerConfig === c.name ? 'rgba(108, 71, 255, 0.15)' : 'var(--bg-elevated)'}; color: {preview.dopplerConfig === c.name ? '#6C47FF' : 'var(--text-secondary)'};"
-								onmouseenter={(e) => (e.currentTarget as HTMLElement).style.borderColor = '#6C47FF'}
-								onmouseleave={(e) => { if (preview.dopplerConfig !== c.name) (e.currentTarget as HTMLElement).style.borderColor = 'var(--border-default)'; }}
+								disabled={syncing}
+								style="padding: 8px 18px; border: 2px solid {preview.dopplerConfig === c.name ? '#6C47FF' : 'var(--border-default)'}; border-radius: 6px; cursor: {syncing ? 'wait' : 'pointer'}; font-size: 12px; font-weight: 600; font-family: var(--font-ui); transition: all 0.15s ease; background: {preview.dopplerConfig === c.name ? 'rgba(108, 71, 255, 0.2)' : 'var(--bg-elevated)'}; color: {preview.dopplerConfig === c.name ? '#6C47FF' : 'var(--text-primary)'}; opacity: {syncing ? 0.5 : 1};"
+								onmouseenter={(e) => { if (!syncing) { (e.currentTarget as HTMLElement).style.borderColor = '#6C47FF'; (e.currentTarget as HTMLElement).style.background = 'rgba(108, 71, 255, 0.15)'; (e.currentTarget as HTMLElement).style.color = '#6C47FF'; (e.currentTarget as HTMLElement).style.transform = 'translateY(-1px)'; } }}
+								onmouseleave={(e) => { if (preview.dopplerConfig !== c.name) { (e.currentTarget as HTMLElement).style.borderColor = 'var(--border-default)'; (e.currentTarget as HTMLElement).style.background = 'var(--bg-elevated)'; (e.currentTarget as HTMLElement).style.color = 'var(--text-primary)'; } (e.currentTarget as HTMLElement).style.transform = 'none'; }}
 							>
 								{c.name}
 							</button>
 						{/each}
 					</div>
+					{#if syncing}
+						<div style="padding: 4px 0; font-size: 11px; color: var(--banana-yellow); font-family: var(--font-ui); display: flex; align-items: center; gap: 6px;">
+							<span class="sync-spinner"></span>
+							Fetching secrets and restarting preview...
+						</div>
+					{/if}
 				{/if}
 			</div>
 		{/if}
@@ -512,6 +536,22 @@
 <style>
 	@keyframes slideDown {
 		from { opacity: 0; max-height: 0; padding-top: 0; padding-bottom: 0; }
-		to { opacity: 1; max-height: 320px; }
+		to { opacity: 1; max-height: 400px; }
+	}
+	@keyframes fadeIn {
+		from { opacity: 0; }
+		to { opacity: 1; }
+	}
+	.sync-spinner {
+		display: inline-block;
+		width: 12px;
+		height: 12px;
+		border: 2px solid rgba(255, 214, 10, 0.3);
+		border-top-color: var(--banana-yellow);
+		border-radius: 50%;
+		animation: spin 0.6s linear infinite;
+	}
+	@keyframes spin {
+		to { transform: rotate(360deg); }
 	}
 </style>

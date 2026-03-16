@@ -29,12 +29,12 @@
 	}
 </script>
 
-<div class="titlebar" data-tauri-drag-region style="display: flex; align-items: center; height: 38px; padding: 0 10px; background: var(--bg-surface); border-bottom: 1px solid var(--border-default); gap: 0;">
+<div class="titlebar" data-tauri-drag-region style="display: flex; align-items: center; height: 40px; padding: 0 14px; background: linear-gradient(180deg, #181E28 0%, #12171F 100%); box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.04); gap: 0; position: relative; z-index: 5; border-bottom: 1px solid rgba(255, 214, 10, 0.06);">
 	<!-- Left: Logo + Brand -->
 	<div style="display: flex; align-items: center; gap: 8px; min-width: 180px;">
-		<span class="banana-logo" style="font-size: 20px; animation: bob 3s ease-in-out infinite;">🍌</span>
-		<span style="font-family: var(--font-ui); font-weight: 700; font-size: 14px; color: var(--banana-yellow); letter-spacing: -0.3px;">Banana Code</span>
-		<span style="font-size: 10px; color: var(--text-muted); font-family: var(--font-mono);">v0.1</span>
+		<span class="banana-logo" style="font-size: 22px; animation: bob 3s ease-in-out infinite; filter: drop-shadow(0 0 10px rgba(255, 214, 10, 0.4));">🍌</span>
+		<span style="font-family: var(--font-ui); font-weight: 700; font-size: 15px; color: var(--banana-yellow); letter-spacing: -0.3px; text-shadow: 0 0 20px rgba(255, 214, 10, 0.25);">Banana Code</span>
+		<span style="font-size: 9px; color: var(--text-muted); font-family: var(--font-mono); background: rgba(255, 214, 10, 0.06); padding: 1px 6px; border-radius: 6px;">v0.1</span>
 	</div>
 
 	<!-- Center: Workspace name -->
@@ -46,7 +46,7 @@
 	<div style="display: flex; align-items: center; gap: 2px; min-width: 100px; justify-content: flex-end;">
 		<button
 			class="win-btn"
-			style="width: 32px; height: 26px; display: flex; align-items: center; justify-content: center; border: none; background: {minimizeHovered ? 'var(--bg-elevated)' : 'transparent'}; color: var(--text-secondary); border-radius: 4px; cursor: pointer; font-size: 16px; transition: all 0.12s ease;"
+			style="width: 32px; height: 26px; display: flex; align-items: center; justify-content: center; border: none; background: {minimizeHovered ? 'var(--bg-elevated)' : 'transparent'}; color: var(--text-secondary); border-radius: 6px; cursor: pointer; font-size: 16px; transition: all 0.15s ease;"
 			onmouseenter={() => minimizeHovered = true}
 			onmouseleave={() => minimizeHovered = false}
 			onclick={minimize}
@@ -56,7 +56,7 @@
 		</button>
 		<button
 			class="win-btn"
-			style="width: 32px; height: 26px; display: flex; align-items: center; justify-content: center; border: none; background: {maximizeHovered ? 'var(--bg-elevated)' : 'transparent'}; color: var(--text-secondary); border-radius: 4px; cursor: pointer; font-size: 16px; transition: all 0.12s ease;"
+			style="width: 32px; height: 26px; display: flex; align-items: center; justify-content: center; border: none; background: {maximizeHovered ? 'var(--bg-elevated)' : 'transparent'}; color: var(--text-secondary); border-radius: 6px; cursor: pointer; font-size: 16px; transition: all 0.15s ease;"
 			onmouseenter={() => maximizeHovered = true}
 			onmouseleave={() => maximizeHovered = false}
 			onclick={maximize}
@@ -66,7 +66,7 @@
 		</button>
 		<button
 			class="win-btn"
-			style="width: 32px; height: 26px; display: flex; align-items: center; justify-content: center; border: none; background: {closeHovered ? 'var(--accent-red)' : 'transparent'}; color: {closeHovered ? '#fff' : 'var(--text-secondary)'}; border-radius: 4px; cursor: pointer; font-size: 16px; transition: all 0.12s ease;"
+			style="width: 32px; height: 26px; display: flex; align-items: center; justify-content: center; border: none; background: {closeHovered ? 'var(--accent-red)' : 'transparent'}; color: {closeHovered ? '#fff' : 'var(--text-secondary)'}; border-radius: 6px; cursor: pointer; font-size: 16px; transition: all 0.15s ease;"
 			onmouseenter={() => closeHovered = true}
 			onmouseleave={() => closeHovered = false}
 			onclick={close}

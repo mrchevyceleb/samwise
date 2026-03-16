@@ -87,8 +87,8 @@
 <div style="
 	display: flex; align-items: center; gap: 8px;
 	height: 40px; padding: 0 12px;
-	border-bottom: 1px solid var(--border-default);
-	flex-shrink: 0; background: var(--bg-surface);
+	box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2), inset 0 -1px 0 rgba(255, 255, 255, 0.03);
+	flex-shrink: 0; background: linear-gradient(180deg, rgba(25, 31, 40, 0.6) 0%, rgba(18, 23, 31, 0.4) 100%); position: relative; z-index: 2;
 ">
 	{#if focused}
 		<!-- Type badge -->
@@ -115,7 +115,7 @@
 			{/if}
 		{/if}
 	{:else}
-		<span style="font-size: 13px; font-weight: 600; color: var(--text-primary);">New Chat</span>
+		<span style="font-size: 13px; font-weight: 700; color: var(--text-primary); letter-spacing: -0.2px;">New Chat</span>
 	{/if}
 
 	<div style="flex: 1;"></div>

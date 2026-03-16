@@ -35,6 +35,7 @@
 	let webviewCreated = $state(false);
 	let appliedUrl = $state('');
 	let appliedSession = $state(-1);
+	let closingWebview = $state(false);
 
 	// Watch for workspace changes and auto-open preview
 	$effect(() => {
@@ -55,28 +56,31 @@
 	// Reset webview state when preview goes back to loading (e.g. restart after Doppler sync)
 	$effect(() => {
 		if (preview.status === 'loading' && webviewCreated) {
-			// Close the old webview so we get a fresh one when the new URL arrives
+			// Close the old webview and wait for it before allowing a new one
+			closingWebview = true;
+			webviewCreated = false;
+			appliedUrl = '';
+			appliedSession = -1;
 			(async () => {
 				try {
 					const { invoke } = await import('@tauri-apps/api/core');
 					await invoke('close_preview_webview');
 				} catch { /* may not exist */ }
+				closingWebview = false;
 			})();
-			webviewCreated = false;
-			appliedUrl = '';
-			appliedSession = -1;
 		}
 	});
 
 	// Watch for URL/session becoming available and create or navigate the webview
-	// DON'T act if the overlay is showing or env setup is in progress
+	// DON'T act if the overlay is showing, env setup is in progress, or a close is pending
 	$effect(() => {
 		const currentUrl = preview.url;
 		const overlayActive = preview.missingSecretsOverlay;
 		const setupPending = preview.envSetupPending;
 		const session = preview.sessionKey;
+		const closing = closingWebview;
 
-		if (!currentUrl || !containerRef || overlayActive || setupPending) return;
+		if (!currentUrl || !containerRef || overlayActive || setupPending || closing) return;
 
 		if (!webviewCreated) {
 			createWebview(currentUrl, session);

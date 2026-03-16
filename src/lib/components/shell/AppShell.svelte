@@ -20,6 +20,8 @@
 	const workspace = getWorkspace();
 
 	let commandPaletteVisible = $state(false);
+	let leftExpandHovered = $state(false);
+	let rightExpandHovered = $state(false);
 
 	onMount(async () => {
 		// 1. Load persisted settings from disk
@@ -78,30 +80,52 @@
 
 <svelte:window onkeydown={handleGlobalKeyDown} />
 
-<div class="app-shell" style="display: flex; flex-direction: column; height: 100vh; width: 100vw; background: var(--bg-primary);">
+<div class="app-shell" style="display: flex; flex-direction: column; height: 100vh; width: 100vw; background: var(--bg-canvas);">
 	<!-- Title Bar -->
 	<TitleBar />
 
 	<!-- Main Content Area -->
-	<div style="display: flex; flex: 1; overflow: hidden;">
+	<div style="display: flex; flex: 1; overflow: hidden; gap: var(--panel-gap); padding: 0 var(--panel-gap) var(--panel-gap);">
 		<!-- Left: Agent Panel -->
 		{#if layout.leftPanelVisible}
-			<div style="width: {layout.agentPanelWidth}px; min-width: 280px; max-width: 600px; display: flex; flex-direction: column; overflow: hidden;">
+			<div style="width: {layout.agentPanelWidth}px; min-width: 280px; max-width: 600px; display: flex; flex-direction: column; overflow: hidden; border-radius: var(--panel-radius); box-shadow: var(--shadow-panel); border: var(--panel-border); border-top: 1px solid rgba(255, 214, 10, 0.08); background: linear-gradient(180deg, #161C26 0%, #11161E 100%);">
 				<AgentPanel />
 			</div>
 
 			<ResizeHandle direction="vertical" onResize={(d) => layout.agentPanelWidth = layout.agentPanelWidth + d} />
+		{:else}
+			<!-- Left panel expand tab -->
+			<button
+				title="Show Agent Panel (Ctrl+B)"
+				style="
+					width: 24px; flex-shrink: 0; display: flex; align-items: center; justify-content: center;
+					background: {leftExpandHovered ? 'rgba(255, 214, 10, 0.08)' : 'var(--bg-surface)'};
+					border: none; border-radius: 0 var(--panel-radius) var(--panel-radius) 0;
+					box-shadow: var(--shadow-sm);
+					color: {leftExpandHovered ? 'var(--banana-yellow)' : 'var(--text-muted)'};
+					cursor: pointer; transition: all 0.15s ease; writing-mode: vertical-rl;
+					font-family: var(--font-ui); font-size: 11px; letter-spacing: 0.5px;
+				"
+				onclick={() => layout.toggleLeftPanel()}
+				onmouseenter={() => leftExpandHovered = true}
+				onmouseleave={() => leftExpandHovered = false}
+			>
+				<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" style="margin-bottom: 6px; transform: rotate(0deg);">
+					<path d="M6 4l4 4-4 4"/>
+				</svg>
+				Agent
+			</button>
 		{/if}
 
 		<!-- Middle: Preview Panel + Terminal -->
-		<div style="flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 300px;">
+		<div style="flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 300px; border-radius: var(--panel-radius); box-shadow: var(--shadow-panel); border: var(--panel-border); border-top: 1px solid rgba(255, 214, 10, 0.08); background: linear-gradient(180deg, #161C26 0%, #0F1318 100%);">
 			<div style="flex: 1; overflow: hidden;">
 				<PreviewPanel />
 			</div>
 
 			{#if layout.terminalVisible}
 				<ResizeHandle direction="horizontal" onResize={(d) => layout.terminalHeight = layout.terminalHeight - d} />
-				<div style="height: {layout.terminalHeight}px; min-height: 100px; background: var(--bg-surface); border-top: 1px solid var(--border-default); display: flex; flex-direction: column; overflow: hidden;">
+				<div style="height: {layout.terminalHeight}px; min-height: 100px; background: var(--bg-surface); display: flex; flex-direction: column; overflow: hidden;">
 					<TerminalPanel />
 				</div>
 			{/if}
@@ -111,9 +135,31 @@
 		{#if layout.rightPanelVisible}
 			<ResizeHandle direction="vertical" onResize={(d) => layout.filePanelWidth = layout.filePanelWidth - d} />
 
-			<div style="width: {layout.filePanelWidth}px; min-width: 200px; max-width: 500px; display: flex; flex-direction: column; overflow: hidden;">
+			<div style="width: {layout.filePanelWidth}px; min-width: 200px; max-width: 500px; display: flex; flex-direction: column; overflow: hidden; border-radius: var(--panel-radius); box-shadow: var(--shadow-panel); border: var(--panel-border); border-top: 1px solid rgba(255, 214, 10, 0.08); background: linear-gradient(180deg, #161C26 0%, #11161E 100%);">
 				<FilePanel />
 			</div>
+		{:else}
+			<!-- Right panel expand tab -->
+			<button
+				title="Show Files Panel (Ctrl+Shift+B)"
+				style="
+					width: 24px; flex-shrink: 0; display: flex; align-items: center; justify-content: center;
+					background: {rightExpandHovered ? 'rgba(255, 214, 10, 0.08)' : 'var(--bg-surface)'};
+					border: none; border-radius: var(--panel-radius) 0 0 var(--panel-radius);
+					box-shadow: var(--shadow-sm);
+					color: {rightExpandHovered ? 'var(--banana-yellow)' : 'var(--text-muted)'};
+					cursor: pointer; transition: all 0.15s ease; writing-mode: vertical-rl;
+					font-family: var(--font-ui); font-size: 11px; letter-spacing: 0.5px;
+				"
+				onclick={() => layout.toggleRightPanel()}
+				onmouseenter={() => rightExpandHovered = true}
+				onmouseleave={() => rightExpandHovered = false}
+			>
+				<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" style="margin-bottom: 6px; transform: rotate(180deg);">
+					<path d="M6 4l4 4-4 4"/>
+				</svg>
+				Files
+			</button>
 		{/if}
 	</div>
 

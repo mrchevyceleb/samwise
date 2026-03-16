@@ -94,10 +94,11 @@
 			/>
 		{:else}
 			<!-- Empty state -->
-			<div style="flex: 1; display: flex; align-items: center; justify-content: center; color: var(--text-muted); font-size: 13px;">
-				<div style="text-align: center;">
-					<div style="font-size: 32px; margin-bottom: 8px; animation: agent-bob 4s ease-in-out infinite; color: var(--banana-yellow);">A</div>
-					<div>Create a new conversation to get started.</div>
+			<div style="flex: 1; display: flex; align-items: center; justify-content: center; color: var(--text-muted); font-size: 13px; position: relative;">
+				<div style="position: absolute; width: 200px; height: 200px; border-radius: 50%; background: radial-gradient(circle, rgba(255, 214, 10, 0.04) 0%, transparent 70%); pointer-events: none;"></div>
+				<div style="text-align: center; position: relative; z-index: 1;">
+					<div style="font-size: 36px; margin-bottom: 10px; animation: agent-bob 4s ease-in-out infinite; color: var(--banana-yellow); text-shadow: 0 0 20px rgba(255, 214, 10, 0.25); font-weight: 800; font-family: var(--font-ui);">A</div>
+					<div style="color: var(--text-muted); font-size: 12px; line-height: 1.5;">Create a new conversation<br/>to get started.</div>
 				</div>
 			</div>
 			<ChatInput

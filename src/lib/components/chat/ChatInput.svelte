@@ -56,7 +56,7 @@
 	});
 </script>
 
-<div style="padding: 8px 10px; border-top: 1px solid var(--border-default); position: relative;">
+<div style="padding: 10px 12px; position: relative; background: linear-gradient(0deg, rgba(14, 18, 24, 0.8) 0%, transparent 100%);">
 	<!-- @ mention hint -->
 	{#if showAtHint}
 		<div style="
@@ -82,9 +82,11 @@
 	<div
 		style="
 			display: flex; flex-direction: column; gap: 0;
-			background: var(--bg-elevated); border: 1px solid var(--border-default);
-			border-radius: 10px; overflow: hidden;
-			transition: border-color 0.15s ease;
+			background: linear-gradient(180deg, rgba(26, 32, 40, 0.9) 0%, rgba(20, 25, 32, 0.95) 100%);
+			border: 1px solid rgba(255, 255, 255, 0.07);
+			border-radius: 14px; overflow: hidden;
+			transition: border-color 0.2s ease, box-shadow 0.2s ease;
+			box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.04);
 			{disabled ? 'opacity: 0.6;' : ''}
 		"
 	>
@@ -104,8 +106,8 @@
 				"
 				oninput={handleInput}
 				onkeydown={handleKeydown}
-				onfocus={(e) => { const p = (e.currentTarget as HTMLElement).closest('[style*="border-radius: 10px"]') as HTMLElement | null; if (p) p.style.borderColor = 'var(--banana-yellow)'; }}
-				onblur={(e) => { const p = (e.currentTarget as HTMLElement).closest('[style*="border-radius: 10px"]') as HTMLElement | null; if (p) p.style.borderColor = 'var(--border-default)'; showAtHint = false; showSlashHint = false; }}
+				onfocus={(e) => { const p = (e.currentTarget as HTMLElement).closest('[style*="border-radius: 14px"]') as HTMLElement | null; if (p) { p.style.borderColor = 'rgba(255, 214, 10, 0.3)'; p.style.boxShadow = '0 4px 16px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(255, 214, 10, 0.1), inset 0 1px 0 rgba(255, 255, 255, 0.04)'; } }}
+				onblur={(e) => { const p = (e.currentTarget as HTMLElement).closest('[style*="border-radius: 14px"]') as HTMLElement | null; if (p) { p.style.borderColor = 'rgba(255, 255, 255, 0.07)'; p.style.boxShadow = '0 4px 16px rgba(0, 0, 0, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.04)'; } showAtHint = false; showSlashHint = false; }}
 			></textarea>
 		</div>
 
@@ -174,13 +176,14 @@
 			<!-- Send button -->
 			<button
 				style="
-					width: 28px; height: 28px; display: flex; align-items: center;
+					width: 30px; height: 30px; display: flex; align-items: center;
 					justify-content: center;
 					background: {disabled ? 'var(--text-muted)' : sendHovered ? 'var(--banana-yellow-hover)' : 'var(--banana-yellow)'};
-					border: none; border-radius: 6px;
+					border: none; border-radius: 10px;
 					cursor: {disabled ? 'not-allowed' : 'pointer'};
-					flex-shrink: 0; transition: all 0.12s ease;
-					transform: {sendHovered && !disabled ? 'scale(1.1)' : 'scale(1)'};
+					flex-shrink: 0; transition: all 0.15s ease;
+					transform: {sendHovered && !disabled ? 'scale(1.1) rotate(-5deg)' : 'scale(1)'};
+					box-shadow: {disabled ? 'none' : sendHovered ? '0 4px 16px rgba(255, 214, 10, 0.35)' : '0 2px 8px rgba(255, 214, 10, 0.2)'};
 				"
 				onmouseenter={() => sendHovered = true}
 				onmouseleave={() => sendHovered = false}

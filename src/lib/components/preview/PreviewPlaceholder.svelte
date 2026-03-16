@@ -2,10 +2,13 @@
 	let hovered = $state(false);
 </script>
 
-<div style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; gap: 16px; padding: 32px;">
+<div style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; gap: 20px; padding: 32px; position: relative; overflow: hidden;">
+	<!-- Radial glow behind banana -->
+	<div style="position: absolute; width: 300px; height: 300px; border-radius: 50%; background: radial-gradient(circle, rgba(255, 214, 10, 0.04) 0%, transparent 70%); pointer-events: none;"></div>
+
 	<!-- Big banana -->
 	<div
-		style="font-size: 72px; animation: bob 3s ease-in-out infinite; cursor: default; transition: transform 0.2s ease; transform: {hovered ? 'scale(1.15) rotate(10deg)' : 'scale(1)'}; filter: {hovered ? 'drop-shadow(0 0 20px rgba(255, 214, 10, 0.4))' : 'none'};"
+		style="font-size: 80px; animation: bob 3s ease-in-out infinite; cursor: default; transition: transform 0.3s ease, filter 0.3s ease; transform: {hovered ? 'scale(1.2) rotate(12deg)' : 'scale(1)'}; filter: drop-shadow(0 0 16px rgba(255, 214, 10, 0.2)) {hovered ? 'drop-shadow(0 0 30px rgba(255, 214, 10, 0.5))' : ''}; position: relative; z-index: 1;"
 		onmouseenter={() => hovered = true}
 		onmouseleave={() => hovered = false}
 		role="img"
@@ -14,19 +17,19 @@
 		🍌
 	</div>
 
-	<div style="text-align: center;">
-		<p style="font-size: 16px; font-weight: 600; color: var(--text-primary); margin-bottom: 6px;">
+	<div style="text-align: center; position: relative; z-index: 1;">
+		<p style="font-size: 17px; font-weight: 700; color: var(--text-primary); margin-bottom: 8px; letter-spacing: -0.3px;">
 			No preview active
 		</p>
-		<p style="font-size: 13px; color: var(--text-muted); max-width: 280px; line-height: 1.5;">
+		<p style="font-size: 13px; color: var(--text-muted); max-width: 280px; line-height: 1.6;">
 			Open a project to see your app come to life. The preview will appear here automatically.
 		</p>
 	</div>
 
 	<!-- Decorative dots -->
-	<div style="display: flex; gap: 6px; margin-top: 8px;">
+	<div style="display: flex; gap: 8px; margin-top: 4px;">
 		{#each [0, 1, 2] as i}
-			<div style="width: 6px; height: 6px; border-radius: 50%; background: var(--banana-yellow); opacity: 0.3; animation: pulse-dot 2s ease-in-out infinite; animation-delay: {i * 0.3}s;"></div>
+			<div style="width: 6px; height: 6px; border-radius: 50%; background: var(--banana-yellow); opacity: 0.4; animation: pulse-dot 2s ease-in-out infinite; animation-delay: {i * 0.3}s; box-shadow: 0 0 8px rgba(255, 214, 10, 0.3);"></div>
 		{/each}
 	</div>
 </div>

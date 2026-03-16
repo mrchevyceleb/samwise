@@ -60,7 +60,7 @@
 	<!-- Activity indicator -->
 	{#if agent.currentActivity}
 		<div style="
-			padding: 4px 14px; border-top: 1px solid var(--border-default);
+			padding: 4px 14px; box-shadow: 0 -1px 3px rgba(0, 0, 0, 0.1);
 			font-size: 11px; color: var(--banana-yellow-dim);
 			font-style: italic; flex-shrink: 0;
 			display: flex; align-items: center; gap: 6px;

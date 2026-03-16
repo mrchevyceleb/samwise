@@ -100,12 +100,12 @@
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div style="
 	width: {collapsed ? '44px' : '220px'}; display: flex; flex-direction: column;
-	height: 100%; border-right: 1px solid var(--border-default);
-	background: var(--bg-surface); flex-shrink: 0;
-	transition: width 0.2s ease; overflow: hidden;
+	height: 100%; box-shadow: 2px 0 8px rgba(0, 0, 0, 0.2);
+	background: linear-gradient(180deg, rgba(18, 23, 31, 0.8) 0%, rgba(14, 18, 24, 0.9) 100%); flex-shrink: 0;
+	transition: width 0.2s ease; overflow: hidden; position: relative; z-index: 2; border-right: 1px solid rgba(255, 255, 255, 0.03);
 ">
 	<!-- Collapse toggle -->
-	<div style="display: flex; align-items: center; height: 36px; padding: 0 {collapsed ? '10px' : '10px'}; border-bottom: 1px solid var(--border-default); flex-shrink: 0;">
+	<div style="display: flex; align-items: center; height: 40px; padding: 0 {collapsed ? '10px' : '10px'}; box-shadow: 0 2px 6px rgba(0, 0, 0, 0.15); flex-shrink: 0; position: relative; z-index: 1;">
 		<button
 			style="
 				border: none; background: none; cursor: pointer; padding: 4px;
@@ -132,7 +132,8 @@
 			<div style="
 				display: flex; align-items: center; gap: 6px; padding: 6px 8px;
 				background: var(--bg-primary); border: 1px solid {searchFocused ? 'var(--banana-yellow)' : 'var(--border-default)'};
-				border-radius: 6px; transition: border-color 0.15s ease;
+				border-radius: 8px; transition: border-color 0.15s ease, box-shadow 0.15s ease;
+				box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.25);
 			">
 				<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="2" style="flex-shrink: 0;">
 					<circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
@@ -149,27 +150,29 @@
 		</div>
 
 		<!-- New conversation buttons -->
-		<div style="padding: 4px 10px 8px; display: flex; gap: 4px; flex-shrink: 0;">
+		<div style="padding: 6px 10px 10px; display: flex; gap: 6px; flex-shrink: 0;">
 			<button
 				style="
-					flex: 1; padding: 7px 0; border: 1px solid var(--border-default); border-radius: 8px;
+					flex: 1; padding: 8px 0; border: 1px solid rgba(255, 214, 10, 0.15); border-radius: 10px;
 					cursor: pointer; font-size: 11px; font-family: var(--font-ui); font-weight: 600;
-					transition: all 0.15s ease; background: var(--bg-primary); color: var(--text-secondary);
+					transition: all 0.2s ease; background: rgba(255, 214, 10, 0.04); color: var(--text-secondary);
+					box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15);
 				"
-				onmouseenter={(e) => { const t = e.currentTarget as HTMLElement; t.style.borderColor = 'var(--banana-yellow)'; t.style.color = 'var(--banana-yellow)'; t.style.background = 'rgba(255,214,10,0.08)'; }}
-				onmouseleave={(e) => { const t = e.currentTarget as HTMLElement; t.style.borderColor = 'var(--border-default)'; t.style.color = 'var(--text-secondary)'; t.style.background = 'var(--bg-primary)'; }}
+				onmouseenter={(e) => { const t = e.currentTarget as HTMLElement; t.style.borderColor = 'rgba(255,214,10,0.4)'; t.style.color = 'var(--banana-yellow)'; t.style.background = 'rgba(255,214,10,0.1)'; t.style.boxShadow = '0 2px 8px rgba(255, 214, 10, 0.12)'; t.style.transform = 'translateY(-1px)'; }}
+				onmouseleave={(e) => { const t = e.currentTarget as HTMLElement; t.style.borderColor = 'rgba(255,214,10,0.15)'; t.style.color = 'var(--text-secondary)'; t.style.background = 'rgba(255,214,10,0.04)'; t.style.boxShadow = '0 1px 4px rgba(0,0,0,0.15)'; t.style.transform = 'translateY(0)'; }}
 				onclick={handleNewAgent}
 			>
 				+ Agent
 			</button>
 			<button
 				style="
-					flex: 1; padding: 7px 0; border: 1px solid var(--border-default); border-radius: 8px;
+					flex: 1; padding: 8px 0; border: 1px solid rgba(139, 92, 246, 0.15); border-radius: 10px;
 					cursor: pointer; font-size: 11px; font-family: var(--font-ui); font-weight: 600;
-					transition: all 0.15s ease; background: var(--bg-primary); color: var(--text-secondary);
+					transition: all 0.2s ease; background: rgba(139, 92, 246, 0.04); color: var(--text-secondary);
+					box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15);
 				"
-				onmouseenter={(e) => { const t = e.currentTarget as HTMLElement; t.style.borderColor = 'rgba(139,92,246,0.6)'; t.style.color = 'rgba(139,92,246,0.9)'; t.style.background = 'rgba(139,92,246,0.08)'; }}
-				onmouseleave={(e) => { const t = e.currentTarget as HTMLElement; t.style.borderColor = 'var(--border-default)'; t.style.color = 'var(--text-secondary)'; t.style.background = 'var(--bg-primary)'; }}
+				onmouseenter={(e) => { const t = e.currentTarget as HTMLElement; t.style.borderColor = 'rgba(139,92,246,0.4)'; t.style.color = 'rgba(139,92,246,0.9)'; t.style.background = 'rgba(139,92,246,0.1)'; t.style.boxShadow = '0 2px 8px rgba(139, 92, 246, 0.12)'; t.style.transform = 'translateY(-1px)'; }}
+				onmouseleave={(e) => { const t = e.currentTarget as HTMLElement; t.style.borderColor = 'rgba(139,92,246,0.15)'; t.style.color = 'var(--text-secondary)'; t.style.background = 'rgba(139,92,246,0.04)'; t.style.boxShadow = '0 1px 4px rgba(0,0,0,0.15)'; t.style.transform = 'translateY(0)'; }}
 				onclick={handleNewClaudeCode}
 			>
 				+ Claude Code

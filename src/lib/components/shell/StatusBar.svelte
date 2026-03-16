@@ -14,7 +14,7 @@
 	let aiSettingsHovered = $state(false);
 </script>
 
-<div class="statusbar" style="display: flex; align-items: center; height: 24px; padding: 0 12px; background: var(--bg-surface); border-top: 1px solid var(--border-default); font-size: 11px; font-family: var(--font-mono); gap: 12px;">
+<div class="statusbar" style="display: flex; align-items: center; height: 28px; padding: 0 14px; background: linear-gradient(0deg, #0E1218 0%, #141920 100%); box-shadow: 0 -2px 8px rgba(0, 0, 0, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.04); font-size: 11px; font-family: var(--font-mono); gap: 12px; position: relative; z-index: 5;">
 	<!-- Left section -->
 	<div style="display: flex; align-items: center; gap: 10px; flex: 1;">
 		<!-- Git branch -->
@@ -105,9 +105,9 @@
 		</button>
 
 		<div style="display: flex; align-items: center; gap: 4px;">
-			<span style="width: 6px; height: 6px; border-radius: 50%; background: var(--accent-green); display: inline-block; animation: pulse-dot 2s ease-in-out infinite;"></span>
+			<span style="width: 6px; height: 6px; border-radius: 50%; background: var(--accent-green); display: inline-block; animation: pulse-dot 2s ease-in-out infinite; box-shadow: 0 0 6px rgba(63, 185, 80, 0.4);"></span>
 			<span style="color: var(--text-muted);">Ready</span>
 		</div>
-		<span style="color: var(--banana-yellow-dim); font-weight: 600;">FREE</span>
+		<span style="color: var(--banana-yellow); font-weight: 600; font-size: 9px; background: rgba(255, 214, 10, 0.1); padding: 1px 8px; border-radius: 8px; box-shadow: 0 0 8px rgba(255, 214, 10, 0.1);">FREE</span>
 	</div>
 </div>

@@ -5,11 +5,13 @@
   --banana-yellow: #FFD60A;
   --banana-yellow-hover: #FFE347;
   --banana-yellow-dim: #B89B00;
-  --bg-primary: #0D1117;
-  --bg-surface: #161B22;
-  --bg-elevated: #1C2129;
-  --border-default: #30363D;
-  --border-bright: #484F58;
+  --bg-canvas: #06080C;
+  --bg-primary: #0B0F15;
+  --bg-surface: #12171F;
+  --bg-elevated: #1A2030;
+  --border-default: #232830;
+  --border-subtle: #1A1F26;
+  --border-bright: #3A424D;
   --text-primary: #E6EDF3;
   --text-secondary: #8B949E;
   --text-muted: #6E7681;
@@ -20,6 +22,18 @@
   --accent-orange: #D29922;
   --font-ui: 'Space Grotesk', system-ui, -apple-system, sans-serif;
   --font-mono: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', monospace;
+
+  /* Depth & shadows */
+  --shadow-panel: 0 4px 20px rgba(0, 0, 0, 0.55), 0 1px 4px rgba(0, 0, 0, 0.35), 0 0 0 1px rgba(255, 255, 255, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  --shadow-sm: 0 2px 6px rgba(0, 0, 0, 0.3);
+  --shadow-toolbar: 0 1px 4px rgba(0, 0, 0, 0.25);
+  --glow-banana: 0 0 16px rgba(255, 214, 10, 0.12);
+  --glow-banana-strong: 0 0 20px rgba(255, 214, 10, 0.2), 0 0 40px rgba(255, 214, 10, 0.05);
+
+  /* Panel layout tokens */
+  --panel-radius: 12px;
+  --panel-gap: 6px;
+  --panel-border: 1px solid rgba(255, 255, 255, 0.08);
 }
 
 * {
@@ -31,7 +45,7 @@
 html, body {
   height: 100%;
   overflow: hidden;
-  background: var(--bg-primary);
+  background: var(--bg-canvas);
   color: var(--text-primary);
   font-family: var(--font-ui);
   font-size: 13px;
@@ -41,8 +55,8 @@ html, body {
 }
 
 ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 6px;
+  height: 6px;
 }
 ::-webkit-scrollbar-track {
   background: transparent;

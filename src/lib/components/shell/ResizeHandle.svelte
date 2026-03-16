@@ -47,28 +47,28 @@
 <style>
 	.resize-handle {
 		position: relative;
-		background: var(--border-default);
+		background: transparent;
 		transition: background 0.15s ease;
 		flex-shrink: 0;
 		z-index: 10;
 	}
 	.resize-handle.vertical {
-		width: 3px;
+		width: 4px;
 		cursor: col-resize;
 	}
 	.resize-handle.horizontal {
-		height: 3px;
+		height: 4px;
 		cursor: row-resize;
 	}
 	.resize-handle.hovered,
 	.resize-handle.active {
-		background: var(--banana-yellow);
+		background: rgba(255, 214, 10, 0.15);
 	}
 	.handle-indicator {
 		position: absolute;
-		border-radius: 2px;
+		border-radius: 3px;
 		background: transparent;
-		transition: background 0.15s ease;
+		transition: background 0.15s ease, box-shadow 0.15s ease;
 	}
 	.vertical .handle-indicator {
 		top: 50%;
@@ -86,6 +86,7 @@
 	}
 	.resize-handle.hovered .handle-indicator,
 	.resize-handle.active .handle-indicator {
-		background: rgba(255, 214, 10, 0.3);
+		background: rgba(255, 214, 10, 0.4);
+		box-shadow: 0 0 8px rgba(255, 214, 10, 0.2);
 	}
 </style>
