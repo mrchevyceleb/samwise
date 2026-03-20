@@ -1,6 +1,8 @@
 <script lang="ts">
-	import type { TaskPriority } from '$lib/types';
+	import type { TaskPriority, AeProject } from '$lib/types';
 	import { getTaskStore } from '$lib/stores/tasks.svelte';
+	import { safeInvoke } from '$lib/utils/tauri';
+	import { onMount } from 'svelte';
 
 	interface Props {
 		onClose: () => void;
@@ -18,6 +20,47 @@
 	let previewUrl = $state('');
 	let saving = $state(false);
 	let quickMode = $state(true);
+
+	let projects = $state<AeProject[]>([]);
+	let projectsLoading = $state(true);
+
+	// Group projects by client for optgroup rendering
+	let groupedProjects = $derived(() => {
+		const groups: Record<string, AeProject[]> = {};
+		for (const p of projects) {
+			const key = p.client || 'Uncategorized';
+			if (!groups[key]) groups[key] = [];
+			groups[key].push(p);
+		}
+		return groups;
+	});
+
+	onMount(async () => {
+		const result = await safeInvoke<AeProject[]>('supabase_fetch_projects');
+		if (result) {
+			projects = result;
+		}
+		projectsLoading = false;
+	});
+
+	function handleProjectSelect(e: Event) {
+		const select = e.currentTarget as HTMLSelectElement;
+		const selectedId = select.value;
+		if (!selectedId) {
+			project = '';
+			repoUrl = '';
+			repoPath = '';
+			previewUrl = '';
+			return;
+		}
+		const found = projects.find(p => p.id === selectedId);
+		if (found) {
+			project = found.name;
+			repoUrl = found.repo_url || '';
+			repoPath = found.repo_path || '';
+			previewUrl = found.preview_url || '';
+		}
+	}
 
 	let titleError = $derived(!title.trim() ? 'Title is required' : '');
 
@@ -145,20 +188,36 @@
 			<label style="font-size: 11px; font-weight: 600; color: var(--text-secondary); display: block; margin-bottom: 4px;">
 				Project
 			</label>
-			<input
-				type="text"
-				bind:value={project}
-				placeholder="e.g. agent-one, wecare-dash"
+			<select
+				onchange={handleProjectSelect}
 				style="
 					width: 100%; padding: 10px 12px;
 					background: var(--bg-primary); border: 1px solid var(--border-default);
 					border-radius: 8px; color: var(--text-primary);
 					font-family: var(--font-ui); font-size: 13px;
 					outline: none; transition: border-color 0.15s;
+					cursor: pointer; appearance: none;
+					background-image: url('data:image/svg+xml;charset=UTF-8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2212%22%20height%3D%2212%22%20viewBox%3D%220%200%2012%2012%22%3E%3Cpath%20fill%3D%22%236e7681%22%20d%3D%22M2%204l4%204%204-4%22%2F%3E%3C%2Fsvg%3E');
+					background-repeat: no-repeat;
+					background-position: right 12px center;
+					padding-right: 32px;
 				"
 				onfocus={(e) => { (e.currentTarget as HTMLElement).style.borderColor = 'rgba(99, 102, 241, 0.4)'; }}
 				onblur={(e) => { (e.currentTarget as HTMLElement).style.borderColor = 'var(--border-default)'; }}
-			/>
+			>
+				<option value="" style="color: var(--text-muted);">
+					{projectsLoading ? 'Loading projects...' : 'Select a project'}
+				</option>
+				{#each Object.entries(groupedProjects()) as [client, clientProjects]}
+					<optgroup label={client} style="background: var(--bg-primary); color: var(--text-secondary);">
+						{#each clientProjects as p}
+							<option value={p.id} style="background: var(--bg-primary); color: var(--text-primary);">
+								{p.name}
+							</option>
+						{/each}
+					</optgroup>
+				{/each}
+			</select>
 		</div>
 
 		<!-- Priority -->

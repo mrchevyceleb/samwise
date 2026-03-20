@@ -227,6 +227,14 @@ pub async fn upload_to_storage(config: &SupabaseConfig, bucket: &str, path: &str
     Ok(format!("{}/storage/v1/object/public/{}/{}", config.url, bucket, path))
 }
 
+// ── Projects (internal) ─────────────────────────────────────────────
+
+pub async fn fetch_projects(config: &SupabaseConfig) -> Result<Value, String> {
+    let client = build_client(config)?;
+    let url = format!("{}?order=client.asc,name.asc", rest_url(config, "ae_projects"));
+    handle_response(client.get(&url).send().await.map_err(|e| e.to_string())?).await
+}
+
 // ── Crons (internal) ────────────────────────────────────────────────
 
 pub async fn fetch_crons(config: &SupabaseConfig) -> Result<Value, String> {
@@ -438,6 +446,14 @@ pub async fn supabase_update_trigger(id: String, updates: Value, state: tauri::S
     let client = build_client(&config)?;
     let url = format!("{}?id=eq.{}", rest_url(&config, "ae_triggers"), id);
     handle_response(client.patch(&url).json(&updates).send().await.map_err(|e| e.to_string())?).await
+}
+
+// ── Project Commands ────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn supabase_fetch_projects(state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
+    let config = state.get_config().await;
+    fetch_projects(&config).await
 }
 
 // ── Worker Commands ─────────────────────────────────────────────────

@@ -95,6 +95,17 @@ export interface AeWorker {
   created_at: string;
 }
 
+export interface AeProject {
+  id: string;
+  name: string;
+  repo_url: string | null;
+  repo_path: string | null;
+  preview_url: string | null;
+  client: string | null;
+  deploy_method: string | null;
+  created_at: string;
+}
+
 /** Kanban column definition */
 export interface KanbanColumn {
   status: TaskStatus;
