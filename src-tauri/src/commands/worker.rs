@@ -171,6 +171,11 @@ async fn worker_loop(
             let _ = evaluate_crons(&config, &app).await;
         }
 
+        // Evaluate triggers every 30 seconds (every 6th tick)
+        if tick % 6 == 0 {
+            let _ = evaluate_triggers(&config, &app).await;
+        }
+
         // Check for new chat messages every 5 seconds
         if tick % 1 == 0 {
             let _ = check_chat_messages(&config, &app).await;
@@ -269,6 +274,82 @@ async fn evaluate_crons(config: &SupabaseConfig, app: &tauri::AppHandle) -> Resu
     Ok(())
 }
 
+// ── Trigger Evaluation ──────────────────────────────────────────────
+
+async fn evaluate_triggers(config: &super::supabase::SupabaseConfig, app: &tauri::AppHandle) -> Result<(), String> {
+    let triggers = supabase::fetch_triggers(config).await?;
+    let Some(arr) = triggers.as_array() else { return Ok(()); };
+
+    for trigger in arr {
+        let enabled = trigger.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !enabled { continue; }
+
+        let trigger_id = trigger.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+        let trigger_name = trigger.get("name").and_then(|v| v.as_str()).unwrap_or("Unnamed trigger");
+        let _source_type = trigger.get("source_type").and_then(|v| v.as_str()).unwrap_or_default();
+
+        // Check for unprocessed trigger events
+        let events = match supabase::fetch_trigger_events(config, trigger_id).await {
+            Ok(e) => e,
+            Err(e) => {
+                // Table might not exist yet, just skip silently
+                log::debug!("[worker] Trigger event fetch failed for '{}': {}", trigger_name, e);
+                continue;
+            }
+        };
+
+        let Some(event_arr) = events.as_array() else { continue; };
+
+        for event in event_arr {
+            let event_id = event.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+            let payload = event.get("payload").cloned().unwrap_or(serde_json::json!({}));
+
+            // Get task template and merge with event payload
+            let template = match trigger.get("task_template") {
+                Some(t) if t.is_object() => t.clone(),
+                _ => {
+                    log::warn!("[worker] Trigger '{}' has no valid task_template", trigger_name);
+                    continue;
+                }
+            };
+
+            let mut task = template.clone();
+            if let Some(obj) = task.as_object_mut() {
+                obj.insert("source".to_string(), serde_json::json!("trigger"));
+                obj.insert("trigger_id".to_string(), serde_json::json!(trigger_id));
+                if !obj.contains_key("status") {
+                    obj.insert("status".to_string(), serde_json::json!("queued"));
+                }
+                if !obj.contains_key("priority") {
+                    obj.insert("priority".to_string(), serde_json::json!("medium"));
+                }
+                // Merge event payload into task context
+                obj.insert("context".to_string(), payload);
+            }
+
+            match supabase::create_task(config, &task).await {
+                Ok(_) => {
+                    log::info!("[worker] Trigger '{}' created task from event {}", trigger_name, event_id);
+                    emit_worker_event(app, "trigger_fired", &format!("Trigger '{}' created a new task", trigger_name), None);
+                    // Only mark processed on success - failed events retry next cycle
+                    let _ = supabase::mark_trigger_event_processed(config, event_id).await;
+                }
+                Err(e) => {
+                    log::error!("[worker] Trigger '{}' failed to create task: {}", trigger_name, e);
+                }
+            }
+        }
+
+        // Update last_checked on the trigger
+        let now = chrono::Utc::now();
+        let _ = supabase::update_trigger(config, trigger_id, &serde_json::json!({
+            "last_checked": now.to_rfc3339(),
+        })).await;
+    }
+
+    Ok(())
+}
+
 // ── Task Execution ──────────────────────────────────────────────────
 
 async fn execute_task(
@@ -281,8 +362,13 @@ async fn execute_task(
     let title = task.get("title").and_then(|v| v.as_str()).unwrap_or("Untitled").to_string();
     let description = task.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let repo_path = task.get("repo_path").and_then(|v| v.as_str()).unwrap_or(".").to_string();
-    let branch = task.get("branch").and_then(|v| v.as_str()).map(|s| s.to_string());
     let preview_url = task.get("preview_url").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+    // Resolve branch name ONCE - used for both checkout and PR creation
+    let branch: Option<String> = task.get("branch")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| Some(format!("agent-one/{}", uuid::Uuid::new_v4())));
 
     // 1. Post initial comment
     agent_comment(config, &task_id, &format!("On it. Setting up for: {}", title)).await;
@@ -295,7 +381,7 @@ async fn execute_task(
 
     emit_worker_event(app, "task_working", &format!("Working on: {}", title), Some(&task_id));
 
-    // 3. If branch specified, check it out
+    // 3. Check out branch (always have one now - user-specified or auto-generated)
     if let Some(ref branch_name) = branch {
         let _ = tokio::process::Command::new("git")
             .args(["checkout", "-B", branch_name])
@@ -312,13 +398,6 @@ async fn execute_task(
 
         let _ = take_screenshot(preview, &format!("{}\\before-desktop.png", screenshot_dir), "1280,720").await;
         let _ = take_screenshot(preview, &format!("{}\\before-mobile.png", screenshot_dir), "393,852").await;
-
-        let _ = supabase::update_task(config, &task_id, &serde_json::json!({
-            "screenshots_before": [
-                format!("{}\\before-desktop.png", screenshot_dir),
-                format!("{}\\before-mobile.png", screenshot_dir),
-            ],
-        })).await;
     }
 
     // 5. Run Claude Code CLI
@@ -341,12 +420,18 @@ async fn execute_task(
 
                 let _ = take_screenshot(preview, &format!("{}\\after-desktop.png", screenshot_dir), "1280,720").await;
                 let _ = take_screenshot(preview, &format!("{}\\after-mobile.png", screenshot_dir), "393,852").await;
+            }
 
+            // 6b. Upload screenshots to Supabase Storage and update task with public URLs
+            if preview_url.is_some() {
+                let (urls, _) = upload_screenshots_to_storage(config, &task_id, &screenshot_dir).await
+                    .unwrap_or_default();
+                // Split into before (first 2) and after (last 2)
+                let before_urls: Vec<&String> = urls.iter().filter(|u| u.contains("before-")).collect();
+                let after_urls: Vec<&String> = urls.iter().filter(|u| u.contains("after-")).collect();
                 let _ = supabase::update_task(config, &task_id, &serde_json::json!({
-                    "screenshots_after": [
-                        format!("{}\\after-desktop.png", screenshot_dir),
-                        format!("{}\\after-mobile.png", screenshot_dir),
-                    ],
+                    "screenshots_before": before_urls,
+                    "screenshots_after": after_urls,
                 })).await;
             }
 
@@ -378,8 +463,8 @@ async fn execute_task(
                 }
             }
 
-            // 8. Create PR
-            let pr_result = create_pr(&repo_path, &title, &description, &branch, &screenshot_dir, preview_url.is_some()).await;
+            // 8. Create PR (branch is already resolved, no UUID regeneration)
+            let pr_result = create_pr(config, &repo_path, &title, &description, &task_id, &branch, &screenshot_dir, preview_url.is_some()).await;
 
             match pr_result {
                 Ok(pr_url) => {
@@ -500,11 +585,13 @@ fn emit_worker_event(app: &tauri::AppHandle, event_type: &str, message: &str, ta
     });
 }
 
-fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+fn truncate(s: &str, max_chars: usize) -> String {
+    let char_count = s.chars().count();
+    if char_count <= max_chars {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_len])
+        let truncated: String = s.chars().take(max_chars).collect();
+        format!("{}...", truncated)
     }
 }
 
@@ -518,8 +605,14 @@ async fn agent_comment(config: &SupabaseConfig, task_id: &str, content: &str) {
     })).await;
 }
 
-/// Run Claude Code CLI one-shot
+/// Run Claude Code CLI one-shot with configurable max turns and timeout
 async fn run_claude_code(cwd: &str, prompt: &str) -> Result<String, String> {
+    run_claude_code_opts(cwd, prompt, 0, 0).await
+}
+
+/// Run Claude Code CLI one-shot with explicit max_turns and timeout_secs.
+/// Pass 0 for either to use defaults (no limit / no timeout).
+async fn run_claude_code_opts(cwd: &str, prompt: &str, max_turns: u32, timeout_secs: u64) -> Result<String, String> {
     let claude_exe = find_claude_exe();
 
     let mut cmd = if claude_exe.ends_with(".cmd") {
@@ -534,8 +627,13 @@ async fn run_claude_code(cwd: &str, prompt: &str) -> Result<String, String> {
         .arg(prompt)
         .arg("--output-format")
         .arg("text")
-        .arg("--dangerously-skip-permissions")
-        .current_dir(cwd);
+        .arg("--dangerously-skip-permissions");
+
+    if max_turns > 0 {
+        cmd.arg("--max-turns").arg(max_turns.to_string());
+    }
+
+    cmd.current_dir(cwd);
 
     #[cfg(target_os = "windows")]
     {
@@ -543,7 +641,16 @@ async fn run_claude_code(cwd: &str, prompt: &str) -> Result<String, String> {
         cmd.creation_flags(0x08000000);
     }
 
-    let output = cmd.output().await.map_err(|e| format!("Failed to run Claude Code: {}", e))?;
+    let fut = cmd.output();
+
+    let output = if timeout_secs > 0 {
+        tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), fut)
+            .await
+            .map_err(|_| format!("Claude Code timed out after {}s", timeout_secs))?
+            .map_err(|e| format!("Failed to run Claude Code: {}", e))?
+    } else {
+        fut.await.map_err(|e| format!("Failed to run Claude Code: {}", e))?
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -553,7 +660,7 @@ async fn run_claude_code(cwd: &str, prompt: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn find_claude_exe() -> String {
+pub fn find_claude_exe() -> String {
     if cfg!(target_os = "windows") {
         let home = std::env::var("USERPROFILE").unwrap_or_default();
         let local_bin = format!("{}\\.local\\bin\\claude.exe", home);
@@ -587,58 +694,193 @@ async fn take_screenshot(url: &str, output_path: &str, viewport: &str) -> Result
     Ok(())
 }
 
-/// Run visual QA: compare before/after screenshots using Claude Code
+/// Run visual QA: compare before/after screenshots using Claude Code vision.
+/// Uses absolute paths so Claude Code can reliably read the images.
+/// Retries once with a stricter prompt if JSON parsing fails.
 async fn run_visual_qa(cwd: &str, title: &str, description: &str, screenshot_dir: &str) -> Result<(bool, String), String> {
-    // Copy screenshots into the working directory so Claude Code can see them
+    // Copy screenshots into the working directory so Claude Code can access them
     let agent_dir = format!("{}\\.agent-one", cwd);
     let _ = tokio::fs::create_dir_all(&agent_dir).await;
 
-    for name in &["before-desktop.png", "after-desktop.png", "before-mobile.png", "after-mobile.png"] {
+    let screenshot_names = ["before-desktop.png", "after-desktop.png", "before-mobile.png", "after-mobile.png"];
+    for name in &screenshot_names {
         let src = format!("{}\\{}", screenshot_dir, name);
         let dst = format!("{}\\{}", agent_dir, name);
         let _ = tokio::fs::copy(&src, &dst).await;
     }
 
+    // Build absolute paths for the prompt (forward slashes for cross-platform clarity)
+    let abs_agent_dir = std::path::Path::new(cwd).join(".agent-one");
+    let abs_path = abs_agent_dir.to_string_lossy().replace('\\', "/");
+
     let prompt = format!(
-        "Look at the screenshots in .agent-one/ folder. Compare before-desktop.png with after-desktop.png, and before-mobile.png with after-mobile.png.\n\nTask: {}\nDescription: {}\n\nDoes the change look correct? Reply with exactly this JSON format:\n{{\"pass\": true, \"explanation\": \"brief explanation\"}}\nor\n{{\"pass\": false, \"explanation\": \"what's wrong\"}}",
-        title, description
+        r#"You are a visual QA reviewer. Read these screenshot files using their absolute paths:
+
+BEFORE (desktop): {abs}/before-desktop.png
+AFTER  (desktop): {abs}/after-desktop.png
+BEFORE (mobile):  {abs}/before-mobile.png
+AFTER  (mobile):  {abs}/after-mobile.png
+
+Task: {title}
+Description: {desc}
+
+Compare the before and after screenshots. Check:
+1. Does the change match the task description?
+2. Are there any visual regressions (broken layout, missing elements, overlapping text)?
+3. Does the mobile view look correct?
+
+Reply with ONLY this JSON (no markdown, no code fences):
+{{"pass": true, "explanation": "brief explanation"}}
+or
+{{"pass": false, "explanation": "what's wrong"}}"#,
+        abs = abs_path, title = title, desc = description
     );
 
-    let result = run_claude_code(cwd, &prompt).await?;
+    // First attempt: 5 max turns, 120s timeout
+    let result = run_claude_code_opts(cwd, &prompt, 5, 120).await?;
 
-    // Try to parse JSON from the response
-    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result) {
-        let pass = parsed.get("pass").and_then(|v| v.as_bool()).unwrap_or(false);
-        let explanation = parsed.get("explanation").and_then(|v| v.as_str()).unwrap_or("No explanation").to_string();
-        return Ok((pass, explanation));
+    if let Some(parsed) = try_parse_qa_json(&result) {
+        cleanup_agent_dir(&agent_dir).await;
+        return Ok(parsed);
     }
 
-    // Try to find JSON in the response text
-    if let Some(start) = result.find('{') {
-        if let Some(end) = result.rfind('}') {
-            let json_str = &result[start..=end];
+    // Retry with a stricter prompt if JSON parsing failed
+    log::warn!("[worker] Visual QA first attempt returned unparseable output, retrying with stricter prompt");
+
+    let retry_prompt = format!(
+        r#"Read these image files and compare them:
+- {abs}/before-desktop.png vs {abs}/after-desktop.png
+- {abs}/before-mobile.png vs {abs}/after-mobile.png
+
+Does the visual change look correct for this task: "{title}"?
+
+IMPORTANT: Your entire response must be valid JSON with no other text. Example:
+{{"pass": true, "explanation": "Changes look correct"}}"#,
+        abs = abs_path, title = title
+    );
+
+    let retry_result = run_claude_code_opts(cwd, &retry_prompt, 3, 90).await?;
+
+    let parsed = try_parse_qa_json(&retry_result)
+        .unwrap_or((true, format!("QA output (unparseable after retry): {}", truncate(&retry_result, 200))));
+
+    cleanup_agent_dir(&agent_dir).await;
+    Ok(parsed)
+}
+
+/// Try to extract {"pass": bool, "explanation": string} from Claude's response.
+fn try_parse_qa_json(text: &str) -> Option<(bool, String)> {
+    // Try direct parse first
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
+        if let Some(pass) = parsed.get("pass").and_then(|v| v.as_bool()) {
+            let explanation = parsed.get("explanation").and_then(|v| v.as_str()).unwrap_or("No explanation").to_string();
+            return Some((pass, explanation));
+        }
+    }
+
+    // Try to find JSON in the response text (Claude sometimes wraps in markdown)
+    if let Some(start) = text.find('{') {
+        if let Some(end) = text.rfind('}') {
+            let json_str = &text[start..=end];
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
-                let pass = parsed.get("pass").and_then(|v| v.as_bool()).unwrap_or(false);
-                let explanation = parsed.get("explanation").and_then(|v| v.as_str()).unwrap_or("No explanation").to_string();
-                return Ok((pass, explanation));
+                if let Some(pass) = parsed.get("pass").and_then(|v| v.as_bool()) {
+                    let explanation = parsed.get("explanation").and_then(|v| v.as_str()).unwrap_or("No explanation").to_string();
+                    return Some((pass, explanation));
+                }
             }
         }
     }
 
-    // Couldn't parse, assume pass with raw output
-    Ok((true, format!("QA output (unparseable): {}", truncate(&result, 200))))
+    None
 }
 
-/// Create a PR with before/after screenshots in the body
+/// Remove the .agent-one/ temp directory after QA
+async fn cleanup_agent_dir(agent_dir: &str) {
+    if let Err(e) = tokio::fs::remove_dir_all(agent_dir).await {
+        log::warn!("[worker] Failed to clean up {}: {}", agent_dir, e);
+    }
+}
+
+/// Detect the default branch for a repo (main, master, etc.)
+async fn detect_base_branch(repo_path: &str) -> String {
+    // Try git symbolic-ref for the remote HEAD
+    if let Ok(output) = tokio::process::Command::new("git")
+        .args(["symbolic-ref", "refs/remotes/origin/HEAD", "--short"])
+        .current_dir(repo_path)
+        .output()
+        .await
+    {
+        if output.status.success() {
+            let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            // Returns "origin/main" or "origin/master", strip the prefix
+            if let Some(name) = branch.strip_prefix("origin/") {
+                return name.to_string();
+            }
+            return branch;
+        }
+    }
+    // Fallback: check if "main" exists, otherwise "master"
+    if let Ok(output) = tokio::process::Command::new("git")
+        .args(["rev-parse", "--verify", "refs/heads/main"])
+        .current_dir(repo_path)
+        .output()
+        .await
+    {
+        if output.status.success() { return "main".to_string(); }
+    }
+    "master".to_string()
+}
+
+/// Upload before/after screenshots to Supabase Storage, return markdown image links.
+async fn upload_screenshots_to_storage(
+    config: &super::supabase::SupabaseConfig,
+    task_id: &str,
+    screenshot_dir: &str,
+) -> Result<(Vec<String>, String), String> {
+    let mut urls = Vec::new();
+    let screenshot_names = ["before-desktop.png", "after-desktop.png", "before-mobile.png", "after-mobile.png"];
+
+    for name in &screenshot_names {
+        let local_path = format!("{}\\{}", screenshot_dir, name);
+        if tokio::fs::metadata(&local_path).await.is_ok() {
+            let storage_path = format!("{}/{}", task_id, name);
+            match supabase::upload_to_storage(config, "agent-one-screenshots", &storage_path, &local_path).await {
+                Ok(url) => urls.push(url),
+                Err(e) => log::warn!("[worker] Failed to upload {}: {}", name, e),
+            }
+        }
+    }
+
+    // Build markdown for PR body
+    let mut md = String::new();
+    if urls.len() >= 4 {
+        md.push_str("### Visual QA\n\n");
+        md.push_str("| Desktop Before | Desktop After |\n|--------|-------|\n");
+        md.push_str(&format!("| ![before]({}) | ![after]({}) |\n\n", urls[0], urls[1]));
+        md.push_str("| Mobile Before | Mobile After |\n|--------|-------|\n");
+        md.push_str(&format!("| ![before]({}) | ![after]({}) |\n\n", urls[2], urls[3]));
+    } else if urls.len() >= 2 {
+        md.push_str("### Visual QA\n\n");
+        md.push_str(&format!("| Before | After |\n|--------|-------|\n| ![before]({}) | ![after]({}) |\n\n", urls[0], urls[1]));
+    }
+
+    Ok((urls, md))
+}
+
+/// Create a PR with before/after screenshots uploaded to Supabase Storage.
 async fn create_pr(
+    config: &super::supabase::SupabaseConfig,
     repo_path: &str,
     title: &str,
     description: &str,
+    task_id: &str,
     branch: &Option<String>,
     screenshot_dir: &str,
     has_screenshots: bool,
 ) -> Result<String, String> {
-    let branch_name = branch.clone().unwrap_or_else(|| format!("agent-one/{}", uuid::Uuid::new_v4()));
+    // Branch should already be resolved by execute_task, but fallback just in case
+    let branch_name = branch.clone().unwrap_or_else(|| "agent-one/patch".to_string());
+    let base_branch = detect_base_branch(repo_path).await;
 
     // Ensure we're on the right branch
     let _ = tokio::process::Command::new("git")
@@ -647,18 +889,15 @@ async fn create_pr(
         .output()
         .await;
 
-    // Copy screenshots into repo if they exist
-    if has_screenshots {
-        let agent_dir = format!("{}\\.agent-one", repo_path);
-        let _ = tokio::fs::create_dir_all(&agent_dir).await;
-        for name in &["before-desktop.png", "after-desktop.png", "before-mobile.png", "after-mobile.png"] {
-            let src = format!("{}\\{}", screenshot_dir, name);
-            let dst = format!("{}\\{}", agent_dir, name);
-            let _ = tokio::fs::copy(&src, &dst).await;
+    // Add .agent-one to .gitignore if not already there
+    let gitignore_path = format!("{}\\.gitignore", repo_path);
+    if let Ok(contents) = tokio::fs::read_to_string(&gitignore_path).await {
+        if !contents.contains(".agent-one") {
+            let _ = tokio::fs::write(&gitignore_path, format!("{}\n.agent-one/\n", contents.trim_end())).await;
         }
     }
 
-    // Stage all changes
+    // Stage all changes (but NOT .agent-one screenshots)
     let stage = tokio::process::Command::new("git").args(["add", "-A"]).current_dir(repo_path).output().await.map_err(|e| format!("git add failed: {}", e))?;
     if !stage.status.success() { return Err("git add failed".to_string()); }
 
@@ -681,20 +920,18 @@ async fn create_pr(
         return Err(format!("git push failed: {}", stderr));
     }
 
-    // Build PR body
+    // Build PR body with Supabase Storage URLs instead of repo-relative paths
     let mut pr_body = format!("## {}\n\n{}\n\n", title, description);
     if has_screenshots {
-        pr_body.push_str("### Visual QA\n\n");
-        pr_body.push_str("| Desktop Before | Desktop After |\n|--------|-------|\n");
-        pr_body.push_str("| ![before](.agent-one/before-desktop.png) | ![after](.agent-one/after-desktop.png) |\n\n");
-        pr_body.push_str("| Mobile Before | Mobile After |\n|--------|-------|\n");
-        pr_body.push_str("| ![before](.agent-one/before-mobile.png) | ![after](.agent-one/after-mobile.png) |\n\n");
+        let (_, screenshot_md) = upload_screenshots_to_storage(config, task_id, screenshot_dir).await
+            .unwrap_or_default();
+        pr_body.push_str(&screenshot_md);
     }
     pr_body.push_str("---\nAutomated by Agent One");
 
-    // Create PR
+    // Create PR with explicit base branch
     let pr = tokio::process::Command::new("gh")
-        .args(["pr", "create", "--title", title, "--body", &pr_body, "--head", &branch_name])
+        .args(["pr", "create", "--title", title, "--body", &pr_body, "--head", &branch_name, "--base", &base_branch])
         .current_dir(repo_path)
         .output()
         .await
@@ -704,6 +941,9 @@ async fn create_pr(
         let stderr = String::from_utf8_lossy(&pr.stderr);
         return Err(format!("gh pr create failed: {}", stderr));
     }
+
+    // Clean up local screenshot directory
+    let _ = tokio::fs::remove_dir_all(screenshot_dir).await;
 
     Ok(String::from_utf8_lossy(&pr.stdout).trim().to_string())
 }

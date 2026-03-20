@@ -163,6 +163,65 @@ pub async fn worker_offline(config: &SupabaseConfig, machine_name: &str) -> Resu
     Ok(())
 }
 
+// ── Triggers (internal) ─────────────────────────────────────────────
+
+pub async fn fetch_triggers(config: &SupabaseConfig) -> Result<Value, String> {
+    let client = build_client(config)?;
+    let url = format!("{}?order=created_at.asc", rest_url(config, "ae_triggers"));
+    handle_response(client.get(&url).send().await.map_err(|e| e.to_string())?).await
+}
+
+pub async fn update_trigger(config: &SupabaseConfig, id: &str, updates: &Value) -> Result<Value, String> {
+    let client = build_client(config)?;
+    let url = format!("{}?id=eq.{}", rest_url(config, "ae_triggers"), id);
+    handle_response(client.patch(&url).json(updates).send().await.map_err(|e| e.to_string())?).await
+}
+
+// ── Trigger Events (internal) ───────────────────────────────────────
+
+pub async fn fetch_trigger_events(config: &SupabaseConfig, trigger_id: &str) -> Result<Value, String> {
+    let client = build_client(config)?;
+    let url = format!("{}?trigger_id=eq.{}&processed=eq.false&order=created_at.asc&limit=10",
+        rest_url(config, "ae_trigger_events"), trigger_id);
+    handle_response(client.get(&url).send().await.map_err(|e| e.to_string())?).await
+}
+
+pub async fn mark_trigger_event_processed(config: &SupabaseConfig, event_id: &str) -> Result<Value, String> {
+    let client = build_client(config)?;
+    let url = format!("{}?id=eq.{}", rest_url(config, "ae_trigger_events"), event_id);
+    let body = serde_json::json!({ "processed": true });
+    handle_response(client.patch(&url).json(&body).send().await.map_err(|e| e.to_string())?).await
+}
+
+// ── Storage (internal) ──────────────────────────────────────────────
+
+/// Upload a file to Supabase Storage and return the public URL.
+pub async fn upload_to_storage(config: &SupabaseConfig, bucket: &str, path: &str, file_path: &str) -> Result<String, String> {
+    let key = config.service_role_key.as_deref().unwrap_or(&config.anon_key);
+    let file_bytes = tokio::fs::read(file_path).await.map_err(|e| format!("Failed to read file: {}", e))?;
+
+    let client = reqwest::Client::new();
+    let url = format!("{}/storage/v1/object/{}/{}", config.url, bucket, path);
+
+    let resp = client.post(&url)
+        .header("apikey", key)
+        .header("Authorization", format!("Bearer {}", key))
+        .header("Content-Type", "image/png")
+        .header("x-upsert", "true")
+        .body(file_bytes)
+        .send()
+        .await
+        .map_err(|e| format!("Storage upload failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Storage upload error: {}", body));
+    }
+
+    // Return public URL
+    Ok(format!("{}/storage/v1/object/public/{}/{}", config.url, bucket, path))
+}
+
 // ── Crons (internal) ────────────────────────────────────────────────
 
 pub async fn fetch_crons(config: &SupabaseConfig) -> Result<Value, String> {

@@ -71,6 +71,15 @@ export interface AeTrigger {
   source_config: Record<string, unknown>;
   task_template: Record<string, unknown>;
   enabled: boolean;
+  last_checked: string | null;
+  created_at: string;
+}
+
+export interface AeTriggerEvent {
+  id: string;
+  trigger_id: string;
+  payload: Record<string, unknown>;
+  processed: boolean;
   created_at: string;
 }
 

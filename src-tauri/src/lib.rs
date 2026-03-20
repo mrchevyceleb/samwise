@@ -106,6 +106,10 @@ pub fn run() {
             // Playwright
             commands::playwright::playwright_screenshot,
             commands::playwright::playwright_screenshot_mobile,
+            // Health checks
+            commands::health::check_claude_code,
+            commands::health::check_gh_auth,
+            commands::health::check_doppler,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
