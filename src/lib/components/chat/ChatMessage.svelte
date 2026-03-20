@@ -53,7 +53,7 @@
 		<div style="
 			max-width: 85%; padding: 10px 14px; border-radius: 14px 14px 4px 14px;
 			background: #6366f1;
-			color: #fff; font-size: 13px; line-height: 1.5;
+			color: #fff; font-size: 14px; line-height: 1.5;
 			white-space: pre-wrap; word-break: break-word;
 			box-shadow: 0 2px 8px rgba(99, 102, 241, 0.3);
 		">
@@ -72,7 +72,7 @@
 					background: #1c2128;
 					border: 1px solid var(--border-default);
 					color: var(--text-primary);
-					font-size: 13px; line-height: 1.6;
+					font-size: 14px; line-height: 1.6;
 					word-break: break-word;
 				">
 					{@html renderedContent}

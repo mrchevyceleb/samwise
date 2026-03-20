@@ -11,6 +11,8 @@ pub struct SupabaseConfig {
     pub url: String,
     pub anon_key: String,
     pub service_role_key: Option<String>,
+    pub telegram_bot_token: Option<String>,
+    pub telegram_chat_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -301,6 +303,8 @@ pub async fn supabase_load_doppler(
         url: secrets.get("SUPABASE_URL").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
         anon_key: secrets.get("SUPABASE_ANON_KEY").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
         service_role_key: secrets.get("SUPABASE_SERVICE_ROLE_KEY").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        telegram_bot_token: secrets.get("TELEGRAM_BOT_TOKEN").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        telegram_chat_id: secrets.get("TELEGRAM_CHAT_ID").and_then(|v| v.as_str()).map(|s| s.to_string()),
     };
 
     let mut config = state.config.write().await;

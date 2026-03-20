@@ -43,7 +43,7 @@
 	role="button"
 	tabindex={0}
 	style="
-		padding: 10px 12px;
+		padding: 12px 14px;
 		border-radius: 10px;
 		background: {hovered ? 'rgba(99, 102, 241, 0.06)' : 'var(--glass-bg)'};
 		backdrop-filter: blur(var(--glass-blur));
@@ -65,7 +65,7 @@
 >
 	<!-- Title (truncated to 2 lines) -->
 	<div style="
-		font-size: 13px; font-weight: 600; color: var(--text-primary);
+		font-size: 14px; font-weight: 600; color: var(--text-primary);
 		margin-bottom: 6px; line-height: 1.4;
 		display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
 		overflow: hidden; text-overflow: ellipsis;
@@ -74,10 +74,10 @@
 	</div>
 
 	<!-- Priority + Project row -->
-	<div style="display: flex; align-items: center; gap: 5px; flex-wrap: wrap; margin-bottom: 6px;">
+	<div style="display: flex; align-items: center; gap: 5px; flex-wrap: wrap; margin-bottom: 8px;">
 		<!-- Priority pill -->
 		<span style="
-			font-size: 9px; font-weight: 700; padding: 1px 6px; border-radius: 5px;
+			font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 5px;
 			background: {priorityColor}18; color: {priorityColor};
 			border: 1px solid {priorityColor}25;
 			text-transform: uppercase; letter-spacing: 0.4px;
@@ -88,9 +88,9 @@
 		<!-- Project label -->
 		{#if task.project}
 			<span style="
-				font-size: 9px; font-weight: 600; padding: 1px 6px; border-radius: 5px;
+				font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 5px;
 				background: rgba(99, 102, 241, 0.08); color: var(--accent-indigo);
-				max-width: 100px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+				max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 			">
 				{task.project}
 			</span>
@@ -99,29 +99,29 @@
 		<div style="flex: 1;"></div>
 
 		<!-- Time elapsed -->
-		<span style="font-size: 9px; color: var(--text-muted); font-family: var(--font-mono);">
+		<span style="font-size: 10px; color: var(--text-muted); font-family: var(--font-mono);">
 			{elapsed}
 		</span>
 	</div>
 
 	<!-- Bottom row: indicators -->
-	<div style="display: flex; align-items: center; gap: 6px;">
+	<div style="display: flex; align-items: center; gap: 8px;">
 		<!-- Assignee indicator -->
 		<span title="{isAgent ? 'Assigned to Agent' : 'Assigned to Matt'}" style="
 			display: flex; align-items: center; justify-content: center;
-			width: 18px; height: 18px; border-radius: 50%;
+			width: 22px; height: 22px; border-radius: 50%;
 			background: {isAgent ? 'rgba(99, 102, 241, 0.12)' : 'rgba(63, 185, 80, 0.12)'};
 			color: {isAgent ? 'var(--accent-indigo)' : 'var(--accent-green)'};
-			font-size: 10px;
+			font-size: 12px;
 		">
 			{#if isAgent}
 				<!-- Robot icon -->
-				<svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor">
+				<svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
 					<path d="M8 0a1 1 0 011 1v1.07A6.002 6.002 0 0114 8v3a2 2 0 01-2 2H4a2 2 0 01-2-2V8a6.002 6.002 0 015-5.93V1a1 1 0 011-1zM6 9a1 1 0 100 2 1 1 0 000-2zm4 0a1 1 0 100 2 1 1 0 000-2z"/>
 				</svg>
 			{:else}
 				<!-- User icon -->
-				<svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor">
+				<svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
 					<path d="M8 8a3 3 0 100-6 3 3 0 000 6zm-5 6s-1 0-1-1 1-4 6-4 6 3 6 4-1 1-1 1H3z"/>
 				</svg>
 			{/if}
@@ -133,7 +133,7 @@
 		{#if commentCount > 0}
 			<span style="
 				display: flex; align-items: center; gap: 3px;
-				font-size: 10px; color: var(--text-muted);
+				font-size: 11px; color: var(--text-muted);
 			">
 				<svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor">
 					<path d="M2.678 11.894a1 1 0 01.287.801 10.97 10.97 0 01-.398 2c1.395-.323 2.247-.697 2.634-.893a1 1 0 01.71-.074A8.06 8.06 0 008 14c3.996 0 7-2.807 7-6s-3.004-6-7-6-7 2.808-7 6c0 1.468.617 2.83 1.678 3.894z"/>
@@ -151,7 +151,7 @@
 				title="View Pull Request"
 				style="
 					display: flex; align-items: center; justify-content: center;
-					width: 18px; height: 18px; border-radius: 4px;
+					width: 22px; height: 22px; border-radius: 4px;
 					background: rgba(63, 185, 80, 0.08);
 					color: var(--accent-green);
 					transition: all 0.15s ease;
@@ -168,7 +168,7 @@
 		{#if hasScreenshots}
 			<span title="Has screenshots" style="
 				display: flex; align-items: center; justify-content: center;
-				width: 18px; height: 18px; border-radius: 4px;
+				width: 22px; height: 22px; border-radius: 4px;
 				background: rgba(188, 140, 255, 0.08);
 				color: var(--accent-purple);
 			">

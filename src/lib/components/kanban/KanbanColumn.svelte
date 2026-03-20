@@ -52,10 +52,11 @@
 <div
 	style="
 		display: flex; flex-direction: column;
-		min-width: {collapsed ? '44px' : '180px'};
+		min-width: {collapsed ? '44px' : '200px'};
 		flex: {collapsed ? '0 0 44px' : '1'};
-		background: {dragOver ? glowColor : 'transparent'};
+		background: {dragOver ? glowColor : 'rgba(255, 255, 255, 0.015)'};
 		border-radius: 10px;
+		border-left: 2px solid {color}30;
 		transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
 		{isInProgress && !collapsed ? 'animation: working-glow 3s ease-in-out infinite;' : ''}
 		{dragOver ? `outline: 2px dashed ${color}60; outline-offset: -2px;` : ''}
@@ -81,7 +82,7 @@
 	>
 		<!-- Status dot -->
 		<span style="
-			width: 8px; height: 8px; border-radius: 50%;
+			width: 9px; height: 9px; border-radius: 50%;
 			background: {color};
 			box-shadow: 0 0 8px {color}60;
 			flex-shrink: 0;
@@ -91,14 +92,14 @@
 		{#if !collapsed}
 			<!-- Icon -->
 			<span style="
-				font-size: 10px; font-weight: 800; color: {color};
+				font-size: 11px; font-weight: 800; color: {color};
 				font-family: var(--font-mono); opacity: 0.6;
 			">
 				{icon}
 			</span>
 
 			<span style="
-				font-size: 11px; font-weight: 700; color: var(--text-secondary);
+				font-size: 12px; font-weight: 700; color: var(--text-secondary);
 				text-transform: uppercase; letter-spacing: 0.5px; flex: 1;
 			">
 				{label}
@@ -106,15 +107,15 @@
 
 			<!-- Task count badge -->
 			<span style="
-				font-size: 10px; font-weight: 700; padding: 1px 7px; border-radius: 6px;
+				font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 6px;
 				background: {color}15; color: {color};
 				font-family: var(--font-mono);
-				min-width: 20px; text-align: center;
+				min-width: 22px; text-align: center;
 			">
 				{tasks.length}
 			</span>
 		{:else}
-			<span style="font-size: 10px; font-weight: 700; color: var(--text-muted); letter-spacing: 0.5px;">
+			<span style="font-size: 11px; font-weight: 700; color: var(--text-muted); letter-spacing: 0.5px;">
 				{label} ({tasks.length})
 			</span>
 		{/if}
@@ -123,8 +124,8 @@
 	<!-- Cards -->
 	{#if !collapsed}
 		<div style="
-			flex: 1; overflow-y: auto; padding: 4px 6px 8px;
-			display: flex; flex-direction: column; gap: 6px;
+			flex: 1; overflow-y: auto; padding: 6px 8px 10px;
+			display: flex; flex-direction: column; gap: 8px;
 		">
 			{#each tasks as task (task.id)}
 				<KanbanCard {task} onClick={onTaskClick} />
@@ -132,8 +133,8 @@
 
 			{#if tasks.length === 0}
 				<div style="
-					padding: 20px 8px; text-align: center;
-					color: var(--text-muted); font-size: 11px;
+					padding: 24px 8px; text-align: center;
+					color: var(--text-muted); font-size: 12px;
 					border: 1px dashed {dragOver ? color + '60' : 'var(--border-default)'};
 					border-radius: 8px; opacity: {dragOver ? '0.8' : '0.4'};
 					transition: all 0.2s ease;

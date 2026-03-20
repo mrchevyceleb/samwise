@@ -71,7 +71,7 @@
 				style="
 					width: 100%; background: none; border: none; outline: none;
 					color: var(--text-primary); font-family: var(--font-ui);
-					font-size: 13px; resize: none; min-height: 36px;
+					font-size: 14px; resize: none; min-height: 36px;
 					max-height: 200px; line-height: 1.5;
 				"
 				oninput={autoResize}

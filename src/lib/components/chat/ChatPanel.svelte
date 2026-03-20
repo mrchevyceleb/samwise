@@ -46,12 +46,12 @@
 		<AgentAvatar size={22} busy={chat.sendingMessage} />
 		<div style="flex: 1; min-width: 0;">
 			<div style="
-				font-size: 13px; font-weight: 600; color: var(--text-primary);
+				font-size: 14px; font-weight: 600; color: var(--text-primary);
 				font-family: var(--font-ui); letter-spacing: 0.3px;
 			">
 				Chat with Agent
 			</div>
-			<div style="font-size: 10px; color: var(--text-muted);">
+			<div style="font-size: 12px; color: var(--text-muted);">
 				{#if chat.sendingMessage}
 					<span style="color: var(--accent-primary);">Thinking...</span>
 				{:else}
@@ -118,10 +118,10 @@
 					animation: fade-in 0.5s ease;
 				">
 					<AgentAvatar size={48} />
-					<div style="font-size: 15px; font-weight: 600; color: var(--text-primary);">
+					<div style="font-size: 16px; font-weight: 600; color: var(--text-primary);">
 						Hey there.
 					</div>
-					<div style="font-size: 12px; color: var(--text-muted); max-width: 260px; line-height: 1.6;">
+					<div style="font-size: 13px; color: var(--text-muted); max-width: 260px; line-height: 1.6;">
 						I'm your AI agent. Send me a message to get started. I can create tasks, run automations, or just chat.
 					</div>
 				</div>

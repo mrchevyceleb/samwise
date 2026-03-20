@@ -15,10 +15,10 @@
 </script>
 
 <div class="statusbar" style="
-	display: flex; align-items: center; height: 28px; padding: 0 14px;
+	display: flex; align-items: center; height: 32px; padding: 0 14px;
 	background: linear-gradient(0deg, #0d1117 0%, #0f1419 100%);
 	box-shadow: 0 -2px 8px rgba(0, 0, 0, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.03);
-	font-size: 11px; font-family: var(--font-mono); gap: 12px;
+	font-size: 12px; font-family: var(--font-mono); gap: 12px;
 	position: relative; z-index: 5;
 ">
 	<!-- Left section -->

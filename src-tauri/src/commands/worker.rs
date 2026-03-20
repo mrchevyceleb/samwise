@@ -114,21 +114,37 @@ async fn worker_loop(
     app: tauri::AppHandle,
 ) {
     let mut tick: u64 = 0;
+    let mut idle_ticks: u64 = 0; // Track how long the worker has been idle
 
     emit_worker_event(&app, "started", "Worker started. Ready to pick up tasks.", None);
+
+    // Greet Matt on startup
+    {
+        let config = sb_config_arc.read().await.clone();
+        agent_chat(&config, "I'm online and ready to work. Drop a task in the queue or just tell me what you need.").await;
+    }
 
     while running.load(Ordering::Relaxed) {
         let config = sb_config_arc.read().await.clone();
 
-        // Heartbeat every 5 seconds (every tick)
-        if tick % 1 == 0 {
-            let _ = supabase::worker_heartbeat(&config, &machine_name).await;
-        }
+        // Heartbeat every tick
+        let _ = supabase::worker_heartbeat(&config, &machine_name).await;
 
         // Poll for tasks every 10 seconds (every 2nd tick)
         if tick % 2 == 0 {
             let is_idle = current_task_id.lock().await.is_none();
             if is_idle {
+                idle_ticks += 1;
+
+                // Proactive idle messages (every ~5 min = 60 ticks at 5s each)
+                if idle_ticks == 60 {
+                    agent_chat(&config, "Been idle for a few minutes. Got anything for me? I can pick up coding tasks, run reviews, or just chat.").await;
+                }
+                if idle_ticks == 360 {
+                    // 30 min idle
+                    agent_chat(&config, "Still here, still idle. Queue's empty. Let me know when you've got something.").await;
+                }
+
                 if let Ok(tasks) = supabase::fetch_tasks(&config, Some("queued")).await {
                     if let Some(arr) = tasks.as_array() {
                         // Sort by priority: critical=0, high=1, medium=2, low=3, then created_at asc
@@ -151,15 +167,22 @@ async fn worker_loop(
                         });
                         if let Some(task) = sorted.first() {
                             let task_id = task.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                            let task_title = task.get("title").and_then(|v| v.as_str()).unwrap_or("a task").to_string();
 
                             if !task_id.is_empty() {
                                 match supabase::claim_task(&config, &task_id, &machine_name).await {
                                     Ok(_) => {
+                                        idle_ticks = 0; // Reset idle counter
                                         {
                                             let mut ct = current_task_id.lock().await;
                                             *ct = Some(task_id.clone());
                                         }
                                         emit_worker_event(&app, "task_claimed", "Picked up a new task.", Some(&task_id));
+
+                                        // Proactive chat: tell Matt what we're doing
+                                        agent_chat(&config, &format!(
+                                            "Picked up \"{}\" from the queue. I'll post updates as I go.", task_title
+                                        )).await;
 
                                         let result = execute_task(&app, &machine_name, &config, task.clone()).await;
 
@@ -168,9 +191,28 @@ async fn worker_loop(
                                             *ct = None;
                                         }
 
-                                        match result {
-                                            Ok(msg) => emit_worker_event(&app, "task_completed", &msg, Some(&task_id)),
-                                            Err(err) => emit_worker_event(&app, "task_failed", &err, Some(&task_id)),
+                                        match &result {
+                                            Ok(msg) => {
+                                                emit_worker_event(&app, "task_completed", msg, Some(&task_id));
+                                                // Proactive chat: announce completion
+                                                if msg.contains("PR created") {
+                                                    agent_chat(&config, &format!(
+                                                        "Done with \"{}\". {} Want me to pick up something else?", task_title, msg
+                                                    )).await;
+                                                } else {
+                                                    agent_chat(&config, &format!(
+                                                        "Finished \"{}\". {} Anything else?", task_title, msg
+                                                    )).await;
+                                                }
+                                            }
+                                            Err(err) => {
+                                                emit_worker_event(&app, "task_failed", err, Some(&task_id));
+                                                // Proactive chat: explain failure
+                                                agent_chat(&config, &format!(
+                                                    "Ran into trouble on \"{}\": {}. You might want to take a look or re-queue it.",
+                                                    task_title, truncate(err, 200)
+                                                )).await;
+                                            }
                                         }
                                     }
                                     Err(_) => {
@@ -181,6 +223,8 @@ async fn worker_loop(
                         }
                     }
                 }
+            } else {
+                idle_ticks = 0; // Working on something, reset idle counter
             }
         }
 
@@ -398,6 +442,7 @@ async fn execute_task(
     })).await;
 
     emit_worker_event(app, "task_working", &format!("Working on: {}", title), Some(&task_id));
+    send_telegram(config, &format!("Working on: *{}*", escape_markdown_v2(&title))).await;
 
     // 3. Check out branch (always have one now - user-specified or auto-generated)
     if let Some(ref branch_name) = branch {
@@ -421,11 +466,41 @@ async fn execute_task(
     // 5. Run Claude Code CLI
     agent_comment(config, &task_id, "Starting code changes with Claude Code...").await;
 
-    let prompt = format!(
-        "Task: {}\n\nDescription: {}\n\nComplete this task. Make all necessary code changes.",
+    // Build a context-aware prompt with repo info
+    let mut prompt_parts: Vec<String> = Vec::new();
+
+    // Read CLAUDE.md if it exists in the repo
+    let claude_md_path = format!("{}\\CLAUDE.md", repo_path);
+    if let Ok(claude_md) = tokio::fs::read_to_string(&claude_md_path).await {
+        let claude_md_truncated = truncate(&claude_md, 2000);
+        prompt_parts.push(format!("## Project Instructions (from CLAUDE.md)\n{}\n", claude_md_truncated));
+    }
+
+    // Get recent git log for context
+    if let Ok(git_log) = tokio::process::Command::new("git")
+        .args(["log", "--oneline", "-10"])
+        .current_dir(&repo_path)
+        .output()
+        .await
+    {
+        if git_log.status.success() {
+            let log_str = String::from_utf8_lossy(&git_log.stdout);
+            if !log_str.trim().is_empty() {
+                prompt_parts.push(format!("## Recent git history\n```\n{}\n```\n", log_str.trim()));
+            }
+        }
+    }
+
+    // The actual task
+    prompt_parts.push(format!(
+        "## Task\n**{}**\n\n{}\n\n## Instructions\nComplete this task. Make all necessary code changes. Be thorough but focused. Commit your changes when done.",
         title, description
-    );
-    let claude_result = run_claude_code(&repo_path, &prompt).await;
+    ));
+
+    let prompt = prompt_parts.join("\n");
+
+    // 30-minute timeout for task execution, 50 max turns to prevent runaway sessions
+    let claude_result = run_claude_code_opts(&repo_path, &prompt, 50, 1800).await;
 
     match claude_result {
         Ok(output) => {
@@ -492,6 +567,11 @@ async fn execute_task(
                         "updated_at": chrono::Utc::now().to_rfc3339(),
                     })).await;
                     agent_comment(config, &task_id, &format!("PR's up: {}. Let me know if you want any changes.", pr_url)).await;
+                    send_telegram(config, &format!(
+                        "PR's up for *{}*: {}",
+                        escape_markdown_v2(&title),
+                        escape_markdown_v2(&pr_url)
+                    )).await;
                     Ok(format!("PR created: {}", pr_url))
                 }
                 Err(e) => {
@@ -510,6 +590,11 @@ async fn execute_task(
                 "updated_at": chrono::Utc::now().to_rfc3339(),
             })).await;
             agent_comment(config, &task_id, &format!("Ran into an issue: {}. You might want to re-queue this or take a look.", e)).await;
+            send_telegram(config, &format!(
+                "Hit a snag on *{}*: {}",
+                escape_markdown_v2(&title),
+                escape_markdown_v2(&e)
+            )).await;
             Err(format!("Task failed: {}", e))
         }
     }
@@ -613,6 +698,44 @@ fn truncate(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Escape special characters for Telegram MarkdownV2 parse mode.
+fn escape_markdown_v2(text: &str) -> String {
+    let special = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!'];
+    let mut escaped = String::with_capacity(text.len() * 2);
+    for ch in text.chars() {
+        if special.contains(&ch) {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+/// Send a Telegram notification. Silently skips if token/chat_id are missing.
+/// Never blocks or fails task execution.
+async fn send_telegram(config: &SupabaseConfig, message: &str) {
+    let (token, chat_id) = match (&config.telegram_bot_token, &config.telegram_chat_id) {
+        (Some(t), Some(c)) if !t.is_empty() && !c.is_empty() => (t.clone(), c.clone()),
+        _ => return,
+    };
+
+    let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+    let body = serde_json::json!({
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "MarkdownV2",
+    });
+
+    let client = match reqwest::Client::builder().build() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    if let Err(e) = client.post(&url).json(&body).send().await {
+        log::warn!("[worker] Telegram send failed: {}", e);
+    }
+}
+
 /// Post a comment as the agent on a task
 async fn agent_comment(config: &SupabaseConfig, task_id: &str, content: &str) {
     let _ = supabase::post_comment(config, &serde_json::json!({
@@ -623,6 +746,15 @@ async fn agent_comment(config: &SupabaseConfig, task_id: &str, content: &str) {
     })).await;
 }
 
+/// Post a proactive message to the chat sidebar (not tied to a specific task).
+/// This is how the agent talks to Matt as a teammate.
+async fn agent_chat(config: &SupabaseConfig, content: &str) {
+    let _ = supabase::send_message(config, &serde_json::json!({
+        "role": "agent",
+        "content": content,
+    })).await;
+}
+
 /// Run Claude Code CLI one-shot with configurable max turns and timeout
 async fn run_claude_code(cwd: &str, prompt: &str) -> Result<String, String> {
     run_claude_code_opts(cwd, prompt, 0, 0).await
@@ -630,6 +762,7 @@ async fn run_claude_code(cwd: &str, prompt: &str) -> Result<String, String> {
 
 /// Run Claude Code CLI one-shot with explicit max_turns and timeout_secs.
 /// Pass 0 for either to use defaults (no limit / no timeout).
+/// Emits worker events for progress tracking.
 async fn run_claude_code_opts(cwd: &str, prompt: &str, max_turns: u32, timeout_secs: u64) -> Result<String, String> {
     let claude_exe = find_claude_exe();
 
@@ -651,7 +784,9 @@ async fn run_claude_code_opts(cwd: &str, prompt: &str, max_turns: u32, timeout_s
         cmd.arg("--max-turns").arg(max_turns.to_string());
     }
 
-    cmd.current_dir(cwd);
+    cmd.current_dir(cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
 
     #[cfg(target_os = "windows")]
     {
@@ -659,23 +794,55 @@ async fn run_claude_code_opts(cwd: &str, prompt: &str, max_turns: u32, timeout_s
         cmd.creation_flags(0x08000000);
     }
 
-    let fut = cmd.output();
+    let mut child = cmd.spawn().map_err(|e| format!("Failed to run Claude Code: {}", e))?;
 
-    let output = if timeout_secs > 0 {
-        tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), fut)
-            .await
-            .map_err(|_| format!("Claude Code timed out after {}s", timeout_secs))?
-            .map_err(|e| format!("Failed to run Claude Code: {}", e))?
+    // Read stdout in background
+    let stdout = child.stdout.take();
+    let stdout_handle = tokio::spawn(async move {
+        let mut output = String::new();
+        if let Some(mut reader) = stdout {
+            use tokio::io::AsyncReadExt;
+            let _ = reader.read_to_string(&mut output).await;
+        }
+        output
+    });
+
+    // Read stderr in background (contains progress info)
+    let stderr = child.stderr.take();
+    let stderr_handle = tokio::spawn(async move {
+        let mut output = String::new();
+        if let Some(mut reader) = stderr {
+            use tokio::io::AsyncReadExt;
+            let _ = reader.read_to_string(&mut output).await;
+        }
+        output
+    });
+
+    // Wait for process with optional timeout
+    let status = if timeout_secs > 0 {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            child.wait()
+        ).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => return Err(format!("Claude Code process error: {}", e)),
+            Err(_) => {
+                let _ = child.kill().await;
+                return Err(format!("Claude Code timed out after {}s", timeout_secs));
+            }
+        }
     } else {
-        fut.await.map_err(|e| format!("Failed to run Claude Code: {}", e))?
+        child.wait().await.map_err(|e| format!("Claude Code process error: {}", e))?
     };
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Claude Code failed: {}", stderr.trim()));
+    let stdout_text = stdout_handle.await.unwrap_or_default();
+    let stderr_text = stderr_handle.await.unwrap_or_default();
+
+    if !status.success() {
+        return Err(format!("Claude Code failed: {}", stderr_text.trim()));
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(stdout_text.trim().to_string())
 }
 
 pub fn find_claude_exe() -> String {
