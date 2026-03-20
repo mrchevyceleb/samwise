@@ -26,9 +26,14 @@
 	let isAgent = $derived(task.assignee === 'agent');
 
 	function handleDragStart(e: DragEvent) {
+		if (!e.dataTransfer) return;
 		dragging = true;
-		e.dataTransfer?.setData('text/plain', task.id);
-		e.dataTransfer!.effectAllowed = 'move';
+		e.dataTransfer.setData('text/plain', task.id);
+		e.dataTransfer.effectAllowed = 'move';
+		// Create a semi-transparent drag image
+		const el = e.currentTarget as HTMLElement;
+		const rect = el.getBoundingClientRect();
+		e.dataTransfer.setDragImage(el, e.clientX - rect.left, e.clientY - rect.top);
 		onDragStart?.(task);
 	}
 

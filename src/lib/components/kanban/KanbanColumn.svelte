@@ -13,9 +13,10 @@
 		onToggleCollapse?: () => void;
 		onDrop?: (taskId: string, status: string) => void;
 		onTaskClick?: (task: AeTask) => void;
+		onTaskDragStart?: (task: AeTask) => void;
 	}
 
-	let { status, label, color, glowColor, icon, tasks, collapsed = false, onToggleCollapse, onDrop, onTaskClick }: Props = $props();
+	let { status, label, color, glowColor, icon, tasks, collapsed = false, onToggleCollapse, onDrop, onTaskClick, onTaskDragStart }: Props = $props();
 
 	let dragOver = $state(false);
 	let headerHovered = $state(false);
@@ -38,11 +39,12 @@
 
 	function handleDrop(e: DragEvent) {
 		e.preventDefault();
+		e.stopPropagation();
 		dragOver = false;
-		const taskId = e.dataTransfer?.getData('text/plain');
-		if (taskId) {
-			onDrop?.(taskId, status);
-		}
+		const taskId = e.dataTransfer?.getData('text/plain') || '';
+		console.log(`[kanban] Drop into ${status}, taskId from dataTransfer: "${taskId}"`);
+		// Pass whatever we got (may be empty string) - parent has fallback
+		onDrop?.(taskId, status);
 	}
 
 	let isInProgress = $derived(status === 'in_progress');
@@ -128,7 +130,7 @@
 			display: flex; flex-direction: column; gap: 8px;
 		">
 			{#each tasks as task (task.id)}
-				<KanbanCard {task} onClick={onTaskClick} />
+				<KanbanCard {task} onClick={onTaskClick} onDragStart={onTaskDragStart} />
 			{/each}
 
 			{#if tasks.length === 0}

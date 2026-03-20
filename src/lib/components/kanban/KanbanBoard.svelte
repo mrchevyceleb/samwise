@@ -15,6 +15,9 @@
 	let selectedTask = $state<AeTask | null>(null);
 	let addBtnHovered = $state(false);
 
+	/** Track currently dragged task ID (fallback for WebView2 dataTransfer issues) */
+	let draggedTaskId = $state<string | null>(null);
+
 	/** Failed tasks shown in a collapsed row at the bottom */
 	let failedTasks = $derived(taskStore.tasks.filter(t => t.status === 'failed'));
 	let failedExpanded = $state(false);
@@ -24,8 +27,17 @@
 		taskStore.fetchTasks();
 	});
 
+	function handleDragStart(task: AeTask) {
+		draggedTaskId = task.id;
+	}
+
 	function handleDrop(taskId: string, newStatus: string) {
-		taskStore.moveTask(taskId, newStatus as TaskStatus);
+		// Use fallback if dataTransfer didn't provide the ID (WebView2 quirk)
+		const resolvedId = taskId || draggedTaskId;
+		draggedTaskId = null;
+		if (resolvedId) {
+			taskStore.moveTask(resolvedId, newStatus as TaskStatus);
+		}
 	}
 
 	function handleTaskClick(task: AeTask) {
@@ -103,6 +115,7 @@
 				onToggleCollapse={column.status === 'done' ? () => layout.toggleDoneColumn() : undefined}
 				onDrop={handleDrop}
 				onTaskClick={handleTaskClick}
+				onTaskDragStart={handleDragStart}
 			/>
 		{/each}
 	</div>
