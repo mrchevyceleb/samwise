@@ -14,6 +14,7 @@
 	let project = $state('');
 	let priority = $state<TaskPriority>('medium');
 	let repoUrl = $state('');
+	let repoPath = $state('');
 	let previewUrl = $state('');
 	let saving = $state(false);
 	let quickMode = $state(true);
@@ -30,6 +31,7 @@
 				priority,
 				project: project.trim() || undefined,
 				repo_url: repoUrl.trim() || undefined,
+				repo_path: repoPath.trim() || undefined,
 				preview_url: previewUrl.trim() || undefined,
 			});
 			onClose();
@@ -206,6 +208,27 @@
 					onfocus={(e) => { (e.currentTarget as HTMLElement).style.borderColor = 'rgba(99, 102, 241, 0.4)'; }}
 					onblur={(e) => { (e.currentTarget as HTMLElement).style.borderColor = 'var(--border-default)'; }}
 				></textarea>
+			</div>
+
+			<!-- Repo Path (local) -->
+			<div style="margin-bottom: 14px; animation: slide-in-top 0.15s ease;">
+				<label style="font-size: 11px; font-weight: 600; color: var(--text-secondary); display: block; margin-bottom: 4px;">
+					Repo Path (local)
+				</label>
+				<input
+					type="text"
+					bind:value={repoPath}
+					placeholder="C:\PERSONAL-PROJECTS\my-repo"
+					style="
+						width: 100%; padding: 10px 12px;
+						background: var(--bg-primary); border: 1px solid var(--border-default);
+						border-radius: 8px; color: var(--text-primary);
+						font-family: var(--font-mono); font-size: 12px;
+						outline: none; transition: border-color 0.15s;
+					"
+					onfocus={(e) => { (e.currentTarget as HTMLElement).style.borderColor = 'rgba(99, 102, 241, 0.4)'; }}
+					onblur={(e) => { (e.currentTarget as HTMLElement).style.borderColor = 'var(--border-default)'; }}
+				/>
 			</div>
 
 			<!-- Repo URL -->

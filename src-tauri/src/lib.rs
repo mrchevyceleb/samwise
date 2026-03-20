@@ -110,6 +110,8 @@ pub fn run() {
             commands::health::check_claude_code,
             commands::health::check_gh_auth,
             commands::health::check_doppler,
+            // Hello
+            commands::hello::hello,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
