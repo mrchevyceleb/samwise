@@ -26,6 +26,9 @@
 	);
 	let isAgent = $derived(task.assignee === 'agent');
 	let isBeingDragged = $derived(drag.dragging && drag.draggedTask?.id === task.id);
+	let isWorking = $derived(task.status === 'in_progress' || task.status === 'testing');
+	let latestComment = $derived(commentStore.getLatestComment(task.id));
+	let qaResult = $derived(task.visual_qa_result);
 
 	function handleMouseDown(e: MouseEvent) {
 		// Only left click, not on links
@@ -63,14 +66,14 @@
 		border-radius: 10px;
 		background: {hovered ? 'rgba(99, 102, 241, 0.06)' : 'var(--glass-bg)'};
 		backdrop-filter: blur(var(--glass-blur));
-		border: 1px solid {hovered ? 'rgba(99, 102, 241, 0.2)' : 'var(--glass-border)'};
+		border: {isWorking ? '1.5px solid rgba(99, 102, 241, 0.5)' : hovered ? '1px solid rgba(99, 102, 241, 0.2)' : '1px solid var(--glass-border)'};
+		{isWorking ? 'animation: working-card-pulse 2s ease-in-out infinite;' : ''}
 		cursor: grab;
 		transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 		transform: {isBeingDragged ? 'scale(0.95)' : hovered ? 'translateY(-2px)' : 'translateY(0)'};
 		box-shadow: {hovered ? 'var(--shadow-card-hover)' : 'var(--shadow-card)'};
 		opacity: {isBeingDragged ? '0.4' : '1'};
-		animation: {task.status !== 'done' && !isBeingDragged ? 'card-idle-bob 4s ease-in-out infinite' : 'none'};
-		animation-delay: {Math.random() * 2}s;
+		{!isWorking ? `animation: ${task.status !== 'done' && !isBeingDragged ? 'card-idle-bob 4s ease-in-out infinite' : 'none'}; animation-delay: ${Math.random() * 2}s;` : ''}
 		user-select: none;
 	"
 	onmouseenter={() => hovered = true}
@@ -120,6 +123,37 @@
 			{elapsed}
 		</span>
 	</div>
+
+	<!-- Latest agent comment preview (shows what the agent is doing) -->
+	{#if latestComment && (isWorking || task.status === 'testing' || task.status === 'review')}
+		<div style="
+			font-size: 11px; color: var(--text-muted); line-height: 1.3;
+			padding: 5px 8px; margin-bottom: 8px; border-radius: 6px;
+			background: rgba(99, 102, 241, 0.04);
+			border-left: 2px solid rgba(99, 102, 241, 0.3);
+			white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+		">
+			{#if isWorking}
+				<span style="color: var(--accent-indigo); font-weight: 600; margin-right: 4px;">
+					&#9679;
+				</span>
+			{/if}
+			{latestComment}
+		</div>
+	{/if}
+
+	<!-- Visual QA result badge -->
+	{#if qaResult}
+		<div style="
+			font-size: 10px; font-weight: 600; padding: 3px 8px; margin-bottom: 8px;
+			border-radius: 5px; display: inline-flex; align-items: center; gap: 4px;
+			background: {qaResult.pass ? 'rgba(63, 185, 80, 0.08)' : 'rgba(248, 81, 73, 0.08)'};
+			color: {qaResult.pass ? 'var(--accent-green)' : 'var(--accent-red)'};
+			border: 1px solid {qaResult.pass ? 'rgba(63, 185, 80, 0.2)' : 'rgba(248, 81, 73, 0.2)'};
+		">
+			{qaResult.pass ? 'QA Passed' : 'QA Failed'}
+		</div>
+	{/if}
 
 	<!-- Bottom row: indicators -->
 	<div style="display: flex; align-items: center; gap: 8px;">

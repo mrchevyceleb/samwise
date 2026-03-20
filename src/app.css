@@ -132,6 +132,18 @@ button, input, textarea, select, a, [role="button"] {
   50% { box-shadow: inset 0 0 30px rgba(99, 102, 241, 0.12); }
 }
 
+/* ── Working card pulse (in-progress cards get a breathing indigo border) */
+@keyframes working-card-pulse {
+  0%, 100% {
+    border-color: rgba(99, 102, 241, 0.3);
+    box-shadow: 0 0 8px rgba(99, 102, 241, 0.1);
+  }
+  50% {
+    border-color: rgba(99, 102, 241, 0.6);
+    box-shadow: 0 0 16px rgba(99, 102, 241, 0.25);
+  }
+}
+
 /* ── Floating animation for background symbols ─────────────────── */
 @keyframes float-drift {
   0% { transform: translate(0, 0) rotate(0deg); opacity: var(--float-opacity, 0.04); }

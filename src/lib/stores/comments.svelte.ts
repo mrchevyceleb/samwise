@@ -27,6 +27,18 @@ export function getCommentStore() {
       return (commentsByTask.get(taskId) || []).length;
     },
 
+    /** Get the latest agent comment content for a task (for card preview) */
+    getLatestComment(taskId: string): string | null {
+      const comments = commentsByTask.get(taskId) || [];
+      // Find last agent comment
+      for (let i = comments.length - 1; i >= 0; i--) {
+        if (comments[i].author === 'agent') {
+          return comments[i].content;
+        }
+      }
+      return null;
+    },
+
     async fetchComments(taskId: string) {
       loading = true;
       error = null;
