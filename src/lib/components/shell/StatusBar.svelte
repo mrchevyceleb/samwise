@@ -37,11 +37,11 @@
 			Tasks
 		</button>
 
-		<!-- Automation panel toggle -->
+		<!-- Automation panel toggle (opens Settings > Automation tab) -->
 		<button
 			title="Toggle Automation (Ctrl+Shift+B)"
-			style="display: flex; align-items: center; gap: 4px; background: none; border: none; color: {rightPanelBtnHovered ? 'var(--accent-indigo)' : layout.rightPanelVisible ? 'var(--text-secondary)' : 'var(--text-muted)'}; cursor: pointer; font-family: var(--font-mono); font-size: 11px; transition: color 0.12s ease; transform: {rightPanelBtnHovered ? 'scale(1.05)' : 'scale(1)'}; opacity: {layout.rightPanelVisible ? 1 : 0.6};"
-			onclick={() => layout.toggleRightPanel()}
+			style="display: flex; align-items: center; gap: 4px; background: none; border: none; color: {rightPanelBtnHovered ? 'var(--accent-indigo)' : 'var(--text-muted)'}; cursor: pointer; font-family: var(--font-mono); font-size: 11px; transition: color 0.12s ease; transform: {rightPanelBtnHovered ? 'scale(1.05)' : 'scale(1)'};"
+			onclick={() => { settingsStore.activeSettingsTab = 'automation'; settingsStore.settingsVisible = true; }}
 			onmouseenter={() => rightPanelBtnHovered = true}
 			onmouseleave={() => rightPanelBtnHovered = false}
 		>

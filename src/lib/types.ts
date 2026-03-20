@@ -21,6 +21,8 @@ export interface AeTask {
   branch: string | null;
   preview_url: string | null;
   pr_url: string | null;
+  pr_number: number | null;
+  screenshots: unknown[] | null;
   screenshots_before: string[] | null;
   screenshots_after: string[] | null;
   visual_qa_result: { pass: boolean; explanation: string } | null;
@@ -46,6 +48,7 @@ export interface AeComment {
 
 export interface AeMessage {
   id: string;
+  conversation_id: string;
   role: MessageRole;
   content: string;
   task_id: string | null;

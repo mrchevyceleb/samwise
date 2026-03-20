@@ -114,6 +114,12 @@
 			e.preventDefault();
 			layout.toggleRightPanel();
 		}
+		// Ctrl+Shift+B -> Toggle Automation (Settings > Automation tab)
+		if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'B') {
+			e.preventDefault();
+			settingsStore.activeSettingsTab = 'automation';
+			settingsStore.settingsVisible = !settingsStore.settingsVisible;
+		}
 	}
 </script>
 

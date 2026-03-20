@@ -30,6 +30,7 @@
 				priority,
 				project: project.trim() || undefined,
 				repo_url: repoUrl.trim() || undefined,
+				preview_url: previewUrl.trim() || undefined,
 			});
 			onClose();
 		} finally {

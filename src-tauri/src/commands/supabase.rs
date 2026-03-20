@@ -127,13 +127,16 @@ pub async fn send_message(config: &SupabaseConfig, message: &Value) -> Result<Va
 pub async fn worker_heartbeat(config: &SupabaseConfig, machine_name: &str) -> Result<Value, String> {
     let client = build_client(config)?;
     let now = chrono::Utc::now().to_rfc3339();
+    // id = machine_name (text PK has no default, machine_name is the stable identity)
+    // on_conflict targets the unique machine_name column for upsert
     let body = serde_json::json!({
+        "id": machine_name,
         "machine_name": machine_name,
         "status": "online",
         "last_heartbeat": now,
     });
     let resp = client
-        .post(&rest_url(config, "ae_workers"))
+        .post(&format!("{}?on_conflict=machine_name", rest_url(config, "ae_workers")))
         .header("Prefer", "resolution=merge-duplicates,return=representation")
         .json(&body)
         .send()

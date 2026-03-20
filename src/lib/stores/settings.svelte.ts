@@ -163,7 +163,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
 
 let currentSettings = $state<AppSettings>({ ...DEFAULT_SETTINGS });
 let settingsVisible = $state(false);
-let activeSettingsTab = $state<string>('general');
+let activeSettingsTab = $state<string>('connection');
 let settingsLoaded = $state(false);
 
 // Debounce timer for auto-saving

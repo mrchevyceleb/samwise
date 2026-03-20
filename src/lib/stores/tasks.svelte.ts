@@ -78,6 +78,7 @@ export function getTaskStore() {
       project?: string;
       repo_url?: string;
       repo_path?: string;
+      preview_url?: string;
       context?: Record<string, unknown>;
     }) {
       try {
@@ -91,6 +92,7 @@ export function getTaskStore() {
             project: data.project || null,
             repo_url: data.repo_url || null,
             repo_path: data.repo_path || null,
+            preview_url: data.preview_url || null,
             context: data.context || null,
           },
         });

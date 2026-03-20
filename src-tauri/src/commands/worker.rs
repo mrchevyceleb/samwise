@@ -131,7 +131,25 @@ async fn worker_loop(
             if is_idle {
                 if let Ok(tasks) = supabase::fetch_tasks(&config, Some("queued")).await {
                     if let Some(arr) = tasks.as_array() {
-                        if let Some(task) = arr.first() {
+                        // Sort by priority: critical=0, high=1, medium=2, low=3, then created_at asc
+                        let priority_order = |p: &str| match p {
+                            "critical" => 0u8,
+                            "high" => 1,
+                            "medium" => 2,
+                            "low" => 3,
+                            _ => 4,
+                        };
+                        let mut sorted = arr.clone();
+                        sorted.sort_by(|a, b| {
+                            let pa = priority_order(a.get("priority").and_then(|v| v.as_str()).unwrap_or("medium"));
+                            let pb = priority_order(b.get("priority").and_then(|v| v.as_str()).unwrap_or("medium"));
+                            pa.cmp(&pb).then_with(|| {
+                                let ta = a.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+                                let tb = b.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+                                ta.cmp(tb)
+                            })
+                        });
+                        if let Some(task) = sorted.first() {
                             let task_id = task.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
 
                             if !task_id.is_empty() {
