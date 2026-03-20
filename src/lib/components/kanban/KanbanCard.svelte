@@ -2,19 +2,20 @@
 	import type { AeTask } from '$lib/types';
 	import { PRIORITY_COLORS } from '$lib/types';
 	import { getCommentStore } from '$lib/stores/comments.svelte';
+	import { getDragStore } from '$lib/stores/drag.svelte';
 	import { formatTimeAgo } from '$lib/utils/relative-time';
 
 	interface Props {
 		task: AeTask;
-		onDragStart?: (task: AeTask) => void;
 		onClick?: (task: AeTask) => void;
 	}
 
-	let { task, onDragStart, onClick }: Props = $props();
+	let { task, onClick }: Props = $props();
 	const commentStore = getCommentStore();
+	const drag = getDragStore();
 
 	let hovered = $state(false);
-	let dragging = $state(false);
+	let mouseDownAt = $state<{ x: number; y: number } | null>(null);
 
 	let elapsed = $derived(formatTimeAgo(new Date(task.created_at).getTime()));
 	let priorityColor = $derived(PRIORITY_COLORS[task.priority]);
@@ -24,27 +25,37 @@
 		(task.screenshots_after && task.screenshots_after.length > 0)
 	);
 	let isAgent = $derived(task.assignee === 'agent');
+	let isBeingDragged = $derived(drag.dragging && drag.draggedTask?.id === task.id);
 
-	function handleDragStart(e: DragEvent) {
-		if (!e.dataTransfer) return;
-		dragging = true;
-		e.dataTransfer.setData('text/plain', task.id);
-		e.dataTransfer.effectAllowed = 'move';
-		// Create a semi-transparent drag image
-		const el = e.currentTarget as HTMLElement;
-		const rect = el.getBoundingClientRect();
-		e.dataTransfer.setDragImage(el, e.clientX - rect.left, e.clientY - rect.top);
-		onDragStart?.(task);
+	function handleMouseDown(e: MouseEvent) {
+		// Only left click, not on links
+		if (e.button !== 0) return;
+		if ((e.target as HTMLElement).closest('a')) return;
+		mouseDownAt = { x: e.clientX, y: e.clientY };
 	}
 
-	function handleDragEnd() {
-		dragging = false;
+	function handleMouseMove(e: MouseEvent) {
+		if (!mouseDownAt) return;
+		// Start drag after 5px movement threshold
+		const dx = e.clientX - mouseDownAt.x;
+		const dy = e.clientY - mouseDownAt.y;
+		if (Math.abs(dx) + Math.abs(dy) > 5) {
+			drag.startDrag(task, e.clientX, e.clientY);
+			mouseDownAt = null;
+		}
+	}
+
+	function handleMouseUp() {
+		if (mouseDownAt && !drag.dragging) {
+			// This was a click, not a drag
+			onClick?.(task);
+		}
+		mouseDownAt = null;
 	}
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
-	draggable="true"
 	role="button"
 	tabindex={0}
 	style="
@@ -55,17 +66,18 @@
 		border: 1px solid {hovered ? 'rgba(99, 102, 241, 0.2)' : 'var(--glass-border)'};
 		cursor: grab;
 		transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-		transform: {dragging ? 'scale(1.04) rotate(1deg)' : hovered ? 'translateY(-2px)' : 'translateY(0)'};
-		box-shadow: {dragging ? 'var(--shadow-card-hover), 0 0 30px rgba(99, 102, 241, 0.15)' : hovered ? 'var(--shadow-card-hover)' : 'var(--shadow-card)'};
-		opacity: {dragging ? '0.7' : '1'};
-		animation: {task.status !== 'done' ? 'card-idle-bob 4s ease-in-out infinite' : 'none'};
+		transform: {isBeingDragged ? 'scale(0.95)' : hovered ? 'translateY(-2px)' : 'translateY(0)'};
+		box-shadow: {hovered ? 'var(--shadow-card-hover)' : 'var(--shadow-card)'};
+		opacity: {isBeingDragged ? '0.4' : '1'};
+		animation: {task.status !== 'done' && !isBeingDragged ? 'card-idle-bob 4s ease-in-out infinite' : 'none'};
 		animation-delay: {Math.random() * 2}s;
+		user-select: none;
 	"
 	onmouseenter={() => hovered = true}
-	onmouseleave={() => hovered = false}
-	ondragstart={handleDragStart}
-	ondragend={handleDragEnd}
-	onclick={() => onClick?.(task)}
+	onmouseleave={() => { hovered = false; mouseDownAt = null; }}
+	onmousedown={handleMouseDown}
+	onmousemove={handleMouseMove}
+	onmouseup={handleMouseUp}
 	onkeydown={(e) => { if (e.key === 'Enter') onClick?.(task); }}
 >
 	<!-- Title (truncated to 2 lines) -->

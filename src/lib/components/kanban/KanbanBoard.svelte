@@ -4,44 +4,65 @@
 	import type { AeTask, TaskStatus } from '$lib/types';
 	import { getTaskStore } from '$lib/stores/tasks.svelte';
 	import { getLayout } from '$lib/stores/layout.svelte';
+	import { getDragStore } from '$lib/stores/drag.svelte';
 	import KanbanColumn from './KanbanColumn.svelte';
 	import NewTaskModal from './NewTaskModal.svelte';
 	import TaskDetailModal from './TaskDetailModal.svelte';
 
 	const taskStore = getTaskStore();
 	const layout = getLayout();
+	const drag = getDragStore();
 
 	let showNewTask = $state(false);
 	let selectedTask = $state<AeTask | null>(null);
 	let addBtnHovered = $state(false);
-
-	/** Track currently dragged task ID (fallback for WebView2 dataTransfer issues) */
-	let draggedTaskId = $state<string | null>(null);
 
 	/** Failed tasks shown in a collapsed row at the bottom */
 	let failedTasks = $derived(taskStore.tasks.filter(t => t.status === 'failed'));
 	let failedExpanded = $state(false);
 	let failedHovered = $state(false);
 
+	let columnsContainer = $state<HTMLDivElement | null>(null);
+
 	onMount(() => {
 		taskStore.fetchTasks();
 	});
 
-	function handleDragStart(task: AeTask) {
-		draggedTaskId = task.id;
+	function handleMouseMove(e: MouseEvent) {
+		if (!drag.dragging) return;
+		drag.updatePosition(e.clientX, e.clientY);
+
+		// Determine which column the pointer is over
+		if (columnsContainer) {
+			const columns = columnsContainer.querySelectorAll('[data-column-status]');
+			let found = false;
+			for (const col of columns) {
+				const rect = col.getBoundingClientRect();
+				if (e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom) {
+					drag.setHoverColumn(col.getAttribute('data-column-status') as TaskStatus);
+					found = true;
+					break;
+				}
+			}
+			if (!found) {
+				drag.setHoverColumn(null);
+			}
+		}
 	}
 
-	function handleDrop(taskId: string, newStatus: string) {
-		// Use fallback if dataTransfer didn't provide the ID (WebView2 quirk)
-		const resolvedId = taskId || draggedTaskId;
-		draggedTaskId = null;
-		if (resolvedId) {
-			taskStore.moveTask(resolvedId, newStatus as TaskStatus);
+	function handleMouseUp() {
+		if (!drag.dragging) return;
+		const result = drag.endDrag();
+		if (result) {
+			taskStore.moveTask(result.task.id, result.targetColumn);
 		}
 	}
 
 	function handleTaskClick(task: AeTask) {
-		selectedTask = task;
+		// Don't open detail if we just finished dragging
+		if (!drag.dragging) {
+			selectedTask = task;
+		}
 	}
 
 	function handleKeyDown(e: KeyboardEvent) {
@@ -49,12 +70,15 @@
 			e.preventDefault();
 			showNewTask = true;
 		}
+		if (e.key === 'Escape' && drag.dragging) {
+			drag.cancelDrag();
+		}
 	}
 </script>
 
-<svelte:window onkeydown={handleKeyDown} />
+<svelte:window onkeydown={handleKeyDown} onmousemove={handleMouseMove} onmouseup={handleMouseUp} />
 
-<div style="display: flex; flex-direction: column; height: 100%; overflow: hidden;">
+<div style="display: flex; flex-direction: column; height: 100%; overflow: hidden; position: relative;">
 	<!-- Header -->
 	<div style="
 		display: flex; align-items: center; gap: 8px;
@@ -70,9 +94,9 @@
 
 		<!-- Task counts -->
 		{#if taskStore.loading}
-			<span style="font-size: 10px; color: var(--text-muted); font-family: var(--font-mono);">loading...</span>
+			<span style="font-size: 12px; color: var(--text-muted); font-family: var(--font-mono);">loading...</span>
 		{:else}
-			<span style="font-size: 10px; color: var(--text-muted); font-family: var(--font-mono);">
+			<span style="font-size: 12px; color: var(--text-muted); font-family: var(--font-mono);">
 				{taskStore.taskCounts.total} tasks
 			</span>
 		{/if}
@@ -81,7 +105,7 @@
 		<button
 			title="New Task (Ctrl+N)"
 			style="
-				width: 28px; height: 28px; display: flex; align-items: center; justify-content: center;
+				width: 32px; height: 32px; display: flex; align-items: center; justify-content: center;
 				border: 1px solid {addBtnHovered ? 'rgba(99, 102, 241, 0.4)' : 'var(--border-default)'};
 				border-radius: 8px; cursor: pointer; transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 				background: {addBtnHovered ? 'rgba(99, 102, 241, 0.12)' : 'transparent'};
@@ -92,17 +116,21 @@
 			onmouseleave={() => addBtnHovered = false}
 			onclick={() => showNewTask = true}
 		>
-			<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+			<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
 				<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
 			</svg>
 		</button>
 	</div>
 
 	<!-- Columns (horizontal scroll) -->
-	<div style="
-		flex: 1; display: flex; gap: 4px; padding: 8px;
-		overflow-x: auto; overflow-y: hidden;
-	">
+	<div
+		bind:this={columnsContainer}
+		style="
+			flex: 1; display: flex; gap: 4px; padding: 8px;
+			overflow-x: auto; overflow-y: hidden;
+			{drag.dragging ? 'cursor: grabbing; user-select: none;' : ''}
+		"
+	>
 		{#each KANBAN_COLUMNS as column (column.status)}
 			<KanbanColumn
 				status={column.status}
@@ -113,9 +141,8 @@
 				tasks={taskStore.tasksByColumn[column.status] || []}
 				collapsed={column.status === 'done' && layout.doneColumnCollapsed}
 				onToggleCollapse={column.status === 'done' ? () => layout.toggleDoneColumn() : undefined}
-				onDrop={handleDrop}
 				onTaskClick={handleTaskClick}
-				onTaskDragStart={handleDragStart}
+				isDragTarget={drag.dragging && drag.hoverColumn === column.status && drag.draggedTask?.status !== column.status}
 			/>
 		{/each}
 	</div>
@@ -192,6 +219,28 @@
 					{/each}
 				</div>
 			{/if}
+		</div>
+	{/if}
+
+	<!-- Drag ghost (floating card that follows the cursor) -->
+	{#if drag.dragging && drag.draggedTask}
+		<div style="
+			position: fixed; left: {drag.ghostX + 12}px; top: {drag.ghostY - 16}px;
+			z-index: 9999; pointer-events: none;
+			padding: 10px 14px; border-radius: 10px;
+			background: rgba(99, 102, 241, 0.15);
+			border: 2px solid rgba(99, 102, 241, 0.5);
+			backdrop-filter: blur(12px);
+			box-shadow: 0 8px 32px rgba(99, 102, 241, 0.3);
+			max-width: 220px; transform: rotate(2deg) scale(1.02);
+			animation: card-idle-bob 2s ease-in-out infinite;
+		">
+			<div style="font-size: 13px; font-weight: 600; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
+				{drag.draggedTask.title}
+			</div>
+			<div style="font-size: 10px; color: var(--accent-indigo); margin-top: 4px;">
+				{drag.hoverColumn ? `Drop in ${drag.hoverColumn.replace('_', ' ')}` : 'Drag to a column'}
+			</div>
 		</div>
 	{/if}
 </div>

@@ -11,61 +11,30 @@
 		tasks: AeTask[];
 		collapsed?: boolean;
 		onToggleCollapse?: () => void;
-		onDrop?: (taskId: string, status: string) => void;
 		onTaskClick?: (task: AeTask) => void;
-		onTaskDragStart?: (task: AeTask) => void;
+		isDragTarget?: boolean;
 	}
 
-	let { status, label, color, glowColor, icon, tasks, collapsed = false, onToggleCollapse, onDrop, onTaskClick, onTaskDragStart }: Props = $props();
+	let { status, label, color, glowColor, icon, tasks, collapsed = false, onToggleCollapse, onTaskClick, isDragTarget = false }: Props = $props();
 
-	let dragOver = $state(false);
 	let headerHovered = $state(false);
-
-	function handleDragOver(e: DragEvent) {
-		e.preventDefault();
-		e.dataTransfer!.dropEffect = 'move';
-		dragOver = true;
-	}
-
-	function handleDragLeave(e: DragEvent) {
-		// Only clear if we actually left the column (not just entered a child)
-		const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-		const x = e.clientX;
-		const y = e.clientY;
-		if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) {
-			dragOver = false;
-		}
-	}
-
-	function handleDrop(e: DragEvent) {
-		e.preventDefault();
-		e.stopPropagation();
-		dragOver = false;
-		const taskId = e.dataTransfer?.getData('text/plain') || '';
-		console.log(`[kanban] Drop into ${status}, taskId from dataTransfer: "${taskId}"`);
-		// Pass whatever we got (may be empty string) - parent has fallback
-		onDrop?.(taskId, status);
-	}
-
 	let isInProgress = $derived(status === 'in_progress');
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
+	data-column-status={status}
 	style="
 		display: flex; flex-direction: column;
 		min-width: {collapsed ? '44px' : '200px'};
 		flex: {collapsed ? '0 0 44px' : '1'};
-		background: {dragOver ? glowColor : 'rgba(255, 255, 255, 0.015)'};
+		background: {isDragTarget ? glowColor : 'rgba(255, 255, 255, 0.015)'};
 		border-radius: 10px;
-		border-left: 2px solid {color}30;
+		border-left: 2px solid {isDragTarget ? color : color + '30'};
 		transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
 		{isInProgress && !collapsed ? 'animation: working-glow 3s ease-in-out infinite;' : ''}
-		{dragOver ? `outline: 2px dashed ${color}60; outline-offset: -2px;` : ''}
+		{isDragTarget ? `outline: 2px dashed ${color}60; outline-offset: -2px; transform: scale(1.01);` : ''}
 	"
-	ondragover={handleDragOver}
-	ondragleave={handleDragLeave}
-	ondrop={handleDrop}
 >
 	<!-- Column header -->
 	<button
@@ -130,18 +99,18 @@
 			display: flex; flex-direction: column; gap: 8px;
 		">
 			{#each tasks as task (task.id)}
-				<KanbanCard {task} onClick={onTaskClick} onDragStart={onTaskDragStart} />
+				<KanbanCard {task} onClick={onTaskClick} />
 			{/each}
 
 			{#if tasks.length === 0}
 				<div style="
 					padding: 24px 8px; text-align: center;
 					color: var(--text-muted); font-size: 12px;
-					border: 1px dashed {dragOver ? color + '60' : 'var(--border-default)'};
-					border-radius: 8px; opacity: {dragOver ? '0.8' : '0.4'};
+					border: 1px dashed {isDragTarget ? color + '60' : 'var(--border-default)'};
+					border-radius: 8px; opacity: {isDragTarget ? '0.8' : '0.4'};
 					transition: all 0.2s ease;
 				">
-					{dragOver ? 'Drop here' : 'No tasks'}
+					{isDragTarget ? 'Drop here' : 'No tasks'}
 				</div>
 			{/if}
 		</div>
