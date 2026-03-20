@@ -1,8 +1,9 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, onDestroy } from 'svelte';
 	import { KANBAN_COLUMNS } from '$lib/types';
 	import type { AeTask, TaskStatus } from '$lib/types';
 	import { getTaskStore } from '$lib/stores/tasks.svelte';
+	import { getCommentStore } from '$lib/stores/comments.svelte';
 	import { getLayout } from '$lib/stores/layout.svelte';
 	import { getDragStore } from '$lib/stores/drag.svelte';
 	import KanbanColumn from './KanbanColumn.svelte';
@@ -10,6 +11,7 @@
 	import TaskDetailModal from './TaskDetailModal.svelte';
 
 	const taskStore = getTaskStore();
+	const commentStore = getCommentStore();
 	const layout = getLayout();
 	const drag = getDragStore();
 
@@ -24,8 +26,28 @@
 
 	let columnsContainer = $state<HTMLDivElement | null>(null);
 
+	/** Auto-poll comments for active tasks so card previews update live */
+	let commentPollInterval: ReturnType<typeof setInterval> | null = null;
+
+	function pollActiveComments() {
+		const activeTasks = taskStore.tasks.filter(
+			t => t.status === 'in_progress' || t.status === 'testing' || t.status === 'review'
+		);
+		for (const task of activeTasks) {
+			commentStore.fetchComments(task.id);
+		}
+	}
+
 	onMount(() => {
 		taskStore.fetchTasks();
+		// Poll comments for active tasks every 8 seconds
+		commentPollInterval = setInterval(pollActiveComments, 8000);
+		// Initial fetch
+		setTimeout(pollActiveComments, 1000);
+	});
+
+	onDestroy(() => {
+		if (commentPollInterval) clearInterval(commentPollInterval);
 	});
 
 	function handleMouseMove(e: MouseEvent) {

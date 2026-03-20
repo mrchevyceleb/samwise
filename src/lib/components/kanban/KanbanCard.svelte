@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { onMount, onDestroy } from 'svelte';
 	import type { AeTask } from '$lib/types';
 	import { PRIORITY_COLORS } from '$lib/types';
 	import { getCommentStore } from '$lib/stores/comments.svelte';
@@ -16,6 +17,7 @@
 
 	let hovered = $state(false);
 	let mouseDownAt = $state<{ x: number; y: number } | null>(null);
+	let nowTick = $state(Date.now());
 
 	let elapsed = $derived(formatTimeAgo(new Date(task.created_at).getTime()));
 	let priorityColor = $derived(PRIORITY_COLORS[task.priority]);
@@ -29,6 +31,43 @@
 	let isWorking = $derived(task.status === 'in_progress' || task.status === 'testing');
 	let latestComment = $derived(commentStore.getLatestComment(task.id));
 	let qaResult = $derived(task.visual_qa_result);
+
+	/** Live elapsed timer for in-progress tasks */
+	let workingElapsed = $derived(() => {
+		if (!isWorking || !task.claimed_at) return '';
+		const start = new Date(task.claimed_at).getTime();
+		const diff = Math.max(0, nowTick - start);
+		const secs = Math.floor(diff / 1000);
+		if (secs < 60) return `${secs}s`;
+		const mins = Math.floor(secs / 60);
+		const remSecs = secs % 60;
+		if (mins < 60) return `${mins}m ${remSecs}s`;
+		const hrs = Math.floor(mins / 60);
+		const remMins = mins % 60;
+		return `${hrs}h ${remMins}m`;
+	});
+
+	let timerInterval: ReturnType<typeof setInterval> | null = null;
+
+	onMount(() => {
+		if (isWorking) {
+			timerInterval = setInterval(() => { nowTick = Date.now(); }, 1000);
+		}
+	});
+
+	onDestroy(() => {
+		if (timerInterval) clearInterval(timerInterval);
+	});
+
+	// Start/stop timer when status changes
+	$effect(() => {
+		if (isWorking && !timerInterval) {
+			timerInterval = setInterval(() => { nowTick = Date.now(); }, 1000);
+		} else if (!isWorking && timerInterval) {
+			clearInterval(timerInterval);
+			timerInterval = null;
+		}
+	});
 
 	function handleMouseDown(e: MouseEvent) {
 		// Only left click, not on links
@@ -118,10 +157,25 @@
 
 		<div style="flex: 1;"></div>
 
-		<!-- Time elapsed -->
-		<span style="font-size: 10px; color: var(--text-muted); font-family: var(--font-mono);">
-			{elapsed}
-		</span>
+		<!-- Time elapsed / working timer -->
+		{#if isWorking}
+			<span style="
+				font-size: 10px; font-weight: 600; color: var(--accent-indigo);
+				font-family: var(--font-mono);
+				display: flex; align-items: center; gap: 3px;
+			">
+				<span style="
+					width: 6px; height: 6px; border-radius: 50%;
+					background: var(--accent-indigo);
+					animation: pulse-dot 1.5s ease-in-out infinite;
+				"></span>
+				{workingElapsed()}
+			</span>
+		{:else}
+			<span style="font-size: 10px; color: var(--text-muted); font-family: var(--font-mono);">
+				{elapsed}
+			</span>
+		{/if}
 	</div>
 
 	<!-- Latest agent comment preview (shows what the agent is doing) -->
