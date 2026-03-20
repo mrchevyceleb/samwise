@@ -11,10 +11,15 @@
 	let loaded = $state(false);
 
 	onMount(async () => {
-		// Check if Supabase is configured - if not, show setup wizard
+		// Try to auto-load config from Doppler on startup
 		const config = await safeInvoke<{ url: string; anon_key: string }>('supabase_get_config');
 		if (!config || !config.url) {
-			showSetup = true;
+			// Config empty - try loading from Doppler automatically
+			const dopplerConfig = await safeInvoke<{ url: string; anon_key: string }>('supabase_load_doppler');
+			if (!dopplerConfig || !dopplerConfig.url) {
+				// Doppler failed too - show setup wizard as last resort
+				showSetup = true;
+			}
 		}
 		loaded = true;
 	});
