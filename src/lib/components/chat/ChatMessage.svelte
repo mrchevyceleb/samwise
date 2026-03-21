@@ -1,6 +1,7 @@
 <script lang="ts">
 	import type { AeMessage } from '$lib/types';
 	import { renderMarkdown } from '$lib/utils/markdown';
+	import { getTheme } from '$lib/stores/theme.svelte';
 	import AgentAvatar from './AgentAvatar.svelte';
 
 	interface Props {
@@ -8,6 +9,7 @@
 	}
 
 	let { message }: Props = $props();
+	const theme = getTheme();
 
 	let isUser = $derived(message.role === 'user');
 	let isAgent = $derived(message.role === 'agent');
@@ -15,7 +17,6 @@
 
 	let renderedContent = $state(message.content);
 
-	// Render markdown for agent messages
 	$effect(() => {
 		if (isAgent && message.content) {
 			renderMarkdown(message.content).then(html => {
@@ -49,47 +50,44 @@
 	animation: {isUser ? 'slide-in-right' : isSystem ? 'fade-in' : 'slide-in-left'} 0.3s ease;
 ">
 	{#if isUser}
-		<!-- User message - solid indigo bubble, right-aligned -->
 		<div style="
 			max-width: 85%; padding: 10px 14px; border-radius: 14px 14px 4px 14px;
-			background: #6366f1;
+			background: {theme.c.accentPrimary};
 			color: #fff; font-size: 14px; line-height: 1.5;
 			white-space: pre-wrap; word-break: break-word;
-			box-shadow: 0 2px 8px rgba(99, 102, 241, 0.3);
+			box-shadow: 0 2px 8px {theme.c.accentGlow};
 		">
 			{message.content}
 		</div>
-		<span style="font-size: 10px; color: var(--text-muted); padding: 0 4px;">
+		<span style="font-size: 10px; color: {theme.c.textMuted}; padding: 0 4px;">
 			{formatTime(message.created_at)}
 		</span>
 	{:else if isAgent}
-		<!-- Agent message - dark surface with avatar -->
 		<div style="max-width: 92%; display: flex; gap: 8px; align-items: flex-start;">
 			<AgentAvatar size={24} />
 			<div style="flex: 1; min-width: 0;">
 				<div class="agent-msg-content" style="
 					padding: 10px 14px; border-radius: 4px 14px 14px 14px;
-					background: #1c2128;
-					border: 1px solid var(--border-default);
-					color: var(--text-primary);
+					background: {theme.c.bgElevated};
+					border: 1px solid {theme.c.borderDefault};
+					color: {theme.c.textPrimary};
 					font-size: 14px; line-height: 1.6;
 					word-break: break-word;
 				">
 					{@html renderedContent}
 				</div>
-				<span style="font-size: 10px; color: var(--text-muted); margin-top: 2px; display: inline-block;">
+				<span style="font-size: 10px; color: {theme.c.textMuted}; margin-top: 2px; display: inline-block;">
 					{formatTime(message.created_at)}
 				</span>
 			</div>
 		</div>
 	{:else if isSystem}
-		<!-- System message - centered, smaller -->
 		<div style="
 			display: inline-flex; align-items: center; gap: 6px;
 			padding: 4px 14px; border-radius: 12px;
-			background: rgba(99, 102, 241, 0.04);
-			border: 1px solid rgba(99, 102, 241, 0.08);
-			font-size: 11px; color: var(--text-muted); font-style: italic;
+			background: {theme.c.bgSurface};
+			border: 1px solid {theme.c.borderDefault};
+			font-size: 11px; color: {theme.c.textMuted}; font-style: italic;
 		">
 			{message.content}
 		</div>
@@ -104,7 +102,7 @@
 		margin-bottom: 0;
 	}
 	.agent-msg-content :global(pre) {
-		background: rgba(0, 0, 0, 0.3);
+		background: var(--bg-surface);
 		border-radius: 6px;
 		padding: 8px 10px;
 		overflow-x: auto;
@@ -116,7 +114,7 @@
 		font-size: 12px;
 	}
 	.agent-msg-content :global(code:not(pre code)) {
-		background: rgba(99, 102, 241, 0.1);
+		background: var(--bg-surface);
 		padding: 1px 5px;
 		border-radius: 3px;
 	}

@@ -121,7 +121,7 @@ async fn worker_loop(
     // Greet Matt on startup
     {
         let config = sb_config_arc.read().await.clone();
-        agent_chat(&config, "I'm online and ready to work. Drop a task in the queue or just tell me what you need.").await;
+        agent_chat(&config, "Hey, Sam here. I'm online and ready. Drop a task or just tell me what you need.").await;
     }
 
     while running.load(Ordering::Relaxed) {
@@ -236,11 +236,6 @@ async fn worker_loop(
         // Evaluate triggers every 30 seconds (every 6th tick)
         if tick % 6 == 0 {
             let _ = evaluate_triggers(&config, &app).await;
-        }
-
-        // Check for new chat messages every 5 seconds
-        if tick % 1 == 0 {
-            let _ = check_chat_messages(&config, &app).await;
         }
 
         tick += 1;
@@ -634,83 +629,7 @@ async fn execute_task(
     }
 }
 
-// ── Chat Message Processing ─────────────────────────────────────────
-
-/// Check for unprocessed user messages and respond via Claude Code CLI.
-async fn check_chat_messages(config: &SupabaseConfig, app: &tauri::AppHandle) {
-    // Fetch recent messages
-    let messages = match supabase::fetch_messages(config).await {
-        Ok(m) => m,
-        Err(_) => return,
-    };
-
-    let Some(arr) = messages.as_array() else { return; };
-
-    // Find the last user message and last agent message
-    let last_user = arr.iter().rev().find(|m| {
-        m.get("role").and_then(|v| v.as_str()) == Some("user")
-    });
-    let last_agent = arr.iter().rev().find(|m| {
-        m.get("role").and_then(|v| v.as_str()) == Some("agent")
-    });
-
-    // If no user message, nothing to do
-    let Some(user_msg) = last_user else { return; };
-
-    // If the last agent message is newer than the last user message, already responded
-    let user_ts = user_msg.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
-    let agent_ts = last_agent.map(|m| m.get("created_at").and_then(|v| v.as_str()).unwrap_or("")).unwrap_or("");
-
-    if !agent_ts.is_empty() && agent_ts >= user_ts {
-        return; // Already responded to the latest user message
-    }
-
-    let user_content = user_msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
-    if user_content.is_empty() { return; }
-
-    // Build context for Claude Code
-    let recent_messages: Vec<String> = arr.iter().rev().take(10).rev().map(|m| {
-        let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("unknown");
-        let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        format!("{}: {}", role, content)
-    }).collect();
-
-    let context = recent_messages.join("\n");
-
-    let prompt = format!(
-        r#"You are Agent One, Matt's AI developer. You work 24/7. You are proactive, communicative, and competent. You talk like a senior developer on Slack - casual but professional. You never say "I'm an AI" or "As an AI." You are a teammate.
-
-Recent chat:
-{}
-
-Matt's latest message: {}
-
-Respond naturally. If Matt asks you to do something that requires creating a task (coding work, fixing bugs, building features), respond and mention you'll create a task for it. Keep it brief and conversational."#,
-        context, user_content
-    );
-
-    // Run Claude Code for the response
-    match run_claude_code(".", &prompt).await {
-        Ok(response) => {
-            let trimmed = response.trim();
-            if !trimmed.is_empty() {
-                let _ = supabase::send_message(config, &serde_json::json!({
-                    "role": "agent",
-                    "content": trimmed,
-                })).await;
-
-                emit_worker_event(app, "chat_response", "Responded to chat message", None);
-            }
-        }
-        Err(e) => {
-            log::warn!("[worker] Chat response failed: {}", e);
-            let _ = supabase::send_message(config, &serde_json::json!({
-                "role": "agent",
-                "content": format!("Sorry, I hit a snag trying to process that: {}. Try again?", e),
-            })).await;
-        }
-    }
-}
+// Chat message processing has been moved to commands/chat.rs (direct API, no worker dependency)
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -789,15 +708,10 @@ async fn agent_chat(config: &SupabaseConfig, content: &str) {
     })).await;
 }
 
-/// Run Claude Code CLI one-shot with configurable max turns and timeout
-async fn run_claude_code(cwd: &str, prompt: &str) -> Result<String, String> {
-    run_claude_code_opts(cwd, prompt, 0, 0).await
-}
-
 /// Run Claude Code CLI one-shot with explicit max_turns and timeout_secs.
 /// Pass 0 for either to use defaults (no limit / no timeout).
-/// Emits worker events for progress tracking.
-async fn run_claude_code_opts(cwd: &str, prompt: &str, max_turns: u32, timeout_secs: u64) -> Result<String, String> {
+/// Also used by commands/chat.rs for direct chat responses.
+pub async fn run_claude_code_opts(cwd: &str, prompt: &str, max_turns: u32, timeout_secs: u64) -> Result<String, String> {
     let claude_exe = find_claude_exe();
 
     let mut cmd = if claude_exe.ends_with(".cmd") {
@@ -1125,7 +1039,7 @@ async fn create_pr(
     if diff.status.success() { return Err("No changes to commit".to_string()); }
 
     // Commit
-    let commit_msg = format!("agent-one: {}", title);
+    let commit_msg = format!("samwise: {}", title);
     let commit = tokio::process::Command::new("git").args(["commit", "-m", &commit_msg]).current_dir(repo_path).output().await.map_err(|e| format!("git commit failed: {}", e))?;
     if !commit.status.success() {
         let stderr = String::from_utf8_lossy(&commit.stderr);
@@ -1146,7 +1060,7 @@ async fn create_pr(
             .unwrap_or_default();
         pr_body.push_str(&screenshot_md);
     }
-    pr_body.push_str("---\nAutomated by Agent One");
+    pr_body.push_str("---\nAutomated by SamWise");
 
     // Create PR with explicit base branch
     let pr = tokio::process::Command::new("gh")

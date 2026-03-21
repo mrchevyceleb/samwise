@@ -123,7 +123,7 @@
 	<div
 		style="
 			width: 500px; max-height: 85vh;
-			background: linear-gradient(180deg, #1c2333 0%, #161b22 100%);
+			background: var(--gradient-modal);
 			border: 1px solid var(--border-glow);
 			border-radius: 16px;
 			box-shadow: 0 24px 80px rgba(0, 0, 0, 0.6), 0 0 40px rgba(99, 102, 241, 0.08);

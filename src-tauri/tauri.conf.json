@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Agent One",
+  "productName": "SamWise",
   "version": "0.1.0",
   "identifier": "com.mattjohnston.agent-one",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Agent One",
+        "title": "SamWise",
         "label": "main",
         "width": 1440,
         "height": 900,

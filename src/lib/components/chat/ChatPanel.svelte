@@ -1,18 +1,18 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
 	import { getChatStore } from '$lib/stores/chat.svelte';
+	import { getTheme } from '$lib/stores/theme.svelte';
 	import ChatMessage from './ChatMessage.svelte';
 	import ChatInput from './ChatInput.svelte';
 	import AgentAvatar from './AgentAvatar.svelte';
 
 	const chat = getChatStore();
+	const theme = getTheme();
 
 	let messagesContainer = $state<HTMLDivElement | null>(null);
 	let minimized = $state(false);
 
-	// Auto-scroll to bottom when messages change
 	$effect(() => {
-		// Touch messages array to create dependency
 		const _len = chat.sortedMessages.length;
 		void _len;
 		tick().then(() => {
@@ -39,46 +39,33 @@
 	<div style="
 		display: flex; align-items: center; gap: 10px;
 		padding: 10px 14px;
-		background: rgba(22, 27, 34, 0.8);
-		border-bottom: 1px solid var(--border-default);
+		background: {theme.c.bgSurface};
+		border-bottom: 1px solid {theme.c.borderDefault};
 		flex-shrink: 0;
 	">
 		<AgentAvatar size={22} busy={chat.sendingMessage} />
 		<div style="flex: 1; min-width: 0;">
 			<div style="
-				font-size: 14px; font-weight: 600; color: var(--text-primary);
+				font-size: 14px; font-weight: 600; color: {theme.c.textPrimary};
 				font-family: var(--font-ui); letter-spacing: 0.3px;
 			">
-				Chat with Agent
+				Chat with Sam
 			</div>
-			<div style="font-size: 12px; color: var(--text-muted);">
+			<div style="font-size: 12px; color: {theme.c.textMuted};">
 				{#if chat.sendingMessage}
-					<span style="color: var(--accent-primary);">Thinking...</span>
+					<span style="color: {theme.c.accentPrimary};">Thinking...</span>
 				{:else}
 					Online
 				{/if}
 			</div>
 		</div>
-		<!-- Minimize button -->
 		<button
 			style="
 				width: 28px; height: 28px; display: flex; align-items: center; justify-content: center;
-				background: none; border: 1px solid var(--border-default); border-radius: 6px;
-				color: var(--text-muted); cursor: pointer;
+				background: none; border: 1px solid {theme.c.borderDefault}; border-radius: 6px;
+				color: {theme.c.textMuted}; cursor: pointer;
 				transition: all 0.15s ease;
 			"
-			onmouseenter={(e) => {
-				const el = e.currentTarget as HTMLElement;
-				el.style.background = 'rgba(99, 102, 241, 0.1)';
-				el.style.borderColor = 'rgba(99, 102, 241, 0.3)';
-				el.style.color = 'var(--accent-primary)';
-			}}
-			onmouseleave={(e) => {
-				const el = e.currentTarget as HTMLElement;
-				el.style.background = 'none';
-				el.style.borderColor = 'var(--border-default)';
-				el.style.color = 'var(--text-muted)';
-			}}
 			onclick={() => minimized = !minimized}
 			aria-label={minimized ? 'Expand chat' : 'Minimize chat'}
 		>
@@ -93,7 +80,6 @@
 	</div>
 
 	{#if !minimized}
-		<!-- Message list -->
 		<div
 			bind:this={messagesContainer}
 			style="
@@ -111,18 +97,17 @@
 					</div>
 				</div>
 			{:else if chat.sortedMessages.length === 0}
-				<!-- Empty state -->
 				<div style="
 					display: flex; flex-direction: column; align-items: center; justify-content: center;
 					flex: 1; gap: 12px; padding: 40px 20px; text-align: center;
 					animation: fade-in 0.5s ease;
 				">
 					<AgentAvatar size={48} />
-					<div style="font-size: 16px; font-weight: 600; color: var(--text-primary);">
-						Hey there.
+					<div style="font-size: 16px; font-weight: 600; color: {theme.c.textPrimary};">
+						Hey.
 					</div>
-					<div style="font-size: 13px; color: var(--text-muted); max-width: 260px; line-height: 1.6;">
-						I'm your AI agent. Send me a message to get started. I can create tasks, run automations, or just chat.
+					<div style="font-size: 13px; color: {theme.c.textMuted}; max-width: 260px; line-height: 1.6;">
+						Hey, I'm Sam. Drop me a task or just say what you need. I'll handle the code, the PRs, the whole nine yards.
 					</div>
 				</div>
 			{:else}
@@ -131,7 +116,6 @@
 				{/each}
 			{/if}
 
-			<!-- Typing indicator -->
 			{#if chat.sendingMessage}
 				<div style="
 					display: flex; gap: 8px; align-items: flex-start;
@@ -141,8 +125,8 @@
 					<AgentAvatar size={24} busy={true} />
 					<div style="
 						padding: 10px 14px; border-radius: 4px 14px 14px 14px;
-						background: #1c2128;
-						border: 1px solid var(--border-default);
+						background: {theme.c.bgElevated};
+						border: 1px solid {theme.c.borderDefault};
 						display: flex; gap: 4px; align-items: center;
 					">
 						<div class="typing-dot" style="animation-delay: 0ms;"></div>
@@ -153,10 +137,9 @@
 			{/if}
 		</div>
 
-		<!-- Input area -->
 		<ChatInput
 			disabled={chat.sendingMessage}
-			placeholder="Message your agent..."
+			placeholder="Message Sam..."
 			onSend={handleSend}
 		/>
 	{/if}

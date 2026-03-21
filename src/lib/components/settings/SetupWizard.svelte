@@ -142,7 +142,7 @@
           <circle cx="12" cy="8" r="5"/><path d="M3 21v-2a7 7 0 0 1 7-7h4a7 7 0 0 1 7 7v2"/><circle cx="9" cy="7" r="1" fill="white"/><circle cx="15" cy="7" r="1" fill="white"/>
         </svg>
       </div>
-      <div style="font-size: 20px; font-weight: 700; color: var(--text-primary, #e6edf3);">Welcome to Agent One</div>
+      <div style="font-size: 20px; font-weight: 700; color: var(--text-primary, #e6edf3);">Welcome to SamWise</div>
       <div style="font-size: 13px; color: var(--text-secondary, #8b949e); margin-top: 4px;">Let's make sure everything is wired up.</div>
     </div>
 
@@ -167,7 +167,7 @@
       {#if currentStep === 0}
         <div style="display: flex; flex-direction: column; gap: 12px;">
           <div style="font-size: 14px; font-weight: 600; color: var(--text-primary, #e6edf3);">Step 1: Doppler Secrets</div>
-          <div style="font-size: 12px; color: var(--text-secondary, #8b949e); line-height: 1.5;">Agent One uses Doppler to load Supabase credentials securely. The Doppler CLI must be installed and authenticated.</div>
+          <div style="font-size: 12px; color: var(--text-secondary, #8b949e); line-height: 1.5;">SamWise uses Doppler to load Supabase credentials securely. The Doppler CLI must be installed and authenticated.</div>
           <div style="display: flex; align-items: center; gap: 8px; padding: 10px 14px; background: var(--bg-primary, #0d1117); border: 1px solid var(--border-default, #30363d); border-radius: 8px;">
             <span style="width: 8px; height: 8px; border-radius: 50%; background: {statusColor(dopplerStatus)}; {dopplerStatus === 'checking' ? 'animation: pulse-dot 1s ease-in-out infinite;' : ''}"></span>
             <span style="font-size: 12px; color: var(--text-secondary, #8b949e); flex: 1;">{dopplerMessage || 'Waiting...'}</span>
@@ -252,7 +252,7 @@
           onclick={finish}
           style="padding: 8px 20px; background: #3fb950; border: none; border-radius: 6px; color: white; font-size: 13px; font-weight: 700; cursor: pointer; transition: all 0.15s;"
         >
-          Start Agent One
+          Start SamWise
         </button>
       {/if}
     </div>

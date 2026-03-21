@@ -114,6 +114,8 @@ pub fn run() {
             commands::health::check_doppler,
             // Hello
             commands::hello::hello,
+            // Chat (direct - no worker dependency)
+            commands::chat::chat_respond,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
@@ -144,5 +146,5 @@ pub fn run() {
             }
         })
         .run(tauri::generate_context!())
-        .expect("error while running Agent One");
+        .expect("error while running SamWise");
 }

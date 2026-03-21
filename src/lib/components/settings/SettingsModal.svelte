@@ -96,7 +96,7 @@
       <!-- Sidebar -->
       <div style="width: 200px; background: var(--bg-primary); border-right: 1px solid var(--border-default); padding: 16px 0; display: flex; flex-direction: column;">
         <div style="padding: 0 16px 16px; display: flex; align-items: center; gap: 8px;">
-          <span style="font-size: 16px; width: 24px; height: 24px; background: var(--accent-indigo, #6366f1); border-radius: 6px; display: flex; align-items: center; justify-content: center;">
+          <span style="font-size: 16px; width: 24px; height: 24px; background: var(--accent-indigo); border-radius: 6px; display: flex; align-items: center; justify-content: center;">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v4m0 12v4m-7.07-2.93l2.83-2.83m8.48-8.48l2.83-2.83M2 12h4m12 0h4M4.93 4.93l2.83 2.83m8.48 8.48l2.83 2.83"/></svg>
           </span>
           <span style="font-size: 14px; font-weight: 700; color: var(--text-primary);">Settings</span>
@@ -108,9 +108,9 @@
               onmouseenter={() => hoveredTab = tab.id}
               onmouseleave={() => hoveredTab = null}
               style="display: flex; align-items: center; gap: 10px; padding: 8px 12px; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; font-family: var(--font-ui); transition: all 0.12s ease; text-align: left;
-                background: {activeTab === tab.id ? 'rgba(99,102,241,0.1)' : hoveredTab === tab.id ? 'var(--bg-elevated, #1c2128)' : 'transparent'};
-                color: {activeTab === tab.id ? '#6366f1' : 'var(--text-secondary)'};
-                border-left: {activeTab === tab.id ? '2px solid #6366f1' : '2px solid transparent'};"
+                background: {activeTab === tab.id ? 'rgba(99,102,241,0.1)' : hoveredTab === tab.id ? 'var(--bg-elevated)' : 'transparent'};
+                color: {activeTab === tab.id ? 'var(--accent-indigo)' : 'var(--text-secondary)'};
+                border-left: {activeTab === tab.id ? '2px solid var(--accent-indigo)' : '2px solid transparent'};"
             >
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d={tab.icon}/></svg>
               {tab.label}
@@ -210,7 +210,7 @@
                 </svg>
               </div>
               <div style="text-align: center;">
-                <div style="font-size: 24px; font-weight: 700; color: var(--text-primary);">Agent One</div>
+                <div style="font-size: 24px; font-weight: 700; color: var(--text-primary);">SamWise</div>
                 <div style="font-size: 13px; color: var(--text-secondary); margin-top: 4px;">Your AI Employee. Always on. Always ON IT.</div>
                 <div style="font-size: 12px; color: var(--text-muted); margin-top: 8px;">Version 0.1.0</div>
               </div>

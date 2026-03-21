@@ -10,6 +10,7 @@
 	import { getTaskStore } from '$lib/stores/tasks.svelte';
 	import { getChatStore } from '$lib/stores/chat.svelte';
 	import { getCommentStore } from '$lib/stores/comments.svelte';
+	import { getTheme } from '$lib/stores/theme.svelte';
 	import { safeInvoke } from '$lib/utils/tauri';
 	import { subscribeToTable } from '$lib/supabase';
 	import type { AeMessage, AeComment } from '$lib/types';
@@ -19,6 +20,7 @@
 	const taskStore = getTaskStore();
 	const chatStore = getChatStore();
 	const commentStore = getCommentStore();
+	const theme = getTheme();
 
 	let chatToggleHovered = $state(false);
 	let realtimeChannels: any[] = [];
@@ -26,12 +28,13 @@
 	let workerUnlisten: (() => void) | null = null;
 
 	onMount(async () => {
+		// Apply theme CSS variables to DOM immediately
+		theme.applyNow();
+
 		await initSettings();
 
-		// Try to load Supabase config from Doppler
 		const config = await safeInvoke<{ url: string; anon_key: string; service_role_key: string | null }>('supabase_load_doppler');
 		if (!config || !config.url) {
-			// Doppler not available, try getting existing config
 			const existing = await safeInvoke<{ url: string; anon_key: string }>('supabase_get_config');
 			if (!existing || !existing.url) {
 				console.warn('[app] Supabase not configured. Open Settings to connect.');
@@ -39,16 +42,13 @@
 			}
 		}
 
-		// Fetch initial data
 		await Promise.all([
 			taskStore.fetchTasks(),
 			chatStore.fetchMessages(),
 		]);
 
-		// Start realtime subscriptions
 		initRealtime();
 
-		// Listen for worker events from Rust backend
 		try {
 			const { listen } = await import('@tauri-apps/api/event');
 			workerUnlisten = await listen('worker-event', (event: any) => {
@@ -59,7 +59,7 @@
 				}
 			});
 		} catch {
-			// Not in Tauri environment (browser dev mode)
+			// Not in Tauri environment
 		}
 	});
 
@@ -74,19 +74,14 @@
 		const config = await safeInvoke<{ url: string; anon_key: string }>('supabase_get_config');
 		if (!config || !config.url || !config.anon_key) return;
 
-		// Subscribe to task changes
 		const taskChannel = subscribeToTable(config.url, config.anon_key, 'ae_tasks', (payload) => {
 			const { eventType } = payload;
-			if (eventType === 'INSERT' || eventType === 'UPDATE') {
-				// Refetch all tasks (simple approach)
-				taskStore.fetchTasks();
-			} else if (eventType === 'DELETE') {
+			if (eventType === 'INSERT' || eventType === 'UPDATE' || eventType === 'DELETE') {
 				taskStore.fetchTasks();
 			}
 		});
 		realtimeChannels.push(taskChannel);
 
-		// Subscribe to new messages
 		const msgChannel = subscribeToTable(config.url, config.anon_key, 'ae_messages', (payload) => {
 			if (payload.eventType === 'INSERT') {
 				chatStore.applyRealtimeMessage(payload.new as AeMessage);
@@ -94,7 +89,6 @@
 		});
 		realtimeChannels.push(msgChannel);
 
-		// Subscribe to new comments
 		const commentChannel = subscribeToTable(config.url, config.anon_key, 'ae_comments', (payload) => {
 			if (payload.eventType === 'INSERT') {
 				commentStore.applyRealtimeComment(payload.new as AeComment);
@@ -104,17 +98,14 @@
 	}
 
 	async function handleGlobalKeyDown(e: KeyboardEvent) {
-		// Ctrl+, -> Settings
 		if ((e.ctrlKey || e.metaKey) && e.key === ',') {
 			e.preventDefault();
 			settingsStore.settingsVisible = !settingsStore.settingsVisible;
 		}
-		// Ctrl+/ -> Toggle Chat Panel
 		if ((e.ctrlKey || e.metaKey) && e.key === '/') {
 			e.preventDefault();
 			layout.toggleRightPanel();
 		}
-		// Ctrl+Shift+B -> Toggle Automation (Settings > Automation tab)
 		if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'B') {
 			e.preventDefault();
 			settingsStore.activeSettingsTab = 'automation';
@@ -125,35 +116,33 @@
 
 <svelte:window onkeydown={handleGlobalKeyDown} />
 
-<div class="app-shell" style="display: flex; flex-direction: column; height: 100vh; width: 100vw; background: var(--bg-canvas);">
-	<!-- Title Bar -->
+<div class="app-shell" style="display: flex; flex-direction: column; height: 100vh; width: 100vw; background: {theme.c.bgCanvas}; color: {theme.c.textPrimary};">
 	<TitleBar />
 
-	<!-- Main Content: Kanban | Chat -->
-	<div style="display: flex; flex: 1; overflow: hidden; gap: var(--panel-gap); padding: 0 var(--panel-gap) var(--panel-gap);">
-		<!-- Left: Kanban Board (primary, fills available space) -->
+	<div style="display: flex; flex: 1; overflow: hidden; gap: 6px; padding: 0 6px 6px;">
+		<!-- Left: Kanban Board -->
 		<div style="
 			flex: 1; min-width: 400px;
 			display: flex; flex-direction: column; overflow: hidden;
-			border-radius: var(--panel-radius);
-			box-shadow: var(--shadow-panel);
-			border: var(--panel-border);
-			border-top: 1px solid rgba(99, 102, 241, 0.08);
-			background: linear-gradient(180deg, #161b22 0%, #0f1419 100%);
+			border-radius: 12px;
+			box-shadow: {theme.c.shadowPanel};
+			border: {theme.c.panelBorder};
+			border-top: {theme.c.panelTopBorder};
+			background: {theme.c.gradientPanelMain};
 		">
 			<KanbanBoard />
 		</div>
 
-		<!-- Right: Chat Panel (collapsible sidebar) -->
+		<!-- Right: Chat Panel -->
 		{#if layout.rightPanelVisible}
 			<div style="
 				width: 400px; min-width: 320px; max-width: 500px; flex-shrink: 0;
 				display: flex; flex-direction: column; overflow: hidden;
-				border-radius: var(--panel-radius);
-				box-shadow: var(--shadow-panel);
-				border: var(--panel-border);
-				border-top: 1px solid rgba(99, 102, 241, 0.08);
-				background: linear-gradient(180deg, #161b22 0%, #0d1117 100%);
+				border-radius: 12px;
+				box-shadow: {theme.c.shadowPanel};
+				border: {theme.c.panelBorder};
+				border-top: {theme.c.panelTopBorder};
+				background: {theme.c.gradientPanelChat};
 				animation: sidebar-slide-in 0.2s ease;
 			">
 				<ChatPanel />
@@ -161,7 +150,6 @@
 		{/if}
 	</div>
 
-	<!-- Chat toggle button (floating, bottom-right when chat is hidden) -->
 	{#if !layout.rightPanelVisible}
 		<button
 			title="Open Chat (Ctrl+/)"
@@ -169,9 +157,9 @@
 				position: fixed; bottom: 40px; right: 16px; z-index: 100;
 				width: 48px; height: 48px; border-radius: 50%;
 				display: flex; align-items: center; justify-content: center;
-				background: {chatToggleHovered ? 'var(--accent-hover)' : 'var(--accent-primary)'};
+				background: {chatToggleHovered ? theme.c.accentHover : theme.c.accentPrimary};
 				border: none; cursor: pointer;
-				box-shadow: 0 4px 20px rgba(99, 102, 241, 0.4), 0 0 40px rgba(99, 102, 241, 0.15);
+				box-shadow: 0 4px 20px {theme.c.accentGlow}, 0 0 40px {theme.c.accentGlow};
 				transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 				transform: {chatToggleHovered ? 'scale(1.1) rotate(-5deg)' : 'scale(1)'};
 				animation: breathe-glow 3s ease-in-out infinite;
@@ -186,9 +174,7 @@
 		</button>
 	{/if}
 
-	<!-- Status Bar -->
 	<StatusBar />
 </div>
 
-<!-- Modals -->
 <SettingsModal />

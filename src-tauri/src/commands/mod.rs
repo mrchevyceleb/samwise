@@ -1,3 +1,4 @@
+pub mod chat;
 pub mod claude_code;
 pub mod files;
 pub mod git;

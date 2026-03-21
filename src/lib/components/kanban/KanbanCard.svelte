@@ -4,6 +4,7 @@
 	import { PRIORITY_COLORS } from '$lib/types';
 	import { getCommentStore } from '$lib/stores/comments.svelte';
 	import { getDragStore } from '$lib/stores/drag.svelte';
+	import { getTheme } from '$lib/stores/theme.svelte';
 	import { formatTimeAgo } from '$lib/utils/relative-time';
 
 	interface Props {
@@ -14,6 +15,7 @@
 	let { task, onClick }: Props = $props();
 	const commentStore = getCommentStore();
 	const drag = getDragStore();
+	const theme = getTheme();
 
 	let hovered = $state(false);
 	let mouseDownAt = $state<{ x: number; y: number } | null>(null);
@@ -103,14 +105,14 @@
 	style="
 		padding: 12px 14px;
 		border-radius: 10px;
-		background: {hovered ? 'rgba(99, 102, 241, 0.06)' : 'var(--glass-bg)'};
-		backdrop-filter: blur(var(--glass-blur));
-		border: {isWorking ? '1.5px solid rgba(99, 102, 241, 0.5)' : hovered ? '1px solid rgba(99, 102, 241, 0.2)' : '1px solid var(--glass-border)'};
+		background: {hovered ? (theme.isDark ? 'rgba(99, 102, 241, 0.06)' : 'rgba(79, 70, 229, 0.04)') : theme.c.glassBg};
+		backdrop-filter: blur(12px);
+		border: {isWorking ? '1.5px solid rgba(99, 102, 241, 0.5)' : hovered ? '1px solid ' + theme.c.borderGlow : '1px solid ' + theme.c.glassBorder};
 		{isWorking ? 'animation: working-card-pulse 2s ease-in-out infinite;' : ''}
 		cursor: grab;
 		transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 		transform: {isBeingDragged ? 'scale(0.95)' : hovered ? 'translateY(-2px)' : 'translateY(0)'};
-		box-shadow: {hovered ? 'var(--shadow-card-hover)' : 'var(--shadow-card)'};
+		box-shadow: {hovered ? theme.c.shadowCardHover : theme.c.shadowCard};
 		opacity: {isBeingDragged ? '0.4' : '1'};
 		{!isWorking ? `animation: ${task.status !== 'done' && !isBeingDragged ? 'card-idle-bob 4s ease-in-out infinite' : 'none'}; animation-delay: ${Math.random() * 2}s;` : ''}
 		user-select: none;

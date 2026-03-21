@@ -2,6 +2,7 @@
 	import type { AeTask, TaskStatus, TaskPriority } from '$lib/types';
 	import { PRIORITY_COLORS, KANBAN_COLUMNS } from '$lib/types';
 	import { getTaskStore } from '$lib/stores/tasks.svelte';
+	import { getTheme } from '$lib/stores/theme.svelte';
 	import { formatTimeAgo } from '$lib/utils/relative-time';
 	import CommentThread from './CommentThread.svelte';
 
@@ -12,6 +13,7 @@
 
 	let { task, onClose }: Props = $props();
 	const taskStore = getTaskStore();
+	const theme = getTheme();
 
 	// Editing states
 	let editingTitle = $state(false);
@@ -97,7 +99,7 @@
 <div
 	style="
 		position: fixed; inset: 0; z-index: 200;
-		background: rgba(0, 0, 0, 0.65); backdrop-filter: blur(6px);
+		background: {theme.isDark ? 'rgba(0, 0, 0, 0.65)' : 'rgba(0, 0, 0, 0.3)'}; backdrop-filter: blur(6px);
 		display: flex; align-items: flex-start; justify-content: center;
 		padding-top: 5vh; overflow-y: auto;
 		animation: fade-in 0.15s ease;
@@ -107,10 +109,10 @@
 	<div
 		style="
 			width: 780px; max-width: 95vw;
-			background: linear-gradient(180deg, #1c2333 0%, #161b22 100%);
-			border: 1px solid var(--border-glow);
+			background: {theme.c.gradientModal};
+			border: 1px solid {theme.c.borderGlow};
 			border-radius: 16px;
-			box-shadow: 0 24px 80px rgba(0, 0, 0, 0.6), 0 0 40px rgba(99, 102, 241, 0.08);
+			box-shadow: {theme.isDark ? '0 24px 80px rgba(0,0,0,0.6), 0 0 40px rgba(99,102,241,0.08)' : '0 24px 80px rgba(0,0,0,0.15), 0 0 0 1px rgba(0,0,0,0.05)'};
 			animation: spring-in 0.25s ease;
 			margin-bottom: 5vh;
 		"
@@ -192,7 +194,7 @@
 							margin-bottom: 16px; cursor: pointer; padding: 4px 0;
 							border-radius: 6px; transition: background 0.1s; line-height: 1.3;
 						"
-						onmouseenter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.03)'; }}
+						onmouseenter={(e) => { (e.currentTarget as HTMLElement).style.background = 'var(--bg-column-header-hover)'; }}
 						onmouseleave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
 						onclick={() => { editingTitle = true; editTitle = task.title; }}
 					>
@@ -229,7 +231,7 @@
 								color: {task.description ? 'var(--text-secondary)' : 'var(--text-muted)'};
 								cursor: pointer; white-space: pre-wrap; transition: background 0.1s;
 							"
-							onmouseenter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.04)'; }}
+							onmouseenter={(e) => { (e.currentTarget as HTMLElement).style.background = 'var(--bg-column-header-hover)'; }}
 							onmouseleave={(e) => { (e.currentTarget as HTMLElement).style.background = 'var(--bg-primary)'; }}
 							onclick={() => { editingDesc = true; editDesc = task.description || ''; }}
 						>
@@ -356,7 +358,7 @@
 									font-family: var(--font-ui); transition: all 0.12s;
 									text-align: left; width: 100%;
 								"
-								onmouseenter={(e) => { if (task.status !== col.status) (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.03)'; }}
+								onmouseenter={(e) => { if (task.status !== col.status) (e.currentTarget as HTMLElement).style.background = 'var(--bg-column-header-hover)'; }}
 								onmouseleave={(e) => { if (task.status !== col.status) (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
 								onclick={() => changeStatus(col.status)}
 							>
@@ -383,7 +385,7 @@
 									font-family: var(--font-ui); transition: all 0.12s;
 									text-align: left; width: 100%;
 								"
-								onmouseenter={(e) => { if (task.priority !== p.value) (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.03)'; }}
+								onmouseenter={(e) => { if (task.priority !== p.value) (e.currentTarget as HTMLElement).style.background = 'var(--bg-column-header-hover)'; }}
 								onmouseleave={(e) => { if (task.priority !== p.value) (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
 								onclick={() => changePriority(p.value)}
 							>

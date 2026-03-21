@@ -10,6 +10,25 @@ let sidebarCollapsed = $state(false);
 let doneColumnCollapsed = $state(false);
 let focusedConversation = $state<{ id: string; type: 'agent' | 'claude-code' } | null>(null);
 
+// Theme: 'dark' | 'light', persisted to localStorage
+type Theme = 'dark' | 'light';
+const storedTheme = typeof localStorage !== 'undefined' ? localStorage.getItem('agent-one-theme') as Theme | null : null;
+let theme = $state<Theme>(storedTheme ?? 'dark');
+
+function applyTheme(t: Theme) {
+	if (typeof document !== 'undefined') {
+		document.documentElement.classList.toggle('light', t === 'light');
+	}
+	if (typeof localStorage !== 'undefined') {
+		localStorage.setItem('agent-one-theme', t);
+	}
+}
+
+// Apply on load
+if (typeof document !== 'undefined') {
+	applyTheme(theme);
+}
+
 export function getLayout() {
 	return {
 		get kanbanPanelWidth() { return kanbanPanelWidth; },
@@ -52,6 +71,11 @@ export function getLayout() {
 		get chatMode(): 'agent' | 'claude-code' {
 			return focusedConversation?.type ?? 'agent';
 		},
+
+		get theme() { return theme; },
+		set theme(v: Theme) { theme = v; applyTheme(v); },
+		toggleTheme() { const next = theme === 'dark' ? 'light' : 'dark'; theme = next; applyTheme(next); },
+		get isDark() { return theme === 'dark'; },
 
 		toggleTerminal() { terminalVisible = !terminalVisible; },
 		toggleLeftPanel() { leftPanelVisible = !leftPanelVisible; },
