@@ -220,11 +220,12 @@ pub async fn chat_respond(
         log::warn!("[chat] Failed to save user message: {}", e);
     }
 
-    // 3. Fetch board state
+    // 3. Fetch board state and project registry
     let board_context = build_board_context(&config, &worker_state).await;
+    let project_registry = build_project_registry(&config).await;
 
-    // 4. Build the full prompt (board context + conversation + new message)
-    let prompt = build_system_prompt(&board_context, &recent_chat, &user_message);
+    // 4. Build the full prompt (board context + projects + conversation + new message)
+    let prompt = build_system_prompt(&board_context, &project_registry, &recent_chat, &user_message);
 
     // 5. Send to persistent Claude Code session
     let raw_response = {
@@ -316,7 +317,7 @@ pub async fn chat_respond(
 
 // ── Fetch recent chat messages ──────────────────────────────────────
 
-async fn fetch_recent_chat(config: &supabase::SupabaseConfig) -> String {
+pub async fn fetch_recent_chat(config: &supabase::SupabaseConfig) -> String {
     let messages = match supabase::fetch_messages(config).await {
         Ok(m) => m,
         Err(_) => return String::new(),
@@ -343,7 +344,7 @@ async fn fetch_recent_chat(config: &supabase::SupabaseConfig) -> String {
 
 // ── Build board context ─────────────────────────────────────────────
 
-async fn build_board_context(
+pub async fn build_board_context(
     config: &supabase::SupabaseConfig,
     worker_state: &WorkerState,
 ) -> String {
@@ -407,6 +408,29 @@ async fn build_board_context(
         }
     }
 
+    // Fetch recent comments on active tasks so Sam knows what's been discussed
+    if let Ok(comments) = supabase::fetch_recent_comments(config, 20).await {
+        if let Some(comment_arr) = comments.as_array() {
+            if !comment_arr.is_empty() {
+                ctx.push_str("\n## Recent Task Comments\n");
+                for c in comment_arr.iter().rev().take(15) {
+                    let author = c.get("author").and_then(|v| v.as_str()).unwrap_or("unknown");
+                    let content = c.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                    let task_id = c.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+                    // Find the task title for this comment
+                    let task_title = arr.iter()
+                        .find(|t| t.get("id").and_then(|v| v.as_str()) == Some(task_id))
+                        .and_then(|t| t.get("title").and_then(|v| v.as_str()))
+                        .unwrap_or("unknown task");
+                    let display_author = if author == "agent" { "Sam" } else { "Matt" };
+                    // Truncate long comments
+                    let short = if content.len() > 120 { &content[..120] } else { content };
+                    ctx.push_str(&format!("- [{}] {}: {}\n", task_title, display_author, short));
+                }
+            }
+        }
+    }
+
     let running = worker_state.running.load(std::sync::atomic::Ordering::Relaxed);
     let machine = worker_state.machine_name.lock().await.clone();
     let current_task = worker_state.current_task_id.lock().await.clone();
@@ -425,14 +449,56 @@ async fn build_board_context(
     ctx
 }
 
+// ── Build project registry context ──────────────────────────────────
+
+pub async fn build_project_registry(config: &supabase::SupabaseConfig) -> String {
+    let projects = match supabase::fetch_projects(config).await {
+        Ok(p) => p,
+        Err(_) => return String::new(),
+    };
+
+    let Some(arr) = projects.as_array() else {
+        return String::new();
+    };
+
+    if arr.is_empty() {
+        return String::new();
+    }
+
+    let mut ctx = String::from("## Known Projects\nONLY reference these projects. Do NOT invent repo URLs or project names.\n");
+
+    for project in arr {
+        let name = project.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let repo_url = project.get("repo_url").and_then(|v| v.as_str()).unwrap_or("");
+        let repo_path = project.get("repo_path").and_then(|v| v.as_str()).unwrap_or("");
+        let client = project.get("client").and_then(|v| v.as_str()).unwrap_or("");
+        let preview_url = project.get("preview_url").and_then(|v| v.as_str()).unwrap_or("");
+        let deploy = project.get("deploy_method").and_then(|v| v.as_str()).unwrap_or("");
+
+        ctx.push_str(&format!("- **{}**", name));
+        if !client.is_empty() { ctx.push_str(&format!(" ({})", client)); }
+        ctx.push('\n');
+        if !repo_url.is_empty() { ctx.push_str(&format!("  repo: {}\n", repo_url)); }
+        if !repo_path.is_empty() { ctx.push_str(&format!("  path: {}\n", repo_path)); }
+        if !preview_url.is_empty() { ctx.push_str(&format!("  preview: {}\n", preview_url)); }
+        if !deploy.is_empty() { ctx.push_str(&format!("  deploy: {}\n", deploy)); }
+    }
+
+    ctx.push_str("\nWhen creating tasks, use the exact project name and repo_url from this list. If a project isn't listed here, ask Matt to add it first.\n");
+
+    ctx
+}
+
 // ── Build system prompt ─────────────────────────────────────────────
 
-fn build_system_prompt(board_context: &str, recent_chat: &str, user_message: &str) -> String {
+pub fn build_system_prompt(board_context: &str, project_registry: &str, recent_chat: &str, user_message: &str) -> String {
     format!(
         r#"You are Sam (SamWise), Matt's AI developer and teammate. You work 24/7. You're proactive, competent, and talk like a senior dev on Slack - casual but professional. Dry humor, genuine loyalty. You never say "I'm an AI" or "As an AI." You are a teammate.
 
 ## Current Board State
 {board_context}
+
+{project_registry}
 
 ## What You Can Do
 - Answer questions directly (quick answers, advice, perspective, explanations)
@@ -460,6 +526,7 @@ Matt's latest message: {user_message}
 
 Respond naturally. Keep it brief and conversational."#,
         board_context = board_context,
+        project_registry = project_registry,
         recent_chat = recent_chat,
         user_message = user_message,
     )
@@ -467,7 +534,7 @@ Respond naturally. Keep it brief and conversational."#,
 
 // ── Parse response for task creation blocks ─────────────────────────
 
-fn parse_chat_response(raw: &str) -> (String, Vec<Value>) {
+pub fn parse_chat_response(raw: &str) -> (String, Vec<Value>) {
     let mut clean_text = raw.to_string();
     let mut task_requests = Vec::new();
 

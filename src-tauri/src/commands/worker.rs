@@ -11,6 +11,7 @@ pub struct WorkerState {
     pub running: Arc<AtomicBool>,
     pub machine_name: Arc<tokio::sync::Mutex<Option<String>>>,
     pub current_task_id: Arc<tokio::sync::Mutex<Option<String>>>,
+    pub last_telegram_update_id: Arc<tokio::sync::Mutex<Option<i64>>>,
 }
 
 impl Default for WorkerState {
@@ -19,6 +20,7 @@ impl Default for WorkerState {
             running: Arc::new(AtomicBool::new(false)),
             machine_name: Arc::new(tokio::sync::Mutex::new(None)),
             current_task_id: Arc::new(tokio::sync::Mutex::new(None)),
+            last_telegram_update_id: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 }
@@ -66,11 +68,12 @@ pub async fn worker_start(
 
     let running = Arc::clone(&state.running);
     let current_task = Arc::clone(&state.current_task_id);
+    let last_tg_update = Arc::clone(&state.last_telegram_update_id);
     let sb_config_arc = Arc::clone(&sb_state.config);
     let app_handle = app.clone();
 
     tokio::spawn(async move {
-        worker_loop(running, current_task, machine_name, sb_config_arc, app_handle).await;
+        worker_loop(running, current_task, last_tg_update, machine_name, sb_config_arc, app_handle).await;
     });
 
     Ok(())
@@ -109,6 +112,7 @@ pub async fn worker_status(
 async fn worker_loop(
     running: Arc<AtomicBool>,
     current_task_id: Arc<tokio::sync::Mutex<Option<String>>>,
+    last_telegram_update_id: Arc<tokio::sync::Mutex<Option<i64>>>,
     machine_name: String,
     sb_config_arc: Arc<tokio::sync::RwLock<SupabaseConfig>>,
     app: tauri::AppHandle,
@@ -236,6 +240,11 @@ async fn worker_loop(
         // Evaluate triggers every 30 seconds (every 6th tick)
         if tick % 6 == 0 {
             let _ = evaluate_triggers(&config, &app).await;
+        }
+
+        // Check Telegram messages every 50 seconds (every 10th tick)
+        if tick % 10 == 0 {
+            check_telegram_messages(&config, &last_telegram_update_id, &machine_name).await;
         }
 
         tick += 1;
@@ -519,16 +528,34 @@ async fn execute_task(
         Ok(output) => {
             let summary = truncate(&output, 500);
 
-            // Research tasks: post findings and mark done
+            // Research tasks: save full output as artifact, post short comment, mark done
             if is_research {
-                agent_comment(config, &task_id, &format!("Analysis complete. Here's what I found:\n\n{}", summary)).await;
+                // Save the full report as an artifact
+                let artifact_result = supabase::create_artifact(config, &serde_json::json!({
+                    "task_id": task_id,
+                    "title": title,
+                    "content": output,
+                    "artifact_type": "report",
+                })).await;
+
+                match artifact_result {
+                    Ok(_) => {
+                        agent_comment(config, &task_id, "Analysis complete. Full report saved -- click the Report tab above to read it.").await;
+                    }
+                    Err(e) => {
+                        log::warn!("[worker] Failed to save artifact: {}", e);
+                        // Fallback: post truncated summary in comment
+                        agent_comment(config, &task_id, &format!("Analysis complete. (Failed to save full report, showing summary)\n\n{}", summary)).await;
+                    }
+                }
+
                 let _ = supabase::update_task(config, &task_id, &serde_json::json!({
                     "status": "done",
                     "completed_at": chrono::Utc::now().to_rfc3339(),
                     "updated_at": chrono::Utc::now().to_rfc3339(),
                 })).await;
                 send_telegram(config, &format!(
-                    "Finished analysis on *{}*\\. Check the comments for the full report\\.",
+                    "Finished analysis on *{}*\\. Full report saved as an artifact\\.",
                     escape_markdown_v2(&title)
                 )).await;
                 return Ok("Analysis complete".to_string());
@@ -686,6 +713,208 @@ async fn send_telegram(config: &SupabaseConfig, message: &str) {
 
     if let Err(e) = client.post(&url).json(&body).send().await {
         log::warn!("[worker] Telegram send failed: {}", e);
+    }
+}
+
+// ── Telegram Inbound ────────────────────────────────────────────────
+
+/// Check for new Telegram messages and process them through Sam's chat logic.
+async fn check_telegram_messages(
+    config: &SupabaseConfig,
+    last_update_id: &Arc<tokio::sync::Mutex<Option<i64>>>,
+    machine_name: &str,
+) {
+    let (token, expected_chat_id) = match (&config.telegram_bot_token, &config.telegram_chat_id) {
+        (Some(t), Some(c)) if !t.is_empty() && !c.is_empty() => (t.clone(), c.clone()),
+        _ => return,
+    };
+
+    // Get the offset (last_update_id + 1)
+    let offset = {
+        let guard = last_update_id.lock().await;
+        guard.map(|id| id + 1)
+    };
+
+    // Poll Telegram getUpdates
+    let mut url = format!("https://api.telegram.org/bot{}/getUpdates?timeout=0", token);
+    if let Some(off) = offset {
+        url.push_str(&format!("&offset={}", off));
+    }
+
+    let client = match reqwest::Client::builder().build() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("[worker] Telegram getUpdates failed: {}", e);
+            return;
+        }
+    };
+
+    let body: serde_json::Value = match resp.json().await {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+
+    let Some(results) = body.get("result").and_then(|r| r.as_array()) else { return; };
+    if results.is_empty() { return; }
+
+    for update in results {
+        let update_id = update.get("update_id").and_then(|v| v.as_i64()).unwrap_or(0);
+
+        // Update the offset
+        {
+            let mut guard = last_update_id.lock().await;
+            *guard = Some(update_id);
+        }
+
+        // Extract message text
+        let message = match update.get("message") {
+            Some(m) => m,
+            None => continue,
+        };
+
+        let chat_id = message.get("chat").and_then(|c| c.get("id")).and_then(|v| v.as_i64());
+        let chat_id_str = chat_id.map(|id| id.to_string()).unwrap_or_default();
+
+        // Only process messages from the configured chat
+        if chat_id_str != expected_chat_id {
+            continue;
+        }
+
+        let text = match message.get("text").and_then(|v| v.as_str()) {
+            Some(t) if !t.is_empty() => t.to_string(),
+            _ => continue,
+        };
+
+        log::info!("[worker] Telegram message received: {}", &text[..text.len().min(50)]);
+
+        // Process through Sam's chat logic
+        process_telegram_message(config, &text, machine_name).await;
+    }
+}
+
+/// Process a single Telegram message: save to chat, get Sam's response, create tasks, reply.
+async fn process_telegram_message(config: &SupabaseConfig, user_message: &str, machine_name: &str) {
+    use super::chat;
+
+    // 1. Save user message to ae_messages (shows in desktop chat UI)
+    let _ = supabase::send_message(config, &serde_json::json!({
+        "role": "user",
+        "content": user_message,
+    })).await;
+
+    // 2. Build context (reuse chat.rs functions)
+    // We don't have WorkerState here directly, but we can build a minimal board context
+    let recent_chat = chat::fetch_recent_chat(config).await;
+    let project_registry = chat::build_project_registry(config).await;
+
+    // Build board context without worker state (simpler version)
+    let board_ctx = build_simple_board_context(config, machine_name).await;
+
+    // 3. Build prompt
+    let prompt = chat::build_system_prompt(&board_ctx, &project_registry, &recent_chat, user_message);
+
+    // 4. Call Claude Code CLI one-shot
+    let raw_response = match run_claude_code_opts(".", &prompt, 3, 90).await {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("[worker] Telegram chat response failed: {}", e);
+            let error_msg = format!("Sorry, hit a snag: {}. Try again?", e);
+            let _ = supabase::send_message(config, &serde_json::json!({
+                "role": "agent",
+                "content": &error_msg,
+            })).await;
+            send_telegram(config, &escape_markdown_v2(&error_msg)).await;
+            return;
+        }
+    };
+
+    // 5. Parse for task creation
+    let (clean_text, task_requests) = chat::parse_chat_response(&raw_response);
+
+    // 6. Create tasks
+    for req in &task_requests {
+        if let Err(e) = supabase::create_task(config, req).await {
+            log::warn!("[worker] Failed to create task from Telegram: {}", e);
+        }
+    }
+
+    // 7. Save Sam's response to ae_messages
+    let response_text = if clean_text.trim().is_empty() {
+        raw_response.trim().to_string()
+    } else {
+        clean_text.trim().to_string()
+    };
+
+    let _ = supabase::send_message(config, &serde_json::json!({
+        "role": "agent",
+        "content": &response_text,
+    })).await;
+
+    // 8. Send response back via Telegram (plain text, no markdown escaping for readability)
+    send_telegram_plain(config, &response_text).await;
+}
+
+/// Build board context without WorkerState (for Telegram handler in worker loop)
+async fn build_simple_board_context(config: &SupabaseConfig, machine_name: &str) -> String {
+    let mut ctx = String::new();
+
+    let tasks = match supabase::fetch_tasks(config, None).await {
+        Ok(t) => t,
+        Err(_) => return "Board: unable to fetch".to_string(),
+    };
+
+    let Some(arr) = tasks.as_array() else {
+        return "Board: no tasks".to_string();
+    };
+
+    let mut counts = std::collections::HashMap::new();
+    for task in arr {
+        let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let title = task.get("title").and_then(|v| v.as_str()).unwrap_or("Untitled");
+        let priority = task.get("priority").and_then(|v| v.as_str()).unwrap_or("medium");
+        *counts.entry(status.to_string()).or_insert(0u32) += 1;
+
+        if status != "done" {
+            ctx.push_str(&format!("- [{}] {} ({})\n", priority.to_uppercase(), title, status));
+        }
+    }
+
+    let summary = format!(
+        "Queued: {} | In Progress: {} | Testing: {} | Review: {}\n",
+        counts.get("queued").unwrap_or(&0),
+        counts.get("in_progress").unwrap_or(&0),
+        counts.get("testing").unwrap_or(&0),
+        counts.get("review").unwrap_or(&0),
+    );
+
+    format!("{}{}Worker: ONLINE on {}\n", summary, ctx, machine_name)
+}
+
+/// Send a Telegram message as plain text (no MarkdownV2 parsing issues).
+async fn send_telegram_plain(config: &SupabaseConfig, message: &str) {
+    let (token, chat_id) = match (&config.telegram_bot_token, &config.telegram_chat_id) {
+        (Some(t), Some(c)) if !t.is_empty() && !c.is_empty() => (t.clone(), c.clone()),
+        _ => return,
+    };
+
+    let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+    let body = serde_json::json!({
+        "chat_id": chat_id,
+        "text": message,
+    });
+
+    let client = match reqwest::Client::builder().build() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    if let Err(e) = client.post(&url).json(&body).send().await {
+        log::warn!("[worker] Telegram reply failed: {}", e);
     }
 }
 

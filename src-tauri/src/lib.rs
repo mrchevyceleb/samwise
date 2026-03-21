@@ -98,6 +98,12 @@ pub fn run() {
             commands::supabase::supabase_update_trigger,
             // Supabase - Projects
             commands::supabase::supabase_fetch_projects,
+            commands::supabase::supabase_create_project,
+            commands::supabase::supabase_update_project,
+            commands::supabase::supabase_delete_project,
+            // Supabase - Artifacts
+            commands::supabase::supabase_create_artifact,
+            commands::supabase::supabase_fetch_artifacts,
             // Supabase - Workers
             commands::supabase::supabase_worker_heartbeat,
             commands::supabase::supabase_worker_offline,

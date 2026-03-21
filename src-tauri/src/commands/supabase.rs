@@ -106,6 +106,12 @@ pub async fn fetch_comments(config: &SupabaseConfig, task_id: &str) -> Result<Va
     handle_response(client.get(&url).send().await.map_err(|e| e.to_string())?).await
 }
 
+pub async fn fetch_recent_comments(config: &SupabaseConfig, limit: u32) -> Result<Value, String> {
+    let client = build_client(config)?;
+    let url = format!("{}?order=created_at.desc&limit={}", rest_url(config, "ae_comments"), limit);
+    handle_response(client.get(&url).send().await.map_err(|e| e.to_string())?).await
+}
+
 pub async fn post_comment(config: &SupabaseConfig, comment: &Value) -> Result<Value, String> {
     let client = build_client(config)?;
     handle_response(client.post(&rest_url(config, "ae_comments")).json(comment).send().await.map_err(|e| e.to_string())?).await
@@ -198,6 +204,19 @@ pub async fn mark_trigger_event_processed(config: &SupabaseConfig, event_id: &st
     handle_response(client.patch(&url).json(&body).send().await.map_err(|e| e.to_string())?).await
 }
 
+// ── Artifacts (internal) ────────────────────────────────────────────
+
+pub async fn create_artifact(config: &SupabaseConfig, artifact: &Value) -> Result<Value, String> {
+    let client = build_client(config)?;
+    handle_response(client.post(&rest_url(config, "ae_artifacts")).json(artifact).send().await.map_err(|e| e.to_string())?).await
+}
+
+pub async fn fetch_artifacts(config: &SupabaseConfig, task_id: &str) -> Result<Value, String> {
+    let client = build_client(config)?;
+    let url = format!("{}?task_id=eq.{}&order=created_at.asc", rest_url(config, "ae_artifacts"), task_id);
+    handle_response(client.get(&url).send().await.map_err(|e| e.to_string())?).await
+}
+
 // ── Storage (internal) ──────────────────────────────────────────────
 
 /// Upload a file to Supabase Storage and return the public URL.
@@ -233,6 +252,23 @@ pub async fn fetch_projects(config: &SupabaseConfig) -> Result<Value, String> {
     let client = build_client(config)?;
     let url = format!("{}?order=client.asc,name.asc", rest_url(config, "ae_projects"));
     handle_response(client.get(&url).send().await.map_err(|e| e.to_string())?).await
+}
+
+pub async fn create_project(config: &SupabaseConfig, project: &Value) -> Result<Value, String> {
+    let client = build_client(config)?;
+    handle_response(client.post(&rest_url(config, "ae_projects")).json(project).send().await.map_err(|e| e.to_string())?).await
+}
+
+pub async fn update_project(config: &SupabaseConfig, id: &str, updates: &Value) -> Result<Value, String> {
+    let client = build_client(config)?;
+    let url = format!("{}?id=eq.{}", rest_url(config, "ae_projects"), id);
+    handle_response(client.patch(&url).json(updates).send().await.map_err(|e| e.to_string())?).await
+}
+
+pub async fn delete_project(config: &SupabaseConfig, id: &str) -> Result<Value, String> {
+    let client = build_client(config)?;
+    let url = format!("{}?id=eq.{}", rest_url(config, "ae_projects"), id);
+    handle_response(client.delete(&url).send().await.map_err(|e| e.to_string())?).await
 }
 
 // ── Crons (internal) ────────────────────────────────────────────────
@@ -454,6 +490,38 @@ pub async fn supabase_update_trigger(id: String, updates: Value, state: tauri::S
 pub async fn supabase_fetch_projects(state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
     let config = state.get_config().await;
     fetch_projects(&config).await
+}
+
+#[tauri::command]
+pub async fn supabase_create_project(project: Value, state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
+    let config = state.get_config().await;
+    create_project(&config, &project).await
+}
+
+#[tauri::command]
+pub async fn supabase_update_project(id: String, updates: Value, state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
+    let config = state.get_config().await;
+    update_project(&config, &id, &updates).await
+}
+
+#[tauri::command]
+pub async fn supabase_delete_project(id: String, state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
+    let config = state.get_config().await;
+    delete_project(&config, &id).await
+}
+
+// ── Artifact Commands ────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn supabase_create_artifact(artifact: Value, state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
+    let config = state.get_config().await;
+    create_artifact(&config, &artifact).await
+}
+
+#[tauri::command]
+pub async fn supabase_fetch_artifacts(task_id: String, state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
+    let config = state.get_config().await;
+    fetch_artifacts(&config, &task_id).await
 }
 
 // ── Worker Commands ─────────────────────────────────────────────────
