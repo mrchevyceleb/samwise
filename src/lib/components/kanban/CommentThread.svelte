@@ -57,9 +57,21 @@
 		return d.toLocaleDateString();
 	}
 
-	/** Render content with @mentions highlighted */
+	/** Render content with @mentions highlighted and URLs clickable */
 	function renderContent(content: string): string {
-		return content.replace(/@(\w+)/g, '<span style="color: var(--accent-indigo); font-weight: 600;">@$1</span>');
+		// First escape HTML to prevent XSS
+		let safe = content
+			.replace(/&/g, '&amp;')
+			.replace(/</g, '&lt;')
+			.replace(/>/g, '&gt;');
+		// Make URLs clickable
+		safe = safe.replace(
+			/(https?:\/\/[^\s<]+)/g,
+			'<a href="$1" target="_blank" rel="noopener" style="color: var(--accent-indigo); text-decoration: underline; cursor: pointer;" onclick="event.stopPropagation()">$1</a>'
+		);
+		// Highlight @mentions
+		safe = safe.replace(/@(\w+)/g, '<span style="color: var(--accent-indigo); font-weight: 600;">@$1</span>');
+		return safe;
 	}
 
 	function getAuthorInfo(author: string): { name: string; color: string; bg: string; isSystem: boolean } {

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { TaskPriority, AeProject } from '$lib/types';
+	import type { TaskPriority, TaskType, AeProject } from '$lib/types';
 	import { getTaskStore } from '$lib/stores/tasks.svelte';
 	import { safeInvoke } from '$lib/utils/tauri';
 	import { onMount } from 'svelte';
@@ -15,6 +15,7 @@
 	let description = $state('');
 	let project = $state('');
 	let priority = $state<TaskPriority>('medium');
+	let taskType = $state<TaskType>('code');
 	let repoUrl = $state('');
 	let repoPath = $state('');
 	let previewUrl = $state('');
@@ -72,6 +73,7 @@
 				title: title.trim(),
 				description: description.trim() || undefined,
 				priority,
+				task_type: taskType,
 				project: project.trim() || undefined,
 				repo_url: repoUrl.trim() || undefined,
 				repo_path: repoPath.trim() || undefined,
@@ -242,6 +244,52 @@
 						{p.label}
 					</button>
 				{/each}
+			</div>
+		</div>
+
+		<!-- Task Type -->
+		<div style="margin-bottom: 14px;">
+			<label style="font-size: 11px; font-weight: 600; color: var(--text-secondary); display: block; margin-bottom: 6px;">
+				Task Type
+			</label>
+			<div style="display: flex; gap: 6px;">
+				<button
+					style="
+						flex: 1; padding: 8px 10px; border-radius: 8px;
+						border: 1px solid {taskType === 'code' ? 'rgba(99, 102, 241, 0.5)' : 'var(--border-default)'};
+						background: {taskType === 'code' ? 'rgba(99, 102, 241, 0.12)' : 'var(--bg-primary)'};
+						color: {taskType === 'code' ? 'var(--accent-indigo)' : 'var(--text-muted)'};
+						font-size: 11px; font-weight: 600; font-family: var(--font-ui);
+						cursor: pointer; transition: all 0.15s ease;
+						display: flex; align-items: center; gap: 6px; justify-content: center;
+					"
+					onclick={() => taskType = 'code'}
+				>
+					<svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" opacity="0.8">
+						<path d="M5.854 4.854a.5.5 0 10-.708-.708l-3.5 3.5a.5.5 0 000 .708l3.5 3.5a.5.5 0 00.708-.708L2.707 8l3.147-3.146zm4.292 0a.5.5 0 01.708-.708l3.5 3.5a.5.5 0 010 .708l-3.5 3.5a.5.5 0 01-.708-.708L13.293 8l-3.147-3.146z"/>
+					</svg>
+					Code Change
+				</button>
+				<button
+					style="
+						flex: 1; padding: 8px 10px; border-radius: 8px;
+						border: 1px solid {taskType === 'research' ? 'rgba(245, 158, 11, 0.5)' : 'var(--border-default)'};
+						background: {taskType === 'research' ? 'rgba(245, 158, 11, 0.12)' : 'var(--bg-primary)'};
+						color: {taskType === 'research' ? '#f59e0b' : 'var(--text-muted)'};
+						font-size: 11px; font-weight: 600; font-family: var(--font-ui);
+						cursor: pointer; transition: all 0.15s ease;
+						display: flex; align-items: center; gap: 6px; justify-content: center;
+					"
+					onclick={() => taskType = 'research'}
+				>
+					<svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" opacity="0.8">
+						<path d="M11.742 10.344a6.5 6.5 0 10-1.397 1.398h-.001c.03.04.062.078.098.115l3.85 3.85a1 1 0 001.415-1.414l-3.85-3.85a1.007 1.007 0 00-.115-.1zM12 6.5a5.5 5.5 0 11-11 0 5.5 5.5 0 0111 0z"/>
+					</svg>
+					Research / Analysis
+				</button>
+			</div>
+			<div style="font-size: 10px; color: var(--text-muted); margin-top: 4px;">
+				{taskType === 'code' ? 'Agent will make code changes and create a PR' : 'Agent will analyze and report back in comments (no code changes)'}
 			</div>
 		</div>
 

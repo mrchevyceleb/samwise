@@ -1,6 +1,6 @@
 /** Task store using Svelte 5 runes - manages Kanban task state */
 
-import type { AeTask, TaskStatus, TaskPriority, TaskSource } from '$lib/types';
+import type { AeTask, TaskStatus, TaskPriority, TaskType, TaskSource } from '$lib/types';
 import { safeInvoke } from '$lib/utils/tauri';
 
 let tasks = $state<AeTask[]>([]);
@@ -74,6 +74,7 @@ export function getTaskStore() {
       title: string;
       description?: string;
       priority?: TaskPriority;
+      task_type?: TaskType;
       source?: TaskSource;
       project?: string;
       repo_url?: string;
@@ -87,6 +88,7 @@ export function getTaskStore() {
             title: data.title,
             description: data.description || null,
             priority: data.priority || 'medium',
+            task_type: data.task_type || 'code',
             source: data.source || 'manual',
             status: 'queued',
             project: data.project || null,

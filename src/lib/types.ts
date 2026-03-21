@@ -3,6 +3,7 @@
 export type TaskStatus = 'queued' | 'in_progress' | 'testing' | 'review' | 'approved' | 'done' | 'failed';
 export type TaskPriority = 'critical' | 'high' | 'medium' | 'low';
 export type TaskSource = 'manual' | 'trigger' | 'cron' | 'chat';
+export type TaskType = 'code' | 'research';
 export type MessageRole = 'user' | 'agent' | 'system';
 export type CommentAuthor = 'matt' | 'agent' | 'system';
 export type WorkerStatus = 'online' | 'offline' | 'busy';
@@ -16,6 +17,7 @@ export interface AeTask {
   priority: TaskPriority;
   project: string | null;
   source: TaskSource;
+  task_type: TaskType;
   repo_url: string | null;
   repo_path: string | null;
   branch: string | null;

@@ -425,12 +425,18 @@ async fn execute_task(
     let description = task.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let repo_path = task.get("repo_path").and_then(|v| v.as_str()).unwrap_or(".").to_string();
     let preview_url = task.get("preview_url").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let task_type = task.get("task_type").and_then(|v| v.as_str()).unwrap_or("code").to_string();
+    let is_research = task_type == "research";
 
-    // Resolve branch name ONCE - used for both checkout and PR creation
-    let branch: Option<String> = task.get("branch")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| Some(format!("agent-one/{}", uuid::Uuid::new_v4())));
+    // Resolve branch name ONCE - only needed for code tasks
+    let branch: Option<String> = if is_research {
+        None
+    } else {
+        task.get("branch")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| Some(format!("agent-one/{}", uuid::Uuid::new_v4())))
+    };
 
     // 1. Post initial comment
     agent_comment(config, &task_id, &format!("On it. Setting up for: {}", title)).await;
@@ -444,27 +450,32 @@ async fn execute_task(
     emit_worker_event(app, "task_working", &format!("Working on: {}", title), Some(&task_id));
     send_telegram(config, &format!("Working on: *{}*", escape_markdown_v2(&title))).await;
 
-    // 3. Check out branch (always have one now - user-specified or auto-generated)
-    if let Some(ref branch_name) = branch {
-        let _ = tokio::process::Command::new("git")
-            .args(["checkout", "-B", branch_name])
-            .current_dir(&repo_path)
-            .output()
-            .await;
+    // 3. Check out branch (code tasks only)
+    if !is_research {
+        if let Some(ref branch_name) = branch {
+            let _ = tokio::process::Command::new("git")
+                .args(["checkout", "-B", branch_name])
+                .current_dir(&repo_path)
+                .output()
+                .await;
+        }
     }
 
-    // 4. Take BEFORE screenshots if preview_url is set
+    // 4. Take BEFORE screenshots if preview_url is set (code tasks only)
     let screenshot_dir = format!("C:\\agent-one-screenshots\\{}", task_id);
-    if let Some(ref preview) = preview_url {
-        let _ = tokio::fs::create_dir_all(&screenshot_dir).await;
-        agent_comment(config, &task_id, "Taking before screenshots...").await;
+    if !is_research {
+        if let Some(ref preview) = preview_url {
+            let _ = tokio::fs::create_dir_all(&screenshot_dir).await;
+            agent_comment(config, &task_id, "Taking before screenshots...").await;
 
-        let _ = take_screenshot(preview, &format!("{}\\before-desktop.png", screenshot_dir), "1280,720").await;
-        let _ = take_screenshot(preview, &format!("{}\\before-mobile.png", screenshot_dir), "393,852").await;
+            let _ = take_screenshot(preview, &format!("{}\\before-desktop.png", screenshot_dir), "1280,720").await;
+            let _ = take_screenshot(preview, &format!("{}\\before-mobile.png", screenshot_dir), "393,852").await;
+        }
     }
 
     // 5. Run Claude Code CLI
-    agent_comment(config, &task_id, "Starting code changes with Claude Code...").await;
+    let action_label = if is_research { "Running analysis with Claude Code..." } else { "Starting code changes with Claude Code..." };
+    agent_comment(config, &task_id, action_label).await;
 
     // Build a context-aware prompt with repo info
     let mut prompt_parts: Vec<String> = Vec::new();
@@ -492,10 +503,17 @@ async fn execute_task(
     }
 
     // The actual task
-    prompt_parts.push(format!(
-        "## Task\n**{}**\n\n{}\n\n## Instructions\nComplete this task. Make all necessary code changes. Be thorough but focused. Commit your changes when done.",
-        title, description
-    ));
+    if is_research {
+        prompt_parts.push(format!(
+            "## Task\n**{}**\n\n{}\n\n## Instructions\nThis is a RESEARCH/ANALYSIS task. Do NOT make any code changes, do NOT commit, do NOT create files. Read, analyze, and provide a thorough written report. Be detailed and specific.",
+            title, description
+        ));
+    } else {
+        prompt_parts.push(format!(
+            "## Task\n**{}**\n\n{}\n\n## Instructions\nComplete this task. Make all necessary code changes. Be thorough but focused. Commit your changes when done.",
+            title, description
+        ));
+    }
 
     let prompt = prompt_parts.join("\n");
 
@@ -505,6 +523,22 @@ async fn execute_task(
     match claude_result {
         Ok(output) => {
             let summary = truncate(&output, 500);
+
+            // Research tasks: post findings and mark done
+            if is_research {
+                agent_comment(config, &task_id, &format!("Analysis complete. Here's what I found:\n\n{}", summary)).await;
+                let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                    "status": "done",
+                    "completed_at": chrono::Utc::now().to_rfc3339(),
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                })).await;
+                send_telegram(config, &format!(
+                    "Finished analysis on *{}*\\. Check the comments for the full report\\.",
+                    escape_markdown_v2(&title)
+                )).await;
+                return Ok("Analysis complete".to_string());
+            }
+
             agent_comment(config, &task_id, &format!("Code changes done. Here's what I did:\n\n{}", summary)).await;
 
             // 6. Take AFTER screenshots
