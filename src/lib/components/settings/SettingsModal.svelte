@@ -220,10 +220,8 @@
 
           {:else if activeTab === 'about'}
             <div style="display: flex; flex-direction: column; align-items: center; gap: 16px; padding: 24px;">
-              <div style="width: 64px; height: 64px; background: linear-gradient(135deg, #6366f1, #8b5cf6); border-radius: 16px; display: flex; align-items: center; justify-content: center; animation: bob 3s ease-in-out infinite;">
-                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.5">
-                  <circle cx="12" cy="8" r="5"/><path d="M3 21v-2a7 7 0 0 1 7-7h4a7 7 0 0 1 7 7v2"/><circle cx="9" cy="7" r="1" fill="white"/><circle cx="15" cy="7" r="1" fill="white"/>
-                </svg>
+              <div style="width: 72px; height: 72px; border-radius: 50%; overflow: hidden; border: 2px solid rgba(99,102,241,0.3); box-shadow: 0 4px 16px rgba(99,102,241,0.2); animation: bob 3s ease-in-out infinite;">
+                <img src="/samwise-avatar.png" alt="SamWise" style="width: 100%; height: 100%; object-fit: cover;" />
               </div>
               <div style="text-align: center;">
                 <div style="font-size: 24px; font-weight: 700; color: var(--text-primary);">SamWise</div>
