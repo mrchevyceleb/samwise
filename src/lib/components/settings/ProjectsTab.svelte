@@ -228,7 +228,7 @@
 <div style="display: flex; flex-direction: column; gap: 16px; height: 100%; overflow-y: auto;">
 	<!-- Scan Folders Section -->
 	<div style="
-		border-radius: 10px;
+		border-radius: 10px; flex-shrink: 0;
 		background: {theme.c.bgSurface}; border: 1px solid {theme.c.borderDefault};
 		overflow: hidden; transition: all 0.2s;
 	">
