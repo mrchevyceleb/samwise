@@ -4,6 +4,12 @@ import type { AeMessage } from '$lib/types';
 import { safeInvoke } from '$lib/utils/tauri';
 import { getWorkerStore } from './worker.svelte';
 
+/** Like safeInvoke but re-throws errors so callers can handle them */
+async function strictInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  const mod = await import('@tauri-apps/api/core');
+  return mod.invoke<T>(cmd, args);
+}
+
 let messages = $state<AeMessage[]>([]);
 let loading = $state(false);
 let sendingMessage = $state(false);
@@ -34,7 +40,20 @@ export function getChatStore() {
       try {
         const result = await safeInvoke<AeMessage[]>('supabase_fetch_messages');
         if (result) {
-          messages = result;
+          // Preserve any optimistic/local messages (pending-, error-, timeout-, local-)
+          // that haven't been confirmed by the server yet. Without this, a fetch that
+          // races with sendMessage() will blow away the user's just-sent message.
+          if (sendingMessage || waitingForSam) {
+            const localMsgs = messages.filter(m =>
+              m.id.startsWith('pending-') || m.id.startsWith('error-') ||
+              m.id.startsWith('timeout-') || m.id.startsWith('local-')
+            );
+            const serverIds = new Set(result.map(m => m.id));
+            const keepLocal = localMsgs.filter(m => !serverIds.has(m.id));
+            messages = [...result, ...keepLocal];
+          } else {
+            messages = result;
+          }
         }
       } catch (e) {
         console.warn('[chat] fetch messages failed:', e);
@@ -47,16 +66,7 @@ export function getChatStore() {
       sendingMessage = true;
       try {
         if (getWorkerStore().isViewer) {
-          // Viewer mode: save message to Supabase directly, response comes via realtime
-          const sendResult = await safeInvoke('supabase_send_message', {
-            message: { role: 'user', content, conversation_id: '00000000-0000-0000-0000-000000000001', needs_response: true },
-          });
-          if (!sendResult) {
-            console.warn('[chat] Failed to send message to Supabase');
-            sendingMessage = false;
-            return;
-          }
-          // Optimistically show the user's message locally
+          // Viewer mode: show message immediately, then save to Supabase
           const optimisticMsg: AeMessage = {
             id: `pending-${Date.now()}`,
             conversation_id: '00000000-0000-0000-0000-000000000001',
@@ -67,6 +77,9 @@ export function getChatStore() {
             created_at: new Date().toISOString(),
           };
           messages = [...messages, optimisticMsg];
+          await strictInvoke('supabase_send_message', {
+            message: { role: 'user', content, conversation_id: '00000000-0000-0000-0000-000000000001', needs_response: true },
+          });
           waitingForSam = true;
           sendingMessage = false;
           // Timeout after 120s so viewer is never permanently stuck
@@ -105,7 +118,9 @@ export function getChatStore() {
         messages = [...messages, optimisticUserMsg];
 
         // Master mode: call Claude Code CLI locally
-        const result = await safeInvoke<ChatResponseResult>('chat_respond', {
+        // Use strictInvoke (not safeInvoke) so errors propagate to the catch block
+        // and the user sees WHY Sam couldn't respond instead of silent failure.
+        const result = await strictInvoke<ChatResponseResult>('chat_respond', {
           userMessage: content,
         });
 
@@ -143,7 +158,7 @@ export function getChatStore() {
           id: `error-${Date.now()}`,
           conversation_id: '00000000-0000-0000-0000-000000000001',
           role: 'system',
-          content: `Sam couldn't respond: ${e instanceof Error ? e.message : String(e)}. Is Claude Code installed and authenticated?`,
+          content: `Sam couldn't respond right now. Check that the worker is running and Claude Code is installed. (${e instanceof Error ? e.message.split('\n')[0] : 'Unknown error'})`,
           task_id: null,
           attachments: null,
           created_at: new Date().toISOString(),

@@ -4,16 +4,12 @@
 /// Check if Claude Code CLI is installed and return the version string.
 #[tauri::command]
 pub async fn check_claude_code() -> Result<String, String> {
-    let claude_exe = super::worker::find_claude_exe();
+    let (exe, prefix_args) = super::worker::find_claude_command();
 
-    let mut cmd = if claude_exe.ends_with(".cmd") {
-        let mut c = tokio::process::Command::new("cmd.exe");
-        c.arg("/C").arg(&claude_exe);
-        c
-    } else {
-        tokio::process::Command::new(&claude_exe)
-    };
-
+    let mut cmd = tokio::process::Command::new(&exe);
+    for arg in &prefix_args {
+        cmd.arg(arg);
+    }
     cmd.arg("--version");
 
     #[cfg(target_os = "windows")]

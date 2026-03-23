@@ -1,10 +1,21 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import type { AeTask, TaskStatus, TaskPriority } from '$lib/types';
 	import { PRIORITY_COLORS, KANBAN_COLUMNS } from '$lib/types';
 	import { getTaskStore } from '$lib/stores/tasks.svelte';
 	import { getTheme } from '$lib/stores/theme.svelte';
 	import { formatTimeAgo } from '$lib/utils/relative-time';
+	import { safeInvoke } from '$lib/utils/tauri';
 	import CommentThread from './CommentThread.svelte';
+
+	interface Artifact {
+		id: string;
+		task_id: string;
+		title: string;
+		content: string;
+		artifact_type: string;
+		created_at: string;
+	}
 
 	interface Props {
 		task: AeTask;
@@ -24,6 +35,29 @@
 	let deleteHovered = $state(false);
 	let requeueHovered = $state(false);
 	let prBtnHovered = $state(false);
+
+	// Tabs: "details" or "report"
+	let activeTab = $state<'details' | 'report'>('details');
+	let artifacts = $state<Artifact[]>([]);
+	let loadingArtifacts = $state(false);
+
+	onMount(async () => {
+		// Fetch artifacts for this task
+		loadingArtifacts = true;
+		try {
+			const result = await safeInvoke<Artifact[]>('supabase_fetch_artifacts', { task_id: task.id });
+			if (result && result.length > 0) {
+				artifacts = result;
+			}
+		} catch (e) {
+			console.warn('[task-detail] Failed to fetch artifacts:', e);
+		} finally {
+			loadingArtifacts = false;
+		}
+	});
+
+	let hasReport = $derived(artifacts.some(a => a.artifact_type === 'report'));
+	let reportArtifact = $derived(artifacts.find(a => a.artifact_type === 'report'));
 
 	// Derived
 	let elapsed = $derived(formatTimeAgo(new Date(task.created_at).getTime()));
@@ -168,6 +202,56 @@
 				<svg width="12" height="12" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="1" y1="1" x2="9" y2="9"/><line x1="9" y1="1" x2="1" y2="9"/></svg>
 			</button>
 		</div>
+
+		<!-- Tab bar -->
+		{#if hasReport}
+			<div style="
+				display: flex; gap: 0; padding: 0 20px;
+				border-bottom: 1px solid var(--border-subtle);
+				background: var(--bg-surface);
+			">
+				<button
+					style="
+						padding: 10px 16px; font-size: 12px; font-weight: 600;
+						font-family: var(--font-ui); cursor: pointer;
+						background: none; border: none;
+						color: {activeTab === 'details' ? 'var(--accent-indigo)' : 'var(--text-muted)'};
+						border-bottom: 2px solid {activeTab === 'details' ? 'var(--accent-indigo)' : 'transparent'};
+						transition: all 0.15s ease;
+					"
+					onclick={() => activeTab = 'details'}
+				>
+					Details
+				</button>
+				<button
+					style="
+						padding: 10px 16px; font-size: 12px; font-weight: 600;
+						font-family: var(--font-ui); cursor: pointer;
+						background: none; border: none;
+						color: {activeTab === 'report' ? 'var(--accent-indigo)' : 'var(--text-muted)'};
+						border-bottom: 2px solid {activeTab === 'report' ? 'var(--accent-indigo)' : 'transparent'};
+						transition: all 0.15s ease;
+						display: flex; align-items: center; gap: 6px;
+					"
+					onclick={() => activeTab = 'report'}
+				>
+					<svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M4.5 0A2.5 2.5 0 002 2.5v11A2.5 2.5 0 004.5 16h7a2.5 2.5 0 002.5-2.5v-8a.5.5 0 00-.146-.354l-4.5-4.5A.5.5 0 009 .5H4.5zM10 4V1l4 4h-3a1 1 0 01-1-1zM5 7.5a.5.5 0 01.5-.5h5a.5.5 0 010 1h-5a.5.5 0 01-.5-.5zm.5 2.5a.5.5 0 000 1h5a.5.5 0 000-1h-5z"/></svg>
+					Report
+				</button>
+			</div>
+		{/if}
+
+		{#if activeTab === 'report' && hasReport && reportArtifact}
+			<!-- Report view -->
+			<div style="padding: 24px; max-height: 60vh; overflow-y: auto;">
+				<div style="
+					font-size: 13px; line-height: 1.8; color: var(--text-secondary);
+					white-space: pre-wrap; font-family: var(--font-ui);
+				">
+					{reportArtifact.content}
+				</div>
+			</div>
+		{:else}
 
 		<!-- Main body: left content + right sidebar -->
 		<div style="display: flex; min-height: 300px;">
@@ -507,5 +591,7 @@
 		<div style="border-top: 1px solid var(--border-subtle); padding: 16px 20px 20px;">
 			<CommentThread taskId={task.id} />
 		</div>
+
+		{/if}
 	</div>
 </div>

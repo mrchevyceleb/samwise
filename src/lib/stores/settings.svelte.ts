@@ -68,6 +68,7 @@ export interface AppSettings {
   autoStartWorker: boolean;
   isMaster: boolean;
   masterConfigured: boolean;
+  workerRules: string[];
 }
 
 export interface MCPServerConfig {
@@ -161,6 +162,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   autoStartWorker: false,
   isMaster: false,
   masterConfigured: false,
+  workerRules: [],
 };
 
 // ---- Svelte 5 Runes State ----

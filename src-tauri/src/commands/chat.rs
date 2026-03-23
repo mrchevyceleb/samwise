@@ -1,184 +1,8 @@
 use serde::Serialize;
 use serde_json::Value;
-use std::io::Write;
-use std::sync::{Arc, OnceLock};
-use tokio::sync::Mutex;
 
 use super::supabase::{self, SupabaseState};
-use super::worker::{find_claude_exe, WorkerState};
-
-// ── Persistent chat session ─────────────────────────────────────────
-
-struct ChatSession {
-    stdin: std::process::ChildStdin,
-    response_rx: std::sync::mpsc::Receiver<String>,
-    #[allow(dead_code)]
-    child: std::process::Child,
-}
-
-fn chat_session() -> &'static Arc<Mutex<Option<ChatSession>>> {
-    static SESSION: OnceLock<Arc<Mutex<Option<ChatSession>>>> = OnceLock::new();
-    SESSION.get_or_init(|| Arc::new(Mutex::new(None)))
-}
-
-/// Spawn (or re-spawn) the persistent Claude Code session for chat.
-/// Uses pipe mode with stream-json so the process stays alive between messages.
-fn spawn_chat_session() -> Result<ChatSession, String> {
-    let claude_exe = find_claude_exe();
-
-    let mut cmd = if claude_exe.ends_with(".cmd") {
-        let mut c = std::process::Command::new("cmd.exe");
-        c.arg("/C").arg(&claude_exe);
-        c
-    } else {
-        std::process::Command::new(&claude_exe)
-    };
-
-    cmd.arg("-p")
-        .arg("--output-format").arg("stream-json")
-        .arg("--input-format").arg("stream-json")
-        .arg("--verbose")
-        .arg("--dangerously-skip-permissions");
-
-    cmd.stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000);
-    }
-
-    let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn Claude Code: {}", e))?;
-
-    let stdin = child.stdin.take().ok_or("Failed to get stdin")?;
-    let stdout = child.stdout.take().ok_or("Failed to get stdout")?;
-
-    // Channel for collecting response lines from stdout reader thread
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
-
-    // Stdout reader thread - reads stream-json lines and sends to channel
-    std::thread::spawn(move || {
-        use std::io::BufRead;
-        let reader = std::io::BufReader::new(stdout);
-        for line in reader.lines() {
-            match line {
-                Ok(data) if !data.is_empty() => {
-                    if tx.send(data).is_err() {
-                        break;
-                    }
-                }
-                _ => break,
-            }
-        }
-    });
-
-    // Stderr reader thread - just drain it so the process doesn't block
-    if let Some(stderr) = child.stderr.take() {
-        std::thread::spawn(move || {
-            use std::io::BufRead;
-            let reader = std::io::BufReader::new(stderr);
-            for line in reader.lines() {
-                match line {
-                    Ok(data) => {
-                        if !data.is_empty() {
-                            log::debug!("[sam-chat stderr] {}", data);
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-    }
-
-    log::info!("[chat] Spawned persistent Claude Code session for Sam");
-
-    Ok(ChatSession {
-        stdin,
-        response_rx: rx,
-        child,
-    })
-}
-
-/// Send a message to the persistent session and collect the full response.
-fn send_and_collect(session: &mut ChatSession, prompt: &str) -> Result<String, String> {
-    // Build stream-json input message
-    let input = serde_json::json!({
-        "type": "user",
-        "message": {
-            "role": "user",
-            "content": prompt,
-        }
-    });
-
-    let input_str = serde_json::to_string(&input).map_err(|e| e.to_string())?;
-
-    // Write to stdin
-    session.stdin.write_all(input_str.as_bytes()).map_err(|e| format!("stdin write failed: {}", e))?;
-    session.stdin.write_all(b"\n").map_err(|e| format!("stdin newline failed: {}", e))?;
-    session.stdin.flush().map_err(|e| format!("stdin flush failed: {}", e))?;
-
-    // Collect response lines until we see a "result" type (response complete)
-    let mut assistant_text = String::new();
-    let timeout = std::time::Duration::from_secs(90);
-    let start = std::time::Instant::now();
-
-    loop {
-        if start.elapsed() > timeout {
-            return Err("Chat response timed out after 90s".to_string());
-        }
-
-        match session.response_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok(line) => {
-                // Parse the stream-json line
-                if let Ok(parsed) = serde_json::from_str::<Value>(&line) {
-                    let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-                    match msg_type {
-                        "assistant" => {
-                            // Full assistant message - extract text content
-                            if let Some(message) = parsed.get("message") {
-                                if let Some(content) = message.get("content") {
-                                    if let Some(arr) = content.as_array() {
-                                        for block in arr {
-                                            if block.get("type").and_then(|v| v.as_str()) == Some("text") {
-                                                if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-                                                    assistant_text.push_str(text);
-                                                }
-                                            }
-                                        }
-                                    } else if let Some(text) = content.as_str() {
-                                        assistant_text.push_str(text);
-                                    }
-                                }
-                            }
-                        }
-                        "result" => {
-                            // Response complete
-                            break;
-                        }
-                        _ => {
-                            // stream_event, system, etc - ignore for now
-                        }
-                    }
-                }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                continue;
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("Claude Code session closed unexpectedly".to_string());
-            }
-        }
-    }
-
-    if assistant_text.is_empty() {
-        return Err("Claude Code returned empty response".to_string());
-    }
-
-    Ok(assistant_text.trim().to_string())
-}
+use super::worker::{run_claude_code_opts, WorkerState};
 
 // ── Response types ──────────────────────────────────────────────────
 
@@ -234,45 +58,43 @@ pub async fn chat_respond(
     // 4. Build the full prompt (board context + projects + conversation + new message)
     let prompt = build_system_prompt(&board_context, &project_registry, &recent_chat, &user_message);
 
-    // 5. Send to persistent Claude Code session
-    let raw_response = {
-        let mut session_guard = chat_session().lock().await;
-
-        // Spawn session if not alive
-        let needs_spawn = session_guard.is_none();
-        if needs_spawn {
-            match spawn_chat_session() {
-                Ok(s) => { *session_guard = Some(s); }
-                Err(e) => return Err(format!("Failed to start Sam's chat session: {}", e)),
-            }
-        }
-
-        let session = session_guard.as_mut().unwrap();
-
-        // Try to send; if session is dead, respawn once
-        match send_and_collect(session, &prompt) {
-            Ok(response) => response,
-            Err(e) => {
-                log::warn!("[chat] Session failed ({}), respawning...", e);
-                match spawn_chat_session() {
-                    Ok(new_session) => {
-                        *session_guard = Some(new_session);
-                        let session = session_guard.as_mut().unwrap();
-                        send_and_collect(session, &prompt)?
-                    }
-                    Err(e2) => return Err(format!("Failed to restart Sam: {}", e2)),
-                }
-            }
-        }
-    };
+    // 5. One-shot Claude Code call (same proven approach as the worker).
+    // Chat is conversational so limit to 3 turns and 90s timeout.
+    let raw_response = run_claude_code_opts(".", &prompt, 3, 90).await?;
 
     // 6. Parse response for task creation
     let (clean_text, task_requests) = parse_chat_response(&raw_response);
 
-    // 7. Create any tasks
+    // 7. Create any tasks - enrich with project registry data (repo_path, repo_url, preview_url)
+    let projects = supabase::fetch_projects(&config).await.ok();
     let mut created_tasks = Vec::new();
     for req in &task_requests {
-        match supabase::create_task(&config, req).await {
+        let mut enriched = req.clone();
+        if let Some(project_name) = req.get("project").and_then(|v| v.as_str()) {
+            if let Some(ref proj_arr) = projects {
+                if let Some(arr) = proj_arr.as_array() {
+                    if let Some(proj) = arr.iter().find(|p| p.get("name").and_then(|v| v.as_str()) == Some(project_name)) {
+                        // Backfill repo_path, repo_url, preview_url from project registry
+                        if enriched.get("repo_path").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+                            if let Some(v) = proj.get("repo_path").filter(|v| v.as_str().map(|s| !s.is_empty()).unwrap_or(false)) {
+                                enriched["repo_path"] = v.clone();
+                            }
+                        }
+                        if enriched.get("repo_url").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+                            if let Some(v) = proj.get("repo_url").filter(|v| v.as_str().map(|s| !s.is_empty()).unwrap_or(false)) {
+                                enriched["repo_url"] = v.clone();
+                            }
+                        }
+                        if enriched.get("preview_url").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+                            if let Some(v) = proj.get("preview_url").filter(|v| v.as_str().map(|s| !s.is_empty()).unwrap_or(false)) {
+                                enriched["preview_url"] = v.clone();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        match supabase::create_task(&config, &enriched).await {
             Ok(result) => {
                 if let Some(arr) = result.as_array() {
                     if let Some(task) = arr.first() {
