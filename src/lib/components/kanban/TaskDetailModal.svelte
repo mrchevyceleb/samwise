@@ -102,7 +102,7 @@
 			setTimeout(() => confirmDelete = false, 3000);
 			return;
 		}
-		await taskStore.updateTask(task.id, { status: 'done' as TaskStatus });
+		await taskStore.deleteTask(task.id);
 		onClose();
 	}
 
@@ -518,7 +518,15 @@
 						</div>
 					{/if}
 
-					<!-- Branch -->
+					<!-- Repo Path (working directory) -->
+					{#if task.repo_path}
+						<div style="display: flex; align-items: flex-start; gap: 6px;">
+							<span style="color: var(--text-muted); width: 60px; flex-shrink: 0;">Path</span>
+							<span style="color: var(--accent-green); word-break: break-all; font-family: var(--font-mono); font-size: 10px;">{task.repo_path}</span>
+						</div>
+					{/if}
+
+				<!-- Branch -->
 					{#if task.branch}
 						<div style="display: flex; align-items: center; gap: 6px;">
 							<span style="color: var(--text-muted); width: 60px;">Branch</span>
