@@ -1,22 +1,18 @@
 /// Health check commands for the setup wizard.
 /// Verifies that external dependencies (Claude Code CLI, gh CLI) are available.
 
+use crate::process::async_cmd;
+
 /// Check if Claude Code CLI is installed and return the version string.
 #[tauri::command]
 pub async fn check_claude_code() -> Result<String, String> {
     let (exe, prefix_args) = super::worker::find_claude_command();
 
-    let mut cmd = tokio::process::Command::new(&exe);
+    let mut cmd = async_cmd(&exe);
     for arg in &prefix_args {
         cmd.arg(arg);
     }
     cmd.arg("--version");
-
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000);
-    }
 
     let output = cmd.output().await.map_err(|e| format!("Claude Code not found: {}", e))?;
 
@@ -36,7 +32,7 @@ pub async fn check_claude_code() -> Result<String, String> {
 /// Check if GitHub CLI (gh) is authenticated.
 #[tauri::command]
 pub async fn check_gh_auth() -> Result<String, String> {
-    let output = tokio::process::Command::new("gh")
+    let output = async_cmd("gh")
         .args(["auth", "status"])
         .output()
         .await
@@ -59,7 +55,7 @@ pub async fn check_gh_auth() -> Result<String, String> {
 /// Check if Doppler CLI is available.
 #[tauri::command]
 pub async fn check_doppler() -> Result<String, String> {
-    let output = tokio::process::Command::new("doppler")
+    let output = async_cmd("doppler")
         .arg("--version")
         .output()
         .await

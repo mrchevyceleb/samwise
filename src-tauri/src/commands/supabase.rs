@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use crate::process::async_cmd;
 
 // ── Config State ────────────────────────────────────────────────────
 
@@ -401,7 +402,7 @@ pub async fn supabase_test_connection(
 pub async fn supabase_load_doppler(
     state: tauri::State<'_, SupabaseState>,
 ) -> Result<SupabaseConfig, String> {
-    let output = tokio::process::Command::new("doppler")
+    let output = async_cmd("doppler")
         .args(["secrets", "download", "--project", "agent-one", "--config", "prd", "--no-file", "--format", "json"])
         .output()
         .await

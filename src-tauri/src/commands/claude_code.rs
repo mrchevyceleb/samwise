@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::Emitter;
+use crate::process::cmd;
 
 // ── State ────────────────────────────────────────────────────────────
 
@@ -90,16 +91,16 @@ pub fn spawn_claude_code(
     }
 
     let (claude_exe, use_cmd_wrapper) = find_claude_exe();
-    let mut cmd = if use_cmd_wrapper {
-        let mut c = std::process::Command::new("cmd.exe");
+    let mut command = if use_cmd_wrapper {
+        let mut c = cmd("cmd.exe");
         c.arg("/C").arg(&claude_exe);
         c
     } else {
-        std::process::Command::new(&claude_exe)
+        cmd(&claude_exe)
     };
 
     // Base args for persistent stream-json mode
-    cmd.arg("-p")
+    command.arg("-p")
         .arg("--output-format").arg("stream-json")
         .arg("--input-format").arg("stream-json")
         .arg("--verbose")
@@ -108,27 +109,20 @@ pub fn spawn_claude_code(
 
     // Add extra args from the frontend (e.g. --model, --resume)
     for arg in &args {
-        cmd.arg(arg);
+        command.arg(arg);
     }
 
     // Set working directory
     let cwd_path = PathBuf::from(&cwd);
     if cwd_path.exists() && cwd_path.is_dir() {
-        cmd.current_dir(&cwd_path);
+        command.current_dir(&cwd_path);
     }
 
-    cmd.stdin(std::process::Stdio::piped())
+    command.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    // On Windows, prevent console window from appearing
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    }
-
-    let mut child = cmd
+    let mut child = command
         .spawn()
         .map_err(|e| format!("Failed to spawn claude: {}", e))?;
 
@@ -232,15 +226,15 @@ pub fn spawn_claude_code(
 pub fn claude_code_prompt(prompt: String, cwd: String) -> Result<String, String> {
     let (claude_exe, use_cmd_wrapper) = find_claude_exe();
 
-    let mut cmd = if use_cmd_wrapper {
-        let mut c = std::process::Command::new("cmd.exe");
+    let mut command = if use_cmd_wrapper {
+        let mut c = cmd("cmd.exe");
         c.arg("/C").arg(&claude_exe);
         c
     } else {
-        std::process::Command::new(&claude_exe)
+        cmd(&claude_exe)
     };
 
-    cmd.arg("-p")
+    command.arg("-p")
         .arg(&prompt)
         .arg("--output-format").arg("text")
         .arg("--max-turns").arg("1")
@@ -248,16 +242,10 @@ pub fn claude_code_prompt(prompt: String, cwd: String) -> Result<String, String>
 
     let cwd_path = std::path::PathBuf::from(&cwd);
     if cwd_path.exists() && cwd_path.is_dir() {
-        cmd.current_dir(&cwd_path);
+        command.current_dir(&cwd_path);
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    }
-
-    let output = cmd
+    let output = command
         .output()
         .map_err(|e| format!("Claude Code not available: {}", e))?;
 

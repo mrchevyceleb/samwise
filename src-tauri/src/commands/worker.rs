@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tauri::{Emitter, Manager};
 
 use super::supabase::{self, SupabaseConfig, SupabaseState};
+use crate::process::async_cmd;
 
 // ── State ────────────────────────────────────────────────────────────
 
@@ -536,7 +537,7 @@ async fn execute_task(
     // 3. Check out branch (code tasks only)
     if !is_research {
         if let Some(ref branch_name) = branch {
-            let _ = tokio::process::Command::new("git")
+            let _ = async_cmd("git")
                 .args(["checkout", "-B", branch_name])
                 .current_dir(&repo_path)
                 .output()
@@ -595,7 +596,7 @@ async fn execute_task(
     }
 
     // Get recent git log for context
-    if let Ok(git_log) = tokio::process::Command::new("git")
+    if let Ok(git_log) = async_cmd("git")
         .args(["log", "--oneline", "-10"])
         .current_dir(&repo_path)
         .output()
@@ -1153,7 +1154,7 @@ async fn agent_chat(config: &SupabaseConfig, content: &str) {
 pub async fn run_claude_code_opts(cwd: &str, prompt: &str, max_turns: u32, timeout_secs: u64) -> Result<String, String> {
     let (exe, prefix_args) = find_claude_command();
 
-    let mut cmd = tokio::process::Command::new(&exe);
+    let mut cmd = async_cmd(&exe);
     for arg in &prefix_args {
         cmd.arg(arg);
     }
@@ -1171,12 +1172,6 @@ pub async fn run_claude_code_opts(cwd: &str, prompt: &str, max_turns: u32, timeo
     cmd.current_dir(cwd)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000);
-    }
 
     let mut child = cmd.spawn().map_err(|e| format!("Failed to run Claude Code: {}", e))?;
 
@@ -1262,7 +1257,7 @@ pub fn find_claude_exe() -> String {
 
 /// Take a screenshot using Playwright
 async fn take_screenshot(url: &str, output_path: &str, viewport: &str) -> Result<(), String> {
-    let output = tokio::process::Command::new("npx")
+    let output = async_cmd("npx")
         .args(["playwright", "screenshot", url, output_path, "--viewport-size", viewport])
         .output()
         .await
@@ -1385,7 +1380,7 @@ async fn cleanup_agent_dir(agent_dir: &str) {
 /// Detect the default branch for a repo (main, master, etc.)
 async fn detect_base_branch(repo_path: &str) -> String {
     // Try git symbolic-ref for the remote HEAD
-    if let Ok(output) = tokio::process::Command::new("git")
+    if let Ok(output) = async_cmd("git")
         .args(["symbolic-ref", "refs/remotes/origin/HEAD", "--short"])
         .current_dir(repo_path)
         .output()
@@ -1401,7 +1396,7 @@ async fn detect_base_branch(repo_path: &str) -> String {
         }
     }
     // Fallback: check if "main" exists, otherwise "master"
-    if let Ok(output) = tokio::process::Command::new("git")
+    if let Ok(output) = async_cmd("git")
         .args(["rev-parse", "--verify", "refs/heads/main"])
         .current_dir(repo_path)
         .output()
@@ -1464,7 +1459,7 @@ async fn create_pr(
     let base_branch = detect_base_branch(repo_path).await;
 
     // Ensure we're on the right branch
-    let _ = tokio::process::Command::new("git")
+    let _ = async_cmd("git")
         .args(["checkout", "-B", &branch_name])
         .current_dir(repo_path)
         .output()
@@ -1479,23 +1474,23 @@ async fn create_pr(
     }
 
     // Stage all changes (but NOT .agent-one screenshots)
-    let stage = tokio::process::Command::new("git").args(["add", "-A"]).current_dir(repo_path).output().await.map_err(|e| format!("git add failed: {}", e))?;
+    let stage = async_cmd("git").args(["add", "-A"]).current_dir(repo_path).output().await.map_err(|e| format!("git add failed: {}", e))?;
     if !stage.status.success() { return Err("git add failed".to_string()); }
 
     // Check if there are changes
-    let diff = tokio::process::Command::new("git").args(["diff", "--cached", "--quiet"]).current_dir(repo_path).output().await.map_err(|e| format!("git diff check failed: {}", e))?;
+    let diff = async_cmd("git").args(["diff", "--cached", "--quiet"]).current_dir(repo_path).output().await.map_err(|e| format!("git diff check failed: {}", e))?;
     if diff.status.success() { return Err("No changes to commit".to_string()); }
 
     // Commit
     let commit_msg = format!("samwise: {}", title);
-    let commit = tokio::process::Command::new("git").args(["commit", "-m", &commit_msg]).current_dir(repo_path).output().await.map_err(|e| format!("git commit failed: {}", e))?;
+    let commit = async_cmd("git").args(["commit", "-m", &commit_msg]).current_dir(repo_path).output().await.map_err(|e| format!("git commit failed: {}", e))?;
     if !commit.status.success() {
         let stderr = String::from_utf8_lossy(&commit.stderr);
         return Err(format!("git commit failed: {}", stderr));
     }
 
     // Push
-    let push = tokio::process::Command::new("git").args(["push", "-u", "origin", &branch_name]).current_dir(repo_path).output().await.map_err(|e| format!("git push failed: {}", e))?;
+    let push = async_cmd("git").args(["push", "-u", "origin", &branch_name]).current_dir(repo_path).output().await.map_err(|e| format!("git push failed: {}", e))?;
     if !push.status.success() {
         let stderr = String::from_utf8_lossy(&push.stderr);
         return Err(format!("git push failed: {}", stderr));
@@ -1511,7 +1506,7 @@ async fn create_pr(
     pr_body.push_str("---\nAutomated by SamWise");
 
     // Create PR with explicit base branch
-    let pr = tokio::process::Command::new("gh")
+    let pr = async_cmd("gh")
         .args(["pr", "create", "--title", title, "--body", &pr_body, "--head", &branch_name, "--base", &base_branch])
         .current_dir(repo_path)
         .output()

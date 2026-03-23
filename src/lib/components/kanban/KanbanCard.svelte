@@ -10,9 +10,10 @@
 	interface Props {
 		task: AeTask;
 		onClick?: (task: AeTask) => void;
+		onContextMenu?: (task: AeTask, x: number, y: number) => void;
 	}
 
-	let { task, onClick }: Props = $props();
+	let { task, onClick, onContextMenu }: Props = $props();
 	const commentStore = getCommentStore();
 	const drag = getDragStore();
 	const theme = getTheme();
@@ -96,6 +97,12 @@
 		}
 		mouseDownAt = null;
 	}
+
+	function handleContextMenu(e: MouseEvent) {
+		e.preventDefault();
+		e.stopPropagation();
+		onContextMenu?.(task, e.clientX, e.clientY);
+	}
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -123,6 +130,7 @@
 	onmousemove={handleMouseMove}
 	onmouseup={handleMouseUp}
 	onkeydown={(e) => { if (e.key === 'Enter') onClick?.(task); }}
+	oncontextmenu={handleContextMenu}
 >
 	<!-- Title (truncated to 2 lines) -->
 	<div style="

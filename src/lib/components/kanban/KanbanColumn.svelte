@@ -13,10 +13,11 @@
 		collapsed?: boolean;
 		onToggleCollapse?: () => void;
 		onTaskClick?: (task: AeTask) => void;
+		onTaskContextMenu?: (task: AeTask, x: number, y: number) => void;
 		isDragTarget?: boolean;
 	}
 
-	let { status, label, color, glowColor, icon, tasks, collapsed = false, onToggleCollapse, onTaskClick, isDragTarget = false }: Props = $props();
+	let { status, label, color, glowColor, icon, tasks, collapsed = false, onToggleCollapse, onTaskClick, onTaskContextMenu, isDragTarget = false }: Props = $props();
 
 	const theme = getTheme();
 	let headerHovered = $state(false);
@@ -97,7 +98,7 @@
 			display: flex; flex-direction: column; gap: 8px;
 		">
 			{#each tasks as task (task.id)}
-				<KanbanCard {task} onClick={onTaskClick} />
+				<KanbanCard {task} onClick={onTaskClick} onContextMenu={onTaskContextMenu} />
 			{/each}
 
 			{#if tasks.length === 0}

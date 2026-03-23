@@ -1,6 +1,7 @@
 mod state;
 mod commands;
 mod models;
+pub mod process;
 
 use commands::claude_code::ClaudeCodeState;
 use commands::supabase::SupabaseState;

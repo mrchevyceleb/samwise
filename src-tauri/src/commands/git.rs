@@ -1,10 +1,10 @@
 use serde::Serialize;
-use std::process::Command;
+use crate::process::cmd;
 
 // ---- Helpers ----
 
 fn run_git(args: &[&str], repo_path: &str, op: &str) -> Result<String, String> {
-    let output = Command::new("git")
+    let output = cmd("git")
         .args(args)
         .current_dir(repo_path)
         .output()
@@ -103,7 +103,7 @@ pub fn git_status(project_dir: String) -> Result<GitStatus, String> {
         .collect();
 
     // Get ahead/behind
-    let (ahead, behind) = Command::new("git")
+    let (ahead, behind) = cmd("git")
         .args(&["rev-list", "--left-right", "--count", "HEAD...@{upstream}"])
         .current_dir(&project_dir)
         .output()

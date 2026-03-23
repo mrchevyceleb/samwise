@@ -7,6 +7,7 @@
 	import { getLayout } from '$lib/stores/layout.svelte';
 	import { getDragStore } from '$lib/stores/drag.svelte';
 	import KanbanColumn from './KanbanColumn.svelte';
+	import CardContextMenu from './CardContextMenu.svelte';
 	import NewTaskModal from './NewTaskModal.svelte';
 	import TaskDetailModal from './TaskDetailModal.svelte';
 
@@ -18,6 +19,7 @@
 	let showNewTask = $state(false);
 	let selectedTask = $state<AeTask | null>(null);
 	let addBtnHovered = $state(false);
+	let contextMenu = $state<{ task: AeTask; x: number; y: number } | null>(null);
 
 	/** Failed tasks shown in a collapsed row at the bottom */
 	let failedTasks = $derived(taskStore.tasks.filter(t => t.status === 'failed'));
@@ -85,6 +87,10 @@
 		if (!drag.dragging) {
 			selectedTask = task;
 		}
+	}
+
+	function handleTaskContextMenu(task: AeTask, x: number, y: number) {
+		contextMenu = { task, x, y };
 	}
 
 	function handleKeyDown(e: KeyboardEvent) {
@@ -164,6 +170,7 @@
 				collapsed={column.status === 'done' && layout.doneColumnCollapsed}
 				onToggleCollapse={column.status === 'done' ? () => layout.toggleDoneColumn() : undefined}
 				onTaskClick={handleTaskClick}
+				onTaskContextMenu={handleTaskContextMenu}
 				isDragTarget={drag.dragging && drag.hoverColumn === column.status && drag.draggedTask?.status !== column.status}
 			/>
 		{/each}
@@ -274,4 +281,14 @@
 
 {#if selectedTask}
 	<TaskDetailModal task={selectedTask} onClose={() => selectedTask = null} />
+{/if}
+
+{#if contextMenu}
+	<CardContextMenu
+		task={contextMenu.task}
+		x={contextMenu.x}
+		y={contextMenu.y}
+		onClose={() => contextMenu = null}
+		onOpenDetail={(task) => { selectedTask = task; }}
+	/>
 {/if}

@@ -1,4 +1,5 @@
 use serde::Serialize;
+use crate::process::async_cmd;
 
 #[derive(Clone, Serialize)]
 pub struct ScreenshotResult {
@@ -25,7 +26,7 @@ pub async fn playwright_screenshot(
 
     let viewport_arg = format!("{},{}", width, height);
 
-    let output = tokio::process::Command::new("npx")
+    let output = async_cmd("npx")
         .args([
             "playwright",
             "screenshot",
@@ -60,7 +61,7 @@ pub async fn playwright_screenshot_mobile(
     let height = 852;
     let viewport_arg = format!("{},{}", width, height);
 
-    let output = tokio::process::Command::new("npx")
+    let output = async_cmd("npx")
         .args([
             "playwright",
             "screenshot",
