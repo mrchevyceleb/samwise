@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
 
+use super::dev_server;
 use super::supabase::{self, SupabaseConfig, SupabaseState};
 use crate::process::async_cmd;
 
@@ -455,6 +456,39 @@ async fn execute_task(
     let task_type = task.get("task_type").and_then(|v| v.as_str()).unwrap_or("code").to_string();
     let is_research = task_type == "research";
 
+    // Read settings.json once and cache for both notification prefs and worker rules
+    let cached_settings: Option<serde_json::Value> = if let Ok(data_dir) = app.path().app_data_dir() {
+        let settings_path = data_dir.join("settings.json");
+        if let Ok(settings_json) = tokio::fs::read_to_string(&settings_path).await {
+            serde_json::from_str::<serde_json::Value>(&settings_json).ok()
+        } else { None }
+    } else { None };
+
+    // Extract notification preferences (default to true if settings unavailable)
+    let mut notify_task_started = true;
+    let mut notify_task_completed_code = true;
+    let mut notify_task_completed_research = true;
+    let mut notify_task_failed = true;
+    if let Some(ref settings) = cached_settings {
+        let master_enabled = settings.get("telegramNotificationsEnabled")
+            .and_then(|v| v.as_bool()).unwrap_or(true);
+        if !master_enabled {
+            notify_task_started = false;
+            notify_task_completed_code = false;
+            notify_task_completed_research = false;
+            notify_task_failed = false;
+        } else {
+            notify_task_started = settings.get("telegramNotifyTaskStarted")
+                .and_then(|v| v.as_bool()).unwrap_or(true);
+            notify_task_completed_code = settings.get("telegramNotifyTaskCompletedCode")
+                .and_then(|v| v.as_bool()).unwrap_or(true);
+            notify_task_completed_research = settings.get("telegramNotifyTaskCompletedResearch")
+                .and_then(|v| v.as_bool()).unwrap_or(true);
+            notify_task_failed = settings.get("telegramNotifyTaskFailed")
+                .and_then(|v| v.as_bool()).unwrap_or(true);
+        }
+    }
+
     // Resolve repo_path and preview_url: if task has a project name but no repo_path,
     // look it up from the ae_projects registry. Tasks created from chat often only have
     // a project name and no paths, which previously defaulted to "." (the Tauri process
@@ -465,6 +499,7 @@ async fn execute_task(
     let mut preview_url = task.get("preview_url").and_then(|v| v.as_str()).map(|s| s.to_string());
 
     let project_name = task.get("project").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let mut project_dev_command: Option<String> = None;
     if (repo_path.is_none() || preview_url.is_none()) && !project_name.is_empty() {
         if let Ok(projects) = supabase::fetch_projects(config).await {
             if let Some(arr) = projects.as_array() {
@@ -481,6 +516,9 @@ async fn execute_task(
                             .filter(|s| !s.is_empty())
                             .map(|s| s.to_string());
                     }
+                    project_dev_command = proj.get("dev_command").and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string());
                     // Also backfill repo_url on the task if missing
                     if task.get("repo_url").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
                         if let Some(repo_url) = proj.get("repo_url").and_then(|v| v.as_str()) {
@@ -532,7 +570,9 @@ async fn execute_task(
     })).await;
 
     emit_worker_event(app, "task_working", &format!("Working on: {}", title), Some(&task_id));
-    send_telegram(config, &format!("Working on: *{}*", escape_markdown_v2(&title))).await;
+    if notify_task_started {
+        send_telegram(config, &format!("Working on: *{}*", escape_markdown_v2(&title))).await;
+    }
 
     // 3. Check out branch (code tasks only)
     if !is_research {
@@ -542,6 +582,40 @@ async fn execute_task(
                 .current_dir(&repo_path)
                 .output()
                 .await;
+        }
+    }
+
+    // 3b. Start dev server if no preview_url and repo has a package.json (code tasks only)
+    let mut dev_server_handle: Option<dev_server::DevServerHandle> = None;
+    if !is_research && preview_url.is_none() {
+        let pkg_json = std::path::Path::new(&repo_path).join("package.json");
+        if tokio::fs::metadata(&pkg_json).await.is_ok() {
+            agent_comment(config, &task_id, "No preview URL set. Starting a dev server...").await;
+
+            // Ensure node_modules exists before trying to start the dev server
+            if let Err(e) = dev_server::ensure_deps_installed(&repo_path).await {
+                agent_comment(config, &task_id, &format!("npm install failed: {}. Proceeding without screenshots or visual QA.", e)).await;
+            } else {
+                match dev_server::start_dev_server(&repo_path, project_dev_command.as_deref()).await {
+                    Ok(handle) => {
+                        // 60s timeout: Next.js and large projects can take 30-60s on first start
+                        match dev_server::wait_for_ready(handle.port, 60).await {
+                            Ok(()) => {
+                                agent_comment(config, &task_id, &format!("Dev server running at {}", handle.url)).await;
+                                preview_url = Some(handle.url.clone());
+                                dev_server_handle = Some(handle);
+                            }
+                            Err(e) => {
+                                agent_comment(config, &task_id, &format!("Dev server started but not responding: {}. Proceeding without screenshots or visual QA.", e)).await;
+                                let _ = dev_server::kill_dev_server(handle).await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        agent_comment(config, &task_id, &format!("Couldn't start dev server: {}. Proceeding without screenshots or visual QA.", e)).await;
+                    }
+                }
+            }
         }
     }
 
@@ -571,26 +645,21 @@ async fn execute_task(
         prompt_parts.push(format!("## Project Instructions (from CLAUDE.md)\n{}\n", claude_md_truncated));
     }
 
-    // Read worker rules from settings
-    if let Ok(data_dir) = app.path().app_data_dir() {
-        let settings_path = data_dir.join("settings.json");
-        if let Ok(settings_json) = tokio::fs::read_to_string(&settings_path).await {
-            if let Ok(settings) = serde_json::from_str::<serde_json::Value>(&settings_json) {
-                if let Some(rules) = settings.get("workerRules").and_then(|v| v.as_array()) {
-                    let rule_strings: Vec<String> = rules
-                        .iter()
-                        .filter_map(|r| r.as_str())
-                        .filter(|r| !r.trim().is_empty())
-                        .enumerate()
-                        .map(|(i, r)| format!("{}. {}", i + 1, r))
-                        .collect();
-                    if !rule_strings.is_empty() {
-                        prompt_parts.push(format!(
-                            "## Worker Rules (MUST follow these)\n{}\n",
-                            rule_strings.join("\n")
-                        ));
-                    }
-                }
+    // Read worker rules from cached settings
+    if let Some(ref settings) = cached_settings {
+        if let Some(rules) = settings.get("workerRules").and_then(|v| v.as_array()) {
+            let rule_strings: Vec<String> = rules
+                .iter()
+                .filter_map(|r| r.as_str())
+                .filter(|r| !r.trim().is_empty())
+                .enumerate()
+                .map(|(i, r)| format!("{}. {}", i + 1, r))
+                .collect();
+            if !rule_strings.is_empty() {
+                prompt_parts.push(format!(
+                    "## Worker Rules (MUST follow these)\n{}\n",
+                    rule_strings.join("\n")
+                ));
             }
         }
     }
@@ -628,7 +697,7 @@ async fn execute_task(
     // 30-minute timeout for task execution, 50 max turns to prevent runaway sessions
     let claude_result = run_claude_code_opts(&repo_path, &prompt, 50, 1800).await;
 
-    match claude_result {
+    let task_result = match claude_result {
         Ok(output) if output.is_empty() => {
             // Claude Code exited cleanly but produced no output - wrong directory or no-op
             agent_comment(config, &task_id, "Claude Code produced no output. The repo_path may be wrong or the task didn't result in any work. Re-check the project settings.").await;
@@ -636,6 +705,13 @@ async fn execute_task(
                 "status": "failed",
                 "updated_at": chrono::Utc::now().to_rfc3339(),
             })).await;
+            if notify_task_failed {
+                send_telegram(config, &format!(
+                    "Hit a snag on *{}*: Claude Code produced no output",
+                    escape_markdown_v2(&title)
+                )).await;
+            }
+            if let Some(h) = dev_server_handle.take() { let _ = dev_server::kill_dev_server(h).await; }
             return Err("Claude Code produced no output".to_string());
         }
         Ok(output) => {
@@ -667,10 +743,13 @@ async fn execute_task(
                     "completed_at": chrono::Utc::now().to_rfc3339(),
                     "updated_at": chrono::Utc::now().to_rfc3339(),
                 })).await;
-                send_telegram(config, &format!(
-                    "Finished analysis on *{}*\\. Full report saved as an artifact\\.",
-                    escape_markdown_v2(&title)
-                )).await;
+                if notify_task_completed_research {
+                    send_telegram(config, &format!(
+                        "Finished analysis on *{}*\\. Full report saved as an artifact\\.",
+                        escape_markdown_v2(&title)
+                    )).await;
+                }
+                if let Some(h) = dev_server_handle.take() { let _ = dev_server::kill_dev_server(h).await; }
                 return Ok("Analysis complete".to_string());
             }
 
@@ -736,11 +815,13 @@ async fn execute_task(
                         "updated_at": chrono::Utc::now().to_rfc3339(),
                     })).await;
                     agent_comment(config, &task_id, &format!("PR's up: {}. Let me know if you want any changes.", pr_url)).await;
-                    send_telegram(config, &format!(
-                        "PR's up for *{}*: {}",
-                        escape_markdown_v2(&title),
-                        escape_markdown_v2(&pr_url)
-                    )).await;
+                    if notify_task_completed_code {
+                        send_telegram(config, &format!(
+                            "PR's up for *{}*: {}",
+                            escape_markdown_v2(&title),
+                            escape_markdown_v2(&pr_url)
+                        )).await;
+                    }
                     Ok(format!("PR created: {}", pr_url))
                 }
                 Err(e) => {
@@ -749,6 +830,13 @@ async fn execute_task(
                         "updated_at": chrono::Utc::now().to_rfc3339(),
                     })).await;
                     agent_comment(config, &task_id, &format!("Code changes are done but PR creation failed: {}. You can push manually.", e)).await;
+                    if notify_task_completed_code {
+                        send_telegram(config, &format!(
+                            "Code done for *{}* but PR failed: {}",
+                            escape_markdown_v2(&title),
+                            escape_markdown_v2(&e)
+                        )).await;
+                    }
                     Ok("Code changes complete (no PR)".to_string())
                 }
             }
@@ -759,14 +847,23 @@ async fn execute_task(
                 "updated_at": chrono::Utc::now().to_rfc3339(),
             })).await;
             agent_comment(config, &task_id, &format!("Ran into an issue: {}. You might want to re-queue this or take a look.", e)).await;
-            send_telegram(config, &format!(
-                "Hit a snag on *{}*: {}",
-                escape_markdown_v2(&title),
-                escape_markdown_v2(&e)
-            )).await;
+            if notify_task_failed {
+                send_telegram(config, &format!(
+                    "Hit a snag on *{}*: {}",
+                    escape_markdown_v2(&title),
+                    escape_markdown_v2(&e)
+                )).await;
+            }
             Err(format!("Task failed: {}", e))
         }
+    };
+
+    // Cleanup: kill dev server if we started one
+    if let Some(h) = dev_server_handle.take() {
+        let _ = dev_server::kill_dev_server(h).await;
     }
+
+    task_result
 }
 
 // Chat message processing has been moved to commands/chat.rs (direct API, no worker dependency)

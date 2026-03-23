@@ -69,6 +69,12 @@ export interface AppSettings {
   isMaster: boolean;
   masterConfigured: boolean;
   workerRules: string[];
+  // Telegram notification preferences
+  telegramNotificationsEnabled: boolean;
+  telegramNotifyTaskStarted: boolean;
+  telegramNotifyTaskCompletedCode: boolean;
+  telegramNotifyTaskCompletedResearch: boolean;
+  telegramNotifyTaskFailed: boolean;
 }
 
 export interface MCPServerConfig {
@@ -163,6 +169,11 @@ export const DEFAULT_SETTINGS: AppSettings = {
   isMaster: false,
   masterConfigured: false,
   workerRules: [],
+  telegramNotificationsEnabled: true,
+  telegramNotifyTaskStarted: true,
+  telegramNotifyTaskCompletedCode: true,
+  telegramNotifyTaskCompletedResearch: true,
+  telegramNotifyTaskFailed: true,
 };
 
 // ---- Svelte 5 Runes State ----

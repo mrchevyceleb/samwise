@@ -1,5 +1,6 @@
 pub mod chat;
 pub mod claude_code;
+pub mod dev_server;
 pub mod files;
 pub mod git;
 pub mod health;

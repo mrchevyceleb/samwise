@@ -18,6 +18,7 @@
 	let previewUrl = $state('');
 	let client = $state('');
 	let deployMethod = $state('');
+	let devCommand = $state('');
 
 	onMount(() => {
 		projectStore.fetchProjects();
@@ -30,6 +31,7 @@
 		previewUrl = '';
 		client = '';
 		deployMethod = '';
+		devCommand = '';
 		editingId = null;
 		showForm = false;
 	}
@@ -41,6 +43,7 @@
 		previewUrl = project.preview_url || '';
 		client = project.client || '';
 		deployMethod = project.deploy_method || '';
+		devCommand = project.dev_command || '';
 		editingId = project.id;
 		showForm = true;
 	}
@@ -55,6 +58,7 @@
 			preview_url: previewUrl.trim() || null,
 			client: client.trim() || null,
 			deploy_method: deployMethod.trim() || null,
+			dev_command: devCommand.trim() || null,
 		};
 
 		if (editingId) {
@@ -147,6 +151,12 @@
 					<input bind:value={deployMethod} placeholder="vercel, railway, etc"
 						style="width: 100%; padding: 6px 10px; background: {theme.c.bgPrimary}; border: 1px solid {theme.c.borderDefault}; border-radius: 6px; color: {theme.c.textPrimary}; font-size: 12px; font-family: var(--font-mono); outline: none;" />
 				</div>
+			</div>
+
+			<div>
+				<div style="font-size: 10px; color: {theme.c.textMuted}; margin-bottom: 3px; text-transform: uppercase;">Dev Command (optional, auto-detects from package.json)</div>
+				<input bind:value={devCommand} placeholder="npm run dev -- --port {'{port}'}"
+					style="width: 100%; padding: 6px 10px; background: {theme.c.bgPrimary}; border: 1px solid {theme.c.borderDefault}; border-radius: 6px; color: {theme.c.textPrimary}; font-size: 12px; font-family: var(--font-mono); outline: none;" />
 			</div>
 
 			<div style="display: flex; gap: 8px; justify-content: flex-end; margin-top: 4px;">

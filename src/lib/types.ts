@@ -106,6 +106,7 @@ export interface AeProject {
   preview_url: string | null;
   client: string | null;
   deploy_method: string | null;
+  dev_command: string | null;
   created_at: string;
 }
 
