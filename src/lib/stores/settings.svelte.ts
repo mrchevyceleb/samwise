@@ -70,6 +70,7 @@ export interface AppSettings {
   masterConfigured: boolean;
   workerRules: string[];
   // Telegram notification preferences
+  scanFolders: string[];
   telegramNotificationsEnabled: boolean;
   telegramNotifyTaskStarted: boolean;
   telegramNotifyTaskCompletedCode: boolean;
@@ -169,6 +170,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   isMaster: false,
   masterConfigured: false,
   workerRules: [],
+  scanFolders: [],
   telegramNotificationsEnabled: true,
   telegramNotifyTaskStarted: true,
   telegramNotifyTaskCompletedCode: true,

@@ -92,6 +92,7 @@ pub fn run() {
             commands::files::read_directory_tree,
             commands::files::read_directory_children,
             commands::files::list_all_files,
+            commands::files::scan_for_repos,
             // Settings
             commands::settings::save_settings,
             commands::settings::load_settings,

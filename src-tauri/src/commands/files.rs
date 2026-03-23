@@ -519,3 +519,82 @@ pub fn list_all_files(root: String, show_hidden: bool) -> Result<Vec<FileEntry>,
 
     Ok(files)
 }
+
+// ── Repo scanner (Fork-style) ──────────────────────────────────────
+
+#[derive(serde::Serialize)]
+pub struct DiscoveredRepo {
+    pub name: String,
+    pub path: String,
+    pub remote_url: Option<String>,
+}
+
+/// Scan a directory one level deep for git repositories.
+/// Returns a list of discovered repos with name, path, and origin remote URL.
+#[tauri::command]
+pub fn scan_for_repos(root: String) -> Result<Vec<DiscoveredRepo>, String> {
+    let root_path = PathBuf::from(&root);
+    if !root_path.is_dir() {
+        return Err(format!("Not a directory: {}", root));
+    }
+
+    let mut repos: Vec<DiscoveredRepo> = Vec::new();
+
+    let entries = fs::read_dir(&root_path).map_err(|e| e.to_string())?;
+    for entry in entries.filter_map(|e| e.ok()) {
+        let child = entry.path();
+        if !child.is_dir() {
+            continue;
+        }
+        let git_dir = child.join(".git");
+        if !git_dir.exists() {
+            continue;
+        }
+
+        let name = child
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        // Try to read the origin remote URL from .git/config
+        let remote_url = read_git_origin_url(&git_dir);
+
+        repos.push(DiscoveredRepo {
+            name,
+            path: child.to_string_lossy().to_string(),
+            remote_url,
+        });
+    }
+
+    repos.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(repos)
+}
+
+/// Parse .git/config to extract the origin remote URL.
+fn read_git_origin_url(git_dir: &Path) -> Option<String> {
+    let config_path = git_dir.join("config");
+    let content = fs::read_to_string(config_path).ok()?;
+
+    let mut in_origin = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[remote \"origin\"]" {
+            in_origin = true;
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            in_origin = false;
+            continue;
+        }
+        if in_origin && trimmed.starts_with("url =") {
+            if let Some(url) = trimmed.splitn(2, '=').nth(1) {
+                let url = url.trim().to_string();
+                if !url.is_empty() {
+                    return Some(url);
+                }
+            }
+        }
+    }
+    None
+}
