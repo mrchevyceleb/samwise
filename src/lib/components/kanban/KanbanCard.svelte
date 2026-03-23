@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import type { AeTask } from '$lib/types';
+	import type { AeTask, Subtask } from '$lib/types';
 	import { PRIORITY_COLORS } from '$lib/types';
 	import { getCommentStore } from '$lib/stores/comments.svelte';
 	import { getDragStore } from '$lib/stores/drag.svelte';
@@ -34,6 +34,11 @@
 	let isWorking = $derived(task.status === 'in_progress' || task.status === 'testing');
 	let latestComment = $derived(commentStore.getLatestComment(task.id));
 	let qaResult = $derived(task.visual_qa_result);
+	let subtasks = $derived(task.subtasks || []);
+	let subtaskTotal = $derived(subtasks.length);
+	let subtaskDone = $derived(subtasks.filter((s: Subtask) => s.done).length);
+	let hasSubtasks = $derived(subtaskTotal > 0);
+	let subtaskAllDone = $derived(subtaskTotal > 0 && subtaskDone === subtaskTotal);
 
 	/** Live elapsed timer for in-progress tasks */
 	let workingElapsed = $derived(() => {
@@ -241,6 +246,28 @@
 				</svg>
 			{/if}
 		</span>
+
+		{#if hasSubtasks}
+			<span style="
+				display: flex; align-items: center; gap: 4px;
+				font-size: 10px; font-weight: 600;
+				color: {subtaskAllDone ? 'var(--accent-green)' : subtaskDone > 0 ? 'var(--accent-indigo)' : 'var(--text-muted)'};
+				padding: 2px 6px; border-radius: 4px;
+				background: {subtaskAllDone ? 'rgba(63, 185, 80, 0.08)' : subtaskDone > 0 ? 'rgba(99, 102, 241, 0.08)' : 'var(--bg-primary)'};
+			">
+				<svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor">
+					<path d="M2.5 1.75a.25.25 0 01.25-.25h10.5a.25.25 0 01.25.25v12.5a.25.25 0 01-.25.25H2.75a.25.25 0 01-.25-.25V1.75zM2.75 0A1.75 1.75 0 001 1.75v12.5c0 .966.784 1.75 1.75 1.75h10.5A1.75 1.75 0 0015 14.25V1.75A1.75 1.75 0 0013.25 0H2.75zM5 6a1 1 0 100-2 1 1 0 000 2zm0 4a1 1 0 100-2 1 1 0 000 2zm0 4a1 1 0 100-2 1 1 0 000 2zm3-11a.75.75 0 000 1.5h3a.75.75 0 000-1.5H8zM7.25 7a.75.75 0 01.75-.75h3a.75.75 0 010 1.5H8A.75.75 0 017.25 7zM8 10.25a.75.75 0 000 1.5h3a.75.75 0 000-1.5H8z"/>
+				</svg>
+				{subtaskDone}/{subtaskTotal}
+			</span>
+			<div style="width: 36px; height: 3px; border-radius: 2px; background: var(--bg-primary); overflow: hidden;">
+				<div style="
+					width: {subtaskTotal > 0 ? (subtaskDone / subtaskTotal) * 100 : 0}%; height: 100%;
+					background: {subtaskAllDone ? 'var(--accent-green)' : 'var(--accent-indigo)'};
+					transition: width 0.3s ease;
+				"></div>
+			</div>
+		{/if}
 
 		<div style="flex: 1;"></div>
 

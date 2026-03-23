@@ -8,6 +8,8 @@ use commands::supabase::SupabaseState;
 use commands::worker::WorkerState;
 use state::AppState;
 use tauri::Manager;
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::menu::{MenuBuilder, MenuItemBuilder};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -30,6 +32,52 @@ pub fn run() {
                         .build(),
                 )?;
             }
+
+            // Build system tray
+            let show_item = MenuItemBuilder::with_id("show", "Show SamWise").build(app)?;
+            let quit_item = MenuItemBuilder::with_id("quit", "Quit SamWise").build(app)?;
+            let tray_menu = MenuBuilder::new(app)
+                .item(&show_item)
+                .separator()
+                .item(&quit_item)
+                .build()?;
+
+            let _tray = TrayIconBuilder::new()
+                .icon(app.default_window_icon().unwrap().clone())
+                .tooltip("SamWise - AI Employee")
+                .menu(&tray_menu)
+                .on_menu_event(|app, event| {
+                    match event.id().as_ref() {
+                        "show" => {
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.unminimize();
+                                let _ = window.set_focus();
+                            }
+                        }
+                        "quit" => {
+                            app.exit(0);
+                        }
+                        _ => {}
+                    }
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        let app = tray.app_handle();
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.unminimize();
+                            let _ = window.set_focus();
+                        }
+                    }
+                })
+                .build(app)?;
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -126,31 +174,42 @@ pub fn run() {
             commands::chat::chat_respond,
         ])
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::Destroyed = event {
-                let label = window.label().to_string();
-                log::info!("[app] Window '{}' destroyed", label);
-
-                if label == "main" {
-                    // Kill all Claude Code processes
-                    log::info!("[app] Main window destroyed, cleaning up");
-                    let cc_state = window.state::<ClaudeCodeState>();
-                    let drained: Vec<_> = {
-                        let mut processes = cc_state.processes.lock();
-                        processes.drain().collect()
-                    };
-                    for (_, mut proc) in drained {
-                        proc.alive.store(false, std::sync::atomic::Ordering::Relaxed);
-                        drop(proc.stdin.take());
-                        let _ = proc.child.kill();
-                        let _ = proc.child.wait();
+            match event {
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    if window.label() == "main" {
+                        // Prevent actual close, hide to system tray instead
+                        api.prevent_close();
+                        let _ = window.hide();
+                        log::info!("[app] Main window hidden to system tray");
                     }
-
-                    // Stop the worker loop
-                    let worker_state = window.state::<WorkerState>();
-                    worker_state
-                        .running
-                        .store(false, std::sync::atomic::Ordering::Relaxed);
                 }
+                tauri::WindowEvent::Destroyed => {
+                    let label = window.label().to_string();
+                    log::info!("[app] Window '{}' destroyed", label);
+
+                    if label == "main" {
+                        // Kill all Claude Code processes
+                        log::info!("[app] Main window destroyed, cleaning up");
+                        let cc_state = window.state::<ClaudeCodeState>();
+                        let drained: Vec<_> = {
+                            let mut processes = cc_state.processes.lock();
+                            processes.drain().collect()
+                        };
+                        for (_, mut proc) in drained {
+                            proc.alive.store(false, std::sync::atomic::Ordering::Relaxed);
+                            drop(proc.stdin.take());
+                            let _ = proc.child.kill();
+                            let _ = proc.child.wait();
+                        }
+
+                        // Stop the worker loop
+                        let worker_state = window.state::<WorkerState>();
+                        worker_state
+                            .running
+                            .store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                _ => {}
             }
         })
         .run(tauri::generate_context!())

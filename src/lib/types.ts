@@ -9,6 +9,13 @@ export type CommentAuthor = 'matt' | 'agent' | 'system';
 export type WorkerStatus = 'online' | 'offline' | 'busy';
 export type TriggerSourceType = 'supabase' | 'webhook' | 'github' | 'triage';
 
+export interface Subtask {
+	id: string;
+	title: string;
+	done: boolean;
+	order: number;
+}
+
 export interface AeTask {
   id: string;
   title: string;
@@ -33,6 +40,7 @@ export interface AeTask {
   trigger_id: string | null;
   cron_id: string | null;
   context: Record<string, unknown> | null;
+  subtasks: Subtask[] | null;
   created_at: string;
   updated_at: string;
   claimed_at: string | null;

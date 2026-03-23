@@ -308,3 +308,22 @@ button, input, textarea, select, a, [role="button"] {
   60% { transform: scale(1.03); }
   100% { transform: scale(1); opacity: 1; }
 }
+
+/* ── Checkbox pop ─────────────────────────────────────────────── */
+@keyframes check-pop {
+  0% { transform: scale(1); }
+  50% { transform: scale(1.25); }
+  100% { transform: scale(1); }
+}
+
+/* ── Checkmark draw ───────────────────────────────────────────── */
+@keyframes check-draw {
+  from { stroke-dashoffset: 20; }
+  to { stroke-dashoffset: 0; }
+}
+
+/* ── Subtask slide in ─────────────────────────────────────────── */
+@keyframes subtask-slide-in {
+  from { opacity: 0; transform: translateY(-8px); }
+  to { opacity: 1; transform: translateY(0); }
+}

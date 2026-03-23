@@ -7,6 +7,7 @@
 	import { formatTimeAgo } from '$lib/utils/relative-time';
 	import { safeInvoke } from '$lib/utils/tauri';
 	import CommentThread from './CommentThread.svelte';
+	import SubtaskChecklist from './SubtaskChecklist.svelte';
 
 	interface Artifact {
 		id: string;
@@ -322,6 +323,11 @@
 							{task.description || 'Click to add a description...'}
 						</div>
 					{/if}
+				</div>
+
+				<!-- Subtask Checklist -->
+				<div style="margin-bottom: 20px;">
+					<SubtaskChecklist {task} />
 				</div>
 
 				<!-- Before/After Screenshots (side-by-side) -->

@@ -15,7 +15,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 # Tauri core
-tauri = { version = "2", features = ["devtools", "unstable"] }
+tauri = { version = "2", features = ["devtools", "unstable", "tray-icon"] }
 tauri-plugin-os = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-dialog = "2"

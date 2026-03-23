@@ -664,6 +664,23 @@ async fn execute_task(
         }
     }
 
+    // Add subtask context if present
+    if let Some(subtasks_val) = task.get("subtasks") {
+        if let Some(arr) = subtasks_val.as_array() {
+            if !arr.is_empty() {
+                let subtask_lines: Vec<String> = arr.iter().enumerate().map(|(i, s)| {
+                    let done = s.get("done").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let title = s.get("title").and_then(|v| v.as_str()).unwrap_or("?");
+                    format!("  {} {}. {}", if done { "[x]" } else { "[ ]" }, i + 1, title)
+                }).collect();
+                prompt_parts.push(format!(
+                    "## Subtasks (checklist)\nWork on the FIRST unchecked item only. Do not skip ahead:\n{}\n",
+                    subtask_lines.join("\n")
+                ));
+            }
+        }
+    }
+
     // Get recent git log for context
     if let Ok(git_log) = async_cmd("git")
         .args(["log", "--oneline", "-10"])
@@ -774,6 +791,74 @@ async fn execute_task(
                     "screenshots_before": before_urls,
                     "screenshots_after": after_urls,
                 })).await;
+            }
+
+            // Mark first unchecked subtask as done (re-fetch fresh subtasks to avoid stale data)
+            let fresh_subtasks = {
+                let all_tasks = supabase::fetch_tasks(config, None).await.ok();
+                all_tasks.and_then(|tasks| {
+                    tasks.as_array().and_then(|arr| {
+                        arr.iter()
+                            .find(|t| t.get("id").and_then(|v| v.as_str()) == Some(&task_id))
+                            .and_then(|t| t.get("subtasks").cloned())
+                    })
+                })
+            };
+            if let Some(subtasks_val) = fresh_subtasks {
+                if let Some(arr) = subtasks_val.as_array() {
+                    let mut updated: Vec<serde_json::Value> = arr.clone();
+                    let mut marked = false;
+                    for item in updated.iter_mut() {
+                        if let Some(done) = item.get("done").and_then(|v| v.as_bool()) {
+                            if !done {
+                                if let Some(obj) = item.as_object_mut() {
+                                    obj.insert("done".to_string(), serde_json::json!(true));
+                                    marked = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if marked {
+                        let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                            "subtasks": updated,
+                            "updated_at": chrono::Utc::now().to_rfc3339()
+                        })).await;
+                    }
+
+                    // Check if unchecked subtasks remain -> re-queue for next subtask
+                    let remaining = updated.iter().any(|s| {
+                        s.get("done").and_then(|v| v.as_bool()) == Some(false)
+                    });
+                    if remaining {
+                        // Push branch so next iteration has the commits
+                        if let Some(ref b) = branch {
+                            let _ = async_cmd("git")
+                                .args(["push", "-u", "origin", b])
+                                .current_dir(&repo_path)
+                                .output()
+                                .await;
+                        }
+
+                        // Kill dev server before early return
+                        if let Some(h) = dev_server_handle.take() {
+                            let _ = dev_server::kill_dev_server(h).await;
+                        }
+
+                        agent_comment(config, &task_id,
+                            &format!("Subtask done. {} more to go. Re-queuing for the next one.",
+                                updated.iter().filter(|s| s.get("done").and_then(|v| v.as_bool()) != Some(true)).count()
+                            )
+                        ).await;
+                        let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                            "status": "queued",
+                            "worker_id": serde_json::Value::Null,
+                            "claimed_at": serde_json::Value::Null,
+                            "updated_at": chrono::Utc::now().to_rfc3339()
+                        })).await;
+                        return Ok("Subtask completed, re-queued for next subtask".to_string());
+                    }
+                }
             }
 
             // 7. Visual QA (if preview_url set)
