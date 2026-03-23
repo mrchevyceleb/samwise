@@ -1227,9 +1227,34 @@ async fn process_telegram_message(config: &SupabaseConfig, user_message: &str, m
     // 5. Parse for task creation
     let (clean_text, task_requests) = chat::parse_chat_response(&raw_response);
 
-    // 6. Create tasks
+    // 6. Create tasks - enrich with project registry data (repo_path, repo_url, preview_url)
+    let projects = supabase::fetch_projects(config).await.ok();
     for req in &task_requests {
-        if let Err(e) = supabase::create_task(config, req).await {
+        let mut enriched = req.clone();
+        if let Some(project_name) = req.get("project").and_then(|v| v.as_str()) {
+            if let Some(ref proj_val) = projects {
+                if let Some(arr) = proj_val.as_array() {
+                    if let Some(proj) = arr.iter().find(|p| p.get("name").and_then(|v| v.as_str()) == Some(project_name)) {
+                        if enriched.get("repo_path").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+                            if let Some(v) = proj.get("repo_path").filter(|v| v.as_str().map(|s| !s.is_empty()).unwrap_or(false)) {
+                                enriched["repo_path"] = v.clone();
+                            }
+                        }
+                        if enriched.get("repo_url").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+                            if let Some(v) = proj.get("repo_url").filter(|v| v.as_str().map(|s| !s.is_empty()).unwrap_or(false)) {
+                                enriched["repo_url"] = v.clone();
+                            }
+                        }
+                        if enriched.get("preview_url").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+                            if let Some(v) = proj.get("preview_url").filter(|v| v.as_str().map(|s| !s.is_empty()).unwrap_or(false)) {
+                                enriched["preview_url"] = v.clone();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Err(e) = supabase::create_task(config, &enriched).await {
             log::warn!("[worker] Failed to create task from Telegram: {}", e);
         }
     }
