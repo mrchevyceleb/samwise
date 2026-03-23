@@ -1,5 +1,9 @@
+use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
+use std::sync::LazyLock;
+
+static MENTION_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?:^|[\s,])@([\w-]+)").unwrap());
 
 use super::supabase::{self, SupabaseState};
 use super::worker::{run_claude_code_opts, WorkerState};
@@ -51,12 +55,74 @@ pub async fn chat_respond(
         log::warn!("[chat] Failed to save user message: {}", e);
     }
 
+    // 2b. Fast-path: confirmation of pending tasks (checked BEFORE status to avoid "yes how's it going" skipping confirmation)
+    if let Some(response_text) = handle_pending_confirmation(&config, &user_message).await {
+        let message_id = match supabase::send_message(&config, &serde_json::json!({
+            "role": "agent",
+            "content": &response_text,
+            "conversation_id": DEFAULT_CONVERSATION_ID,
+        })).await {
+            Ok(result) => result.as_array()
+                .and_then(|arr| arr.first())
+                .and_then(|msg| msg.get("id"))
+                .and_then(|id| id.as_str())
+                .map(|s| s.to_string()),
+            Err(_) => None,
+        };
+
+        return Ok(ChatResponse {
+            content: response_text,
+            message_id,
+            created_tasks: Vec::new(),
+        });
+    }
+
+    // 2c. Fast-path: status queries skip Claude Code entirely
+    if is_status_query(&user_message) {
+        let board_context = build_board_context(&config, &worker_state).await;
+        let response_text = build_status_response(&board_context);
+
+        let message_id = match supabase::send_message(&config, &serde_json::json!({
+            "role": "agent",
+            "content": &response_text,
+            "conversation_id": DEFAULT_CONVERSATION_ID,
+        })).await {
+            Ok(result) => result.as_array()
+                .and_then(|arr| arr.first())
+                .and_then(|msg| msg.get("id"))
+                .and_then(|id| id.as_str())
+                .map(|s| s.to_string()),
+            Err(e) => {
+                log::warn!("[chat] Failed to save status response: {}", e);
+                None
+            }
+        };
+
+        return Ok(ChatResponse {
+            content: response_text,
+            message_id,
+            created_tasks: Vec::new(),
+        });
+    }
+
     // 3. Fetch board state and project registry
     let board_context = build_board_context(&config, &worker_state).await;
     let project_registry = build_project_registry(&config).await;
 
+    // 3b. Extract @ mentions for explicit project tagging
+    let projects_for_mentions = supabase::fetch_projects(&config).await.ok().unwrap_or(serde_json::json!([]));
+    let mentioned_projects = extract_project_mentions(&user_message, &projects_for_mentions);
+
     // 4. Build the full prompt (board context + projects + conversation + new message)
-    let prompt = build_system_prompt(&board_context, &project_registry, &recent_chat, &user_message);
+    let mut effective_message = user_message.clone();
+    if !mentioned_projects.is_empty() {
+        effective_message = format!(
+            "{}\n\n[System: Matt explicitly tagged @{}. Use this project for any tasks you create.]",
+            user_message,
+            mentioned_projects.join(", @")
+        );
+    }
+    let prompt = build_system_prompt(&board_context, &project_registry, &recent_chat, &effective_message);
 
     // 5. One-shot Claude Code call (same proven approach as the worker).
     // Chat is conversational so limit to 3 turns and 90s timeout.
@@ -65,16 +131,32 @@ pub async fn chat_respond(
     // 6. Parse response for task creation
     let (clean_text, task_requests) = parse_chat_response(&raw_response);
 
-    // 7. Create any tasks - enrich with project registry data (repo_path, repo_url, preview_url)
-    let projects = supabase::fetch_projects(&config).await.ok();
+    // 7. Create any tasks - enrich with project registry data and handle @ mentions
+    let projects = if mentioned_projects.is_empty() {
+        supabase::fetch_projects(&config).await.ok()
+    } else {
+        Some(projects_for_mentions.clone())
+    };
     let mut created_tasks = Vec::new();
     for req in &task_requests {
         let mut enriched = req.clone();
-        if let Some(project_name) = req.get("project").and_then(|v| v.as_str()) {
+
+        // If @ mention was used, override the project field
+        if let Some(mentioned) = mentioned_projects.first() {
+            enriched["project"] = serde_json::Value::String(mentioned.clone());
+            // @ mention = explicit, skip confirmation
+            enriched["status"] = serde_json::Value::String("queued".to_string());
+        } else {
+            // No @ mention: set pending_confirmation so user must confirm repo
+            enriched["status"] = serde_json::Value::String("pending_confirmation".to_string());
+        }
+
+        // Backfill repo fields from project registry
+        let project_name = enriched.get("project").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if !project_name.is_empty() {
             if let Some(ref proj_arr) = projects {
                 if let Some(arr) = proj_arr.as_array() {
-                    if let Some(proj) = arr.iter().find(|p| p.get("name").and_then(|v| v.as_str()) == Some(project_name)) {
-                        // Backfill repo_path, repo_url, preview_url from project registry
+                    if let Some(proj) = arr.iter().find(|p| p.get("name").and_then(|v| v.as_str()) == Some(&project_name)) {
                         if enriched.get("repo_path").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
                             if let Some(v) = proj.get("repo_path").filter(|v| v.as_str().map(|s| !s.is_empty()).unwrap_or(false)) {
                                 enriched["repo_path"] = v.clone();
@@ -94,6 +176,7 @@ pub async fn chat_respond(
                 }
             }
         }
+
         match supabase::create_task(&config, &enriched).await {
             Ok(result) => {
                 if let Some(arr) = result.as_array() {
@@ -194,6 +277,7 @@ pub async fn build_board_context(
     let mut testing = Vec::new();
     let mut review = Vec::new();
     let mut approved = Vec::new();
+    let mut pending_confirm = Vec::new();
 
     for task in arr {
         let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("");
@@ -215,16 +299,19 @@ pub async fn build_board_context(
             "testing" => testing.push(desc),
             "review" => review.push(desc),
             "approved" => approved.push(desc),
+            "pending_confirmation" => pending_confirm.push(desc),
             _ => {}
         }
     }
 
     ctx.push_str(&format!(
-        "Queued: {} | In Progress: {} | Testing: {} | Review: {} | Approved: {}\n",
-        queued.len(), in_progress.len(), testing.len(), review.len(), approved.len()
+        "Queued: {} | In Progress: {} | Testing: {} | Review: {} | Approved: {}{}\n",
+        queued.len(), in_progress.len(), testing.len(), review.len(), approved.len(),
+        if pending_confirm.is_empty() { String::new() } else { format!(" | Pending Confirmation: {}", pending_confirm.len()) }
     ));
 
     let all_active: Vec<(&str, &Vec<String>)> = vec![
+        ("Pending Confirmation", &pending_confirm),
         ("In Progress", &in_progress),
         ("Testing", &testing),
         ("Review", &review),
@@ -346,6 +433,11 @@ If Matt asks you to BUILD, FIX, IMPLEMENT, REFACTOR, RESEARCH, INVESTIGATE, or D
 - priority: "critical", "high", "medium", "low"
 - project: the project/repo name if mentioned, otherwise omit
 
+## Project Confirmation
+If Matt tagged a project with @project-name, use that project (no need to confirm).
+If Matt did NOT use an @ tag, you MUST still pick the most likely project and include it in your task JSON. But also tell Matt which project you picked so he can confirm. Say something like: "I'm putting this on **project-name**. That right?"
+If you're unsure which project, ask Matt to clarify before creating the task.
+
 Do NOT create tasks for simple questions, opinions, quick lookups, or general chat.
 When you create a task, mention it naturally in your response (e.g. "On it, I've queued that up.").
 
@@ -399,6 +491,7 @@ pub fn parse_chat_response(raw: &str) -> (String, Vec<Value>) {
 
                 let block_end = end + 3;
                 clean_text = format!("{}{}", &clean_text[..start], &clean_text[block_end..]);
+                search_from = start; // Reset to where the block was, since text was mutated
                 continue;
             }
         }
@@ -407,4 +500,253 @@ pub fn parse_chat_response(raw: &str) -> (String, Vec<Value>) {
     }
 
     (clean_text, task_requests)
+}
+
+// ── Status query fast-path ──────────────────────────────────────────
+
+const STATUS_KEYWORDS: &[&str] = &[
+    "status", "how's", "hows", "how is", "progress", "update on",
+    "what are you working on", "what's happening", "whats happening",
+    "any updates", "how's it going", "hows it going", "check in",
+    "checkin", "what are you doing", "where are we", "sitrep",
+];
+
+const TASK_CREATION_KEYWORDS: &[&str] = &[
+    "build", "fix", "implement", "create", "add", "make", "change",
+    "refactor", "deploy", "migrate", "write", "set up", "setup",
+    "integrate", "remove", "delete", "update the", "upgrade",
+];
+
+/// Returns true if the message is a simple status check (no work request).
+pub fn is_status_query(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+
+    // Must contain at least one status keyword
+    let has_status = STATUS_KEYWORDS.iter().any(|kw| lower.contains(kw));
+    if !has_status {
+        return false;
+    }
+
+    // Bail if it also contains task-creation intent
+    let has_work = TASK_CREATION_KEYWORDS.iter().any(|kw| lower.contains(kw));
+    if has_work {
+        return false;
+    }
+
+    true
+}
+
+/// Build a casual Sam-style status response from board context (no AI call needed).
+pub fn build_status_response(board_context: &str) -> String {
+    // Detect fetch errors (build_board_context returns "Board: unable to fetch" on Supabase errors)
+    if board_context.starts_with("Board: unable") {
+        return "Couldn't reach Supabase right now. Try again in a moment.".to_string();
+    }
+
+    // Parse the board context to extract useful info
+    let lines: Vec<&str> = board_context.lines().collect();
+
+    let mut response = String::from("Here's where things stand:\n\n");
+
+    // First line is usually the summary counts
+    if let Some(first) = lines.first() {
+        if first.contains("Queued:") {
+            response.push_str(&format!("{}\n\n", first));
+        }
+    }
+
+    // Find worker status
+    let worker_line = lines.iter().find(|l| l.starts_with("Worker:"));
+
+    // Find in-progress tasks (match both title-case from build_board_context and lowercase from build_simple_board_context)
+    let in_progress: Vec<&&str> = lines.iter()
+        .filter(|l| l.contains("(In Progress)") || l.contains("(in_progress)"))
+        .collect();
+
+    if !in_progress.is_empty() {
+        response.push_str("Working on:\n");
+        for task in &in_progress {
+            response.push_str(&format!("{}\n", task));
+        }
+        response.push('\n');
+    }
+
+    // Find queued tasks
+    let queued: Vec<&&str> = lines.iter()
+        .filter(|l| l.contains("(Queued)") || l.contains("(queued)"))
+        .collect();
+
+    if !queued.is_empty() {
+        response.push_str(&format!("{} in the queue", queued.len()));
+        if queued.len() <= 3 {
+            response.push_str(":\n");
+            for task in &queued {
+                response.push_str(&format!("{}\n", task));
+            }
+        } else {
+            response.push_str(". ");
+        }
+        response.push('\n');
+    }
+
+    // Find review/testing tasks
+    let review: Vec<&&str> = lines.iter()
+        .filter(|l| l.contains("(Review)") || l.contains("(review)") || l.contains("(Testing)") || l.contains("(testing)"))
+        .collect();
+
+    if !review.is_empty() {
+        response.push_str(&format!("{} waiting for review/testing.\n", review.len()));
+    }
+
+    if let Some(wl) = worker_line {
+        response.push_str(&format!("\n{}", wl));
+    }
+
+    if in_progress.is_empty() && queued.is_empty() && review.is_empty() {
+        return "Board's empty right now. Nothing queued, nothing in progress. Give me something to do.".to_string();
+    }
+
+    response.trim().to_string()
+}
+
+// ── @ mention extraction ────────────────────────────────────────────
+
+/// Extract project names from @mentions in a message, matched against the project registry.
+/// Requires @ to be preceded by whitespace, comma, or start of string (avoids triggering on emails).
+pub fn extract_project_mentions(message: &str, projects: &Value) -> Vec<String> {
+    let Some(arr) = projects.as_array() else {
+        return Vec::new();
+    };
+
+    let project_names: Vec<String> = arr.iter()
+        .filter_map(|p| p.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .collect();
+
+    let mut matched = Vec::new();
+    for cap in MENTION_RE.captures_iter(message) {
+        let mention = &cap[1];
+        // Case-insensitive match against project names
+        if let Some(name) = project_names.iter().find(|n| n.eq_ignore_ascii_case(mention)) {
+            if !matched.contains(name) {
+                matched.push(name.clone());
+            }
+        }
+    }
+
+    matched
+}
+
+// ── Confirmation detection ──────────────────────────────────────────
+
+const AFFIRMATIVE: &[&str] = &[
+    "yes", "yeah", "yep", "yup", "correct", "right", "confirm",
+    "go ahead", "do it", "that's right", "thats right", "sure",
+    "affirmative", "approved", "ok", "okay", "y",
+];
+
+const NEGATIVE: &[&str] = &[
+    "no", "nope", "wrong", "cancel", "wrong project", "not that",
+    "different project", "nah", "n",
+];
+
+/// Check if a message is a simple confirmation or rejection.
+/// Returns Some(true) for affirmative, Some(false) for negative, None for neither.
+pub fn is_confirmation(msg: &str) -> Option<bool> {
+    let lower = msg.to_lowercase().trim().to_string();
+
+    // Check if the entire message (or very short message) is a confirmation
+    if lower.len() > 40 {
+        return None; // Too long to be a simple yes/no
+    }
+
+    if AFFIRMATIVE.iter().any(|kw| lower == *kw || lower.starts_with(&format!("{} ", kw)) || lower.starts_with(&format!("{}!", kw))) {
+        return Some(true);
+    }
+
+    if NEGATIVE.iter().any(|kw| lower == *kw || lower.starts_with(&format!("{} ", kw)) || lower.starts_with(&format!("{}!", kw))) {
+        return Some(false);
+    }
+
+    // Check if it's a positive number (for numbered list selection, 1-99)
+    if let Ok(num) = lower.parse::<u32>() {
+        if num >= 1 {
+            return Some(true); // Will be handled separately as a numbered selection
+        }
+    }
+
+    None
+}
+
+// ── Shared confirmation handler ─────────────────────────────────────
+
+/// Handle a pending confirmation message. Returns Some(response_text) if handled, None if not.
+/// This is the single source of truth for confirmation logic across chat, Telegram, and remote chat.
+/// Uses conditional PATCH (status=eq.pending_confirmation) to prevent race conditions.
+pub async fn handle_pending_confirmation(
+    config: &supabase::SupabaseConfig,
+    user_message: &str,
+) -> Option<String> {
+    // Only check if the message looks like a confirmation
+    let confirmation = is_confirmation(user_message)?;
+
+    // Fetch pending tasks
+    let pending_tasks = match supabase::fetch_tasks(config, Some("pending_confirmation")).await {
+        Ok(tasks) => tasks,
+        Err(_) => return None, // Can't reach Supabase, fall through to normal processing
+    };
+
+    let Some(arr) = pending_tasks.as_array() else { return None; };
+    if arr.is_empty() { return None; }
+
+    // Sort by created_at descending to get the most recent pending task
+    let mut sorted = arr.clone();
+    sorted.sort_by(|a, b| {
+        let ta = a.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+        let tb = b.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+        tb.cmp(ta)
+    });
+
+    let Some(most_recent) = sorted.first() else { return None; };
+    let task_id = most_recent.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let task_title = most_recent.get("title").and_then(|v| v.as_str()).unwrap_or("untitled");
+
+    if task_id.is_empty() { return None; }
+
+    let response = if confirmation {
+        let lower = user_message.trim().to_lowercase();
+        if let Ok(num) = lower.parse::<usize>() {
+            // Number selection: fetch projects and match
+            let projects = supabase::fetch_projects(config).await.ok();
+            if let Some(proj_arr) = projects.as_ref().and_then(|v| v.as_array()) {
+                if num >= 1 && num <= proj_arr.len() {
+                    let selected = &proj_arr[num - 1];
+                    let proj_name = selected.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let mut updates = serde_json::json!({"status": "queued", "project": proj_name});
+                    for field in &["repo_path", "repo_url", "preview_url"] {
+                        if let Some(v) = selected.get(*field).filter(|v| v.as_str().map(|s| !s.is_empty()).unwrap_or(false)) {
+                            updates[*field] = v.clone();
+                        }
+                    }
+                    // Conditional PATCH: only update if still pending_confirmation (prevents race)
+                    let _ = supabase::update_task_if_status(config, task_id, "pending_confirmation", &updates).await;
+                    format!("Got it. Queued \"{}\" on {}. I'll get to it shortly.", task_title, proj_name)
+                } else {
+                    format!("That number's out of range. Pick a number between 1 and {}.", proj_arr.len())
+                }
+            } else {
+                let _ = supabase::update_task_if_status(config, task_id, "pending_confirmation", &serde_json::json!({"status": "queued"})).await;
+                format!("Got it, queued up \"{}\".", task_title)
+            }
+        } else {
+            // Simple "yes" confirmation
+            let _ = supabase::update_task_if_status(config, task_id, "pending_confirmation", &serde_json::json!({"status": "queued"})).await;
+            format!("Got it, queued up \"{}\". I'll get to it shortly.", task_title)
+        }
+    } else {
+        // Rejected
+        let _ = supabase::update_task_if_status(config, task_id, "pending_confirmation", &serde_json::json!({"status": "failed"})).await;
+        format!("Cancelled \"{}\". Send it again with @project-name to pick the right one.", task_title)
+    };
+
+    Some(response)
 }

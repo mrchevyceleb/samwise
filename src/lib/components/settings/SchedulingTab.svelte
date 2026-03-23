@@ -432,9 +432,25 @@
 			<div style="padding: 12px 14px; background: rgba(99,102,241,0.04); border: 1px solid rgba(99,102,241,0.12); border-radius: 8px; font-size: 12px; color: var(--text-secondary); line-height: 1.6;">
 				<div style="font-weight: 600; color: var(--text-primary); margin-bottom: 4px;">How webhooks work</div>
 				Each webhook gets a unique URL. When something POSTs to that URL, Sam creates a task from the template.
-				No authentication needed on the webhook URL (the trigger ID is the secret).
-				<br/><br/>
-				<span style="font-weight: 500; color: var(--text-primary);">Use cases:</span> GitHub push events, deploy notifications, external cron services (cron-job.org), Zapier/Make, CI/CD pipelines.
+				No authentication needed (the trigger ID in the URL is the secret).
+				<div style="margin-top: 8px;">
+					<span style="font-weight: 500; color: var(--text-primary);">Use cases:</span> GitHub push events, deploy notifications, external cron services (cron-job.org), Zapier/Make, CI/CD pipelines.
+				</div>
+				<details style="margin-top: 10px; font-size: 11px; color: var(--text-muted);">
+					<summary style="cursor: pointer; user-select: none; font-size: 12px; font-weight: 600; color: var(--text-primary);">JSON payload schema</summary>
+					<div style="margin-top: 6px; padding: 8px 10px; background: var(--bg-primary); border-radius: 6px; border: 1px solid var(--border-subtle); overflow-x: auto;">
+						<code style="font-size: 11px; font-family: var(--font-mono, monospace); color: var(--text-secondary); white-space: pre; display: block; line-height: 1.6;">{`{
+  "repo_url":    "https://github.com/you/repo",
+  "title":       "Overrides default task title",
+  "description": "What Sam should do",
+  "priority":    "low | medium | high | critical",
+  "project":     "project-name (alternative to repo_url)"
+}`}</code>
+					</div>
+					<div style="margin-top: 6px; line-height: 1.5;">
+						<strong style="color: var(--text-primary);">repo_url</strong> (recommended) resolves the project automatically from the project registry. Sam matches the URL to a registered project and fills in repo_path, preview_url, and project name. Accepts <code style="font-family: var(--font-mono, monospace); font-size: 10px; color: var(--accent-blue);">.git</code> suffixes and trailing slashes. If neither <code style="font-family: var(--font-mono, monospace); font-size: 10px; color: var(--accent-blue);">repo_url</code> nor <code style="font-family: var(--font-mono, monospace); font-size: 10px; color: var(--accent-blue);">project</code> is provided, the task may fail or require manual confirmation. All other fields are optional and override template defaults. The full payload is saved as <code style="font-family: var(--font-mono, monospace); font-size: 10px; color: var(--accent-blue);">context</code> on the task for Sam to reference during execution. Note: <code style="font-family: var(--font-mono, monospace); font-size: 10px; color: var(--accent-blue);">task_type</code> (code/research) is set by the template and cannot be overridden via payload.
+					</div>
+				</details>
 			</div>
 
 			<!-- Webhook form -->
@@ -448,8 +464,9 @@
 					</div>
 
 					<div style="display: flex; flex-direction: column; gap: 4px;">
-						<span style="{labelStyle}">Task Title (when triggered)</span>
+						<span style="{labelStyle}">Default Task Title</span>
 						<input bind:value={webhookTaskTitle} placeholder="Leave blank to use webhook name" style="{inputStyle}" />
+						<span style="font-size: 10px; color: var(--text-muted);">Fallback title when the webhook payload does not include a title field.</span>
 					</div>
 
 					<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
@@ -537,14 +554,28 @@
 						<!-- Quick curl example -->
 						<details style="font-size: 11px; color: var(--text-muted);">
 							<summary style="cursor: pointer; user-select: none; padding: 2px 0;">Test with curl</summary>
-							<div style="margin-top: 6px; padding: 8px 10px; background: var(--bg-surface); border-radius: 6px; border: 1px solid var(--border-subtle);">
-								<code style="font-size: 10px; font-family: var(--font-mono, monospace); color: var(--text-secondary); white-space: pre-wrap; word-break: break-all;">curl -X POST {webhookUrl(trigger.id)} \{'\n'}  -H "Content-Type: application/json" \{'\n'}  -d '{JSON.stringify({event: "test", source: "manual"})}'</code>
-								<div style="margin-top: 4px;">
+							<div style="margin-top: 6px; padding: 8px 10px; background: var(--bg-surface); border-radius: 6px; border: 1px solid var(--border-subtle); overflow-x: auto;">
+								<code style="font-size: 10px; font-family: var(--font-mono, monospace); color: var(--text-secondary); white-space: pre; display: block; line-height: 1.5;">{`curl -X POST ${webhookUrl(trigger.id)} \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "repo_url": "https://github.com/you/repo",
+    "title": "Fix login bug",
+    "description": "Users report 500 on /auth/login",
+    "priority": "high"
+  }'`}</code>
+								<div style="margin-top: 4px; font-size: 10px; color: var(--text-muted);">bash/zsh syntax. <code style="font-family: var(--font-mono, monospace);">repo_url</code> routes the task to the correct project automatically.</div>
+								<div style="margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap;">
 									<button
-										onclick={() => copyToClipboard(`curl -X POST ${webhookUrl(trigger.id)} -H "Content-Type: application/json" -d '${JSON.stringify({event: "test", source: "manual"})}'`, `curl-${trigger.id}`)}
+										onclick={() => copyToClipboard(`curl -X POST ${webhookUrl(trigger.id)} -H "Content-Type: application/json" -d '{"repo_url": "https://github.com/you/repo", "title": "Fix login bug", "description": "Users report 500 on /auth/login", "priority": "high"}'`, `curl-${trigger.id}`)}
 										style="padding: 3px 8px; border: 1px solid var(--border-default); background: {copiedId === `curl-${trigger.id}` ? 'rgba(63,185,80,0.1)' : 'none'}; border-radius: 4px; color: {copiedId === `curl-${trigger.id}` ? '#3fb950' : 'var(--text-muted)'}; font-size: 10px; cursor: pointer; font-family: var(--font-ui); transition: all 0.15s;"
 									>
-										{copiedId === `curl-${trigger.id}` ? 'Copied!' : 'Copy curl command'}
+										{copiedId === `curl-${trigger.id}` ? 'Copied!' : 'Copy curl (with example)'}
+									</button>
+									<button
+										onclick={() => copyToClipboard(`curl -X POST ${webhookUrl(trigger.id)} -H "Content-Type: application/json" -d '{}'`, `curl-min-${trigger.id}`)}
+										style="padding: 3px 8px; border: 1px solid var(--border-default); background: {copiedId === `curl-min-${trigger.id}` ? 'rgba(63,185,80,0.1)' : 'none'}; border-radius: 4px; color: {copiedId === `curl-min-${trigger.id}` ? '#3fb950' : 'var(--text-muted)'}; font-size: 10px; cursor: pointer; font-family: var(--font-ui); transition: all 0.15s;"
+									>
+										{copiedId === `curl-min-${trigger.id}` ? 'Copied!' : 'Copy curl (empty body)'}
 									</button>
 								</div>
 							</div>

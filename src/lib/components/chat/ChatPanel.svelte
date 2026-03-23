@@ -1,16 +1,31 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
 	import { getChatStore } from '$lib/stores/chat.svelte';
+	import { getTaskStore } from '$lib/stores/tasks.svelte';
 	import { getTheme } from '$lib/stores/theme.svelte';
 	import ChatMessage from './ChatMessage.svelte';
 	import ChatInput from './ChatInput.svelte';
 	import AgentAvatar from './AgentAvatar.svelte';
 
 	const chat = getChatStore();
+	const taskStore = getTaskStore();
 	const theme = getTheme();
 
 	let messagesContainer = $state<HTMLDivElement | null>(null);
 	let minimized = $state(false);
+	let confirmingTaskId = $state<string | null>(null);
+
+	// Track pending confirmation tasks
+	let pendingTasks = $derived(
+		taskStore.tasks.filter((t: any) => t.status === 'pending_confirmation')
+	);
+
+	// Clear confirming state when pending tasks change (task was confirmed/rejected)
+	$effect(() => {
+		if (confirmingTaskId && !pendingTasks.some((t: any) => t.id === confirmingTaskId)) {
+			confirmingTaskId = null;
+		}
+	});
 
 	$effect(() => {
 		const _len = chat.sortedMessages.length;
@@ -28,6 +43,16 @@
 
 	function handleSend(content: string) {
 		chat.sendMessage(content);
+	}
+
+	function confirmTask(task: any) {
+		confirmingTaskId = task.id;
+		chat.sendMessage('yes');
+	}
+
+	function rejectTask(task: any) {
+		confirmingTaskId = task.id;
+		chat.sendMessage('no');
 	}
 </script>
 
@@ -138,6 +163,55 @@
 				</div>
 			{/if}
 		</div>
+
+		<!-- Pending confirmation banner -->
+		{#if pendingTasks.length > 0}
+			<div style="
+				padding: 8px 14px; display: flex; flex-direction: column; gap: 6px;
+				border-top: 1px solid {theme.c.borderDefault};
+				background: {theme.c.bgSurface};
+			">
+				{#each pendingTasks as task (task.id)}
+					<div style="
+						display: flex; align-items: center; gap: 8px;
+						padding: 8px 10px; border-radius: 8px;
+						background: {theme.c.accentAmber}08;
+						border: 1px solid {theme.c.accentAmber}30;
+					">
+						<div style="flex: 1; min-width: 0;">
+							<div style="font-size: 11px; color: {theme.c.textMuted};">Confirm project for:</div>
+							<div style="font-size: 12px; font-weight: 600; color: {theme.c.textPrimary}; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
+								{task.title}
+								{#if task.project}
+									<span style="font-weight: 400; color: {theme.c.accentIndigo};"> on {task.project}</span>
+								{/if}
+							</div>
+						</div>
+						<button
+							onclick={() => confirmTask(task)}
+							style="
+								padding: 4px 12px; border-radius: 6px; font-size: 11px; font-weight: 600;
+								background: {theme.c.accentGreen}; color: #fff; border: none;
+								cursor: pointer; font-family: var(--font-ui);
+								transition: all 0.15s;
+							"
+						disabled={confirmingTaskId !== null || chat.sendingMessage}
+						>{confirmingTaskId === task.id ? 'Confirming...' : 'Confirm'}</button>
+						<button
+							onclick={() => rejectTask(task)}
+							disabled={confirmingTaskId !== null || chat.sendingMessage}
+							style="
+								padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 600;
+								background: none; color: {theme.c.accentRed}; border: 1px solid {theme.c.accentRed}40;
+								cursor: {confirmingTaskId ? 'wait' : 'pointer'}; font-family: var(--font-ui);
+								opacity: {confirmingTaskId ? '0.6' : '1'};
+								transition: all 0.15s;
+							"
+						>Wrong</button>
+					</div>
+				{/each}
+			</div>
+		{/if}
 
 		<ChatInput
 			disabled={chat.sendingMessage || chat.waitingForSam}

@@ -254,6 +254,11 @@ async fn worker_loop(
             check_remote_chat_messages(&config, &machine_name).await;
         }
 
+        // Expire pending_confirmation tasks older than 30 min (every 5 min, skip startup)
+        if tick > 0 && tick % 60 == 0 {
+            expire_pending_confirmations(&config).await;
+        }
+
         tick += 1;
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
@@ -356,11 +361,25 @@ async fn evaluate_crons(config: &SupabaseConfig, app: &tauri::AppHandle) -> Resu
     Ok(())
 }
 
+// ── URL Normalization ───────────────────────────────────────────────
+
+/// Normalize a GitHub repo URL for comparison: lowercase, strip .git suffix and trailing slashes.
+fn normalize_repo_url(url: &str) -> String {
+    url.trim().to_lowercase()
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .trim_end_matches('/')
+        .to_string()
+}
+
 // ── Trigger Evaluation ──────────────────────────────────────────────
 
 async fn evaluate_triggers(config: &super::supabase::SupabaseConfig, app: &tauri::AppHandle) -> Result<(), String> {
     let triggers = supabase::fetch_triggers(config).await?;
     let Some(arr) = triggers.as_array() else { return Ok(()); };
+
+    // Fetch projects once for all triggers (avoids N+1 queries per event)
+    let cached_projects = supabase::fetch_projects(config).await.ok();
 
     for trigger in arr {
         let enabled = trigger.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -403,11 +422,42 @@ async fn evaluate_triggers(config: &super::supabase::SupabaseConfig, app: &tauri
                     obj.insert("status".to_string(), serde_json::json!("queued"));
                 }
 
-                // Allow payload to override template fields (title, description, priority, project)
+                // Allow payload to override template fields (string values only)
                 if let Some(payload_obj) = payload.as_object() {
-                    for field in &["title", "description", "priority", "project"] {
+                    for field in &["title", "description", "priority", "project", "repo_url"] {
                         if let Some(val) = payload_obj.get(*field) {
-                            obj.insert(field.to_string(), val.clone());
+                            if val.is_string() {
+                                obj.insert(field.to_string(), val.clone());
+                            } else {
+                                log::warn!("[worker] Trigger '{}': ignoring non-string payload field '{}' = {}", trigger_name, field, val);
+                            }
+                        }
+                    }
+                }
+
+                // Resolve repo_url -> project registry fields (repo_path, preview_url, project name)
+                let task_repo_url = obj.get("repo_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let task_project = obj.get("project").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if !task_repo_url.is_empty() && task_project.is_empty() {
+                    if let Some(ref projects) = cached_projects {
+                        if let Some(proj_arr) = projects.as_array() {
+                            let normalized = normalize_repo_url(&task_repo_url);
+                            if let Some(proj) = proj_arr.iter().find(|p| {
+                                let purl = p.get("repo_url").and_then(|v| v.as_str()).unwrap_or("");
+                                normalize_repo_url(purl) == normalized
+                            }) {
+                                if let Some(name) = proj.get("name").and_then(|v| v.as_str()) {
+                                    obj.insert("project".to_string(), serde_json::json!(name));
+                                }
+                                for field in &["repo_path", "preview_url"] {
+                                    if let Some(v) = proj.get(*field).filter(|v| v.as_str().map(|s| !s.is_empty()).unwrap_or(false)) {
+                                        obj.insert(field.to_string(), v.clone());
+                                    }
+                                }
+                            } else {
+                                log::warn!("[worker] Trigger '{}': repo_url '{}' not found in project registry", trigger_name, task_repo_url);
+                                obj.insert("status".to_string(), serde_json::json!("pending_confirmation"));
+                            }
                         }
                     }
                 }
@@ -498,14 +548,42 @@ async fn execute_task(
         .map(|s| s.to_string());
     let mut preview_url = task.get("preview_url").and_then(|v| v.as_str()).map(|s| s.to_string());
 
-    let project_name = task.get("project").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let mut project_name = task.get("project").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let task_repo_url = task.get("repo_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let mut project_dev_command: Option<String> = None;
-    if (repo_path.is_none() || preview_url.is_none()) && !project_name.is_empty() {
+
+    // Resolve project from registry: by project name, or by repo_url if no name is set
+    if repo_path.is_none() || preview_url.is_none() || project_name.is_empty() {
         if let Ok(projects) = supabase::fetch_projects(config).await {
             if let Some(arr) = projects.as_array() {
-                if let Some(proj) = arr.iter().find(|p| {
-                    p.get("name").and_then(|v| v.as_str()) == Some(&project_name)
-                }) {
+                // Try matching by project name first, then fall back to repo_url
+                let matched_proj = if !project_name.is_empty() {
+                    let name_lower = project_name.to_lowercase();
+                    arr.iter().find(|p| {
+                        p.get("name").and_then(|v| v.as_str())
+                            .map(|n| n.to_lowercase() == name_lower)
+                            .unwrap_or(false)
+                    })
+                } else if !task_repo_url.is_empty() {
+                    let normalized = normalize_repo_url(&task_repo_url);
+                    arr.iter().find(|p| {
+                        let purl = p.get("repo_url").and_then(|v| v.as_str()).unwrap_or("");
+                        normalize_repo_url(purl) == normalized
+                    })
+                } else {
+                    None
+                };
+
+                if let Some(proj) = matched_proj {
+                    // Backfill project name if resolved via repo_url
+                    if project_name.is_empty() {
+                        if let Some(name) = proj.get("name").and_then(|v| v.as_str()) {
+                            project_name = name.to_string();
+                            let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                                "project": &project_name,
+                            })).await;
+                        }
+                    }
                     if repo_path.is_none() {
                         repo_path = proj.get("repo_path").and_then(|v| v.as_str())
                             .filter(|s| !s.is_empty())
@@ -519,11 +597,11 @@ async fn execute_task(
                     project_dev_command = proj.get("dev_command").and_then(|v| v.as_str())
                         .filter(|s| !s.is_empty())
                         .map(|s| s.to_string());
-                    // Also backfill repo_url on the task if missing
-                    if task.get("repo_url").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
-                        if let Some(repo_url) = proj.get("repo_url").and_then(|v| v.as_str()) {
+                    // Backfill repo_url on the task if missing
+                    if task_repo_url.is_empty() {
+                        if let Some(url) = proj.get("repo_url").and_then(|v| v.as_str()) {
                             let _ = supabase::update_task(config, &task_id, &serde_json::json!({
-                                "repo_url": repo_url,
+                                "repo_url": url,
                             })).await;
                         }
                     }
@@ -692,6 +770,21 @@ async fn execute_task(
             let log_str = String::from_utf8_lossy(&git_log.stdout);
             if !log_str.trim().is_empty() {
                 prompt_parts.push(format!("## Recent git history\n```\n{}\n```\n", log_str.trim()));
+            }
+        }
+    }
+
+    // Inject webhook/trigger context if present (capped at 8KB to avoid blowing up the prompt)
+    if let Some(context) = task.get("context") {
+        if !context.is_null() {
+            let ctx_str = if context.is_string() {
+                context.as_str().unwrap_or("").to_string()
+            } else {
+                serde_json::to_string_pretty(context).unwrap_or_default()
+            };
+            if !ctx_str.is_empty() {
+                let capped = truncate(&ctx_str, 8000);
+                prompt_parts.push(format!("## Task Context\n```json\n{}\n```\n", capped));
             }
         }
     }
@@ -1136,13 +1229,49 @@ async fn check_remote_chat_messages(config: &SupabaseConfig, machine_name: &str)
 async fn process_remote_chat_message(config: &SupabaseConfig, message_id: &str, user_message: &str, machine_name: &str) {
     use super::chat;
 
-    // 1. Build context (same as Telegram handler)
+    // 0. Fast-path: confirmation of pending tasks (checked BEFORE status query)
+    if let Some(response_text) = chat::handle_pending_confirmation(config, user_message).await {
+        let _ = supabase::send_message(config, &serde_json::json!({
+            "role": "agent",
+            "content": &response_text,
+            "conversation_id": supabase::DEFAULT_CONVERSATION_ID,
+        })).await;
+        return;
+    }
+
+    // 0b. Fast-path: status queries skip Claude Code entirely
+    if chat::is_status_query(user_message) {
+        let board_ctx = build_simple_board_context(config, machine_name).await;
+        let response_text = chat::build_status_response(&board_ctx);
+        let _ = supabase::send_message(config, &serde_json::json!({
+            "role": "agent",
+            "content": &response_text,
+            "conversation_id": supabase::DEFAULT_CONVERSATION_ID,
+        })).await;
+        log::info!("[worker] Remote chat status fast-path for message {}", message_id);
+        return;
+    }
+
+    // 1. Build context
     let recent_chat = chat::fetch_recent_chat(config).await;
     let project_registry = chat::build_project_registry(config).await;
     let board_ctx = build_simple_board_context(config, machine_name).await;
 
+    // 1b. Extract @ mentions
+    let projects_all = supabase::fetch_projects(config).await.ok().unwrap_or(serde_json::json!([]));
+    let mentioned_projects = chat::extract_project_mentions(user_message, &projects_all);
+
     // 2. Build prompt
-    let prompt = chat::build_system_prompt(&board_ctx, &project_registry, &recent_chat, user_message);
+    let effective_message = if !mentioned_projects.is_empty() {
+        format!(
+            "{}\n\n[System: Matt explicitly tagged @{}. Use this project for any tasks you create.]",
+            user_message,
+            mentioned_projects.join(", @")
+        )
+    } else {
+        user_message.to_string()
+    };
+    let prompt = chat::build_system_prompt(&board_ctx, &project_registry, &recent_chat, &effective_message);
 
     // 3. Call Claude Code CLI one-shot
     let raw_response = match run_claude_code_opts(".", &prompt, 3, 90).await {
@@ -1155,7 +1284,6 @@ async fn process_remote_chat_message(config: &SupabaseConfig, message_id: &str, 
                 "content": &error_msg,
                 "conversation_id": supabase::DEFAULT_CONVERSATION_ID,
             })).await;
-            // mark_message_responded already called before processing
             return;
         }
     };
@@ -1163,9 +1291,31 @@ async fn process_remote_chat_message(config: &SupabaseConfig, message_id: &str, 
     // 4. Parse for task creation
     let (clean_text, task_requests) = chat::parse_chat_response(&raw_response);
 
-    // 5. Create tasks
+    // 5. Create tasks with @ mention handling
     for req in &task_requests {
-        if let Err(e) = supabase::create_task(config, req).await {
+        let mut enriched = req.clone();
+        if let Some(mentioned) = mentioned_projects.first() {
+            enriched["project"] = serde_json::Value::String(mentioned.clone());
+            enriched["status"] = serde_json::Value::String("queued".to_string());
+        } else {
+            enriched["status"] = serde_json::Value::String("pending_confirmation".to_string());
+        }
+        // Backfill repo fields
+        let project_name = enriched.get("project").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if !project_name.is_empty() {
+            if let Some(arr) = projects_all.as_array() {
+                if let Some(proj) = arr.iter().find(|p| p.get("name").and_then(|v| v.as_str()) == Some(&project_name)) {
+                    for field in &["repo_path", "repo_url", "preview_url"] {
+                        if enriched.get(*field).and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+                            if let Some(v) = proj.get(*field).filter(|v| v.as_str().map(|s| !s.is_empty()).unwrap_or(false)) {
+                                enriched[*field] = v.clone();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Err(e) = supabase::create_task(config, &enriched).await {
             log::warn!("[worker] Failed to create task from remote chat: {}", e);
         }
     }
@@ -1197,16 +1347,50 @@ async fn process_telegram_message(config: &SupabaseConfig, user_message: &str, m
         "conversation_id": supabase::DEFAULT_CONVERSATION_ID,
     })).await;
 
+    // 1b. Fast-path: confirmation of pending tasks (checked BEFORE status query)
+    if let Some(response_text) = chat::handle_pending_confirmation(config, user_message).await {
+        let _ = supabase::send_message(config, &serde_json::json!({
+            "role": "agent",
+            "content": &response_text,
+            "conversation_id": supabase::DEFAULT_CONVERSATION_ID,
+        })).await;
+        send_telegram_plain(config, &response_text).await;
+        return;
+    }
+
+    // 1c. Fast-path: status queries skip Claude Code entirely
+    if chat::is_status_query(user_message) {
+        let board_ctx = build_simple_board_context(config, machine_name).await;
+        let response_text = chat::build_status_response(&board_ctx);
+        let _ = supabase::send_message(config, &serde_json::json!({
+            "role": "agent",
+            "content": &response_text,
+            "conversation_id": supabase::DEFAULT_CONVERSATION_ID,
+        })).await;
+        send_telegram_plain(config, &response_text).await;
+        return;
+    }
+
     // 2. Build context (reuse chat.rs functions)
-    // We don't have WorkerState here directly, but we can build a minimal board context
     let recent_chat = chat::fetch_recent_chat(config).await;
     let project_registry = chat::build_project_registry(config).await;
-
-    // Build board context without worker state (simpler version)
     let board_ctx = build_simple_board_context(config, machine_name).await;
 
-    // 3. Build prompt
-    let prompt = chat::build_system_prompt(&board_ctx, &project_registry, &recent_chat, user_message);
+    // 2b. Extract @ mentions
+    let projects_all = supabase::fetch_projects(config).await.ok().unwrap_or(serde_json::json!([]));
+    let mentioned_projects = chat::extract_project_mentions(user_message, &projects_all);
+
+    // 3. Build prompt (inject @ mention if present)
+    let effective_message = if !mentioned_projects.is_empty() {
+        format!(
+            "{}\n\n[System: Matt explicitly tagged @{}. Use this project for any tasks you create.]",
+            user_message,
+            mentioned_projects.join(", @")
+        )
+    } else {
+        user_message.to_string()
+    };
+    let prompt = chat::build_system_prompt(&board_ctx, &project_registry, &recent_chat, &effective_message);
 
     // 4. Call Claude Code CLI one-shot
     let raw_response = match run_claude_code_opts(".", &prompt, 3, 90).await {
@@ -1227,33 +1411,43 @@ async fn process_telegram_message(config: &SupabaseConfig, user_message: &str, m
     // 5. Parse for task creation
     let (clean_text, task_requests) = chat::parse_chat_response(&raw_response);
 
-    // 6. Create tasks - enrich with project registry data (repo_path, repo_url, preview_url)
-    let projects = supabase::fetch_projects(config).await.ok();
+    // 6. Create tasks - enrich with project registry data + handle @ mentions
     for req in &task_requests {
         let mut enriched = req.clone();
-        if let Some(project_name) = req.get("project").and_then(|v| v.as_str()) {
-            if let Some(ref proj_val) = projects {
-                if let Some(arr) = proj_val.as_array() {
-                    if let Some(proj) = arr.iter().find(|p| p.get("name").and_then(|v| v.as_str()) == Some(project_name)) {
-                        if enriched.get("repo_path").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
-                            if let Some(v) = proj.get("repo_path").filter(|v| v.as_str().map(|s| !s.is_empty()).unwrap_or(false)) {
-                                enriched["repo_path"] = v.clone();
-                            }
+
+        // Override project with @ mention if present
+        if let Some(mentioned) = mentioned_projects.first() {
+            enriched["project"] = serde_json::Value::String(mentioned.clone());
+            enriched["status"] = serde_json::Value::String("queued".to_string());
+        } else {
+            // No @ mention: pending_confirmation
+            enriched["status"] = serde_json::Value::String("pending_confirmation".to_string());
+        }
+
+        // Backfill repo fields
+        let project_name = enriched.get("project").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if !project_name.is_empty() {
+            if let Some(arr) = projects_all.as_array() {
+                if let Some(proj) = arr.iter().find(|p| p.get("name").and_then(|v| v.as_str()) == Some(&project_name)) {
+                    if enriched.get("repo_path").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+                        if let Some(v) = proj.get("repo_path").filter(|v| v.as_str().map(|s| !s.is_empty()).unwrap_or(false)) {
+                            enriched["repo_path"] = v.clone();
                         }
-                        if enriched.get("repo_url").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
-                            if let Some(v) = proj.get("repo_url").filter(|v| v.as_str().map(|s| !s.is_empty()).unwrap_or(false)) {
-                                enriched["repo_url"] = v.clone();
-                            }
+                    }
+                    if enriched.get("repo_url").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+                        if let Some(v) = proj.get("repo_url").filter(|v| v.as_str().map(|s| !s.is_empty()).unwrap_or(false)) {
+                            enriched["repo_url"] = v.clone();
                         }
-                        if enriched.get("preview_url").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
-                            if let Some(v) = proj.get("preview_url").filter(|v| v.as_str().map(|s| !s.is_empty()).unwrap_or(false)) {
-                                enriched["preview_url"] = v.clone();
-                            }
+                    }
+                    if enriched.get("preview_url").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+                        if let Some(v) = proj.get("preview_url").filter(|v| v.as_str().map(|s| !s.is_empty()).unwrap_or(false)) {
+                            enriched["preview_url"] = v.clone();
                         }
                     }
                 }
             }
         }
+
         if let Err(e) = supabase::create_task(config, &enriched).await {
             log::warn!("[worker] Failed to create task from Telegram: {}", e);
         }
@@ -1272,8 +1466,23 @@ async fn process_telegram_message(config: &SupabaseConfig, user_message: &str, m
         "conversation_id": supabase::DEFAULT_CONVERSATION_ID,
     })).await;
 
-    // 8. Send response back via Telegram (plain text, no markdown escaping for readability)
+    // 7b. Send response back via Telegram first
     send_telegram_plain(config, &response_text).await;
+
+    // 7c. If tasks created with pending_confirmation, send numbered project list via Telegram
+    if !task_requests.is_empty() && mentioned_projects.is_empty() {
+        if let Some(arr) = projects_all.as_array() {
+            if !arr.is_empty() {
+                let mut list = String::from("Which project?\n");
+                for (i, proj) in arr.iter().enumerate() {
+                    let name = proj.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    list.push_str(&format!("{}. {}\n", i + 1, name));
+                }
+                list.push_str("\nReply with the number.");
+                send_telegram_plain(config, &list).await;
+            }
+        }
+    }
 }
 
 /// Build board context without WorkerState (for Telegram handler in worker loop)
@@ -1353,6 +1562,49 @@ async fn agent_chat(config: &SupabaseConfig, content: &str) {
         "content": content,
         "conversation_id": supabase::DEFAULT_CONVERSATION_ID,
     })).await;
+}
+
+/// Expire pending_confirmation tasks older than 30 minutes.
+async fn expire_pending_confirmations(config: &SupabaseConfig) {
+    let tasks = match supabase::fetch_tasks(config, Some("pending_confirmation")).await {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+
+    let Some(arr) = tasks.as_array() else { return; };
+    let now = chrono::Utc::now();
+    let mut expired_titles: Vec<String> = Vec::new();
+
+    for task in arr {
+        let created_at = task.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+        let task_id = task.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let task_title = task.get("title").and_then(|v| v.as_str()).unwrap_or("untitled");
+
+        if task_id.is_empty() || created_at.is_empty() { continue; }
+
+        if let Ok(created) = chrono::DateTime::parse_from_rfc3339(created_at) {
+            let age = now - created.with_timezone(&chrono::Utc);
+            if age.num_minutes() >= 30 {
+                // Use conditional update to avoid racing with a user confirmation
+                let _ = supabase::update_task_if_status(config, task_id, "pending_confirmation", &serde_json::json!({
+                    "status": "failed",
+                    "updated_at": now.to_rfc3339(),
+                })).await;
+                expired_titles.push(task_title.to_string());
+            }
+        }
+    }
+
+    // Send a single batched notification for all expired tasks
+    if !expired_titles.is_empty() {
+        let msg = if expired_titles.len() == 1 {
+            format!("Task \"{}\" expired waiting for project confirmation. Create a new task with @project to retry.", expired_titles[0])
+        } else {
+            let names: Vec<String> = expired_titles.iter().map(|t| format!("\"{}\"", t)).collect();
+            format!("{} tasks expired waiting for project confirmation: {}. Create new tasks with @project to retry.", expired_titles.len(), names.join(", "))
+        };
+        agent_chat(config, &msg).await;
+    }
 }
 
 /// Run Claude Code CLI one-shot with explicit max_turns and timeout_secs.

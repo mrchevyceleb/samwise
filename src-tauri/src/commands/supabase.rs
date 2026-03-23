@@ -80,6 +80,14 @@ pub async fn update_task(config: &SupabaseConfig, id: &str, updates: &Value) -> 
     handle_response(client.patch(&url).json(updates).send().await.map_err(|e| e.to_string())?).await
 }
 
+/// Update a task only if its current status matches `expected_status` (optimistic locking).
+/// Returns Ok with empty array if the status already changed (no rows affected).
+pub async fn update_task_if_status(config: &SupabaseConfig, id: &str, expected_status: &str, updates: &Value) -> Result<Value, String> {
+    let client = build_client(config)?;
+    let url = format!("{}?id=eq.{}&status=eq.{}", rest_url(config, "ae_tasks"), id, expected_status);
+    handle_response(client.patch(&url).json(updates).send().await.map_err(|e| e.to_string())?).await
+}
+
 pub async fn claim_task(config: &SupabaseConfig, task_id: &str, worker_id: &str) -> Result<Value, String> {
     let client = build_client(config)?;
     let url = format!("{}?id=eq.{}&status=eq.queued", rest_url(config, "ae_tasks"), task_id);

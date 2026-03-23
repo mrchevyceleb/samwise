@@ -17,6 +17,7 @@ function getTasksByColumn(): Record<TaskStatus, AeTask[]> {
     approved: [],
     done: [],
     failed: [],
+    pending_confirmation: [],
   };
   for (const t of tasks) {
     if (grouped[t.status]) {
@@ -51,6 +52,7 @@ export function getTaskStore() {
         review: tasks.filter(t => t.status === 'review').length,
         done: tasks.filter(t => t.status === 'done').length,
         failed: tasks.filter(t => t.status === 'failed').length,
+        pendingConfirmation: tasks.filter(t => t.status === 'pending_confirmation').length,
       };
     },
 

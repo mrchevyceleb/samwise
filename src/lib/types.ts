@@ -1,6 +1,6 @@
 /** Agent One - Supabase table types */
 
-export type TaskStatus = 'queued' | 'in_progress' | 'testing' | 'review' | 'approved' | 'done' | 'failed';
+export type TaskStatus = 'queued' | 'in_progress' | 'testing' | 'review' | 'approved' | 'done' | 'failed' | 'pending_confirmation';
 export type TaskPriority = 'critical' | 'high' | 'medium' | 'low';
 export type TaskSource = 'manual' | 'trigger' | 'cron' | 'chat';
 export type TaskType = 'code' | 'research';

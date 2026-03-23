@@ -3,11 +3,13 @@
 	import { getProjectStore } from '$lib/stores/projects.svelte';
 	import { getTheme } from '$lib/stores/theme.svelte';
 	import { getSettings, updateSetting } from '$lib/stores/settings.svelte';
+	import { getWorkerStore } from '$lib/stores/worker.svelte';
 	import { safeInvoke } from '$lib/utils/tauri';
 	import type { AeProject } from '$lib/types';
 
 	const projectStore = getProjectStore();
 	const theme = getTheme();
+	const workerStore = getWorkerStore();
 
 	let showForm = $state(false);
 	let editingId = $state<string | null>(null);
@@ -73,8 +75,15 @@
 		showForm = true;
 	}
 
+	let nameError = $derived.by(() => {
+		const trimmed = name.trim();
+		if (!trimmed) return '';
+		if (!/^[\w-]+$/.test(trimmed)) return 'Name can only contain letters, numbers, hyphens, and underscores (required for @ tagging)';
+		return '';
+	});
+
 	async function handleSubmit() {
-		if (!name.trim()) return;
+		if (!name.trim() || nameError) return;
 
 		const data: Partial<AeProject> = {
 			name: name.trim(),
@@ -226,7 +235,16 @@
 </script>
 
 <div style="display: flex; flex-direction: column; gap: 16px; height: 100%; overflow-y: auto;">
-	<!-- Scan Folders Section -->
+	<!-- Scan Folders Section (master only) -->
+	{#if workerStore.isViewer}
+		<div style="
+			padding: 12px 16px; border-radius: 10px;
+			background: {theme.c.bgSurface}; border: 1px solid {theme.c.borderDefault};
+			font-size: 12px; color: {theme.c.textMuted};
+		">
+			Projects synced from Supabase. Repo scanning is only available on the master machine.
+		</div>
+	{:else}
 	<div style="
 		border-radius: 10px; flex-shrink: 0;
 		background: {theme.c.bgSurface}; border: 1px solid {theme.c.borderDefault};
@@ -419,6 +437,7 @@
 			</div>
 		{/if}
 	</div>
+	{/if}
 
 	<!-- Header -->
 	<div style="display: flex; align-items: center; justify-content: space-between;">
@@ -456,8 +475,11 @@
 			<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
 				<div>
 					<div style="font-size: 10px; color: {theme.c.textMuted}; margin-bottom: 3px; text-transform: uppercase;">Name *</div>
-					<input bind:value={name} placeholder="operly"
-						style="width: 100%; padding: 6px 10px; background: {theme.c.bgPrimary}; border: 1px solid {theme.c.borderDefault}; border-radius: 6px; color: {theme.c.textPrimary}; font-size: 12px; font-family: var(--font-mono); outline: none;" />
+					<input bind:value={name} placeholder="my-project"
+						style="width: 100%; padding: 6px 10px; background: {theme.c.bgPrimary}; border: 1px solid {nameError ? theme.c.accentRed + '60' : theme.c.borderDefault}; border-radius: 6px; color: {theme.c.textPrimary}; font-size: 12px; font-family: var(--font-mono); outline: none;" />
+					{#if nameError}
+						<div style="font-size: 9px; color: {theme.c.accentRed}; margin-top: 2px;">{nameError}</div>
+					{/if}
 				</div>
 				<div>
 					<div style="font-size: 10px; color: {theme.c.textMuted}; margin-bottom: 3px; text-transform: uppercase;">Client / Group</div>
