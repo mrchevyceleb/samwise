@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
 use super::supabase::{self, SupabaseConfig, SupabaseState};
 
@@ -400,6 +400,16 @@ async fn evaluate_triggers(config: &super::supabase::SupabaseConfig, app: &tauri
                 if !obj.contains_key("status") {
                     obj.insert("status".to_string(), serde_json::json!("queued"));
                 }
+
+                // Allow payload to override template fields (title, description, priority, project)
+                if let Some(payload_obj) = payload.as_object() {
+                    for field in &["title", "description", "priority", "project"] {
+                        if let Some(val) = payload_obj.get(*field) {
+                            obj.insert(field.to_string(), val.clone());
+                        }
+                    }
+                }
+
                 if !obj.contains_key("priority") {
                     obj.insert("priority".to_string(), serde_json::json!("medium"));
                 }
@@ -441,10 +451,65 @@ async fn execute_task(
     let task_id = task.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
     let title = task.get("title").and_then(|v| v.as_str()).unwrap_or("Untitled").to_string();
     let description = task.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let repo_path = task.get("repo_path").and_then(|v| v.as_str()).unwrap_or(".").to_string();
-    let preview_url = task.get("preview_url").and_then(|v| v.as_str()).map(|s| s.to_string());
     let task_type = task.get("task_type").and_then(|v| v.as_str()).unwrap_or("code").to_string();
     let is_research = task_type == "research";
+
+    // Resolve repo_path and preview_url: if task has a project name but no repo_path,
+    // look it up from the ae_projects registry. Tasks created from chat often only have
+    // a project name and no paths, which previously defaulted to "." (the Tauri process
+    // directory), causing Claude Code to run in the wrong location.
+    let mut repo_path = task.get("repo_path").and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty() && *s != ".")
+        .map(|s| s.to_string());
+    let mut preview_url = task.get("preview_url").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+    let project_name = task.get("project").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if (repo_path.is_none() || preview_url.is_none()) && !project_name.is_empty() {
+        if let Ok(projects) = supabase::fetch_projects(config).await {
+            if let Some(arr) = projects.as_array() {
+                if let Some(proj) = arr.iter().find(|p| {
+                    p.get("name").and_then(|v| v.as_str()) == Some(&project_name)
+                }) {
+                    if repo_path.is_none() {
+                        repo_path = proj.get("repo_path").and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_string());
+                    }
+                    if preview_url.is_none() {
+                        preview_url = proj.get("preview_url").and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_string());
+                    }
+                    // Also backfill repo_url on the task if missing
+                    if task.get("repo_url").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+                        if let Some(repo_url) = proj.get("repo_url").and_then(|v| v.as_str()) {
+                            let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                                "repo_url": repo_url,
+                            })).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let repo_path = match repo_path {
+        Some(p) => p,
+        None => {
+            // No repo_path found - cannot run Claude Code in an unknown directory
+            let msg = if project_name.is_empty() {
+                "No repo_path or project set on this task. I need to know which repo to work in. Add a project or set the repo_path.".to_string()
+            } else {
+                format!("Project \"{}\" doesn't have a repo_path configured. Add it in the Projects settings so I know where to find the code.", project_name)
+            };
+            agent_comment(config, &task_id, &msg).await;
+            let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                "status": "failed",
+                "updated_at": chrono::Utc::now().to_rfc3339(),
+            })).await;
+            return Err(format!("No repo_path for task {}", task_id));
+        }
+    };
 
     // Resolve branch name ONCE - only needed for code tasks
     let branch: Option<String> = if is_research {
@@ -505,6 +570,30 @@ async fn execute_task(
         prompt_parts.push(format!("## Project Instructions (from CLAUDE.md)\n{}\n", claude_md_truncated));
     }
 
+    // Read worker rules from settings
+    if let Ok(data_dir) = app.path().app_data_dir() {
+        let settings_path = data_dir.join("settings.json");
+        if let Ok(settings_json) = tokio::fs::read_to_string(&settings_path).await {
+            if let Ok(settings) = serde_json::from_str::<serde_json::Value>(&settings_json) {
+                if let Some(rules) = settings.get("workerRules").and_then(|v| v.as_array()) {
+                    let rule_strings: Vec<String> = rules
+                        .iter()
+                        .filter_map(|r| r.as_str())
+                        .filter(|r| !r.trim().is_empty())
+                        .enumerate()
+                        .map(|(i, r)| format!("{}. {}", i + 1, r))
+                        .collect();
+                    if !rule_strings.is_empty() {
+                        prompt_parts.push(format!(
+                            "## Worker Rules (MUST follow these)\n{}\n",
+                            rule_strings.join("\n")
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     // Get recent git log for context
     if let Ok(git_log) = tokio::process::Command::new("git")
         .args(["log", "--oneline", "-10"])
@@ -539,6 +628,15 @@ async fn execute_task(
     let claude_result = run_claude_code_opts(&repo_path, &prompt, 50, 1800).await;
 
     match claude_result {
+        Ok(output) if output.is_empty() => {
+            // Claude Code exited cleanly but produced no output - wrong directory or no-op
+            agent_comment(config, &task_id, "Claude Code produced no output. The repo_path may be wrong or the task didn't result in any work. Re-check the project settings.").await;
+            let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                "status": "failed",
+                "updated_at": chrono::Utc::now().to_rfc3339(),
+            })).await;
+            return Err("Claude Code produced no output".to_string());
+        }
         Ok(output) => {
             let summary = truncate(&output, 500);
 
@@ -1053,15 +1151,12 @@ async fn agent_chat(config: &SupabaseConfig, content: &str) {
 /// Pass 0 for either to use defaults (no limit / no timeout).
 /// Also used by commands/chat.rs for direct chat responses.
 pub async fn run_claude_code_opts(cwd: &str, prompt: &str, max_turns: u32, timeout_secs: u64) -> Result<String, String> {
-    let claude_exe = find_claude_exe();
+    let (exe, prefix_args) = find_claude_command();
 
-    let mut cmd = if claude_exe.ends_with(".cmd") {
-        let mut c = tokio::process::Command::new("cmd.exe");
-        c.arg("/C").arg(&claude_exe);
-        c
-    } else {
-        tokio::process::Command::new(&claude_exe)
-    };
+    let mut cmd = tokio::process::Command::new(&exe);
+    for arg in &prefix_args {
+        cmd.arg(arg);
+    }
 
     cmd.arg("-p")
         .arg(prompt)
@@ -1128,29 +1223,41 @@ pub async fn run_claude_code_opts(cwd: &str, prompt: &str, max_turns: u32, timeo
     let stderr_text = stderr_handle.await.unwrap_or_default();
 
     if !status.success() {
-        return Err(format!("Claude Code failed: {}", stderr_text.trim()));
+        return Err(format!("Claude Code failed (exit {}): {}", status, stderr_text.trim()));
     }
 
     Ok(stdout_text.trim().to_string())
 }
 
-pub fn find_claude_exe() -> String {
+/// Returns (executable, prefix_args) for spawning the Claude CLI.
+/// On Windows with npm install, we bypass claude.cmd to avoid cmd.exe pipe
+/// inheritance issues - directly invoking `node cli.js` keeps stdin reliable.
+/// (Pattern borrowed from assistantos-v2's proven implementation.)
+pub fn find_claude_command() -> (String, Vec<String>) {
     if cfg!(target_os = "windows") {
         let home = std::env::var("USERPROFILE").unwrap_or_default();
+        // Official installer: direct .exe, no intermediary needed
         let local_bin = format!("{}\\.local\\bin\\claude.exe", home);
-        if std::path::Path::new(&local_bin).exists() { return local_bin; }
+        if std::path::Path::new(&local_bin).exists() { return (local_bin, vec![]); }
         let appdata = std::env::var("APPDATA").unwrap_or_default();
-        let npm_exe = format!("{}\\npm\\claude.exe", appdata);
-        if std::path::Path::new(&npm_exe).exists() { return npm_exe; }
-        let npm_cmd = format!("{}\\npm\\claude.cmd", appdata);
-        if std::path::Path::new(&npm_cmd).exists() { return npm_cmd; }
-        "claude".to_string()
+        // npm global install: bypass claude.cmd to avoid cmd.exe stdin pipe issues.
+        // claude.cmd -> cmd.exe /c -> node cli.js breaks stdin with CREATE_NO_WINDOW.
+        // Directly invoking node + cli.js avoids the cmd.exe layer entirely.
+        let cli_js = format!("{}\\npm\\node_modules\\@anthropic-ai\\claude-code\\cli.js", appdata);
+        if std::path::Path::new(&cli_js).exists() { return ("node".to_string(), vec![cli_js]); }
+        // Fall back to claude on PATH
+        ("claude".to_string(), vec![])
     } else {
         let home = std::env::var("HOME").unwrap_or_default();
         let local_bin = format!("{}/.local/bin/claude", home);
-        if std::path::Path::new(&local_bin).exists() { return local_bin; }
-        "claude".to_string()
+        if std::path::Path::new(&local_bin).exists() { return (local_bin, vec![]); }
+        ("claude".to_string(), vec![])
     }
+}
+
+// Backwards-compat shim for imports that expect the old signature
+pub fn find_claude_exe() -> String {
+    find_claude_command().0
 }
 
 /// Take a screenshot using Playwright
