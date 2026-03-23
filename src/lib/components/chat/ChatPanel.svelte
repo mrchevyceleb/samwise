@@ -54,6 +54,8 @@
 			<div style="font-size: 12px; color: {theme.c.textMuted};">
 				{#if chat.sendingMessage}
 					<span style="color: {theme.c.accentPrimary};">Thinking...</span>
+				{:else if chat.waitingForSam}
+					<span style="color: {theme.c.accentIndigo};">Waiting for Sam...</span>
 				{:else}
 					Online
 				{/if}
@@ -116,7 +118,7 @@
 				{/each}
 			{/if}
 
-			{#if chat.sendingMessage}
+			{#if chat.sendingMessage || chat.waitingForSam}
 				<div style="
 					display: flex; gap: 8px; align-items: flex-start;
 					padding: 4px 0;
@@ -138,7 +140,7 @@
 		</div>
 
 		<ChatInput
-			disabled={chat.sendingMessage}
+			disabled={chat.sendingMessage || chat.waitingForSam}
 			placeholder="Message Sam..."
 			onSend={handleSend}
 		/>

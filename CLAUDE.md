@@ -13,11 +13,17 @@ The backend worker picks up tasks from the board, writes code via Claude Code CL
 ## Commands
 
 ```bash
-npx tauri dev          # Full app (Vite + Rust)
-npx tauri build        # Production build
+npx tauri dev          # Full app (Vite + Rust) - dev server
+npx tauri build        # Production build (EXE + installers)
 cd src-tauri && cargo check  # Rust only
 npm run check          # Svelte type check
 ```
+
+**Production EXE**: `src-tauri/target/release/agent-one.exe`
+
+## Build Rules
+
+- **Always rebuild the EXE after pushing changes.** Run `npx tauri build` after any commit/push so the production binary stays current. The EXE is used on machines without the dev environment (viewer mode).
 
 ## Architecture
 

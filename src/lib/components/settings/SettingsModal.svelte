@@ -1,7 +1,7 @@
 <script lang="ts">
   import { getSettingsStore } from '$lib/stores/settings.svelte';
   import { safeInvoke } from '$lib/utils/tauri';
-  import AutomationPanel from '$lib/components/automation/AutomationPanel.svelte';
+  import SchedulingTab from './SchedulingTab.svelte';
   import ProjectsTab from './ProjectsTab.svelte';
 
   const settingsStore = getSettingsStore();
@@ -79,7 +79,7 @@
     { id: 'connection', label: 'Connection', icon: 'M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z' },
     { id: 'worker', label: 'Worker', icon: 'M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm0 0' },
     { id: 'projects', label: 'Projects', icon: 'M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z' },
-    { id: 'automation', label: 'Automation', icon: 'M13 2L3 14h9l-1 8 10-12h-9l1-8z' },
+    { id: 'automation', label: 'Scheduling', icon: 'M13 2L3 14h9l-1 8 10-12h-9l1-8z' },
     { id: 'about', label: 'About', icon: 'M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z' },
   ];
 
@@ -189,15 +189,21 @@
               </div>
               <div style="display: flex; align-items: center; gap: 16px; padding: 4px 0;">
                 <div style="flex: 1;">
-                  <div style="font-size: 13px; color: var(--text-primary);">Auto-start Worker</div>
-                  <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">Start the worker automatically when the app launches</div>
+                  <div style="font-size: 13px; color: var(--text-primary);">Machine Role</div>
+                  <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">
+                    {settingsStore.value.isMaster ? 'This is Sam\'s home machine (master)' : 'This machine is in viewer mode'}
+                  </div>
                 </div>
-                <label style="position: relative; display: inline-block; width: 36px; height: 20px; cursor: pointer;">
-                  <input type="checkbox" checked={false} style="opacity: 0; width: 0; height: 0;" />
-                  <span style="position: absolute; inset: 0; background: var(--border-default); border-radius: 10px; transition: background 0.2s ease;">
-                    <span style="position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; background: white; border-radius: 50%; transition: left 0.2s ease;"></span>
-                  </span>
-                </label>
+                <button
+                  onclick={() => {
+                    // Show the master/viewer prompt immediately
+                    settingsStore.reconfigureRequested = true;
+                    close();
+                  }}
+                  style="padding: 6px 12px; background: var(--bg-primary); color: var(--text-secondary); border: 1px solid var(--border-default); border-radius: 6px; font-size: 12px; cursor: pointer; transition: all 0.15s ease;"
+                >
+                  Reconfigure
+                </button>
               </div>
             </div>
 
@@ -205,7 +211,7 @@
             <ProjectsTab />
 
           {:else if activeTab === 'automation'}
-            <AutomationPanel />
+            <SchedulingTab />
 
           {:else if activeTab === 'about'}
             <div style="display: flex; flex-direction: column; align-items: center; gap: 16px; padding: 24px;">

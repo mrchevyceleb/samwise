@@ -247,6 +247,11 @@ async fn worker_loop(
             check_telegram_messages(&config, &last_telegram_update_id, &machine_name).await;
         }
 
+        // Check remote chat messages every 10 seconds (every 2nd tick)
+        if tick % 2 == 0 {
+            check_remote_chat_messages(&config, &machine_name).await;
+        }
+
         tick += 1;
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
@@ -284,8 +289,17 @@ async fn evaluate_crons(config: &SupabaseConfig, app: &tauri::AppHandle) -> Resu
             if nr > now { continue; }
         }
 
-        // Parse cron schedule
-        let schedule = match schedule_str.parse::<cron::Schedule>() {
+        // Parse cron schedule - convert 5-field standard cron to 7-field (sec min hour dom month dow year)
+        let cron_expr = {
+            let parts: Vec<&str> = schedule_str.trim().split_whitespace().collect();
+            match parts.len() {
+                5 => format!("0 {} *", schedule_str),  // standard 5-field: prepend sec=0, append year=*
+                6 => format!("0 {}", schedule_str),     // 6-field (with year): prepend sec=0
+                7 => schedule_str.to_string(),           // already 7-field
+                _ => schedule_str.to_string(),           // let parser handle invalid
+            }
+        };
+        let schedule = match cron_expr.parse::<cron::Schedule>() {
             Ok(s) => s,
             Err(e) => {
                 log::warn!("[worker] Invalid cron schedule '{}' for '{}': {}", schedule_str, cron_name, e);
@@ -797,6 +811,100 @@ async fn check_telegram_messages(
     }
 }
 
+// ── Remote Chat Message Processing ───────────────────────────────────
+
+/// Check Supabase for user messages flagged needs_response=true (from viewer machines)
+async fn check_remote_chat_messages(config: &SupabaseConfig, machine_name: &str) {
+    let messages = match supabase::fetch_pending_chat_messages(config).await {
+        Ok(m) => m,
+        Err(e) => {
+            log::debug!("[worker] Remote chat fetch failed (column may not exist yet): {}", e);
+            return;
+        }
+    };
+
+    if messages.is_empty() {
+        return;
+    }
+
+    for msg in &messages {
+        let msg_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+        let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or_default();
+
+        if msg_id.is_empty() || content.is_empty() {
+            if !msg_id.is_empty() {
+                let _ = supabase::mark_message_responded(config, msg_id).await;
+            }
+            continue;
+        }
+
+        // Mark as responded BEFORE processing to prevent duplicate pickup on next poll
+        if let Err(e) = supabase::mark_message_responded(config, msg_id).await {
+            log::warn!("[worker] Failed to claim message {}: {}", msg_id, e);
+            continue; // Skip if we can't claim it
+        }
+
+        let preview: String = content.chars().take(50).collect();
+        log::info!("[worker] Remote chat message received: {}", preview);
+
+        process_remote_chat_message(config, msg_id, content, machine_name).await;
+    }
+}
+
+/// Process a single remote chat message: generate Sam's response, save to ae_messages, mark responded.
+async fn process_remote_chat_message(config: &SupabaseConfig, message_id: &str, user_message: &str, machine_name: &str) {
+    use super::chat;
+
+    // 1. Build context (same as Telegram handler)
+    let recent_chat = chat::fetch_recent_chat(config).await;
+    let project_registry = chat::build_project_registry(config).await;
+    let board_ctx = build_simple_board_context(config, machine_name).await;
+
+    // 2. Build prompt
+    let prompt = chat::build_system_prompt(&board_ctx, &project_registry, &recent_chat, user_message);
+
+    // 3. Call Claude Code CLI one-shot
+    let raw_response = match run_claude_code_opts(".", &prompt, 3, 90).await {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("[worker] Remote chat response failed: {}", e);
+            let error_msg = format!("Sorry, hit a snag: {}. Try again?", e);
+            let _ = supabase::send_message(config, &serde_json::json!({
+                "role": "agent",
+                "content": &error_msg,
+                "conversation_id": supabase::DEFAULT_CONVERSATION_ID,
+            })).await;
+            // mark_message_responded already called before processing
+            return;
+        }
+    };
+
+    // 4. Parse for task creation
+    let (clean_text, task_requests) = chat::parse_chat_response(&raw_response);
+
+    // 5. Create tasks
+    for req in &task_requests {
+        if let Err(e) = supabase::create_task(config, req).await {
+            log::warn!("[worker] Failed to create task from remote chat: {}", e);
+        }
+    }
+
+    // 6. Save Sam's response to ae_messages
+    let response_text = if clean_text.trim().is_empty() {
+        raw_response.trim().to_string()
+    } else {
+        clean_text.trim().to_string()
+    };
+
+    let _ = supabase::send_message(config, &serde_json::json!({
+        "role": "agent",
+        "content": &response_text,
+        "conversation_id": supabase::DEFAULT_CONVERSATION_ID,
+    })).await;
+
+    log::info!("[worker] Remote chat response sent for message {}", message_id);
+}
+
 /// Process a single Telegram message: save to chat, get Sam's response, create tasks, reply.
 async fn process_telegram_message(config: &SupabaseConfig, user_message: &str, machine_name: &str) {
     use super::chat;
@@ -805,6 +913,7 @@ async fn process_telegram_message(config: &SupabaseConfig, user_message: &str, m
     let _ = supabase::send_message(config, &serde_json::json!({
         "role": "user",
         "content": user_message,
+        "conversation_id": supabase::DEFAULT_CONVERSATION_ID,
     })).await;
 
     // 2. Build context (reuse chat.rs functions)
@@ -827,6 +936,7 @@ async fn process_telegram_message(config: &SupabaseConfig, user_message: &str, m
             let _ = supabase::send_message(config, &serde_json::json!({
                 "role": "agent",
                 "content": &error_msg,
+                "conversation_id": supabase::DEFAULT_CONVERSATION_ID,
             })).await;
             send_telegram(config, &escape_markdown_v2(&error_msg)).await;
             return;
@@ -853,6 +963,7 @@ async fn process_telegram_message(config: &SupabaseConfig, user_message: &str, m
     let _ = supabase::send_message(config, &serde_json::json!({
         "role": "agent",
         "content": &response_text,
+        "conversation_id": supabase::DEFAULT_CONVERSATION_ID,
     })).await;
 
     // 8. Send response back via Telegram (plain text, no markdown escaping for readability)
@@ -934,6 +1045,7 @@ async fn agent_chat(config: &SupabaseConfig, content: &str) {
     let _ = supabase::send_message(config, &serde_json::json!({
         "role": "agent",
         "content": content,
+        "conversation_id": supabase::DEFAULT_CONVERSATION_ID,
     })).await;
 }
 

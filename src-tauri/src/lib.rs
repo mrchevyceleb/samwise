@@ -106,6 +106,7 @@ pub fn run() {
             commands::supabase::supabase_fetch_artifacts,
             // Supabase - Workers
             commands::supabase::supabase_worker_heartbeat,
+            commands::supabase::supabase_check_active_worker,
             commands::supabase::supabase_worker_offline,
             // Worker
             commands::worker::worker_start,

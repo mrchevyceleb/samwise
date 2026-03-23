@@ -55,6 +55,7 @@ export interface AeMessage {
   content: string;
   task_id: string | null;
   attachments: unknown[] | null;
+  needs_response?: boolean;
   created_at: string;
 }
 

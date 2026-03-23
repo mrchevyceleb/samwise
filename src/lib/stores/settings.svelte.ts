@@ -66,6 +66,8 @@ export interface AppSettings {
   supabaseAnonKey: string;
   agentMachineName: string;
   autoStartWorker: boolean;
+  isMaster: boolean;
+  masterConfigured: boolean;
 }
 
 export interface MCPServerConfig {
@@ -157,6 +159,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   supabaseAnonKey: '',
   agentMachineName: '',
   autoStartWorker: false,
+  isMaster: false,
+  masterConfigured: false,
 };
 
 // ---- Svelte 5 Runes State ----
@@ -165,6 +169,7 @@ let currentSettings = $state<AppSettings>({ ...DEFAULT_SETTINGS });
 let settingsVisible = $state(false);
 let activeSettingsTab = $state<string>('connection');
 let settingsLoaded = $state(false);
+let reconfigureRequested = $state(false);
 
 // Debounce timer for auto-saving
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -212,6 +217,9 @@ export function getSettingsStore() {
     set activeSettingsTab(v: string) { activeSettingsTab = v; },
 
     get loaded() { return settingsLoaded; },
+
+    get reconfigureRequested() { return reconfigureRequested; },
+    set reconfigureRequested(v: boolean) { reconfigureRequested = v; },
   };
 }
 

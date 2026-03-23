@@ -119,15 +119,61 @@ pub async fn post_comment(config: &SupabaseConfig, comment: &Value) -> Result<Va
 
 // ── Messages (internal) ─────────────────────────────────────────────
 
+// Fixed UUID for the default Sam<->Matt conversation (matches chat.rs constant).
+pub const DEFAULT_CONVERSATION_ID: &str = "00000000-0000-0000-0000-000000000001";
+
 pub async fn fetch_messages(config: &SupabaseConfig) -> Result<Value, String> {
     let client = build_client(config)?;
-    let url = format!("{}?order=created_at.asc&limit=200", rest_url(config, "ae_messages"));
+    // Filter by the fixed conversation UUID so old messages with random UUIDs
+    // (written before the conversation_id bug was fixed) don't pollute the feed.
+    let url = format!(
+        "{}?conversation_id=eq.{}&order=created_at.asc&limit=200",
+        rest_url(config, "ae_messages"),
+        DEFAULT_CONVERSATION_ID
+    );
     handle_response(client.get(&url).send().await.map_err(|e| e.to_string())?).await
 }
 
 pub async fn send_message(config: &SupabaseConfig, message: &Value) -> Result<Value, String> {
     let client = build_client(config)?;
     handle_response(client.post(&rest_url(config, "ae_messages")).json(message).send().await.map_err(|e| e.to_string())?).await
+}
+
+// ── Pending Chat Messages (internal) ─────────────────────────────────
+
+/// Fetch user messages that need a response (from viewer machines)
+pub async fn fetch_pending_chat_messages(config: &SupabaseConfig) -> Result<Vec<Value>, String> {
+    let client = build_client(config)?;
+    let url = format!(
+        "{}/rest/v1/ae_messages?conversation_id=eq.{}&role=eq.user&needs_response=eq.true&order=created_at.asc&limit=5",
+        config.url, DEFAULT_CONVERSATION_ID
+    );
+    let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("fetch_pending_chat_messages: HTTP {}", resp.status()));
+    }
+    let rows: Vec<Value> = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+
+/// Mark a message as responded to
+pub async fn mark_message_responded(config: &SupabaseConfig, message_id: &str) -> Result<(), String> {
+    // Validate UUID format to prevent URL injection
+    if !message_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err("Invalid message_id format".to_string());
+    }
+    let client = build_client(config)?;
+    let url = format!(
+        "{}/rest/v1/ae_messages?id=eq.{}",
+        config.url, message_id
+    );
+    let resp = client.patch(&url)
+        .json(&serde_json::json!({ "needs_response": false }))
+        .send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("mark_message_responded: HTTP {}", resp.status()));
+    }
+    Ok(())
 }
 
 // ── Workers (internal) ──────────────────────────────────────────────
@@ -157,6 +203,32 @@ pub async fn update_cron(config: &SupabaseConfig, id: &str, updates: &Value) -> 
     let client = build_client(config)?;
     let url = format!("{}?id=eq.{}", rest_url(config, "ae_crons"), id);
     handle_response(client.patch(&url).json(updates).send().await.map_err(|e| e.to_string())?).await
+}
+
+pub async fn check_active_worker(config: &SupabaseConfig) -> Result<(bool, Option<String>), String> {
+    let client = build_client(config)?;
+    let url = format!(
+        "{}?status=eq.online&select=machine_name,last_heartbeat&order=last_heartbeat.desc&limit=1",
+        rest_url(config, "ae_workers")
+    );
+    let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("check_active_worker: HTTP {}", resp.status()));
+    }
+    let rows: Vec<Value> = resp.json().await.map_err(|e| e.to_string())?;
+
+    if let Some(row) = rows.first() {
+        if let Some(hb_str) = row["last_heartbeat"].as_str() {
+            if let Ok(hb_time) = chrono::DateTime::parse_from_rfc3339(hb_str) {
+                let age = chrono::Utc::now().signed_duration_since(hb_time);
+                if age.num_seconds() <= 60 {
+                    let machine = row["machine_name"].as_str().map(|s| s.to_string());
+                    return Ok((true, machine));
+                }
+            }
+        }
+    }
+    Ok((false, None))
 }
 
 pub async fn worker_offline(config: &SupabaseConfig, machine_name: &str) -> Result<(), String> {
@@ -530,6 +602,16 @@ pub async fn supabase_fetch_artifacts(task_id: String, state: tauri::State<'_, S
 pub async fn supabase_worker_heartbeat(machine_name: String, state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
     let config = state.get_config().await;
     worker_heartbeat(&config, &machine_name).await
+}
+
+#[tauri::command]
+pub async fn supabase_check_active_worker(state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
+    let config = state.get_config().await;
+    let (active, machine_name) = check_active_worker(&config).await?;
+    Ok(serde_json::json!({
+        "active": active,
+        "machine_name": machine_name
+    }))
 }
 
 #[tauri::command]

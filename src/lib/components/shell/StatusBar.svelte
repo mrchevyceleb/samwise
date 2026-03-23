@@ -111,7 +111,7 @@
 				animation: pulse-dot 2s ease-in-out infinite;
 				box-shadow: 0 0 6px {worker.statusColor}60;
 			"></span>
-			<span style="color: {theme.c.textMuted};">{worker.statusLabel}</span>
+			<span style="color: {theme.c.textMuted};">{worker.isViewer ? `Viewer (Sam on ${worker.machineName})` : worker.statusLabel}</span>
 		</div>
 	</div>
 </div>

@@ -196,6 +196,12 @@ pub struct ChatResponse {
     pub created_tasks: Vec<CreatedTaskInfo>,
 }
 
+// Fixed UUID for the default Sam<->Matt conversation.
+// The ae_messages.conversation_id column is typed uuid, so "default" is
+// silently rejected by PostgREST and replaced by gen_random_uuid(), which
+// scatters every message into its own conversation.
+const DEFAULT_CONVERSATION_ID: &str = "00000000-0000-0000-0000-000000000001";
+
 // ── Main chat command ───────────────────────────────────────────────
 
 #[tauri::command]
@@ -216,6 +222,7 @@ pub async fn chat_respond(
     if let Err(e) = supabase::send_message(&config, &serde_json::json!({
         "role": "user",
         "content": &user_message,
+        "conversation_id": DEFAULT_CONVERSATION_ID,
     })).await {
         log::warn!("[chat] Failed to save user message: {}", e);
     }
@@ -294,6 +301,7 @@ pub async fn chat_respond(
     let message_id = match supabase::send_message(&config, &serde_json::json!({
         "role": "agent",
         "content": &response_text,
+        "conversation_id": DEFAULT_CONVERSATION_ID,
     })).await {
         Ok(result) => {
             result.as_array()
@@ -424,8 +432,8 @@ pub async fn build_board_context(
                         .unwrap_or("unknown task");
                     let display_author = if author == "agent" { "Sam" } else { "Matt" };
                     // Truncate long comments
-                    let short = if content.len() > 120 { &content[..120] } else { content };
-                    ctx.push_str(&format!("- [{}] {}: {}\n", task_title, display_author, short));
+                    let short: String = if content.chars().count() > 120 { content.chars().take(120).collect() } else { content.to_string() };
+                    ctx.push_str(&format!("- [{}] {}: {}\n", task_title, display_author, &short));
                 }
             }
         }

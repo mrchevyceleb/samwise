@@ -3,11 +3,14 @@
 import type { AeTask, WorkerStatus } from '$lib/types';
 import { safeInvoke } from '$lib/utils/tauri';
 
+type WorkerMode = 'master' | 'viewer' | 'unknown';
+
 let status = $state<WorkerStatus>('offline');
 let currentTask = $state<AeTask | null>(null);
 let machineName = $state('agent-one');
 let workerId = $state<string | null>(null);
 let lastHeartbeat = $state<string | null>(null);
+let mode = $state<WorkerMode>('unknown');
 
 export function getWorkerStore() {
   return {
@@ -18,22 +21,29 @@ export function getWorkerStore() {
     get workerId() { return workerId; },
     get lastHeartbeat() { return lastHeartbeat; },
 
+    get mode() { return mode; },
+    set mode(v: WorkerMode) { mode = v; },
+    get isViewer() { return mode === 'viewer'; },
+    get isMaster() { return mode === 'master'; },
+
     get isOnline() { return status === 'online' || status === 'busy'; },
     get isBusy() { return status === 'busy'; },
 
     get statusColor(): string {
+      if (mode === 'viewer') return '#58a6ff';
       switch (status) {
         case 'online': return '#3fb950';
         case 'busy': return '#6366f1';
-        case 'offline': return '#f85149';
+        case 'offline': default: return '#f85149';
       }
     },
 
     get statusLabel(): string {
+      if (mode === 'viewer') return 'Viewer';
       switch (status) {
         case 'online': return 'Online';
         case 'busy': return 'Working';
-        case 'offline': return 'Offline';
+        case 'offline': default: return 'Offline';
       }
     },
 
@@ -78,6 +88,16 @@ export function getWorkerStore() {
         lastHeartbeat = new Date().toISOString();
       } catch (e) {
         console.warn('[worker] heartbeat failed:', e);
+      }
+    },
+
+    async checkActiveWorker(): Promise<{ active: boolean; machine_name: string | null; error?: boolean }> {
+      try {
+        const result = await safeInvoke<{ active: boolean; machine_name: string | null }>('supabase_check_active_worker');
+        return result || { active: false, machine_name: null };
+      } catch (e) {
+        console.warn('[worker] checkActiveWorker failed:', e);
+        return { active: false, machine_name: null, error: true };
       }
     },
 

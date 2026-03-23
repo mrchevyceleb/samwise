@@ -5,11 +5,13 @@
 	import KanbanBoard from '$lib/components/kanban/KanbanBoard.svelte';
 	import ChatPanel from '$lib/components/chat/ChatPanel.svelte';
 	import SettingsModal from '$lib/components/settings/SettingsModal.svelte';
+	import MasterPrompt from '$lib/components/settings/MasterPrompt.svelte';
 	import { getLayout } from '$lib/stores/layout.svelte';
-	import { getSettingsStore, initSettings } from '$lib/stores/settings.svelte';
+	import { getSettingsStore, initSettings, getSettings, updateSetting } from '$lib/stores/settings.svelte';
 	import { getTaskStore } from '$lib/stores/tasks.svelte';
 	import { getChatStore } from '$lib/stores/chat.svelte';
 	import { getCommentStore } from '$lib/stores/comments.svelte';
+	import { getWorkerStore } from '$lib/stores/worker.svelte';
 	import { getTheme } from '$lib/stores/theme.svelte';
 	import { safeInvoke } from '$lib/utils/tauri';
 	import { subscribeToTable } from '$lib/supabase';
@@ -20,9 +22,11 @@
 	const taskStore = getTaskStore();
 	const chatStore = getChatStore();
 	const commentStore = getCommentStore();
+	const worker = getWorkerStore();
 	const theme = getTheme();
 
 	let chatToggleHovered = $state(false);
+	let showMasterPrompt = $state(false);
 	let realtimeChannels: any[] = [];
 
 	let workerUnlisten: (() => void) | null = null;
@@ -39,6 +43,43 @@
 			if (!existing || !existing.url) {
 				console.warn('[app] Supabase not configured. Open Settings to connect.');
 				return;
+			}
+		}
+
+		// Master/viewer detection
+		const settings = getSettings();
+		if (settings.masterConfigured && settings.isMaster) {
+			// This is the master machine - auto-start worker
+			worker.mode = 'master';
+			worker.startWorker();
+		} else if (settings.masterConfigured && !settings.isMaster) {
+			// Explicitly set to viewer - check if master is alive
+			const result = await worker.checkActiveWorker();
+			if (result?.active) {
+				worker.mode = 'viewer';
+				worker.machineName = result.machine_name || 'unknown';
+			} else if (result?.error) {
+				// Network error - default to viewer, don't offer master (could cause dual-master)
+				worker.mode = 'viewer';
+				worker.machineName = 'unknown';
+			} else {
+				// Master seems down, offer to become master
+				showMasterPrompt = true;
+			}
+		} else {
+			// First launch - never configured
+			const result = await worker.checkActiveWorker();
+			if (result?.active) {
+				// Another machine is already the master
+				worker.mode = 'viewer';
+				worker.machineName = result.machine_name || 'unknown';
+			} else if (result?.error) {
+				// Network error on first launch - default to viewer to be safe
+				worker.mode = 'viewer';
+				worker.machineName = 'unknown';
+			} else {
+				// No active worker found - ask if this should be home
+				showMasterPrompt = true;
 			}
 		}
 
@@ -95,6 +136,30 @@
 			}
 		});
 		realtimeChannels.push(commentChannel);
+	}
+
+	// Watch for reconfigure requests from Settings modal
+	$effect(() => {
+		if (settingsStore.reconfigureRequested) {
+			settingsStore.reconfigureRequested = false;
+			showMasterPrompt = true;
+		}
+	});
+
+	function handleMasterConfirm() {
+		updateSetting('masterConfigured', true);
+		updateSetting('isMaster', true);
+		updateSetting('autoStartWorker', true);
+		worker.mode = 'master';
+		worker.startWorker();
+		showMasterPrompt = false;
+	}
+
+	function handleMasterDecline() {
+		updateSetting('masterConfigured', true);
+		updateSetting('isMaster', false);
+		worker.mode = 'viewer';
+		showMasterPrompt = false;
 	}
 
 	async function handleGlobalKeyDown(e: KeyboardEvent) {
@@ -176,5 +241,9 @@
 
 	<StatusBar />
 </div>
+
+{#if showMasterPrompt}
+	<MasterPrompt onConfirm={handleMasterConfirm} onDecline={handleMasterDecline} />
+{/if}
 
 <SettingsModal />
