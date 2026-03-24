@@ -179,6 +179,7 @@ pub fn run() {
             commands::chat::chat_build_system_prompt,
             commands::chat::chat_check_fast_path,
             commands::chat::chat_process_response,
+            commands::chat::ai_expand_task,
         ])
         .on_window_event(|window, event| {
             match event {

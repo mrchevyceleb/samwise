@@ -914,6 +914,78 @@ pub async fn chat_process_response(
     })
 }
 
+/// Expand a raw problem description into a structured task title + description.
+/// Uses a quick one-shot Claude call (max 1 turn, 30s timeout).
+#[derive(Serialize, Clone)]
+pub struct ExpandedTask {
+    pub title: String,
+    pub description: String,
+    pub priority: String,
+    pub task_type: String,
+}
+
+#[tauri::command]
+pub async fn ai_expand_task(
+    raw_input: String,
+    project: String,
+) -> Result<ExpandedTask, String> {
+    // Escape curly braces in user input to prevent format!() panics
+    let safe_input = raw_input.replace('{', "{{").replace('}', "}}");
+    let safe_project = if project.is_empty() { "unspecified".to_string() } else { project.replace('{', "{{").replace('}', "}}") };
+
+    let prompt = format!(
+        r#"You are a task creation assistant. The user described a problem in plain language. Your job is to create a structured task from it.
+
+User's input: "{safe_input}"
+Project: {safe_project}
+
+Respond with ONLY a JSON object (no markdown fences, no explanation) in this exact format:
+{{"title": "Fix: concise bug title OR Feat: concise feature title", "description": "Detailed step-by-step instructions for a developer to fix this. Include what files to investigate, what the expected behavior should be, and how to verify the fix works.", "priority": "medium", "task_type": "code"}}
+
+Rules for the title:
+- Start with "Fix:" for bugs or "Feat:" for new features
+- Keep it under 80 characters
+- Be specific (not "fix the thing", but "Fix: slideshow navigation not advancing on click")
+
+Rules for the description:
+- Write clear, actionable instructions as if briefing a developer
+- Include what the current (broken) behavior is
+- Include what the expected behavior should be
+- Suggest files or areas to investigate if obvious from context
+- Keep it 2-5 sentences
+
+Rules for priority:
+- "critical" = app is broken/unusable for users right now
+- "high" = significant functionality broken but workarounds exist
+- "medium" = minor bug or improvement
+- "low" = cosmetic or nice-to-have
+
+Rules for task_type:
+- "code" = requires code changes and a PR
+- "research" = investigation/analysis only, no code changes"#,
+        safe_input = safe_input,
+        safe_project = safe_project,
+    );
+
+    let result = super::worker::run_claude_code_opts(".", &prompt, 1, 30).await?;
+
+    // Parse the JSON response
+    let cleaned = result.trim()
+        .trim_start_matches("```json").trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+
+    let parsed: serde_json::Value = serde_json::from_str(cleaned)
+        .map_err(|e| format!("Failed to parse AI response: {}. Raw: {}", e, &result[..result.len().min(200)]))?;
+
+    Ok(ExpandedTask {
+        title: parsed.get("title").and_then(|v| v.as_str()).unwrap_or(&raw_input).to_string(),
+        description: parsed.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        priority: parsed.get("priority").and_then(|v| v.as_str()).unwrap_or("medium").to_string(),
+        task_type: parsed.get("task_type").and_then(|v| v.as_str()).unwrap_or("code").to_string(),
+    })
+}
+
 /// Save an agent message to Supabase and return the message ID.
 async fn save_agent_message(config: &supabase::SupabaseConfig, content: &str) -> Option<String> {
     match supabase::send_message(config, &serde_json::json!({
