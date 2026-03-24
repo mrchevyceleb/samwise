@@ -57,13 +57,33 @@
 		return d.toLocaleDateString();
 	}
 
-	/** Render content with @mentions highlighted and URLs clickable */
+	/** Render content with @mentions highlighted, URLs clickable, and basic markdown */
 	function renderContent(content: string): string {
 		// First escape HTML to prevent XSS
 		let safe = content
 			.replace(/&/g, '&amp;')
 			.replace(/</g, '&lt;')
 			.replace(/>/g, '&gt;');
+
+		// Extract code blocks and inline code to placeholders so they aren't
+		// processed by bold/URL/mention/newline regexes.
+		const codeSlots: string[] = [];
+		function stash(html: string): string {
+			codeSlots.push(html);
+			return `\x00CODE${codeSlots.length - 1}\x00`;
+		}
+
+		// Code blocks (triple backticks) - use [\s\S] to allow backticks inside
+		safe = safe.replace(/```([\s\S]*?)```/g, (_m, inner: string) =>
+			stash(`<code style="display: block; background: rgba(0,0,0,0.3); padding: 8px 10px; border-radius: 6px; font-family: var(--font-mono); font-size: 11px; margin: 4px 0; white-space: pre-wrap; overflow-x: auto;">${inner}</code>`)
+		);
+		// Inline code (single backticks)
+		safe = safe.replace(/`([^`]+)`/g, (_m, inner: string) =>
+			stash(`<code style="background: rgba(0,0,0,0.25); padding: 1px 5px; border-radius: 3px; font-family: var(--font-mono); font-size: 11px;">${inner}</code>`)
+		);
+
+		// Bold (**text**)
+		safe = safe.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
 		// Make URLs clickable
 		safe = safe.replace(
 			/(https?:\/\/[^\s<]+)/g,
@@ -71,6 +91,11 @@
 		);
 		// Highlight @mentions
 		safe = safe.replace(/@(\w+)/g, '<span style="color: var(--accent-indigo); font-weight: 600;">@$1</span>');
+		// Newlines to <br> (only outside code blocks, which are stashed)
+		safe = safe.replace(/\n/g, '<br>');
+
+		// Restore code blocks/inline code
+		safe = safe.replace(/\x00CODE(\d+)\x00/g, (_m, idx: string) => codeSlots[parseInt(idx)]);
 		return safe;
 	}
 
@@ -94,7 +119,7 @@
 		<div
 			bind:this={commentsEl}
 			style="
-				max-height: 280px; overflow-y: auto;
+				max-height: 50vh; overflow-y: auto;
 				display: flex; flex-direction: column; gap: 8px;
 				padding-right: 4px;
 			"

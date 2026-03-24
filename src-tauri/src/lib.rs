@@ -173,6 +173,10 @@ pub fn run() {
             commands::hello::hello,
             // Chat (direct - no worker dependency)
             commands::chat::chat_respond,
+            // Chat (persistent session helpers)
+            commands::chat::chat_build_system_prompt,
+            commands::chat::chat_check_fast_path,
+            commands::chat::chat_process_response,
         ])
         .on_window_event(|window, event| {
             match event {

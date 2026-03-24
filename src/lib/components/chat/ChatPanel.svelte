@@ -28,8 +28,12 @@
 	});
 
 	$effect(() => {
-		const _len = chat.sortedMessages.length;
+		const sorted = chat.sortedMessages;
+		const _len = sorted.length;
+		// Also track the last message content so streaming updates trigger scroll
+		const _lastContent = sorted.length > 0 ? sorted[sorted.length - 1].content?.length : 0;
 		void _len;
+		void _lastContent;
 		tick().then(() => {
 			if (messagesContainer) {
 				messagesContainer.scrollTop = messagesContainer.scrollHeight;

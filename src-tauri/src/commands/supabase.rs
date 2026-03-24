@@ -41,6 +41,8 @@ fn build_client(config: &SupabaseConfig) -> Result<reqwest::Client, String> {
     headers.insert("Prefer", HeaderValue::from_static("return=representation"));
     reqwest::Client::builder()
         .default_headers(headers)
+        .timeout(std::time::Duration::from_secs(15))
+        .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))
 }
@@ -305,7 +307,11 @@ pub async fn upload_to_storage(config: &SupabaseConfig, bucket: &str, path: &str
     let key = config.service_role_key.as_deref().unwrap_or(&config.anon_key);
     let file_bytes = tokio::fs::read(file_path).await.map_err(|e| format!("Failed to read file: {}", e))?;
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
     let url = format!("{}/storage/v1/object/{}/{}", config.url, bucket, path);
 
     let resp = client.post(&url)

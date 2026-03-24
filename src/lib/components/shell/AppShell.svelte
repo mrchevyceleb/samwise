@@ -109,6 +109,7 @@
 			ch.unsubscribe();
 		}
 		workerUnlisten?.();
+		chatStore.destroySession();
 	});
 
 	async function initRealtime() {

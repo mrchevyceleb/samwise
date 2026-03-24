@@ -863,7 +863,9 @@ async fn execute_task(
                 return Ok("Analysis complete".to_string());
             }
 
-            agent_comment(config, &task_id, &format!("Code changes done. Here's what I did:\n\n{}", summary)).await;
+            // Post full output but cap at 10KB to avoid Supabase/UI issues with massive comments
+            let comment_output = truncate(&output, 10_000);
+            agent_comment(config, &task_id, &format!("Code changes done. Here's what I did:\n\n{}", comment_output)).await;
 
             // 6. Take AFTER screenshots
             if let Some(ref preview) = preview_url {

@@ -35,36 +35,34 @@ struct ClaudeCodeClosedPayload {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-/// Returns (exe_path, use_cmd_wrapper). When `use_cmd_wrapper` is true,
-/// the caller must spawn via `cmd.exe /C <exe_path>` because the path
-/// points to a `.cmd` batch file that cannot be CreateProcess'd directly.
-fn find_claude_exe() -> (String, bool) {
+/// Returns (executable, prefix_args) for spawning the Claude CLI.
+/// On Windows with npm install, we bypass claude.cmd to avoid cmd.exe pipe
+/// inheritance issues -- directly invoking `node cli.js` keeps stdin reliable.
+fn find_claude_command() -> (String, Vec<String>) {
     if cfg!(target_os = "windows") {
         let home = std::env::var("USERPROFILE").unwrap_or_default();
-        // Check .local/bin first (official installer location)
+        // Official installer: direct .exe, no intermediary needed
         let local_bin = format!("{}\\.local\\bin\\claude.exe", home);
         if std::path::Path::new(&local_bin).exists() {
-            return (local_bin, false);
+            return (local_bin, vec![]);
         }
-        // Check npm global install location (.exe shim first, then .cmd)
+        // npm global install: bypass claude.cmd to avoid cmd.exe stdin pipe issues.
+        // claude.cmd -> cmd.exe /c -> node cli.js breaks stdin inheritance with CREATE_NO_WINDOW.
+        // Directly invoking node + cli.js avoids the cmd.exe layer entirely.
         let appdata = std::env::var("APPDATA").unwrap_or_default();
-        let npm_exe = format!("{}\\npm\\claude.exe", appdata);
-        if std::path::Path::new(&npm_exe).exists() {
-            return (npm_exe, false);
+        let cli_js = format!("{}\\npm\\node_modules\\@anthropic-ai\\claude-code\\cli.js", appdata);
+        if std::path::Path::new(&cli_js).exists() {
+            return ("node".to_string(), vec![cli_js]);
         }
-        let npm_cmd = format!("{}\\npm\\claude.cmd", appdata);
-        if std::path::Path::new(&npm_cmd).exists() {
-            return (npm_cmd, true);
-        }
-        // Fall back to PATH
-        ("claude".to_string(), false)
+        // Fall back to claude on PATH
+        ("claude".to_string(), vec![])
     } else {
         let home = std::env::var("HOME").unwrap_or_default();
         let local_bin = format!("{}/.local/bin/claude", home);
         if std::path::Path::new(&local_bin).exists() {
-            return (local_bin, false);
+            return (local_bin, vec![]);
         }
-        ("claude".to_string(), false)
+        ("claude".to_string(), vec![])
     }
 }
 
@@ -90,14 +88,11 @@ pub fn spawn_claude_code(
         }
     }
 
-    let (claude_exe, use_cmd_wrapper) = find_claude_exe();
-    let mut command = if use_cmd_wrapper {
-        let mut c = cmd("cmd.exe");
-        c.arg("/C").arg(&claude_exe);
-        c
-    } else {
-        cmd(&claude_exe)
-    };
+    let (claude_exe, prefix_args) = find_claude_command();
+    let mut command = cmd(&claude_exe);
+    for arg in &prefix_args {
+        command.arg(arg);
+    }
 
     // Base args for persistent stream-json mode
     command.arg("-p")
@@ -121,6 +116,8 @@ pub fn spawn_claude_code(
     command.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+
+    // CREATE_NO_WINDOW is already set by process::cmd() on Windows
 
     let mut child = command
         .spawn()
@@ -224,15 +221,11 @@ pub fn spawn_claude_code(
 /// Run a one-shot Claude Code prompt and return the text output.
 #[tauri::command]
 pub fn claude_code_prompt(prompt: String, cwd: String) -> Result<String, String> {
-    let (claude_exe, use_cmd_wrapper) = find_claude_exe();
-
-    let mut command = if use_cmd_wrapper {
-        let mut c = cmd("cmd.exe");
-        c.arg("/C").arg(&claude_exe);
-        c
-    } else {
-        cmd(&claude_exe)
-    };
+    let (claude_exe, prefix_args) = find_claude_command();
+    let mut command = cmd(&claude_exe);
+    for arg in &prefix_args {
+        command.arg(arg);
+    }
 
     command.arg("-p")
         .arg(&prompt)

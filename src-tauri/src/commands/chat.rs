@@ -43,6 +43,22 @@ pub async fn chat_respond(
         return Err("Supabase not configured".to_string());
     }
 
+    // Wrap the entire chat flow in a 120s hard timeout so the UI never hangs forever.
+    // The Claude Code call inside has its own 90s timeout; the extra 30s covers Supabase I/O.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        chat_respond_inner(config, user_message, &worker_state),
+    ).await {
+        Ok(result) => result,
+        Err(_) => Err("Sam took too long to respond (timed out after 2 minutes). Try again.".to_string()),
+    }
+}
+
+async fn chat_respond_inner(
+    config: supabase::SupabaseConfig,
+    user_message: String,
+    worker_state: &WorkerState,
+) -> Result<ChatResponse, String> {
     // 1. Fetch conversation context BEFORE saving the new message
     let recent_chat = fetch_recent_chat(&config).await;
 
@@ -79,7 +95,7 @@ pub async fn chat_respond(
 
     // 2c. Fast-path: status queries skip Claude Code entirely
     if is_status_query(&user_message) {
-        let board_context = build_board_context(&config, &worker_state).await;
+        let board_context = build_board_context(&config, worker_state).await;
         let response_text = build_status_response(&board_context);
 
         let message_id = match supabase::send_message(&config, &serde_json::json!({
@@ -106,7 +122,7 @@ pub async fn chat_respond(
     }
 
     // 3. Fetch board state and project registry
-    let board_context = build_board_context(&config, &worker_state).await;
+    let board_context = build_board_context(&config, worker_state).await;
     let project_registry = build_project_registry(&config).await;
 
     // 3b. Extract @ mentions for explicit project tagging
@@ -749,4 +765,170 @@ pub async fn handle_pending_confirmation(
     };
 
     Some(response)
+}
+
+// ── Persistent session helpers ──────────────────────────────────────
+// These replace the one-shot `chat_respond` flow with a persistent
+// Claude Code CLI session that stays alive between messages.
+
+/// Build the system prompt for Sam's chat session (board context + personality).
+/// Called once when spawning a new session, then the session retains history.
+#[tauri::command]
+pub async fn chat_build_system_prompt(
+    sb_state: tauri::State<'_, SupabaseState>,
+    worker_state: tauri::State<'_, WorkerState>,
+) -> Result<String, String> {
+    let config = sb_state.get_config().await;
+    if config.url.is_empty() {
+        return Err("Supabase not configured".to_string());
+    }
+    let recent_chat = fetch_recent_chat(&config).await;
+    let board_context = build_board_context(&config, &worker_state).await;
+    let project_registry = build_project_registry(&config).await;
+    // Build prompt without a specific user message (session init)
+    Ok(build_system_prompt(&board_context, &project_registry, &recent_chat, "[Session starting. Wait for Matt's first message.]"))
+}
+
+/// Fast-path check: handle confirmations and status queries without Claude.
+/// Returns Some(response) if handled, None if the message needs Claude.
+#[derive(Serialize, Clone)]
+pub struct FastPathResult {
+    pub handled: bool,
+    pub response: Option<String>,
+    pub message_id: Option<String>,
+}
+
+#[tauri::command]
+pub async fn chat_check_fast_path(
+    user_message: String,
+    sb_state: tauri::State<'_, SupabaseState>,
+    worker_state: tauri::State<'_, WorkerState>,
+) -> Result<FastPathResult, String> {
+    let config = sb_state.get_config().await;
+    if config.url.is_empty() {
+        return Err("Supabase not configured".to_string());
+    }
+
+    // Save user message
+    if let Err(e) = supabase::send_message(&config, &serde_json::json!({
+        "role": "user",
+        "content": &user_message,
+        "conversation_id": DEFAULT_CONVERSATION_ID,
+    })).await {
+        log::warn!("[chat] Failed to save user message: {}", e);
+    }
+
+    // Check confirmation fast-path
+    if let Some(response_text) = handle_pending_confirmation(&config, &user_message).await {
+        let message_id = save_agent_message(&config, &response_text).await;
+        return Ok(FastPathResult { handled: true, response: Some(response_text), message_id });
+    }
+
+    // Check status query fast-path
+    if is_status_query(&user_message) {
+        let board_context = build_board_context(&config, &worker_state).await;
+        let response_text = build_status_response(&board_context);
+        let message_id = save_agent_message(&config, &response_text).await;
+        return Ok(FastPathResult { handled: true, response: Some(response_text), message_id });
+    }
+
+    // Not a fast-path, needs Claude
+    Ok(FastPathResult { handled: false, response: None, message_id: None })
+}
+
+/// Process a completed Claude response: extract task creation blocks, create tasks,
+/// save agent message to Supabase.
+#[tauri::command]
+pub async fn chat_process_response(
+    response_text: String,
+    user_message: String,
+    sb_state: tauri::State<'_, SupabaseState>,
+) -> Result<ChatResponse, String> {
+    let config = sb_state.get_config().await;
+
+    let (clean_text, task_requests) = parse_chat_response(&response_text);
+
+    // Extract @ mentions for project tagging (single fetch, reused for both)
+    let projects_for_mentions = supabase::fetch_projects(&config).await.ok().unwrap_or(serde_json::json!([]));
+    let mentioned_projects = extract_project_mentions(&user_message, &projects_for_mentions);
+    let projects = Some(projects_for_mentions);
+
+    let mut created_tasks = Vec::new();
+    for req in &task_requests {
+        let mut enriched = req.clone();
+
+        if let Some(mentioned) = mentioned_projects.first() {
+            enriched["project"] = serde_json::Value::String(mentioned.clone());
+            enriched["status"] = serde_json::Value::String("queued".to_string());
+        } else {
+            enriched["status"] = serde_json::Value::String("pending_confirmation".to_string());
+        }
+
+        // Backfill repo fields from project registry
+        let project_name = enriched.get("project").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if !project_name.is_empty() {
+            if let Some(ref proj_arr) = projects {
+                if let Some(arr) = proj_arr.as_array() {
+                    if let Some(proj) = arr.iter().find(|p| p.get("name").and_then(|v| v.as_str()) == Some(&project_name)) {
+                        for field in &["repo_path", "repo_url", "preview_url"] {
+                            if enriched.get(*field).and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+                                if let Some(v) = proj.get(*field).filter(|v| v.as_str().map(|s| !s.is_empty()).unwrap_or(false)) {
+                                    enriched[*field] = v.clone();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        match supabase::create_task(&config, &enriched).await {
+            Ok(result) => {
+                if let Some(arr) = result.as_array() {
+                    if let Some(task) = arr.first() {
+                        let id = task.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let title = task.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let task_type = task.get("task_type").and_then(|v| v.as_str()).unwrap_or("code").to_string();
+                        if !id.is_empty() {
+                            created_tasks.push(CreatedTaskInfo { id, title, task_type });
+                        }
+                    }
+                }
+            }
+            Err(e) => log::warn!("[chat] Failed to create task: {}", e),
+        }
+    }
+
+    // Save agent response to Supabase
+    let final_text = if clean_text.trim().is_empty() {
+        response_text.trim().to_string()
+    } else {
+        clean_text.trim().to_string()
+    };
+    let message_id = save_agent_message(&config, &final_text).await;
+
+    Ok(ChatResponse {
+        content: final_text,
+        message_id,
+        created_tasks,
+    })
+}
+
+/// Save an agent message to Supabase and return the message ID.
+async fn save_agent_message(config: &supabase::SupabaseConfig, content: &str) -> Option<String> {
+    match supabase::send_message(config, &serde_json::json!({
+        "role": "agent",
+        "content": content,
+        "conversation_id": DEFAULT_CONVERSATION_ID,
+    })).await {
+        Ok(result) => result.as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|msg| msg.get("id"))
+            .and_then(|id| id.as_str())
+            .map(|s| s.to_string()),
+        Err(e) => {
+            log::warn!("[chat] Failed to save agent message: {}", e);
+            None
+        }
+    }
 }
