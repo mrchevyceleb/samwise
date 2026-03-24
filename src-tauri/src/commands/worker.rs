@@ -14,6 +14,8 @@ pub struct WorkerState {
     pub machine_name: Arc<tokio::sync::Mutex<Option<String>>>,
     pub current_task_id: Arc<tokio::sync::Mutex<Option<String>>>,
     pub last_telegram_update_id: Arc<tokio::sync::Mutex<Option<i64>>>,
+    /// PID of the currently running Claude Code process (for stop functionality)
+    pub current_process_id: Arc<tokio::sync::Mutex<Option<u32>>>,
 }
 
 impl Default for WorkerState {
@@ -23,6 +25,7 @@ impl Default for WorkerState {
             machine_name: Arc::new(tokio::sync::Mutex::new(None)),
             current_task_id: Arc::new(tokio::sync::Mutex::new(None)),
             last_telegram_update_id: Arc::new(tokio::sync::Mutex::new(None)),
+            current_process_id: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 }
@@ -71,11 +74,12 @@ pub async fn worker_start(
     let running = Arc::clone(&state.running);
     let current_task = Arc::clone(&state.current_task_id);
     let last_tg_update = Arc::clone(&state.last_telegram_update_id);
+    let current_pid = Arc::clone(&state.current_process_id);
     let sb_config_arc = Arc::clone(&sb_state.config);
     let app_handle = app.clone();
 
     tokio::spawn(async move {
-        worker_loop(running, current_task, last_tg_update, machine_name, sb_config_arc, app_handle).await;
+        worker_loop(running, current_task, last_tg_update, current_pid, machine_name, sb_config_arc, app_handle).await;
     });
 
     Ok(())
@@ -109,12 +113,72 @@ pub async fn worker_status(
     })
 }
 
+/// Stop the currently running task by killing its Claude Code process.
+/// The task is marked as "failed" with a comment explaining it was manually stopped.
+#[tauri::command]
+pub async fn stop_current_task(
+    state: tauri::State<'_, WorkerState>,
+    sb_state: tauri::State<'_, SupabaseState>,
+) -> Result<String, String> {
+    let task_id = state.current_task_id.lock().await.clone();
+    let Some(task_id) = task_id else {
+        return Err("No task is currently running".to_string());
+    };
+
+    // Kill the Claude Code process
+    let pid = state.current_process_id.lock().await.take();
+    if let Some(pid) = pid {
+        #[cfg(target_os = "windows")]
+        {
+            // On Windows, kill the process tree (claude spawns child processes)
+            let _ = async_cmd("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .output()
+                .await;
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = async_cmd("kill")
+                .args(["-9", &pid.to_string()])
+                .output()
+                .await;
+        }
+        log::info!("[worker] Killed Claude Code process {} for task {}", pid, task_id);
+    }
+
+    // Mark task as failed with explanation
+    let config = sb_state.get_config().await;
+    let _ = supabase::update_task(&config, &task_id, &serde_json::json!({
+        "status": "failed",
+        "updated_at": chrono::Utc::now().to_rfc3339(),
+    })).await;
+    agent_comment(&config, &task_id, "Task stopped manually.").await;
+
+    Ok(task_id)
+}
+
+/// Restart a failed/stopped task by setting it back to queued.
+#[tauri::command]
+pub async fn restart_task(
+    task_id: String,
+    sb_state: tauri::State<'_, SupabaseState>,
+) -> Result<(), String> {
+    let config = sb_state.get_config().await;
+    let _ = supabase::update_task(&config, &task_id, &serde_json::json!({
+        "status": "queued",
+        "updated_at": chrono::Utc::now().to_rfc3339(),
+    })).await;
+    agent_comment(&config, &task_id, "Task restarted. Back in the queue.").await;
+    Ok(())
+}
+
 // ── Worker Loop ─────────────────────────────────────────────────────
 
 async fn worker_loop(
     running: Arc<AtomicBool>,
     current_task_id: Arc<tokio::sync::Mutex<Option<String>>>,
     last_telegram_update_id: Arc<tokio::sync::Mutex<Option<i64>>>,
+    current_process_id: Arc<tokio::sync::Mutex<Option<u32>>>,
     machine_name: String,
     sb_config_arc: Arc<tokio::sync::RwLock<SupabaseConfig>>,
     app: tauri::AppHandle,
@@ -190,7 +254,7 @@ async fn worker_loop(
                                             "Picked up \"{}\" from the queue. I'll post updates as I go.", task_title
                                         )).await;
 
-                                        let result = execute_task(&app, &machine_name, &config, task.clone()).await;
+                                        let result = execute_task(&app, &machine_name, &config, task.clone(), current_process_id.clone()).await;
 
                                         {
                                             let mut ct = current_task_id.lock().await;
@@ -499,6 +563,7 @@ async fn execute_task(
     worker_id: &str,
     config: &SupabaseConfig,
     task: serde_json::Value,
+    process_id_slot: Arc<tokio::sync::Mutex<Option<u32>>>,
 ) -> Result<String, String> {
     let task_id = task.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
     let title = task.get("title").and_then(|v| v.as_str()).unwrap_or("Untitled").to_string();
@@ -824,7 +889,10 @@ async fn execute_task(
     let prompt = prompt_parts.join("\n");
 
     // 30-minute timeout for task execution, 50 max turns to prevent runaway sessions
-    let claude_result = run_claude_code_opts(&repo_path, &prompt, 50, 1800).await;
+    // Use streaming version to post real-time progress comments
+    let claude_result = run_claude_code_streaming(&repo_path, &prompt, 50, 1800, config, &task_id, process_id_slot.clone()).await;
+    // Clear PID after process completes
+    { let mut pid = process_id_slot.lock().await; *pid = None; }
 
     let task_result = match claude_result {
         Ok(output) if output.is_empty() => {
@@ -1741,6 +1809,194 @@ pub async fn run_claude_code_opts(cwd: &str, prompt: &str, max_turns: u32, timeo
     }
 
     Ok(stdout_text.trim().to_string())
+}
+
+/// Run Claude Code CLI with stream-json output, posting progress comments as it works.
+/// Returns the final text output. Used for worker tasks where transparency is important.
+pub async fn run_claude_code_streaming(
+    cwd: &str,
+    prompt: &str,
+    max_turns: u32,
+    timeout_secs: u64,
+    config: &supabase::SupabaseConfig,
+    task_id: &str,
+    process_id_slot: Arc<tokio::sync::Mutex<Option<u32>>>,
+) -> Result<String, String> {
+    let (exe, prefix_args) = find_claude_command();
+
+    let mut cmd = async_cmd(&exe);
+    for arg in &prefix_args {
+        cmd.arg(arg);
+    }
+
+    cmd.arg("-p")
+        .arg(prompt)
+        .arg("--output-format")
+        .arg("stream-json")
+        .arg("--verbose")
+        .arg("--dangerously-skip-permissions");
+
+    if max_turns > 0 {
+        cmd.arg("--max-turns").arg(max_turns.to_string());
+    }
+
+    cmd.current_dir(cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| format!("Failed to run Claude Code: {}", e))?;
+
+    // Store PID so the process can be killed externally via stop_current_task
+    {
+        let mut pid = process_id_slot.lock().await;
+        *pid = Some(child.id().unwrap_or(0));
+    }
+
+    let stdout = child.stdout.take();
+    let config_clone = config.clone();
+    let task_id_owned = task_id.to_string();
+
+    // Read stdout line-by-line, parse stream-json, post progress comments
+    let stdout_handle = tokio::spawn(async move {
+        let mut result_text = String::new();
+        let mut last_comment_time = std::time::Instant::now();
+        // Throttle: don't post more than one progress comment per 10 seconds
+        const MIN_COMMENT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+        if let Some(reader) = stdout {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut lines = BufReader::new(reader).lines();
+
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.is_empty() { continue; }
+
+                // Try to parse as JSON
+                let parsed: serde_json::Value = match serde_json::from_str(&line) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+
+                let event_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+                // Capture result text
+                if event_type == "result" {
+                    if let Some(text) = parsed.get("result_text").and_then(|v| v.as_str()) {
+                        result_text = text.to_string();
+                    }
+                    continue;
+                }
+
+                // Extract progress info from assistant messages
+                if event_type == "assistant" {
+                    if let Some(content) = parsed.get("message")
+                        .and_then(|m| m.get("content"))
+                        .and_then(|c| c.as_array())
+                    {
+                        for block in content {
+                            let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+                            if block_type == "tool_use" {
+                                let tool_name = block.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+                                let input = block.get("input");
+
+                                // Build a human-readable progress message
+                                let progress = match tool_name {
+                                    "Read" | "read_file" => {
+                                        let path = input.and_then(|i| i.get("file_path").or(i.get("path")))
+                                            .and_then(|v| v.as_str()).unwrap_or("...");
+                                        // Show just the filename, not full path
+                                        let short = path.rsplit(['/', '\\']).next().unwrap_or(path);
+                                        format!("Reading {}", short)
+                                    }
+                                    "Edit" | "edit_file" => {
+                                        let path = input.and_then(|i| i.get("file_path").or(i.get("path")))
+                                            .and_then(|v| v.as_str()).unwrap_or("...");
+                                        let short = path.rsplit(['/', '\\']).next().unwrap_or(path);
+                                        format!("Editing {}", short)
+                                    }
+                                    "Write" | "write_file" => {
+                                        let path = input.and_then(|i| i.get("file_path").or(i.get("path")))
+                                            .and_then(|v| v.as_str()).unwrap_or("...");
+                                        let short = path.rsplit(['/', '\\']).next().unwrap_or(path);
+                                        format!("Writing {}", short)
+                                    }
+                                    "Bash" | "bash" => {
+                                        let command = input.and_then(|i| i.get("command"))
+                                            .and_then(|v| v.as_str()).unwrap_or("...");
+                                        let short: String = command.chars().take(80).collect();
+                                        format!("Running: {}", short)
+                                    }
+                                    "Grep" | "grep" => {
+                                        let pattern = input.and_then(|i| i.get("pattern"))
+                                            .and_then(|v| v.as_str()).unwrap_or("...");
+                                        format!("Searching for \"{}\"", pattern)
+                                    }
+                                    "Glob" | "glob" => {
+                                        let pattern = input.and_then(|i| i.get("pattern"))
+                                            .and_then(|v| v.as_str()).unwrap_or("...");
+                                        format!("Finding files: {}", pattern)
+                                    }
+                                    "Agent" | "agent" => {
+                                        "Spawning a sub-agent...".to_string()
+                                    }
+                                    _ => {
+                                        format!("Using {}", tool_name)
+                                    }
+                                };
+
+                                // Post comment if enough time has passed since last one
+                                if last_comment_time.elapsed() >= MIN_COMMENT_INTERVAL {
+                                    agent_comment(&config_clone, &task_id_owned, &progress).await;
+                                    last_comment_time = std::time::Instant::now();
+                                } else {
+                                    log::debug!("[worker] Throttled progress: {}", progress);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        result_text
+    });
+
+    // Read stderr in background
+    let stderr = child.stderr.take();
+    let stderr_handle = tokio::spawn(async move {
+        let mut output = String::new();
+        if let Some(mut reader) = stderr {
+            use tokio::io::AsyncReadExt;
+            let _ = reader.read_to_string(&mut output).await;
+        }
+        output
+    });
+
+    // Wait for process with optional timeout
+    let status = if timeout_secs > 0 {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            child.wait()
+        ).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => return Err(format!("Claude Code process error: {}", e)),
+            Err(_) => {
+                let _ = child.kill().await;
+                return Err(format!("Claude Code timed out after {}s", timeout_secs));
+            }
+        }
+    } else {
+        child.wait().await.map_err(|e| format!("Claude Code process error: {}", e))?
+    };
+
+    let result_text = stdout_handle.await.unwrap_or_default();
+    let stderr_text = stderr_handle.await.unwrap_or_default();
+
+    if !status.success() {
+        return Err(format!("Claude Code failed (exit {}): {}", status, stderr_text.trim()));
+    }
+
+    Ok(result_text.trim().to_string())
 }
 
 /// Returns (executable, prefix_args) for spawning the Claude CLI.

@@ -35,6 +35,10 @@
 	let confirmDelete = $state(false);
 	let deleteHovered = $state(false);
 	let requeueHovered = $state(false);
+	let stopHovered = $state(false);
+	let restartHovered = $state(false);
+	let stopping = $state(false);
+	let restarting = $state(false);
 	let prBtnHovered = $state(false);
 
 	// Tabs: "details" or "report"
@@ -65,6 +69,9 @@
 	let priorityColor = $derived(PRIORITY_COLORS[task.priority]);
 	let statusColumn = $derived(KANBAN_COLUMNS.find(c => c.status === task.status));
 	let isFailed = $derived(task.status === 'failed');
+	let isInProgress = $derived(task.status === 'in_progress');
+	let isStoppable = $derived(task.status === 'in_progress' || task.status === 'testing');
+	let isRestartable = $derived(task.status === 'failed');
 	let isAgent = $derived(task.assignee === 'agent');
 	let hasBefore = $derived(task.screenshots_before && task.screenshots_before.length > 0);
 	let hasAfter = $derived(task.screenshots_after && task.screenshots_after.length > 0);
@@ -95,6 +102,26 @@
 
 	async function handleRequeue() {
 		await taskStore.moveTask(task.id, 'queued');
+	}
+
+	async function handleStop() {
+		stopping = true;
+		try {
+			await safeInvoke('stop_current_task');
+			await taskStore.fetchTasks();
+		} finally {
+			stopping = false;
+		}
+	}
+
+	async function handleRestart() {
+		restarting = true;
+		try {
+			await safeInvoke('restart_task', { taskId: task.id });
+			await taskStore.fetchTasks();
+		} finally {
+			restarting = false;
+		}
 	}
 
 	async function handleDelete() {
@@ -563,6 +590,48 @@
 
 				<!-- Actions -->
 				<div style="border-top: 1px solid var(--border-subtle); padding-top: 12px; display: flex; flex-direction: column; gap: 6px;">
+					{#if isStoppable}
+						<button
+							style="
+								width: 100%; padding: 7px 12px; border-radius: 8px;
+								background: {stopHovered ? 'rgba(210, 153, 34, 0.12)' : 'rgba(210, 153, 34, 0.06)'};
+								border: 1px solid rgba(210, 153, 34, 0.2);
+								color: var(--accent-amber); font-size: 11px; font-weight: 700;
+								font-family: var(--font-ui); cursor: {stopping ? 'wait' : 'pointer'};
+								transition: all 0.15s ease;
+								transform: {stopHovered && !stopping ? 'translateY(-1px)' : 'none'};
+								opacity: {stopping ? '0.6' : '1'};
+							"
+							onmouseenter={() => stopHovered = true}
+							onmouseleave={() => stopHovered = false}
+							onclick={handleStop}
+							disabled={stopping}
+						>
+							{stopping ? 'Stopping...' : 'Stop Task'}
+						</button>
+					{/if}
+
+					{#if isRestartable}
+						<button
+							style="
+								width: 100%; padding: 7px 12px; border-radius: 8px;
+								background: {restartHovered ? 'rgba(99, 102, 241, 0.12)' : 'rgba(99, 102, 241, 0.06)'};
+								border: 1px solid rgba(99, 102, 241, 0.2);
+								color: var(--accent-indigo); font-size: 11px; font-weight: 700;
+								font-family: var(--font-ui); cursor: {restarting ? 'wait' : 'pointer'};
+								transition: all 0.15s ease;
+								transform: {restartHovered && !restarting ? 'translateY(-1px)' : 'none'};
+								opacity: {restarting ? '0.6' : '1'};
+							"
+							onmouseenter={() => restartHovered = true}
+							onmouseleave={() => restartHovered = false}
+							onclick={handleRestart}
+							disabled={restarting}
+						>
+							{restarting ? 'Restarting...' : 'Restart Task'}
+						</button>
+					{/if}
+
 					{#if isFailed}
 						<button
 							style="

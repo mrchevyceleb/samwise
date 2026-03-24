@@ -162,6 +162,8 @@ pub fn run() {
             commands::worker::worker_start,
             commands::worker::worker_stop,
             commands::worker::worker_status,
+            commands::worker::stop_current_task,
+            commands::worker::restart_task,
             // Playwright
             commands::playwright::playwright_screenshot,
             commands::playwright::playwright_screenshot_mobile,
