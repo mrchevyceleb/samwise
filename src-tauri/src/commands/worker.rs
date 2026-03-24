@@ -641,6 +641,32 @@ async fn execute_task(
     // 1. Post initial comment
     agent_comment(config, &task_id, &format!("On it. Setting up for: {}", title)).await;
 
+    // 1b. Extract and display active worker rules for transparency
+    let active_rules: Vec<String> = cached_settings.as_ref()
+        .and_then(|s| s.get("workerRules"))
+        .and_then(|v| v.as_array())
+        .map(|rules| {
+            rules.iter()
+                .filter_map(|r| r.as_str())
+                .filter(|r| !r.trim().is_empty())
+                .map(|r| r.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if !active_rules.is_empty() {
+        let rules_display: Vec<String> = active_rules.iter()
+            .enumerate()
+            .map(|(i, r)| format!("{}. {}", i + 1, r))
+            .collect();
+        agent_comment(config, &task_id, &format!(
+            "Keeping {} rule{} in mind on this one:\n{}",
+            active_rules.len(),
+            if active_rules.len() == 1 { "" } else { "s" },
+            rules_display.join("\n")
+        )).await;
+    }
+
     // 2. Update status
     let _ = supabase::update_task(config, &task_id, &serde_json::json!({
         "status": "in_progress",
@@ -723,23 +749,16 @@ async fn execute_task(
         prompt_parts.push(format!("## Project Instructions (from CLAUDE.md)\n{}\n", claude_md_truncated));
     }
 
-    // Read worker rules from cached settings
-    if let Some(ref settings) = cached_settings {
-        if let Some(rules) = settings.get("workerRules").and_then(|v| v.as_array()) {
-            let rule_strings: Vec<String> = rules
-                .iter()
-                .filter_map(|r| r.as_str())
-                .filter(|r| !r.trim().is_empty())
-                .enumerate()
-                .map(|(i, r)| format!("{}. {}", i + 1, r))
-                .collect();
-            if !rule_strings.is_empty() {
-                prompt_parts.push(format!(
-                    "## Worker Rules (MUST follow these)\n{}\n",
-                    rule_strings.join("\n")
-                ));
-            }
-        }
+    // Inject worker rules into prompt (reuse the rules extracted earlier for the comment)
+    if !active_rules.is_empty() {
+        let rule_strings: Vec<String> = active_rules.iter()
+            .enumerate()
+            .map(|(i, r)| format!("{}. {}", i + 1, r))
+            .collect();
+        prompt_parts.push(format!(
+            "## Worker Rules (MUST follow these)\n{}\n\nAt the end of your response, briefly mention any rules that affected your approach (one line max).\n",
+            rule_strings.join("\n")
+        ));
     }
 
     // Add subtask context if present
