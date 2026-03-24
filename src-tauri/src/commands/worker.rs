@@ -822,6 +822,7 @@ async fn execute_task(
                 )).await;
             }
             if let Some(h) = dev_server_handle.take() { let _ = dev_server::kill_dev_server(h).await; }
+            cleanup_branch(&repo_path, &branch).await;
             return Err("Claude Code produced no output".to_string());
         }
         Ok(output) => {
@@ -1043,7 +1044,45 @@ async fn execute_task(
         let _ = dev_server::kill_dev_server(h).await;
     }
 
+    // Cleanup: switch back to default branch and delete the local feature branch.
+    // The remote branch persists for the PR; this just prevents local accumulation.
+    cleanup_branch(&repo_path, &branch).await;
+
     task_result
+}
+
+/// Clean up local feature branch after task execution.
+/// Discards uncommitted changes, switches to base branch, and safely deletes the feature branch.
+/// Uses `-d` (not `-D`) to refuse deleting branches with unpushed commits.
+async fn cleanup_branch(repo_path: &str, branch: &Option<String>) {
+    let Some(ref branch_name) = branch else { return; };
+
+    // Discard any uncommitted changes (failed tasks may leave dirty worktree)
+    if let Err(e) = async_cmd("git").args(["reset", "--hard"]).current_dir(repo_path).output().await {
+        log::warn!("[worker] Branch cleanup: git reset --hard failed: {}", e);
+    }
+    if let Err(e) = async_cmd("git").args(["clean", "-fd"]).current_dir(repo_path).output().await {
+        log::warn!("[worker] Branch cleanup: git clean -fd failed: {}", e);
+    }
+
+    // Switch back to default branch
+    let base = detect_base_branch(repo_path).await;
+    let checkout = async_cmd("git").args(["checkout", &base]).current_dir(repo_path).output().await;
+    match checkout {
+        Ok(out) if out.status.success() => {
+            // Safe delete: -d refuses if commits aren't pushed (prevents data loss)
+            if let Err(e) = async_cmd("git").args(["branch", "-d", branch_name]).current_dir(repo_path).output().await {
+                log::warn!("[worker] Branch cleanup: git branch -d failed: {}", e);
+            }
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            log::warn!("[worker] Branch cleanup: checkout {} failed: {}", base, stderr.trim());
+        }
+        Err(e) => {
+            log::warn!("[worker] Branch cleanup: checkout {} failed: {}", base, e);
+        }
+    }
 }
 
 // Chat message processing has been moved to commands/chat.rs (direct API, no worker dependency)

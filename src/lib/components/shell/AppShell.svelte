@@ -12,6 +12,7 @@
 	import { getChatStore } from '$lib/stores/chat.svelte';
 	import { getCommentStore } from '$lib/stores/comments.svelte';
 	import { getWorkerStore } from '$lib/stores/worker.svelte';
+	import { getProjectStore } from '$lib/stores/projects.svelte';
 	import { getTheme } from '$lib/stores/theme.svelte';
 	import { safeInvoke } from '$lib/utils/tauri';
 	import { subscribeToTable } from '$lib/supabase';
@@ -23,6 +24,7 @@
 	const chatStore = getChatStore();
 	const commentStore = getCommentStore();
 	const worker = getWorkerStore();
+	const projectStore = getProjectStore();
 	const theme = getTheme();
 
 	let chatToggleHovered = $state(false);
@@ -86,6 +88,7 @@
 		await Promise.all([
 			taskStore.fetchTasks(),
 			chatStore.fetchMessages(),
+			projectStore.fetchProjects(),
 		]);
 
 		initRealtime();
