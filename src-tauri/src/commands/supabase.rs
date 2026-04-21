@@ -25,6 +25,17 @@ impl SupabaseState {
     pub async fn get_config(&self) -> SupabaseConfig {
         self.config.read().await.clone()
     }
+
+    pub fn with_compiled_defaults() -> Self {
+        let config = SupabaseConfig {
+            url: option_env!("SB_URL").unwrap_or("").to_string(),
+            anon_key: option_env!("SB_ANON_KEY").unwrap_or("").to_string(),
+            service_role_key: option_env!("SB_SERVICE_ROLE_KEY").map(String::from),
+            telegram_bot_token: option_env!("TELEGRAM_BOT_TOKEN").map(String::from),
+            telegram_chat_id: option_env!("TELEGRAM_CHAT_ID").map(String::from),
+        };
+        Self { config: Arc::new(RwLock::new(config)) }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════

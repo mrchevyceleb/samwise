@@ -17,7 +17,7 @@ pub fn run() {
         .manage(AppState::new())
         .manage(ClaudeCodeState::default())
         .manage(WorkerState::default())
-        .manage(SupabaseState::default())
+        .manage(SupabaseState::with_compiled_defaults())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
