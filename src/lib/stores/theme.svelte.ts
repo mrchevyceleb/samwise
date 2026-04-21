@@ -157,6 +157,13 @@ function detectInitialMode(): ThemeMode {
 	if (typeof localStorage !== 'undefined') {
 		const stored = localStorage.getItem(STORAGE_KEY) as ThemeMode | null;
 		if (stored === 'dark' || stored === 'light') return stored;
+		// Migrate from legacy key so existing users don't lose their preference.
+		const legacy = localStorage.getItem('agent-one-theme') as ThemeMode | null;
+		if (legacy === 'dark' || legacy === 'light') {
+			localStorage.setItem(STORAGE_KEY, legacy);
+			localStorage.removeItem('agent-one-theme');
+			return legacy;
+		}
 	}
 	if (typeof window !== 'undefined' && window.matchMedia?.('(prefers-color-scheme: light)').matches) {
 		return 'light';
@@ -171,6 +178,7 @@ let colors = $state<ThemeColors>(initialMode === 'light' ? lightColors : darkCol
 function applyToDOM(c: ThemeColors) {
 	if (typeof document === 'undefined') return;
 	document.documentElement.setAttribute('data-theme', mode);
+	document.documentElement.classList.toggle('light', mode === 'light');
 	const s = document.documentElement.style;
 	s.setProperty('--bg-canvas', c.bgCanvas);
 	s.setProperty('--bg-primary', c.bgPrimary);
