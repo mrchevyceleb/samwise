@@ -151,12 +151,26 @@ const lightColors: ThemeColors = {
 };
 
 export type ThemeMode = 'dark' | 'light';
-const stored = typeof localStorage !== 'undefined' ? localStorage.getItem('agent-one-theme') as ThemeMode | null : null;
-let mode = $state<ThemeMode>(stored ?? 'dark');
-let colors = $state<ThemeColors>(stored === 'light' ? lightColors : darkColors);
+const STORAGE_KEY = 'samwise_theme';
+
+function detectInitialMode(): ThemeMode {
+	if (typeof localStorage !== 'undefined') {
+		const stored = localStorage.getItem(STORAGE_KEY) as ThemeMode | null;
+		if (stored === 'dark' || stored === 'light') return stored;
+	}
+	if (typeof window !== 'undefined' && window.matchMedia?.('(prefers-color-scheme: light)').matches) {
+		return 'light';
+	}
+	return 'dark';
+}
+
+const initialMode = detectInitialMode();
+let mode = $state<ThemeMode>(initialMode);
+let colors = $state<ThemeColors>(initialMode === 'light' ? lightColors : darkColors);
 
 function applyToDOM(c: ThemeColors) {
 	if (typeof document === 'undefined') return;
+	document.documentElement.setAttribute('data-theme', mode);
 	const s = document.documentElement.style;
 	s.setProperty('--bg-canvas', c.bgCanvas);
 	s.setProperty('--bg-primary', c.bgPrimary);
@@ -212,7 +226,7 @@ function setMode(m: ThemeMode) {
 	colors = m === 'light' ? lightColors : darkColors;
 	applyToDOM(colors);
 	if (typeof localStorage !== 'undefined') {
-		localStorage.setItem('agent-one-theme', m);
+		localStorage.setItem(STORAGE_KEY, m);
 	}
 }
 
