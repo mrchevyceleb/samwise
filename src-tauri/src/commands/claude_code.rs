@@ -35,35 +35,43 @@ struct ClaudeCodeClosedPayload {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
+/// The Claude model Sam always uses. Single source of truth so chat and worker
+/// stay aligned. Change this string when bumping models.
+pub const CLAUDE_MODEL: &str = "claude-opus-4-7";
+
 /// Returns (executable, prefix_args) for spawning the Claude CLI.
-/// On Windows with npm install, we bypass claude.cmd to avoid cmd.exe pipe
-/// inheritance issues -- directly invoking `node cli.js` keeps stdin reliable.
-fn find_claude_command() -> (String, Vec<String>) {
-    if cfg!(target_os = "windows") {
+///
+/// On Windows with an npm install, we bypass `claude.cmd` and invoke `node cli.js`
+/// directly. `claude.cmd -> cmd.exe /c -> node cli.js` breaks stdin inheritance when
+/// combined with CREATE_NO_WINDOW, so the extra `cmd.exe` layer has to go.
+pub fn find_claude_command() -> (String, Vec<String>) {
+    #[cfg(target_os = "windows")]
+    {
         let home = std::env::var("USERPROFILE").unwrap_or_default();
-        // Official installer: direct .exe, no intermediary needed
         let local_bin = format!("{}\\.local\\bin\\claude.exe", home);
         if std::path::Path::new(&local_bin).exists() {
             return (local_bin, vec![]);
         }
-        // npm global install: bypass claude.cmd to avoid cmd.exe stdin pipe issues.
-        // claude.cmd -> cmd.exe /c -> node cli.js breaks stdin inheritance with CREATE_NO_WINDOW.
-        // Directly invoking node + cli.js avoids the cmd.exe layer entirely.
         let appdata = std::env::var("APPDATA").unwrap_or_default();
         let cli_js = format!("{}\\npm\\node_modules\\@anthropic-ai\\claude-code\\cli.js", appdata);
         if std::path::Path::new(&cli_js).exists() {
             return ("node".to_string(), vec![cli_js]);
         }
-        // Fall back to claude on PATH
-        ("claude".to_string(), vec![])
-    } else {
-        let home = std::env::var("HOME").unwrap_or_default();
-        let local_bin = format!("{}/.local/bin/claude", home);
-        if std::path::Path::new(&local_bin).exists() {
-            return (local_bin, vec![]);
-        }
-        ("claude".to_string(), vec![])
     }
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            let local_bin = format!("{}/.local/bin/claude", home);
+            if std::path::Path::new(&local_bin).exists() {
+                return (local_bin, vec![]);
+            }
+        }
+    }
+    // Last resort: resolve via PATH.
+    if let Ok(path) = which::which("claude") {
+        return (path.to_string_lossy().into_owned(), vec![]);
+    }
+    ("claude".to_string(), vec![])
 }
 
 // ── Commands ─────────────────────────────────────────────────────────
@@ -100,9 +108,11 @@ pub fn spawn_claude_code(
         .arg("--input-format").arg("stream-json")
         .arg("--verbose")
         .arg("--include-partial-messages")
-        .arg("--dangerously-skip-permissions");
+        .arg("--dangerously-skip-permissions")
+        .arg("--model").arg(CLAUDE_MODEL);
 
-    // Add extra args from the frontend (e.g. --model, --resume)
+    // Add extra args from the frontend (e.g. --resume). Note: --model is already
+    // pinned above to CLAUDE_MODEL; frontend args take precedence if they set it again.
     for arg in &args {
         command.arg(arg);
     }
@@ -231,7 +241,8 @@ pub fn claude_code_prompt(prompt: String, cwd: String) -> Result<String, String>
         .arg(&prompt)
         .arg("--output-format").arg("text")
         .arg("--max-turns").arg("1")
-        .arg("--no-input");
+        .arg("--no-input")
+        .arg("--model").arg(CLAUDE_MODEL);
 
     let cwd_path = std::path::PathBuf::from(&cwd);
     if cwd_path.exists() && cwd_path.is_dir() {

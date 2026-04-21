@@ -448,6 +448,7 @@ If Matt asks you to BUILD, FIX, IMPLEMENT, REFACTOR, RESEARCH, INVESTIGATE, or D
 - task_type "research" = investigate, analyze, read code, report findings (no PR)
 - priority: "critical", "high", "medium", "low"
 - project: the project/repo name if mentioned, otherwise omit
+- base_branch (optional): if Matt wants the worktree stacked on a feature branch instead of main/master, include e.g. "base_branch": "feature/payments". Leave out to default to the repo's main branch.
 
 ## Project Confirmation
 If Matt tagged a project with @project-name, use that project (no need to confirm).

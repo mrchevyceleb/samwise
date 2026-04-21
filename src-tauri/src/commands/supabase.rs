@@ -430,12 +430,14 @@ pub async fn supabase_load_doppler(
     let secrets: Value = serde_json::from_slice(&output.stdout)
         .map_err(|e| format!("Failed to parse Doppler output: {}", e))?;
 
+    // SB_ prefix per Matt's Doppler naming rule (full word "supabase" blocks Vercel Config Sync).
+    let pick = |k: &str| secrets.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
     let new_config = SupabaseConfig {
-        url: secrets.get("SUPABASE_URL").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-        anon_key: secrets.get("SUPABASE_ANON_KEY").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-        service_role_key: secrets.get("SUPABASE_SERVICE_ROLE_KEY").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        telegram_bot_token: secrets.get("TELEGRAM_BOT_TOKEN").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        telegram_chat_id: secrets.get("TELEGRAM_CHAT_ID").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        url: pick("SB_URL").or_else(|| pick("SUPABASE_URL")).unwrap_or_default(),
+        anon_key: pick("SB_ANON_KEY").or_else(|| pick("SUPABASE_ANON_KEY")).unwrap_or_default(),
+        service_role_key: pick("SB_SERVICE_ROLE_KEY").or_else(|| pick("SUPABASE_SERVICE_ROLE_KEY")),
+        telegram_bot_token: pick("TELEGRAM_BOT_TOKEN"),
+        telegram_chat_id: pick("TELEGRAM_CHAT_ID"),
     };
 
     let mut config = state.config.write().await;

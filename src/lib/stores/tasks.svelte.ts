@@ -82,6 +82,7 @@ export function getTaskStore() {
       repo_url?: string;
       repo_path?: string;
       preview_url?: string;
+      base_branch?: string;
       context?: Record<string, unknown>;
     }) {
       try {
@@ -97,6 +98,7 @@ export function getTaskStore() {
             repo_url: data.repo_url || null,
             repo_path: data.repo_path || null,
             preview_url: data.preview_url || null,
+            base_branch: data.base_branch || null,
             context: data.context || null,
           },
         });

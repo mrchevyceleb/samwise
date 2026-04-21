@@ -28,6 +28,7 @@ export interface AeTask {
   repo_url: string | null;
   repo_path: string | null;
   branch: string | null;
+  base_branch: string | null;
   preview_url: string | null;
   pr_url: string | null;
   pr_number: number | null;

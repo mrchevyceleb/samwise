@@ -6,7 +6,7 @@ use crate::process::async_cmd;
 /// Check if Claude Code CLI is installed and return the version string.
 #[tauri::command]
 pub async fn check_claude_code() -> Result<String, String> {
-    let (exe, prefix_args) = super::worker::find_claude_command();
+    let (exe, prefix_args) = super::claude_code::find_claude_command();
 
     let mut cmd = async_cmd(&exe);
     for arg in &prefix_args {

@@ -76,23 +76,29 @@ fn detect_port_style(script: &str) -> PortStyle {
 }
 
 /// Find an open port starting from `starting_from`, trying 20 consecutive ports.
-/// Note: TOCTOU gap between bind check and actual server start is inherent to this pattern.
-/// If the port gets claimed in the gap, the dev server will fail to start and we handle that gracefully.
+///
+/// Binds to both IPv4 and IPv6 loopback to catch dual-stack conflicts. On macOS,
+/// `TcpListener::bind("127.0.0.1:port")` will succeed even when something else is
+/// listening on `[::1]:port` — so we have to check both. This was the cause of
+/// the "screenshots show a different app" bug: find_open_port returned a port that
+/// was actually owned by another app on the IPv6 side.
+fn port_is_free(port: u16) -> bool {
+    let v4 = std::net::TcpListener::bind(format!("127.0.0.1:{}", port));
+    let v6 = std::net::TcpListener::bind(format!("[::1]:{}", port));
+    v4.is_ok() && v6.is_ok()
+}
+
 pub fn find_open_port(starting_from: u16) -> u16 {
     for port in starting_from..=starting_from + 20 {
-        if let Ok(listener) = std::net::TcpListener::bind(format!("127.0.0.1:{}", port)) {
-            drop(listener);
+        if port_is_free(port) {
             return port;
         }
     }
-    // Fallback: try a random high port
     for port in 10000..10100 {
-        if let Ok(listener) = std::net::TcpListener::bind(format!("127.0.0.1:{}", port)) {
-            drop(listener);
+        if port_is_free(port) {
             return port;
         }
     }
-    // Last resort
     9876
 }
 
@@ -130,23 +136,30 @@ pub async fn start_dev_server(
     repo_path: &str,
     dev_command: Option<&str>,
 ) -> Result<DevServerHandle, String> {
-    let (npm_script, port) = if let Some(custom_cmd) = dev_command.filter(|s| !s.is_empty()) {
-        // Custom command: detect port from the command text, find open port
-        let default_port = detect_port_from_script(custom_cmd);
-        let port = find_open_port(default_port);
-        let resolved = custom_cmd.replace("{port}", &port.to_string());
-        if !custom_cmd.contains("{port}") {
-            log::warn!("[dev_server] Custom dev_command has no {{port}} placeholder. Server may start on a different port than {} and wait_for_ready will time out.", port);
-        }
-        (resolved, port)
+    // A custom dev_command is only honored when it has a {port} placeholder.
+    // Without the placeholder we can't guarantee the server binds where we're watching,
+    // which leads to screenshots of whatever random process happens to own the port.
+    // Sam always binds in his own dedicated high-port range (47100+). Framework
+    // defaults like 5173 (Vite) or 3000 (Next) are collision magnets with other apps
+    // Matt runs on the mini. We still care about framework detection for the port
+    // *flag style* (--port vs -p vs PORT env) but the port number is always ours.
+    const SAM_PORT_START: u16 = 47100;
+    let port = find_open_port(SAM_PORT_START);
+
+    let custom_with_port = dev_command
+        .filter(|s| !s.is_empty() && s.contains("{port}"));
+
+    let npm_script = if let Some(custom_cmd) = custom_with_port {
+        custom_cmd.replace("{port}", &port.to_string())
     } else {
-        // Auto-detect from package.json
-        let (script_name, default_port) = detect_dev_command(repo_path).await?;
-        let port = find_open_port(default_port);
-        (script_name, port)
+        if dev_command.filter(|s| !s.is_empty()).is_some() {
+            log::info!("[dev_server] dev_command has no {{port}} placeholder; falling back to package.json auto-detect so we can inject port {}.", port);
+        }
+        let (script_name, _) = detect_dev_command(repo_path).await?;
+        script_name
     };
 
-    let is_custom = dev_command.filter(|s| !s.is_empty()).is_some();
+    let is_custom = custom_with_port.is_some();
 
     let mut cmd = if is_custom {
         // Custom command: execute via shell to handle paths with spaces and complex commands
@@ -251,22 +264,33 @@ async fn read_script_content(repo_path: &str, script_name: &str) -> Result<Strin
         .ok_or_else(|| format!("Script '{}' not found in package.json", script_name))
 }
 
-/// Wait for the dev server to accept TCP connections on the given port.
-pub async fn wait_for_ready(port: u16, timeout_secs: u64) -> Result<(), String> {
+/// Wait until the dev server responds at `url` with a non-error HTTP status.
+///
+/// TCP-accept is not enough: some other process on the machine can be listening
+/// on the port we think we reserved (e.g. because our dev server bound a different
+/// port than expected and a stray app owns this one). Hitting HTTP and checking
+/// status ensures we're actually talking to a real app, not a random listener.
+///
+/// 2xx/3xx = ready. 4xx/5xx keeps polling until timeout. A 404 is still "someone's
+/// answering, just not with our app yet" — if it persists the whole timeout window
+/// the caller will skip screenshots rather than capture the wrong thing.
+pub async fn wait_for_ready(url: &str, timeout_secs: u64) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .map_err(|e| format!("reqwest build: {}", e))?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    let addr = format!("127.0.0.1:{}", port);
-
     loop {
         if tokio::time::Instant::now() >= deadline {
-            return Err(format!("Dev server not ready after {}s on port {}", timeout_secs, port));
+            return Err(format!("Dev server didn't return 2xx/3xx at {} within {}s", url, timeout_secs));
         }
-
-        match tokio::net::TcpStream::connect(&addr).await {
-            Ok(_) => return Ok(()),
-            Err(_) => {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if let Ok(resp) = client.get(url).send().await {
+            let s = resp.status();
+            if s.is_success() || s.is_redirection() {
+                return Ok(());
             }
         }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }
 
@@ -275,8 +299,6 @@ pub async fn kill_dev_server(mut handle: DevServerHandle) -> Result<(), String> 
     let pid = handle.pid;
     log::info!("[dev_server] Killing dev server (pid={}, port={})", pid, handle.port);
 
-    // On Windows, use taskkill to kill the entire process tree.
-    // npm spawns child processes (node, vite, etc.) that won't die from just killing the parent.
     #[cfg(target_os = "windows")]
     {
         if pid > 0 {
@@ -299,8 +321,42 @@ pub async fn kill_dev_server(mut handle: DevServerHandle) -> Result<(), String> 
         }
     }
 
-    // Also try to kill the child directly as a fallback
-    let _ = handle.child.kill().await;
+    // On macOS/Linux, npm -> sh -> vite is 2-3 levels deep; directly killing the child
+    // only gets npm. Walk the descendant tree via pgrep -P and TERM each PID.
+    #[cfg(not(target_os = "windows"))]
+    {
+        if pid > 0 {
+            kill_tree_unix(pid).await;
+        }
+    }
 
+    let _ = handle.child.kill().await;
     Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn kill_tree_unix(pid: u32) {
+    // BFS through the descendant tree using pgrep -P.
+    let mut frontier = vec![pid];
+    let mut all = vec![pid];
+    while let Some(parent) = frontier.pop() {
+        if let Ok(out) = async_cmd("pgrep").args(["-P", &parent.to_string()]).output().await {
+            if out.status.success() {
+                for line in String::from_utf8_lossy(&out.stdout).lines() {
+                    if let Ok(child) = line.trim().parse::<u32>() {
+                        all.push(child);
+                        frontier.push(child);
+                    }
+                }
+            }
+        }
+    }
+    // TERM leaves first so parents don't respawn children, then mop up with KILL.
+    for p in all.iter().rev() {
+        let _ = async_cmd("kill").args(["-TERM", &p.to_string()]).output().await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    for p in all.iter().rev() {
+        let _ = async_cmd("kill").args(["-KILL", &p.to_string()]).output().await;
+    }
 }

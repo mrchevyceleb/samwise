@@ -30,6 +30,149 @@ impl Default for WorkerState {
     }
 }
 
+fn join_path(dir: &str, name: &str) -> String {
+    std::path::Path::new(dir).join(name).to_string_lossy().into_owned()
+}
+
+async fn run_git(args: &[&str], repo_path: &str) -> Result<String, String> {
+    let output = async_cmd("git")
+        .args(args)
+        .current_dir(repo_path)
+        .output()
+        .await
+        .map_err(|e| format!("git {:?}: {}", args, e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("git {:?}: {}", args, stderr.trim()));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+async fn detect_default_branch(repo_path: &str) -> String {
+    if let Ok(out) = run_git(&["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], repo_path).await {
+        if let Some(name) = out.rsplit('/').next() {
+            if !name.is_empty() { return name.to_string(); }
+        }
+    }
+    // Fall back to main, then master.
+    for candidate in ["main", "master"] {
+        if run_git(&["rev-parse", "--verify", &format!("origin/{}", candidate)], repo_path).await.is_ok() {
+            return candidate.to_string();
+        }
+    }
+    "main".to_string()
+}
+
+/// Returns true if the repo has any evidence of work: uncommitted changes, staged
+/// changes, untracked files, or new commits on the current branch vs the base branch.
+async fn worker_made_changes(repo_path: &str) -> bool {
+    if let Ok(out) = run_git(&["status", "--porcelain"], repo_path).await {
+        if !out.trim().is_empty() { return true; }
+    }
+    let base = detect_default_branch(repo_path).await;
+    if let Ok(count) = run_git(&["rev-list", "--count", &format!("origin/{}..HEAD", base)], repo_path).await {
+        if count.trim().parse::<u32>().unwrap_or(0) > 0 { return true; }
+    }
+    false
+}
+
+/// Path where Sam keeps his worktrees, one subdirectory per repo, one leaf per task.
+fn worktrees_root() -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("samwise")
+        .join("worktrees")
+}
+
+/// Returns the short form of a task id used for worktree paths and branch names.
+fn short_task_id(task_id: &str) -> String {
+    task_id.chars().filter(|c| c.is_ascii_hexdigit()).take(8).collect()
+}
+
+/// Compute the task branch name from a short id. Single source of truth so sweep
+/// and task-create agree.
+fn task_branch_name(short_id: &str) -> String {
+    format!("sam/{}", short_id)
+}
+
+/// Fetch latest origin state into Matt's main repo, then create a worktree for Sam
+/// to work in. Matt's checkout is never touched. Returns (worktree_path, base_branch,
+/// task_branch).
+///
+/// `base_branch_override`: when Some, use that branch as the base instead of the
+/// repo's default (main/master). Used when a task wants to stack on a feature branch.
+/// If the requested base doesn't exist on origin, returns Err so the caller can set
+/// the task to pending_confirmation.
+///
+/// If a worktree for this task already exists (follow-up work on an open PR), reuse
+/// it rather than failing. The caller is expected to have git fetch'd fresh refs.
+async fn create_task_worktree(
+    main_repo_path: &str,
+    task_id: &str,
+    base_branch_override: Option<&str>,
+) -> Result<(String, String, String), String> {
+    if tokio::fs::metadata(main_repo_path).await.is_err() {
+        return Err(format!("repo_path does not exist: {}", main_repo_path));
+    }
+    if tokio::fs::metadata(join_path(main_repo_path, ".git")).await.is_err() {
+        return Err(format!("repo_path is not a git repo: {}", main_repo_path));
+    }
+
+    run_git(&["fetch", "origin", "--prune"], main_repo_path).await?;
+    let base_branch = match base_branch_override {
+        Some(b) if !b.trim().is_empty() => {
+            let b = b.trim().to_string();
+            // Verify origin/<b> resolves before proceeding.
+            if run_git(&["rev-parse", "--verify", &format!("origin/{}", b)], main_repo_path).await.is_err() {
+                return Err(format!("base branch `origin/{}` doesn't exist on remote. Push it or pick a different base.", b));
+            }
+            b
+        }
+        _ => detect_default_branch(main_repo_path).await,
+    };
+
+    let repo_name = std::path::Path::new(main_repo_path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "repo".to_string());
+    let short_id = short_task_id(task_id);
+    let task_branch = task_branch_name(&short_id);
+    let worktree_path = worktrees_root().join(&repo_name).join(&short_id);
+    let worktree_str = worktree_path.to_string_lossy().into_owned();
+
+    if let Some(parent) = worktree_path.parent() {
+        tokio::fs::create_dir_all(parent).await
+            .map_err(|e| format!("create worktree parent dir: {}", e))?;
+    }
+
+    // Existing worktree for this task (follow-up task on an open PR)? Reuse it.
+    if tokio::fs::metadata(&worktree_path).await.is_ok() {
+        // Make sure it really is a git worktree and the branch matches.
+        if run_git(&["rev-parse", "--git-dir"], &worktree_str).await.is_ok() {
+            let _ = run_git(&["checkout", &task_branch], &worktree_str).await;
+            let _ = run_git(&["fetch", "origin", "--prune"], &worktree_str).await;
+            return Ok((worktree_str, base_branch, task_branch));
+        }
+        // Directory is there but it isn't a worktree (stale junk). Blow it away.
+        let _ = tokio::fs::remove_dir_all(&worktree_path).await;
+    }
+
+    // Create a fresh worktree off origin/<base>. Using `--force` lets us recover from
+    // a dangling worktree registration where the dir is gone but git still lists it.
+    let origin_ref = format!("origin/{}", base_branch);
+    run_git(
+        &[
+            "worktree", "add", "--force",
+            "-b", &task_branch,
+            &worktree_str,
+            &origin_ref,
+        ],
+        main_repo_path,
+    ).await?;
+
+    Ok((worktree_str, base_branch, task_branch))
+}
+
 // ── Event Payloads ──────────────────────────────────────────────────
 
 #[derive(Clone, Serialize)]
@@ -194,11 +337,38 @@ async fn worker_loop(
         agent_chat(&config, "Hey, Sam here. I'm online and ready. Drop a task or just tell me what you need.").await;
     }
 
+    // Sweep merged/closed PR worktrees on startup, and periodically thereafter.
+    // Tick is ~5s; 4320 ticks = 6h cadence.
+    const SWEEP_TICKS: u64 = 4320;
+    {
+        let (removed, kept) = sweep_merged_worktrees().await;
+        if removed > 0 {
+            log::info!("[worker] startup sweep removed {} worktree(s), kept {}", removed, kept);
+            let config = sb_config_arc.read().await.clone();
+            agent_chat(&config, &format!(
+                "Cleaned up {} worktree{} whose PRs were merged or closed while I was away. {} still in flight.",
+                removed, if removed == 1 { "" } else { "s" }, kept
+            )).await;
+        }
+    }
+
     while running.load(Ordering::Relaxed) {
         let config = sb_config_arc.read().await.clone();
 
         // Heartbeat every tick
         let _ = supabase::worker_heartbeat(&config, &machine_name).await;
+
+        // Periodic worktree sweep (every 6h). Only runs when idle to avoid racing
+        // with an in-flight task touching the same branch/worktree.
+        if tick > 0 && tick % SWEEP_TICKS == 0 {
+            let is_idle = current_task_id.lock().await.is_none();
+            if is_idle {
+                let (removed, kept) = sweep_merged_worktrees().await;
+                if removed > 0 {
+                    log::info!("[worker] periodic sweep removed {} worktree(s), kept {}", removed, kept);
+                }
+            }
+        }
 
         // Poll for tasks every 10 seconds (every 2nd tick)
         if tick % 2 == 0 {
@@ -675,33 +845,32 @@ async fn execute_task(
         }
     }
 
-    let repo_path = match repo_path {
+    let mut repo_path = match repo_path {
         Some(p) => p,
         None => {
-            // No repo_path found - cannot run Claude Code in an unknown directory
+            // Pause the task and ask Matt to wire up repo_path rather than failing.
+            // Matt can answer in chat to move it back to `queued`.
             let msg = if project_name.is_empty() {
-                "No repo_path or project set on this task. I need to know which repo to work in. Add a project or set the repo_path.".to_string()
+                "I need to know which repo to work in. Tag a project with @name in the task, or set repo_path directly and I'll pick this back up.".to_string()
             } else {
-                format!("Project \"{}\" doesn't have a repo_path configured. Add it in the Projects settings so I know where to find the code.", project_name)
+                format!("Project \"{}\" doesn't have a repo_path configured yet. Add it in Projects settings and I'll pick this back up.", project_name)
             };
             agent_comment(config, &task_id, &msg).await;
             let _ = supabase::update_task(config, &task_id, &serde_json::json!({
-                "status": "failed",
+                "status": "pending_confirmation",
                 "updated_at": chrono::Utc::now().to_rfc3339(),
             })).await;
             return Err(format!("No repo_path for task {}", task_id));
         }
     };
 
-    // Resolve branch name ONCE - only needed for code tasks
-    let branch: Option<String> = if is_research {
-        None
-    } else {
-        task.get("branch")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .or_else(|| Some(format!("agent-one/{}", uuid::Uuid::new_v4())))
-    };
+    // Matt's main clone of the repo. We never modify this — we create worktrees off it.
+    let main_repo_path = repo_path.clone();
+    // Branch is set after the worktree is created for code tasks; research leaves it None.
+    let mut branch: Option<String> = None;
+    // The actual base branch used for the worktree, so create_pr targets the right one
+    // (feature/foo if we stacked on it, not main).
+    let mut resolved_base_branch: Option<String> = None;
 
     // 1. Post initial comment
     agent_comment(config, &task_id, &format!("On it. Setting up for: {}", title)).await;
@@ -743,14 +912,40 @@ async fn execute_task(
         send_telegram(config, &format!("Working on: *{}*", escape_markdown_v2(&title))).await;
     }
 
-    // 3. Check out branch (code tasks only)
+    // 3. Create a git worktree for this task off a fresh origin/<base>. Matt's main
+    // checkout at main_repo_path is untouched (he can keep editing it while Sam works).
+    // The worktree lives at ~/samwise/worktrees/<repo>/<short_id> and persists through
+    // the PR lifecycle so follow-up tasks can reuse it. A daily sweep removes it once
+    // the PR is merged or closed.
     if !is_research {
-        if let Some(ref branch_name) = branch {
-            let _ = async_cmd("git")
-                .args(["checkout", "-B", branch_name])
-                .current_dir(&repo_path)
-                .output()
-                .await;
+        // Optional base_branch from the task row — supports stacking on feature branches
+        // instead of always basing off the default branch.
+        let base_override = task.get("base_branch")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
+
+        match create_task_worktree(&main_repo_path, &task_id, base_override).await {
+            Ok((worktree_path, base_branch, task_branch)) => {
+                agent_comment(config, &task_id, &format!(
+                    "Worktree ready at `{}` on branch `{}` off `origin/{}`.",
+                    worktree_path, task_branch, base_branch
+                )).await;
+                repo_path = worktree_path;
+                branch = Some(task_branch);
+                resolved_base_branch = Some(base_branch);
+            }
+            Err(e) => {
+                agent_comment(config, &task_id, &format!(
+                    "Can't prepare the workspace at `{}`: {}. Fix the repo_path or base_branch and I'll pick this back up.",
+                    main_repo_path, e
+                )).await;
+                let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                    "status": "pending_confirmation",
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                })).await;
+                return Err(format!("create_task_worktree failed: {}", e));
+            }
         }
     }
 
@@ -768,7 +963,7 @@ async fn execute_task(
                 match dev_server::start_dev_server(&repo_path, project_dev_command.as_deref()).await {
                     Ok(handle) => {
                         // 60s timeout: Next.js and large projects can take 30-60s on first start
-                        match dev_server::wait_for_ready(handle.port, 60).await {
+                        match dev_server::wait_for_ready(&handle.url, 60).await {
                             Ok(()) => {
                                 agent_comment(config, &task_id, &format!("Dev server running at {}", handle.url)).await;
                                 preview_url = Some(handle.url.clone());
@@ -789,14 +984,19 @@ async fn execute_task(
     }
 
     // 4. Take BEFORE screenshots if preview_url is set (code tasks only)
-    let screenshot_dir = format!("C:\\agent-one-screenshots\\{}", task_id);
+    let screenshot_dir = dirs::cache_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("agent-one-screenshots")
+        .join(&task_id)
+        .to_string_lossy()
+        .into_owned();
     if !is_research {
         if let Some(ref preview) = preview_url {
             let _ = tokio::fs::create_dir_all(&screenshot_dir).await;
             agent_comment(config, &task_id, "Taking before screenshots...").await;
 
-            let _ = take_screenshot(preview, &format!("{}\\before-desktop.png", screenshot_dir), "1280,720").await;
-            let _ = take_screenshot(preview, &format!("{}\\before-mobile.png", screenshot_dir), "393,852").await;
+            let _ = take_screenshot(preview, &join_path(&screenshot_dir, "before-desktop.png"), "1280,720").await;
+            let _ = take_screenshot(preview, &join_path(&screenshot_dir, "before-mobile.png"), "393,852").await;
         }
     }
 
@@ -808,7 +1008,7 @@ async fn execute_task(
     let mut prompt_parts: Vec<String> = Vec::new();
 
     // Read CLAUDE.md if it exists in the repo
-    let claude_md_path = format!("{}\\CLAUDE.md", repo_path);
+    let claude_md_path = join_path(&repo_path, "CLAUDE.md");
     if let Ok(claude_md) = tokio::fs::read_to_string(&claude_md_path).await {
         let claude_md_truncated = truncate(&claude_md, 2000);
         prompt_parts.push(format!("## Project Instructions (from CLAUDE.md)\n{}\n", claude_md_truncated));
@@ -881,36 +1081,50 @@ async fn execute_task(
         ));
     } else {
         prompt_parts.push(format!(
-            "## Task\n**{}**\n\n{}\n\n## Instructions\nComplete this task. Make all necessary code changes. Be thorough but focused. Commit your changes when done.",
-            title, description
+            "## Task\n**{title}**\n\n{description}\n\n\
+## Instructions\n\
+Make the code changes required by this task. You have approval to edit \
+any file in this repo \u{2014} do not ask for confirmation before writing.\n\n\
+Explore only what the task needs. Do not read the whole codebase or add \
+unrelated cleanup \u{2014} those will bloat the diff and slow review.\n\n\
+When you are done making changes, run:\n\
+```\n\
+git add -A && git commit -m \"{title}\"\n\
+```\n\
+Then stop. Do not open the PR yourself \u{2014} that is handled after this step.\n\n\
+If the task is genuinely ambiguous and you cannot proceed without a decision \
+from Matt, stop without making changes and explain specifically what you need clarified."
         ));
     }
 
     let prompt = prompt_parts.join("\n");
 
-    // 30-minute timeout for task execution, 50 max turns to prevent runaway sessions
-    // Use streaming version to post real-time progress comments
-    let claude_result = run_claude_code_streaming(&repo_path, &prompt, 50, 1800, config, &task_id, process_id_slot.clone()).await;
+    // 30-minute timeout, 20 max turns. 20 is enough for any focused single-task edit
+    // and keeps Claude from drifting into open-ended exploration.
+    let claude_result = run_claude_code_streaming(&repo_path, &prompt, 20, 1800, config, &task_id, process_id_slot.clone()).await;
     // Clear PID after process completes
     { let mut pid = process_id_slot.lock().await; *pid = None; }
 
     let task_result = match claude_result {
-        Ok(output) if output.is_empty() => {
-            // Claude Code exited cleanly but produced no output - wrong directory or no-op
-            agent_comment(config, &task_id, "Claude Code produced no output. The repo_path may be wrong or the task didn't result in any work. Re-check the project settings.").await;
+        Ok(output) if !is_research && !worker_made_changes(&repo_path).await => {
+            // Code task finished with zero changes (nothing committed, nothing staged,
+            // nothing untracked). Distinct from a task failure: Claude read the code and
+            // concluded there was nothing to do, or the task was unclear. Route to
+            // review so Matt can decide if it's really done or needs more context.
+            let summary = truncate(&output, 800);
+            let msg = if summary.trim().is_empty() {
+                "I looked at this but didn't change anything. Either the task is already done or I wasn't sure what to do. Mark it done, or reply with more context and requeue.".to_string()
+            } else {
+                format!("I looked at this but didn't change anything. What I considered:\n\n{}\n\nMark it done, or reply with more context and requeue.", summary)
+            };
+            agent_comment(config, &task_id, &msg).await;
             let _ = supabase::update_task(config, &task_id, &serde_json::json!({
-                "status": "failed",
+                "status": "review",
                 "updated_at": chrono::Utc::now().to_rfc3339(),
             })).await;
-            if notify_task_failed {
-                send_telegram(config, &format!(
-                    "Hit a snag on *{}*: Claude Code produced no output",
-                    escape_markdown_v2(&title)
-                )).await;
-            }
             if let Some(h) = dev_server_handle.take() { let _ = dev_server::kill_dev_server(h).await; }
-            cleanup_branch(&repo_path, &branch).await;
-            return Err("Claude Code produced no output".to_string());
+            // Leave the worktree in place; daily sweep will reap it after 48h if no PR shows up.
+            return Ok("No changes made; routed to review".to_string());
         }
         Ok(output) => {
             let summary = truncate(&output, 500);
@@ -955,25 +1169,45 @@ async fn execute_task(
             let comment_output = truncate(&output, 10_000);
             agent_comment(config, &task_id, &format!("Code changes done. Here's what I did:\n\n{}", comment_output)).await;
 
-            // 6. Take AFTER screenshots
+            // 5b. Run /codex-fix in the worktree to get a Codex review of the diff and auto-apply
+            // any must-fix/should-fix edits. Runs BEFORE screenshots + QA so QA validates the
+            // final state. Any edits codex-fix makes are committed separately so the PR shows
+            // a clear "task commit" + "codex-fix commit" history.
+            agent_comment(config, &task_id, "Running /codex-fix for a review pass before QA...").await;
+            let codex_result = run_claude_code_streaming(
+                &repo_path, "/codex-fix", 30, 1200, config, &task_id, process_id_slot.clone()
+            ).await;
+            { let mut pid = process_id_slot.lock().await; *pid = None; }
+            match codex_result {
+                Ok(_) => {
+                    let porcelain = run_git(&["status", "--porcelain"], &repo_path).await.unwrap_or_default();
+                    if porcelain.trim().is_empty() {
+                        agent_comment(config, &task_id, "codex-fix found nothing to change.").await;
+                    } else {
+                        let _ = run_git(&["add", "-A"], &repo_path).await;
+                        match run_git(&["commit", "-m", "codex-fix: apply review feedback"], &repo_path).await {
+                            Ok(_) => {
+                                agent_comment(config, &task_id, "Applied codex-fix suggestions in a follow-up commit.").await;
+                            }
+                            Err(e) => {
+                                log::warn!("[worker] codex-fix commit failed: {}", e);
+                                agent_comment(config, &task_id, &format!("codex-fix edited files but the commit failed ({}). Changes still staged.", e)).await;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("[worker] /codex-fix failed: {}", e);
+                    agent_comment(config, &task_id, &format!("codex-fix didn't complete cleanly ({}). Proceeding to QA.", e)).await;
+                }
+            }
+
+            // 6. Take AFTER screenshots (may be re-taken inside the QA retry loop below)
             if let Some(ref preview) = preview_url {
                 agent_comment(config, &task_id, "Taking after screenshots...").await;
 
-                let _ = take_screenshot(preview, &format!("{}\\after-desktop.png", screenshot_dir), "1280,720").await;
-                let _ = take_screenshot(preview, &format!("{}\\after-mobile.png", screenshot_dir), "393,852").await;
-            }
-
-            // 6b. Upload screenshots to Supabase Storage and update task with public URLs
-            if preview_url.is_some() {
-                let (urls, _) = upload_screenshots_to_storage(config, &task_id, &screenshot_dir).await
-                    .unwrap_or_default();
-                // Split into before (first 2) and after (last 2)
-                let before_urls: Vec<&String> = urls.iter().filter(|u| u.contains("before-")).collect();
-                let after_urls: Vec<&String> = urls.iter().filter(|u| u.contains("after-")).collect();
-                let _ = supabase::update_task(config, &task_id, &serde_json::json!({
-                    "screenshots_before": before_urls,
-                    "screenshots_after": after_urls,
-                })).await;
+                let _ = take_screenshot(preview, &join_path(&screenshot_dir, "after-desktop.png"), "1280,720").await;
+                let _ = take_screenshot(preview, &join_path(&screenshot_dir, "after-mobile.png"), "393,852").await;
             }
 
             // Mark first unchecked subtask as done (re-fetch fresh subtasks to avoid stale data)
@@ -1044,36 +1278,134 @@ async fn execute_task(
                 }
             }
 
-            // 7. Visual QA (if preview_url set)
+            // 7. Visual QA with self-correct loop.
+            // If QA flags a problem, feed the explanation back to Claude Code as a fix-it
+            // prompt, re-screenshot, re-QA. Up to MAX_QA_ATTEMPTS (3) total attempts so
+            // Sam can't spiral. On exhaustion we push anyway with an honest note.
+            const MAX_QA_ATTEMPTS: u32 = 3;
             let _ = supabase::update_task(config, &task_id, &serde_json::json!({
                 "status": "testing",
                 "updated_at": chrono::Utc::now().to_rfc3339(),
             })).await;
 
+            let mut qa_attempts: u32 = 0;
+            let mut final_qa: Option<(bool, String)> = None;
+
             if preview_url.is_some() {
-                agent_comment(config, &task_id, "Running visual QA...").await;
+                loop {
+                    qa_attempts += 1;
+                    let starting_msg = if qa_attempts == 1 {
+                        "Running visual QA...".to_string()
+                    } else {
+                        format!("Re-running visual QA (attempt {}/{})...", qa_attempts, MAX_QA_ATTEMPTS)
+                    };
+                    agent_comment(config, &task_id, &starting_msg).await;
 
-                let qa_result = run_visual_qa(&repo_path, &title, &description, &screenshot_dir).await;
-                match qa_result {
-                    Ok((passed, explanation)) => {
-                        let _ = supabase::update_task(config, &task_id, &serde_json::json!({
-                            "visual_qa_result": { "pass": passed, "explanation": explanation },
-                        })).await;
+                    match run_visual_qa(&repo_path, &title, &description, &screenshot_dir).await {
+                        Ok((passed, explanation)) => {
+                            if passed {
+                                let msg = if qa_attempts == 1 {
+                                    format!("Visual QA passed. {}", explanation)
+                                } else {
+                                    format!("Visual QA passed on attempt {}/{}. {}", qa_attempts, MAX_QA_ATTEMPTS, explanation)
+                                };
+                                agent_comment(config, &task_id, &msg).await;
+                                final_qa = Some((true, explanation));
+                                break;
+                            }
 
-                        if passed {
-                            agent_comment(config, &task_id, &format!("Visual QA passed. {}", explanation)).await;
-                        } else {
-                            agent_comment(config, &task_id, &format!("Visual QA caught something: {}. Pushing anyway so you can take a look.", explanation)).await;
+                            final_qa = Some((false, explanation.clone()));
+
+                            if qa_attempts >= MAX_QA_ATTEMPTS {
+                                agent_comment(config, &task_id, &format!(
+                                    "QA still flagging after {} attempts: {}. Pushing anyway with a note so you can review.",
+                                    MAX_QA_ATTEMPTS, explanation
+                                )).await;
+                                break;
+                            }
+
+                            agent_comment(config, &task_id, &format!(
+                                "QA flagged: {}. Having a go at fixing it (attempt {}/{}).",
+                                explanation, qa_attempts + 1, MAX_QA_ATTEMPTS
+                            )).await;
+
+                            let fix_prompt = format!(
+                                "## Fix visual QA feedback\n\n\
+The visual QA reviewer looked at before/after screenshots of your last changes \
+and flagged this problem:\n\n\
+> {explanation}\n\n\
+## Original task\n\
+**{title}**\n\n\
+{description}\n\n\
+## Instructions\n\
+Your previous changes are already committed on this branch. Make additional edits \
+to fix *only* the issue QA described. Don't add unrelated changes or touch files \
+that weren't involved.\n\n\
+When done, run `git add -A && git commit -m \"fix: address QA feedback\"` and stop."
+                            );
+
+                            let fix_result = run_claude_code_streaming(
+                                &repo_path, &fix_prompt, 15, 900, config, &task_id, process_id_slot.clone()
+                            ).await;
+                            { let mut pid = process_id_slot.lock().await; *pid = None; }
+
+                            if let Err(e) = fix_result {
+                                agent_comment(config, &task_id, &format!(
+                                    "Fix attempt {} errored: {}. Pushing what we have.", qa_attempts, e
+                                )).await;
+                                break;
+                            }
+
+                            // Re-take AFTER screenshots so the next QA round sees the fixed app.
+                            if let Some(ref preview) = preview_url {
+                                let _ = take_screenshot(preview, &join_path(&screenshot_dir, "after-desktop.png"), "1280,720").await;
+                                let _ = take_screenshot(preview, &join_path(&screenshot_dir, "after-mobile.png"), "393,852").await;
+                            }
+                        }
+                        Err(e) => {
+                            agent_comment(config, &task_id, &format!("Visual QA couldn't run: {}. Skipping.", e)).await;
+                            break;
                         }
                     }
-                    Err(e) => {
-                        agent_comment(config, &task_id, &format!("Visual QA couldn't run: {}. Skipping.", e)).await;
-                    }
+                }
+
+                if let Some((passed, explanation)) = &final_qa {
+                    let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                        "visual_qa_result": { "pass": passed, "explanation": explanation, "attempts": qa_attempts },
+                    })).await;
                 }
             }
 
-            // 8. Create PR (branch is already resolved, no UUID regeneration)
-            let pr_result = create_pr(config, &repo_path, &title, &description, &task_id, &branch, &screenshot_dir, preview_url.is_some()).await;
+            // 7b. Upload the (possibly revised) screenshots to Supabase Storage now that
+            // the QA loop has settled. Task record points at the final images only.
+            if preview_url.is_some() {
+                let (urls, _) = upload_screenshots_to_storage(config, &task_id, &screenshot_dir).await
+                    .unwrap_or_default();
+                let before_urls: Vec<&String> = urls.iter().filter(|u| u.contains("before-")).collect();
+                let after_urls: Vec<&String> = urls.iter().filter(|u| u.contains("after-")).collect();
+                let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                    "screenshots_before": before_urls,
+                    "screenshots_after": after_urls,
+                })).await;
+            }
+
+            let qa_note_for_pr = match &final_qa {
+                Some((false, explanation)) => Some(format!(
+                    "\n\n> **Visual QA flagged after {} attempt{}:** {}",
+                    qa_attempts,
+                    if qa_attempts == 1 { "" } else { "s" },
+                    explanation
+                )),
+                _ => None,
+            };
+
+            // 8. Create PR targeting the branch we stacked on (not always main/master).
+            let pr_result = create_pr(
+                config, &repo_path, &title, &description, &task_id,
+                &branch, resolved_base_branch.as_deref(),
+                &screenshot_dir, preview_url.is_some(),
+                qa_note_for_pr.as_deref(),
+            ).await;
 
             match pr_result {
                 Ok(pr_url) => {
@@ -1131,45 +1463,117 @@ async fn execute_task(
         let _ = dev_server::kill_dev_server(h).await;
     }
 
-    // Cleanup: switch back to default branch and delete the local feature branch.
-    // The remote branch persists for the PR; this just prevents local accumulation.
-    cleanup_branch(&repo_path, &branch).await;
-
+    // Worktree persists on disk. If the PR opened successfully, it lives until merged
+    // or closed (daily sweep reaps it then). If no PR materialized, the sweep treats it
+    // as orphaned after 48h and removes it.
+    let _ = &main_repo_path; // kept for sweep-side use; silence unused-warning if any
     task_result
 }
 
-/// Clean up local feature branch after task execution.
-/// Discards uncommitted changes, switches to base branch, and safely deletes the feature branch.
-/// Uses `-d` (not `-D`) to refuse deleting branches with unpushed commits.
-async fn cleanup_branch(repo_path: &str, branch: &Option<String>) {
-    let Some(ref branch_name) = branch else { return; };
+/// Resolve the main repo path for a linked worktree by asking git.
+/// `git -C <wt> rev-parse --git-common-dir` points at <main>/.git; the parent is the main repo.
+async fn main_repo_for_worktree(wt_str: &str) -> Option<String> {
+    let common_dir = run_git(&["rev-parse", "--git-common-dir"], wt_str).await.ok()?;
+    let common_dir = common_dir.trim();
+    let abs = if std::path::Path::new(common_dir).is_absolute() {
+        std::path::PathBuf::from(common_dir)
+    } else {
+        std::path::PathBuf::from(wt_str).join(common_dir)
+    };
+    abs.parent().map(|p| p.to_string_lossy().into_owned())
+}
 
-    // Discard any uncommitted changes (failed tasks may leave dirty worktree)
-    if let Err(e) = async_cmd("git").args(["reset", "--hard"]).current_dir(repo_path).output().await {
-        log::warn!("[worker] Branch cleanup: git reset --hard failed: {}", e);
-    }
-    if let Err(e) = async_cmd("git").args(["clean", "-fd"]).current_dir(repo_path).output().await {
-        log::warn!("[worker] Branch cleanup: git clean -fd failed: {}", e);
+/// Walk ~/samwise/worktrees/<repo>/<short_id>, query the matching PR via `gh pr list
+/// --head sam/<short_id>`, and remove worktrees whose PRs are merged or closed. Worktrees
+/// without a PR that are >48h old are treated as orphans (crashed task) and removed too.
+/// Returns (removed, kept).
+async fn sweep_merged_worktrees() -> (usize, usize) {
+    let root = worktrees_root();
+    if tokio::fs::metadata(&root).await.is_err() {
+        return (0, 0);
     }
 
-    // Switch back to default branch
-    let base = detect_base_branch(repo_path).await;
-    let checkout = async_cmd("git").args(["checkout", &base]).current_dir(repo_path).output().await;
-    match checkout {
-        Ok(out) if out.status.success() => {
-            // Safe delete: -d refuses if commits aren't pushed (prevents data loss)
-            if let Err(e) = async_cmd("git").args(["branch", "-d", branch_name]).current_dir(repo_path).output().await {
-                log::warn!("[worker] Branch cleanup: git branch -d failed: {}", e);
+    let mut removed = 0usize;
+    let mut kept = 0usize;
+    let mut touched_main_repos: std::collections::HashSet<String> = Default::default();
+
+    let Ok(mut repos) = tokio::fs::read_dir(&root).await else { return (0, 0); };
+    while let Ok(Some(repo_entry)) = repos.next_entry().await {
+        let repo_dir = repo_entry.path();
+        if !repo_dir.is_dir() { continue; }
+        let Ok(mut wts) = tokio::fs::read_dir(&repo_dir).await else { continue; };
+        while let Ok(Some(wt_entry)) = wts.next_entry().await {
+            let wt_path = wt_entry.path();
+            if !wt_path.is_dir() { continue; }
+            let wt_str = wt_path.to_string_lossy().into_owned();
+            let short_id = wt_path.file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let branch = task_branch_name(&short_id);
+
+            let Some(main_repo) = main_repo_for_worktree(&wt_str).await else {
+                kept += 1;
+                continue;
+            };
+            touched_main_repos.insert(main_repo.clone());
+
+            let pr_state = async_cmd("gh")
+                .args(["pr", "list", "--head", &branch, "--state", "all", "--json", "state", "--limit", "1"])
+                .current_dir(&main_repo)
+                .output().await;
+
+            let (should_remove, reason) = match pr_state {
+                Ok(out) if out.status.success() => {
+                    let body = String::from_utf8_lossy(&out.stdout);
+                    let body = body.trim();
+                    if body.contains("\"state\":\"MERGED\"") {
+                        (true, "PR merged")
+                    } else if body.contains("\"state\":\"CLOSED\"") {
+                        (true, "PR closed")
+                    } else if body == "[]" {
+                        let age_secs = wt_entry.metadata().await.ok()
+                            .and_then(|m| m.modified().ok())
+                            .and_then(|t| t.elapsed().ok())
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        if age_secs > 48 * 3600 {
+                            (true, "orphan (no PR, >48h)")
+                        } else {
+                            (false, "no PR yet")
+                        }
+                    } else {
+                        (false, "PR open")
+                    }
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    log::warn!("[sweep] gh pr list failed for {}: {}", branch, stderr.trim());
+                    (false, "gh failed")
+                }
+                Err(e) => {
+                    log::warn!("[sweep] gh invocation failed: {}", e);
+                    (false, "gh failed")
+                }
+            };
+
+            if should_remove {
+                log::info!("[sweep] removing worktree {} ({})", wt_str, reason);
+                let _ = run_git(&["worktree", "remove", "--force", &wt_str], &main_repo).await;
+                let _ = run_git(&["branch", "-D", &branch], &main_repo).await;
+                let _ = tokio::fs::remove_dir_all(&wt_path).await;
+                removed += 1;
+            } else {
+                kept += 1;
             }
         }
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            log::warn!("[worker] Branch cleanup: checkout {} failed: {}", base, stderr.trim());
-        }
-        Err(e) => {
-            log::warn!("[worker] Branch cleanup: checkout {} failed: {}", base, e);
-        }
     }
+
+    // Drop any dangling worktree entries whose directories went away outside our flow.
+    for main_repo in touched_main_repos {
+        let _ = run_git(&["worktree", "prune"], &main_repo).await;
+    }
+
+    (removed, kept)
 }
 
 // Chat message processing has been moved to commands/chat.rs (direct API, no worker dependency)
@@ -1739,7 +2143,7 @@ async fn expire_pending_confirmations(config: &SupabaseConfig) {
 /// Pass 0 for either to use defaults (no limit / no timeout).
 /// Also used by commands/chat.rs for direct chat responses.
 pub async fn run_claude_code_opts(cwd: &str, prompt: &str, max_turns: u32, timeout_secs: u64) -> Result<String, String> {
-    let (exe, prefix_args) = find_claude_command();
+    let (exe, prefix_args) = super::claude_code::find_claude_command();
 
     let mut cmd = async_cmd(&exe);
     for arg in &prefix_args {
@@ -1750,7 +2154,9 @@ pub async fn run_claude_code_opts(cwd: &str, prompt: &str, max_turns: u32, timeo
         .arg(prompt)
         .arg("--output-format")
         .arg("text")
-        .arg("--dangerously-skip-permissions");
+        .arg("--dangerously-skip-permissions")
+        .arg("--model")
+        .arg(super::claude_code::CLAUDE_MODEL);
 
     if max_turns > 0 {
         cmd.arg("--max-turns").arg(max_turns.to_string());
@@ -1822,7 +2228,7 @@ pub async fn run_claude_code_streaming(
     task_id: &str,
     process_id_slot: Arc<tokio::sync::Mutex<Option<u32>>>,
 ) -> Result<String, String> {
-    let (exe, prefix_args) = find_claude_command();
+    let (exe, prefix_args) = super::claude_code::find_claude_command();
 
     let mut cmd = async_cmd(&exe);
     for arg in &prefix_args {
@@ -1834,7 +2240,9 @@ pub async fn run_claude_code_streaming(
         .arg("--output-format")
         .arg("stream-json")
         .arg("--verbose")
-        .arg("--dangerously-skip-permissions");
+        .arg("--dangerously-skip-permissions")
+        .arg("--model")
+        .arg(super::claude_code::CLAUDE_MODEL);
 
     if max_turns > 0 {
         cmd.arg("--max-turns").arg(max_turns.to_string());
@@ -1999,48 +2407,31 @@ pub async fn run_claude_code_streaming(
     Ok(result_text.trim().to_string())
 }
 
-/// Returns (executable, prefix_args) for spawning the Claude CLI.
-/// On Windows with npm install, we bypass claude.cmd to avoid cmd.exe pipe
-/// inheritance issues - directly invoking `node cli.js` keeps stdin reliable.
-/// (Pattern borrowed from assistantos-v2's proven implementation.)
-pub fn find_claude_command() -> (String, Vec<String>) {
-    if cfg!(target_os = "windows") {
-        let home = std::env::var("USERPROFILE").unwrap_or_default();
-        // Official installer: direct .exe, no intermediary needed
-        let local_bin = format!("{}\\.local\\bin\\claude.exe", home);
-        if std::path::Path::new(&local_bin).exists() { return (local_bin, vec![]); }
-        let appdata = std::env::var("APPDATA").unwrap_or_default();
-        // npm global install: bypass claude.cmd to avoid cmd.exe stdin pipe issues.
-        // claude.cmd -> cmd.exe /c -> node cli.js breaks stdin with CREATE_NO_WINDOW.
-        // Directly invoking node + cli.js avoids the cmd.exe layer entirely.
-        let cli_js = format!("{}\\npm\\node_modules\\@anthropic-ai\\claude-code\\cli.js", appdata);
-        if std::path::Path::new(&cli_js).exists() { return ("node".to_string(), vec![cli_js]); }
-        // Fall back to claude on PATH
-        ("claude".to_string(), vec![])
-    } else {
-        let home = std::env::var("HOME").unwrap_or_default();
-        let local_bin = format!("{}/.local/bin/claude", home);
-        if std::path::Path::new(&local_bin).exists() { return (local_bin, vec![]); }
-        ("claude".to_string(), vec![])
-    }
-}
-
-// Backwards-compat shim for imports that expect the old signature
-pub fn find_claude_exe() -> String {
-    find_claude_command().0
-}
-
-/// Take a screenshot using Playwright
+/// Take a screenshot using Playwright (headless chromium).
+/// Retries once if the first capture fails, since the app may still be hydrating.
 async fn take_screenshot(url: &str, output_path: &str, viewport: &str) -> Result<(), String> {
-    let output = async_cmd("npx")
-        .args(["playwright", "screenshot", url, output_path, "--viewport-size", viewport])
-        .output()
-        .await
-        .map_err(|e| format!("Playwright failed: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Screenshot failed: {}", stderr.trim()));
+    for attempt in 1..=2 {
+        let output = async_cmd("npx")
+            .args([
+                "playwright", "screenshot",
+                "--browser", "chromium",
+                "--viewport-size", viewport,
+                // Give the SPA a beat to mount before the snapshot.
+                "--wait-for-timeout", "2000",
+                "--timeout", "30000",
+                url, output_path,
+            ])
+            .output()
+            .await
+            .map_err(|e| format!("Playwright failed: {}", e))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        if attempt == 2 {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("playwright screenshot: {}", stderr.trim()));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
     }
     Ok(())
 }
@@ -2050,13 +2441,13 @@ async fn take_screenshot(url: &str, output_path: &str, viewport: &str) -> Result
 /// Retries once with a stricter prompt if JSON parsing fails.
 async fn run_visual_qa(cwd: &str, title: &str, description: &str, screenshot_dir: &str) -> Result<(bool, String), String> {
     // Copy screenshots into the working directory so Claude Code can access them
-    let agent_dir = format!("{}\\.agent-one", cwd);
+    let agent_dir = join_path(cwd, ".agent-one");
     let _ = tokio::fs::create_dir_all(&agent_dir).await;
 
     let screenshot_names = ["before-desktop.png", "after-desktop.png", "before-mobile.png", "after-mobile.png"];
     for name in &screenshot_names {
-        let src = format!("{}\\{}", screenshot_dir, name);
-        let dst = format!("{}\\{}", agent_dir, name);
+        let src = join_path(screenshot_dir, name);
+        let dst = join_path(&agent_dir, name);
         let _ = tokio::fs::copy(&src, &dst).await;
     }
 
@@ -2192,7 +2583,7 @@ async fn upload_screenshots_to_storage(
     let screenshot_names = ["before-desktop.png", "after-desktop.png", "before-mobile.png", "after-mobile.png"];
 
     for name in &screenshot_names {
-        let local_path = format!("{}\\{}", screenshot_dir, name);
+        let local_path = join_path(screenshot_dir, name);
         if tokio::fs::metadata(&local_path).await.is_ok() {
             let storage_path = format!("{}/{}", task_id, name);
             match supabase::upload_to_storage(config, "agent-one-screenshots", &storage_path, &local_path).await {
@@ -2226,43 +2617,67 @@ async fn create_pr(
     description: &str,
     task_id: &str,
     branch: &Option<String>,
+    base_branch_override: Option<&str>,
     screenshot_dir: &str,
     has_screenshots: bool,
+    qa_note: Option<&str>,
 ) -> Result<String, String> {
     // Branch should already be resolved by execute_task, but fallback just in case
     let branch_name = branch.clone().unwrap_or_else(|| "agent-one/patch".to_string());
-    let base_branch = detect_base_branch(repo_path).await;
+    let base_branch = match base_branch_override {
+        Some(b) if !b.is_empty() => b.to_string(),
+        _ => detect_base_branch(repo_path).await,
+    };
 
-    // Ensure we're on the right branch
+    // We should already be on branch_name from prepare_workspace; checkout (not -B)
+    // so we fail loudly if somehow we're not, instead of blowing away the branch ref.
     let _ = async_cmd("git")
-        .args(["checkout", "-B", &branch_name])
+        .args(["checkout", &branch_name])
         .current_dir(repo_path)
         .output()
         .await;
 
     // Add .agent-one to .gitignore if not already there
-    let gitignore_path = format!("{}\\.gitignore", repo_path);
+    let gitignore_path = join_path(repo_path, ".gitignore");
     if let Ok(contents) = tokio::fs::read_to_string(&gitignore_path).await {
         if !contents.contains(".agent-one") {
             let _ = tokio::fs::write(&gitignore_path, format!("{}\n.agent-one/\n", contents.trim_end())).await;
         }
     }
 
-    // Stage all changes (but NOT .agent-one screenshots)
+    // Stage anything Claude left uncommitted (usually nothing; the prompt asks him to commit).
     let stage = async_cmd("git").args(["add", "-A"]).current_dir(repo_path).output().await.map_err(|e| format!("git add failed: {}", e))?;
     if !stage.status.success() { return Err("git add failed".to_string()); }
 
-    // Check if there are changes
-    let diff = async_cmd("git").args(["diff", "--cached", "--quiet"]).current_dir(repo_path).output().await.map_err(|e| format!("git diff check failed: {}", e))?;
-    if diff.status.success() { return Err("No changes to commit".to_string()); }
+    let has_staged = !async_cmd("git")
+        .args(["diff", "--cached", "--quiet"])
+        .current_dir(repo_path)
+        .output().await
+        .map_err(|e| format!("git diff check failed: {}", e))?
+        .status.success();
 
-    // Commit
-    let commit_msg = format!("samwise: {}", title);
-    let commit = async_cmd("git").args(["commit", "-m", &commit_msg]).current_dir(repo_path).output().await.map_err(|e| format!("git commit failed: {}", e))?;
-    if !commit.status.success() {
-        let stderr = String::from_utf8_lossy(&commit.stderr);
-        return Err(format!("git commit failed: {}", stderr));
+    let commits_ahead: u32 = async_cmd("git")
+        .args(["rev-list", "--count", &format!("origin/{}..HEAD", base_branch)])
+        .current_dir(repo_path)
+        .output().await
+        .ok()
+        .and_then(|o| if o.status.success() { String::from_utf8(o.stdout).ok() } else { None })
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+
+    if has_staged {
+        // Claude didn't commit (or left leftovers); commit them for him.
+        let commit_msg = format!("samwise: {}", title);
+        let commit = async_cmd("git").args(["commit", "-m", &commit_msg]).current_dir(repo_path).output().await.map_err(|e| format!("git commit failed: {}", e))?;
+        if !commit.status.success() {
+            let stderr = String::from_utf8_lossy(&commit.stderr);
+            return Err(format!("git commit failed: {}", stderr));
+        }
+    } else if commits_ahead == 0 {
+        // Nothing staged AND no new commits vs base -> genuinely no work done.
+        return Err("No changes on branch vs base".to_string());
     }
+    // else: Claude already committed, nothing staged -> just push what's on the branch.
 
     // Push
     let push = async_cmd("git").args(["push", "-u", "origin", &branch_name]).current_dir(repo_path).output().await.map_err(|e| format!("git push failed: {}", e))?;
@@ -2278,7 +2693,10 @@ async fn create_pr(
             .unwrap_or_default();
         pr_body.push_str(&screenshot_md);
     }
-    pr_body.push_str("---\nAutomated by SamWise");
+    if let Some(note) = qa_note {
+        pr_body.push_str(note);
+    }
+    pr_body.push_str("\n\n---\nAutomated by SamWise");
 
     // Create PR with explicit base branch
     let pr = async_cmd("gh")

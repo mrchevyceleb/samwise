@@ -19,6 +19,7 @@
 	let repoUrl = $state('');
 	let repoPath = $state('');
 	let previewUrl = $state('');
+	let baseBranch = $state('');
 	let saving = $state(false);
 	let quickMode = $state(true);
 	let priorityManuallySet = $state(false);
@@ -129,6 +130,7 @@
 				repo_url: repoUrl.trim() || undefined,
 				repo_path: repoPath.trim() || undefined,
 				preview_url: previewUrl.trim() || undefined,
+				base_branch: baseBranch.trim() || undefined,
 			});
 			onClose();
 		} finally {
@@ -329,6 +331,23 @@
 						type="text"
 						bind:value={previewUrl}
 						placeholder="https://my-app.vercel.app"
+						style="
+							width: 100%; padding: 10px 12px;
+							background: var(--bg-primary); border: 1px solid var(--border-default);
+							border-radius: 8px; color: var(--text-primary);
+							font-family: var(--font-mono); font-size: 12px;
+							outline: none; transition: border-color 0.15s;
+						"
+					/>
+				</div>
+				<div style="margin-bottom: 14px; animation: slide-in-top 0.15s ease;">
+					<label style="font-size: 11px; font-weight: 600; color: var(--text-secondary); display: block; margin-bottom: 4px;">
+						Base branch <span style="font-weight: 400; color: var(--text-muted);">(leave blank for main/master)</span>
+					</label>
+					<input
+						type="text"
+						bind:value={baseBranch}
+						placeholder="feature/payments"
 						style="
 							width: 100%; padding: 10px 12px;
 							background: var(--bg-primary); border: 1px solid var(--border-default);
