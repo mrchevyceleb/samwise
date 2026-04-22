@@ -63,13 +63,24 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
-            if cfg!(debug_assertions) {
-                app.handle().plugin(
-                    tauri_plugin_log::Builder::default()
-                        .level(log::LevelFilter::Info)
-                        .build(),
-                )?;
-            }
+            // Always initialize logging, including in release builds.
+            // Previously this was gated behind cfg!(debug_assertions), which
+            // meant the launchd-run production binary had NO logger at all:
+            // every log::info!/warn!/error! silently dropped, and Claude
+            // Code subprocess failures surfaced with empty diagnostics.
+            // Targets: stdout (captured by launchd into samwise.out.log) and
+            // a rotating file in the app's log dir as a durable fallback.
+            app.handle().plugin(
+                tauri_plugin_log::Builder::default()
+                    .level(log::LevelFilter::Info)
+                    .targets([
+                        tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
+                        tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
+                            file_name: Some("samwise".to_string()),
+                        }),
+                    ])
+                    .build(),
+            )?;
 
             // Build system tray
             let show_item = MenuItemBuilder::with_id("show", "Show SamWise").build(app)?;
