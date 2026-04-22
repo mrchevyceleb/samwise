@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tauri::{Emitter, Manager};
 
 use super::dev_server;
+use super::review;
 use super::supabase::{self, SupabaseConfig, SupabaseState};
 use crate::process::async_cmd;
 
@@ -1172,7 +1173,7 @@ from Matt, stop without making changes and explain specifically what you need cl
 
                 match artifact_result {
                     Ok(_) => {
-                        agent_comment(config, &task_id, "Analysis complete. Full report saved -- click the Report tab above to read it.").await;
+                        agent_comment(config, &task_id, "Analysis complete. Full report saved. Click the Report tab above to read it.").await;
                     }
                     Err(e) => {
                         log::warn!("[worker] Failed to save artifact: {}", e);
@@ -1549,6 +1550,35 @@ When done, run `git add -A && git commit -m \"fix: address QA feedback\"` and st
                             escape_markdown_v2(&pr_url)
                         )).await;
                     }
+
+                    // Auto-merge gate. Never throws; worst case it leaves the PR in review.
+                    let outcome = review::try_auto_merge(
+                        config, &repo_path, &pr_url, &task_id, &title, &description, &cached_settings,
+                    ).await;
+                    match outcome {
+                        review::AutoMergeOutcome::Merged => {
+                            agent_comment(config, &task_id, "Auto-merged. All gates green.").await;
+                            if notify_task_completed_code {
+                                send_telegram(config, &format!(
+                                    "Auto-merged *{}*",
+                                    escape_markdown_v2(&title)
+                                )).await;
+                            }
+                        }
+                        review::AutoMergeOutcome::Blocked { reason, scores } => {
+                            let mut updates = serde_json::json!({
+                                "auto_merge_blocked_reason": reason,
+                                "updated_at": chrono::Utc::now().to_rfc3339(),
+                            });
+                            if let Some(s) = scores {
+                                updates["review_scores"] = s;
+                            }
+                            let _ = supabase::update_task(config, &task_id, &updates).await;
+                            agent_comment(config, &task_id, &format!("Auto-merge blocked: {}", reason)).await;
+                        }
+                        review::AutoMergeOutcome::Skipped => {}
+                    }
+
                     Ok(format!("PR created: {}", pr_url))
                 }
                 Err(e) => {
@@ -2540,7 +2570,24 @@ pub async fn run_claude_code_opts(cwd: &str, prompt: &str, max_turns: u32, timeo
         if let Some(msg) = detect_rate_limit(stderr).or_else(|| detect_rate_limit(stdout_text.trim())) {
             return Err(msg);
         }
-        return Err(format!("Claude Code failed (exit {}): {}", status, stderr));
+        // Fall back to stdout tail when stderr is empty so the failure
+        // message is never a naked "Claude Code failed (exit X): ".
+        let detail = if !stderr.is_empty() {
+            stderr.to_string()
+        } else {
+            let tail = stdout_text.trim();
+            let snippet: String = if tail.len() > 1200 {
+                format!("…{}", &tail[tail.len() - 1200..])
+            } else {
+                tail.to_string()
+            };
+            if snippet.is_empty() {
+                "no stderr, no stdout captured".to_string()
+            } else {
+                format!("no stderr — stdout tail: {}", snippet)
+            }
+        };
+        return Err(format!("Claude Code failed (exit {}): {}", status, detail));
     }
 
     // Some rate-limit errors show on stdout with exit=0. Catch those too.
@@ -2693,9 +2740,15 @@ pub async fn run_claude_code_streaming(
 
     let last_activity_stream = last_activity.clone();
 
-    // Read stdout line-by-line, parse stream-json, post progress comments
+    // Read stdout line-by-line, parse stream-json, post progress comments.
+    // Also captures raw-stdout tail + any `result` event carrying an error so
+    // non-zero exits can surface a useful diagnostic instead of an empty string
+    // (Claude Code CLI emits errors on stdout as JSON, not stderr).
     let stdout_handle = tokio::spawn(async move {
         let mut result_text = String::new();
+        let mut raw_tail = String::new();
+        let mut error_summary: Option<String> = None;
+        const RAW_TAIL_CAP: usize = 4096;
         let mut last_comment_time = std::time::Instant::now();
         // Throttle: don't post more than one progress comment per 10 seconds
         const MIN_COMMENT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
@@ -2707,6 +2760,16 @@ pub async fn run_claude_code_streaming(
             while let Ok(Some(line)) = lines.next_line().await {
                 if line.is_empty() { continue; }
 
+                // Keep a rolling tail of raw stdout so exit-1 diagnostics are
+                // never empty when stderr is silent (common for stream-json).
+                if raw_tail.len() + line.len() + 1 > RAW_TAIL_CAP {
+                    let drop = (raw_tail.len() + line.len() + 1).saturating_sub(RAW_TAIL_CAP);
+                    if drop >= raw_tail.len() { raw_tail.clear(); }
+                    else { raw_tail.drain(..drop); }
+                }
+                raw_tail.push_str(&line);
+                raw_tail.push('\n');
+
                 // Try to parse as JSON
                 let parsed: serde_json::Value = match serde_json::from_str(&line) {
                     Ok(v) => v,
@@ -2715,10 +2778,32 @@ pub async fn run_claude_code_streaming(
 
                 let event_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-                // Capture result text
+                // Capture result text + any error carried in the final event.
+                // Claude Code stream-json emits errors on stdout, e.g.
+                //   {"type":"result","subtype":"error_max_turns","is_error":true,...}
+                //   {"type":"result","subtype":"error_during_execution","is_error":true,"error":"..."}
                 if event_type == "result" {
-                    if let Some(text) = parsed.get("result_text").and_then(|v| v.as_str()) {
+                    if let Some(text) = parsed.get("result")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| parsed.get("result_text").and_then(|v| v.as_str()))
+                    {
                         result_text = text.to_string();
+                    }
+                    let is_error = parsed.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let subtype = parsed.get("subtype").and_then(|v| v.as_str()).unwrap_or("");
+                    if is_error || subtype.starts_with("error") {
+                        let detail = parsed.get("error").and_then(|v| v.as_str())
+                            .or_else(|| parsed.get("message").and_then(|v| v.as_str()))
+                            .unwrap_or("");
+                        let summary = if detail.is_empty() {
+                            if subtype.is_empty() { "Claude Code reported an error".to_string() }
+                            else { format!("Claude Code error: {}", subtype) }
+                        } else if subtype.is_empty() {
+                            format!("Claude Code error: {}", detail)
+                        } else {
+                            format!("Claude Code error ({}): {}", subtype, detail)
+                        };
+                        error_summary = Some(summary);
                     }
                     continue;
                 }
@@ -2799,7 +2884,7 @@ pub async fn run_claude_code_streaming(
             }
         }
 
-        result_text
+        (result_text, raw_tail, error_summary)
     });
 
     // Read stderr in background
@@ -2851,15 +2936,39 @@ pub async fn run_claude_code_streaming(
         return Err("TASK_CANCELLED".to_string());
     }
 
-    let result_text = stdout_handle.await.unwrap_or_default();
+    let (result_text, raw_tail, error_summary) =
+        stdout_handle.await.unwrap_or_default();
     let stderr_text = stderr_handle.await.unwrap_or_default();
 
     if !status.success() {
         let stderr = stderr_text.trim();
-        if let Some(msg) = detect_rate_limit(stderr).or_else(|| detect_rate_limit(&result_text)) {
+        if let Some(msg) = detect_rate_limit(stderr)
+            .or_else(|| detect_rate_limit(&result_text))
+            .or_else(|| detect_rate_limit(&raw_tail))
+        {
             return Err(msg);
         }
-        return Err(format!("Claude Code failed (exit {}): {}", status, stderr));
+        // Build the best possible diagnostic. Prefer: parsed error from the
+        // stream-json `result` event → stderr → tail of raw stdout. Never
+        // return an empty "Claude Code failed (exit ...): " again.
+        let detail = if let Some(s) = error_summary {
+            s
+        } else if !stderr.is_empty() {
+            stderr.to_string()
+        } else {
+            let tail = raw_tail.trim();
+            let snippet: String = if tail.len() > 1200 {
+                format!("…{}", &tail[tail.len() - 1200..])
+            } else {
+                tail.to_string()
+            };
+            if snippet.is_empty() {
+                "no stderr, no stdout captured".to_string()
+            } else {
+                format!("no stderr — stdout tail: {}", snippet)
+            }
+        };
+        return Err(format!("Claude Code failed (exit {}): {}", status, detail));
     }
     if let Some(msg) = detect_rate_limit(&result_text) {
         return Err(msg);
