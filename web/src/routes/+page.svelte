@@ -4,8 +4,10 @@
   import { STATUSES, type AeTask } from '$lib/types';
   import KanbanColumn from '$lib/components/KanbanColumn.svelte';
   import TaskDetail from '$lib/components/TaskDetail.svelte';
+  import NewTaskModal from '$lib/components/NewTaskModal.svelte';
 
   let selected = $state<AeTask | null>(null);
+  let showNew = $state(false);
   let query = $state('');
   let projectFilter = $state('');
 
@@ -108,3 +110,14 @@
 {#if selected}
   <TaskDetail task={selected} onClose={() => (selected = null)} />
 {/if}
+
+{#if showNew}
+  <NewTaskModal {projects} onClose={() => (showNew = false)} />
+{/if}
+
+<button
+  type="button"
+  onclick={() => (showNew = true)}
+  aria-label="New task"
+  class="fixed bottom-5 right-5 z-30 h-14 w-14 rounded-full bg-emerald-500 hover:bg-emerald-400 shadow-xl shadow-emerald-500/30 text-slate-900 text-3xl font-bold grid place-items-center hover:scale-105 active:scale-95 transition bob"
+>+</button>
