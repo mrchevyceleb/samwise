@@ -1127,6 +1127,15 @@ from Matt, stop without making changes and explain specifically what you need cl
     // Clear PID after process completes
     { let mut pid = process_id_slot.lock().await; *pid = None; }
 
+    // Honor cancellation from the streaming heartbeat: task was deleted or
+    // cancelled by Matt mid-run. Tear down the worktree helpers and stop
+    // without posting failure comments on a task that no longer exists.
+    if matches!(&claude_result, Err(e) if e == "TASK_CANCELLED") {
+        log::info!("[worker] execute_task aborting: task {} was cancelled/deleted", task_id);
+        if let Some(h) = dev_server_handle.take() { let _ = dev_server::kill_dev_server(h).await; }
+        return Ok("Task was cancelled".to_string());
+    }
+
     let task_result = match claude_result {
         Ok(output) if !is_research && !worker_made_changes(&repo_path).await => {
             // Code task finished with zero changes (nothing committed, nothing staged,
@@ -1195,11 +1204,24 @@ from Matt, stop without making changes and explain specifically what you need cl
             // any must-fix/should-fix edits. Runs BEFORE screenshots + QA so QA validates the
             // final state. Any edits codex-fix makes are committed separately so the PR shows
             // a clear "task commit" + "codex-fix commit" history.
+            // Cancellation check before starting another long phase.
+            if !task_is_live(config, &task_id).await {
+                log::info!("[worker] Task {} cancelled before codex-fix; stopping", task_id);
+                if let Some(h) = dev_server_handle.take() { let _ = dev_server::kill_dev_server(h).await; }
+                return Ok("Task was cancelled".to_string());
+            }
+
             agent_comment(config, &task_id, "Running /codex-fix for a review pass before QA...").await;
             let codex_result = run_claude_code_streaming(
                 &repo_path, "/codex-fix", 30, 1200, config, &task_id, process_id_slot.clone()
             ).await;
             { let mut pid = process_id_slot.lock().await; *pid = None; }
+            // If codex-fix itself was cancelled mid-run, bail out.
+            if matches!(&codex_result, Err(e) if e == "TASK_CANCELLED") {
+                log::info!("[worker] Task {} cancelled during codex-fix; stopping", task_id);
+                if let Some(h) = dev_server_handle.take() { let _ = dev_server::kill_dev_server(h).await; }
+                return Ok("Task was cancelled".to_string());
+            }
             match codex_result {
                 Ok(_) => {
                     let porcelain = run_git(&["status", "--porcelain"], &repo_path).await.unwrap_or_default();
@@ -1247,6 +1269,11 @@ from Matt, stop without making changes and explain specifically what you need cl
                     let retry_fix = run_claude_code_streaming(
                         &repo_path, &fix_prompt, 30, 1200, config, &task_id, process_id_slot.clone()
                     ).await;
+                    if matches!(&retry_fix, Err(e) if e == "TASK_CANCELLED") {
+                        log::info!("[worker] Task {} cancelled during build-retry codex-fix; stopping", task_id);
+                        if let Some(h) = dev_server_handle.take() { let _ = dev_server::kill_dev_server(h).await; }
+                        return Ok("Task was cancelled".to_string());
+                    }
                     if let Err(e) = retry_fix {
                         log::warn!("[worker] codex-fix (build retry) failed: {}", e);
                     }
@@ -1435,6 +1462,11 @@ When done, run `git add -A && git commit -m \"fix: address QA feedback\"` and st
                                 &repo_path, &fix_prompt, 15, 900, config, &task_id, process_id_slot.clone()
                             ).await;
                             { let mut pid = process_id_slot.lock().await; *pid = None; }
+                            if matches!(&fix_result, Err(e) if e == "TASK_CANCELLED") {
+                                log::info!("[worker] Task {} cancelled during QA-retry fix; stopping", task_id);
+                                if let Some(h) = dev_server_handle.take() { let _ = dev_server::kill_dev_server(h).await; }
+                                return Ok("Task was cancelled".to_string());
+                            }
 
                             if let Err(e) = fix_result {
                                 agent_comment(config, &task_id, &format!(
@@ -1485,6 +1517,14 @@ When done, run `git add -A && git commit -m \"fix: address QA feedback\"` and st
                 )),
                 _ => None,
             };
+
+            // Last cancellation check before the PR is opened. If Matt deleted
+            // the task during QA, don't create a PR for it.
+            if !task_is_live(config, &task_id).await {
+                log::info!("[worker] Task {} cancelled before PR creation; skipping", task_id);
+                if let Some(h) = dev_server_handle.take() { let _ = dev_server::kill_dev_server(h).await; }
+                return Ok("Task was cancelled".to_string());
+            }
 
             // 8. Create PR targeting the branch we stacked on (not always main/master).
             let pr_result = create_pr(
@@ -2590,20 +2630,51 @@ pub async fn run_claude_code_streaming(
     // deep thinking, long tool calls). Prevents the UI from going silent.
     let last_activity = std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
     let heartbeat_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    // Signals the outer caller that Matt cancelled the task (deleted it or set
+    // status=cancelled). The heartbeat polls the row; if it disappears or flips
+    // to cancelled, it kills the Claude child process and sets this flag.
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let task_started_at = std::time::Instant::now();
 
-    // Heartbeat task
+    // Heartbeat + cancellation-watcher task. Polls every 15s. Two jobs:
+    //  - If the task has been quiet in the stream parser for 2+ min, post a
+    //    "still working" nudge so the UI never looks dead.
+    //  - If the task row was deleted or its status flipped to cancelled,
+    //    kill the Claude child process and flip the `cancelled` flag so the
+    //    outer caller bails out of the rest of the task pipeline.
     {
         let last_activity_hb = last_activity.clone();
         let alive_hb = heartbeat_alive.clone();
+        let cancelled_hb = cancelled.clone();
+        let pid_slot_hb = process_id_slot.clone();
         let config_hb = config.clone();
         let task_id_hb = task_id.to_string();
         tokio::spawn(async move {
             use std::sync::atomic::Ordering;
             let mut last_hb_post = std::time::Instant::now();
             while alive_hb.load(Ordering::Relaxed) {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
                 if !alive_hb.load(Ordering::Relaxed) { break; }
+
+                // Cancellation check: row missing or cancelled = stop
+                let still_live = task_is_live(&config_hb, &task_id_hb).await;
+                if !still_live {
+                    log::info!("[worker] Task {} was deleted/cancelled mid-run; killing Claude Code subprocess", task_id_hb);
+                    cancelled_hb.store(true, Ordering::Relaxed);
+                    // Kill the Claude child so stdout_handle wakes up and the
+                    // main wait() returns.
+                    let pid_opt = { *pid_slot_hb.lock().await };
+                    if let Some(pid) = pid_opt {
+                        if pid > 0 {
+                            #[cfg(unix)]
+                            unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+                        }
+                    }
+                    alive_hb.store(false, Ordering::Relaxed);
+                    break;
+                }
+
+                // Quiet-nudge check
                 let quiet_for = {
                     let guard = last_activity_hb.lock().unwrap_or_else(|e| e.into_inner());
                     guard.elapsed()
@@ -2773,6 +2844,13 @@ pub async fn run_claude_code_streaming(
     // stale "still working" message just as we're reporting success.
     heartbeat_alive.store(false, std::sync::atomic::Ordering::Relaxed);
 
+    // If the cancellation watcher killed the subprocess, report that
+    // specifically so callers can skip the post-work pipeline (no PR, no
+    // comments on a task that no longer exists).
+    if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("TASK_CANCELLED".to_string());
+    }
+
     let result_text = stdout_handle.await.unwrap_or_default();
     let stderr_text = stderr_handle.await.unwrap_or_default();
 
@@ -2788,6 +2866,42 @@ pub async fn run_claude_code_streaming(
     }
 
     Ok(result_text.trim().to_string())
+}
+
+/// Is the task still active? Returns false if the row is gone or its status
+/// flipped to cancelled. Used by the streaming heartbeat to stop work mid-run
+/// when Matt deletes/cancels a task from the UI.
+async fn task_is_live(config: &SupabaseConfig, task_id: &str) -> bool {
+    let url = format!(
+        "{}/rest/v1/ae_tasks?id=eq.{}&select=status",
+        config.url, task_id
+    );
+    let key = config.service_role_key.as_deref().unwrap_or(&config.anon_key);
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return true, // don't cancel work on a transient client error
+    };
+    let resp = match client
+        .get(&url)
+        .header("apikey", key)
+        .header("Authorization", format!("Bearer {}", key))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return true,
+    };
+    let body: serde_json::Value = match resp.json().await {
+        Ok(b) => b,
+        Err(_) => return true,
+    };
+    let Some(arr) = body.as_array() else { return true; };
+    if arr.is_empty() { return false; } // row deleted
+    let status = arr[0].get("status").and_then(|v| v.as_str()).unwrap_or("");
+    !matches!(status, "cancelled")
 }
 
 /// Take a screenshot using Playwright (headless chromium).
@@ -2810,8 +2924,14 @@ async fn take_screenshot(url: &str, output_path: &str, viewport: &str) -> Result
                 // Give the SPA a beat to mount before the snapshot.
                 "--wait-for-timeout", "2000",
                 "--timeout", "30000",
+                // Chromium probes macOS for media devices on launch, which
+                // triggers the "Apple Music" / microphone / camera TCC
+                // prompts. We never need any of that for a screenshot.
+                // These flags skip those subsystems entirely.
+                "--user-agent", "Mozilla/5.0 SamWise-QA",
                 url, output_path,
             ])
+            .env("PLAYWRIGHT_CHROMIUM_ARGS", "--disable-features=MediaSessionService,MediaRouter,MediaFoundationVideoCapture,HardwareMediaKeyHandling --mute-audio --disable-audio-output --use-fake-ui-for-media-stream --deny-permission-prompts --no-default-browser-check --disable-sync --disable-background-networking")
             .current_dir(&playwright_cwd)
             .output()
             .await

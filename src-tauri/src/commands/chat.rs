@@ -478,7 +478,9 @@ pub fn build_system_prompt(board_context: &str, project_registry: &str, recent_c
 - Create tasks for real work that requires coding, research, or investigation
 
 ## When to Create a Task
-If Matt asks you to BUILD, FIX, IMPLEMENT, REFACTOR, RESEARCH, INVESTIGATE, or DO something that requires actual work beyond a quick answer, create a task. Include a JSON block in your response like this:
+ONLY create a task in response to Matt's **latest** message. The "Recent Conversation" section below is for context only — do NOT re-create tasks for things Matt mentioned earlier in the chat. If he already asked for it and you already handled it (or he deleted/cancelled it), it stays gone. Only create a task if Matt's CURRENT message is a fresh ask for new work.
+
+If Matt's latest message asks you to BUILD, FIX, IMPLEMENT, REFACTOR, RESEARCH, INVESTIGATE, or DO something that requires actual work beyond a quick answer, create a task. Include a JSON block in your response like this:
 
 ```json
 {{"create_task": {{"title": "Short descriptive title", "description": "Detailed description of what needs to be done", "priority": "medium", "task_type": "code", "project": "project-name", "source": "chat"}}}}
