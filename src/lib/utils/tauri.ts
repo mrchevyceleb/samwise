@@ -16,6 +16,20 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
 	return fn<T>(cmd, args);
 }
 
+/** Open a URL in the system browser. Tauri's webview traps `<a target="_blank">`
+ *  and does nothing with it; this goes through the shell plugin so PR/GitHub
+ *  links actually open. */
+export async function openExternal(url: string): Promise<void> {
+	if (!url) return;
+	try {
+		const { open } = await import('@tauri-apps/plugin-shell');
+		await open(url);
+	} catch (e) {
+		console.warn('[openExternal] shell.open failed, falling back to window.open', e);
+		try { window.open(url, '_blank'); } catch {}
+	}
+}
+
 export interface FileNode {
 	name: string;
 	path: string;

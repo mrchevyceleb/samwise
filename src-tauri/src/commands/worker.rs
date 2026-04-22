@@ -1010,8 +1010,15 @@ async fn execute_task(
             let _ = tokio::fs::create_dir_all(&screenshot_dir).await;
             agent_comment(config, &task_id, "Taking before screenshots...").await;
 
-            let _ = take_screenshot(preview, &join_path(&screenshot_dir, "before-desktop.png"), "1280,720").await;
-            let _ = take_screenshot(preview, &join_path(&screenshot_dir, "before-mobile.png"), "393,852").await;
+            for (label, name, viewport) in [
+                ("desktop", "before-desktop.png", "1280,720"),
+                ("mobile",  "before-mobile.png",  "393,852"),
+            ] {
+                if let Err(e) = take_screenshot(preview, &join_path(&screenshot_dir, name), viewport).await {
+                    agent_comment(config, &task_id, &format!("Before-{} screenshot failed: {}", label, e)).await;
+                    log::warn!("[worker] before-{} screenshot failed: {}", label, e);
+                }
+            }
         }
     }
 
@@ -1279,8 +1286,15 @@ from Matt, stop without making changes and explain specifically what you need cl
             if let Some(ref preview) = preview_url {
                 agent_comment(config, &task_id, "Taking after screenshots...").await;
 
-                let _ = take_screenshot(preview, &join_path(&screenshot_dir, "after-desktop.png"), "1280,720").await;
-                let _ = take_screenshot(preview, &join_path(&screenshot_dir, "after-mobile.png"), "393,852").await;
+                for (label, name, viewport) in [
+                    ("desktop", "after-desktop.png", "1280,720"),
+                    ("mobile",  "after-mobile.png",  "393,852"),
+                ] {
+                    if let Err(e) = take_screenshot(preview, &join_path(&screenshot_dir, name), viewport).await {
+                        agent_comment(config, &task_id, &format!("After-{} screenshot failed: {}", label, e)).await;
+                        log::warn!("[worker] after-{} screenshot failed: {}", label, e);
+                    }
+                }
             }
 
             // Mark first unchecked subtask as done (re-fetch fresh subtasks to avoid stale data)
@@ -2173,10 +2187,39 @@ async fn process_telegram_message(config: &SupabaseConfig, user_message: &str, m
         if let Some(mentioned) = mentioned_projects.first() {
             enriched["project"] = serde_json::Value::String(mentioned.clone());
         }
+
+        // Rescue: Claude sometimes says "queuing up for operly" in the text
+        // but omits the "project" field from the task JSON. Infer from the
+        // user message + Sam's reply text.
+        let has_project_now = enriched.get("project").and_then(|v| v.as_str()).map(|s| !s.is_empty()).unwrap_or(false);
+        if !has_project_now {
+            if let Some(arr) = projects_all.as_array() {
+                let mut names: Vec<String> = arr.iter()
+                    .filter_map(|p| p.get("name").and_then(|v| v.as_str()).map(str::to_string))
+                    .collect();
+                names.sort_by_key(|n| std::cmp::Reverse(n.len()));
+                let haystack = format!(
+                    "{}\n{}\n{}",
+                    user_message.to_lowercase(),
+                    clean_text.to_lowercase(),
+                    raw_response.to_lowercase()
+                );
+                for name in &names {
+                    if haystack.contains(&name.to_lowercase()) {
+                        enriched["project"] = serde_json::Value::String(name.clone());
+                        log::info!("[telegram] inferred project '{}' from conversation text", name);
+                        break;
+                    }
+                }
+            }
+        }
+
         let has_project = enriched.get("project").and_then(|v| v.as_str()).map(|s| !s.is_empty()).unwrap_or(false);
-        enriched["status"] = serde_json::Value::String(
-            if has_project { "queued" } else { "pending_confirmation" }.to_string()
-        );
+        if !has_project {
+            log::warn!("[telegram] Skipping task create: no project resolvable. Sam should ask via reply.");
+            continue;
+        }
+        enriched["status"] = serde_json::Value::String("queued".to_string());
 
         // Backfill repo fields
         let project_name = enriched.get("project").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -2735,6 +2778,14 @@ pub async fn run_claude_code_streaming(
 /// Take a screenshot using Playwright (headless chromium).
 /// Retries once if the first capture fails, since the app may still be hydrating.
 async fn take_screenshot(url: &str, output_path: &str, viewport: &str) -> Result<(), String> {
+    // Playwright is installed as a dev dep of the Samwise repo (not globally),
+    // so `npx playwright` has to run with cwd inside that repo or npx tries to
+    // download a fresh copy that doesn't have the chromium browser installed.
+    // Under launchd SamWise's cwd is `/` so the bare call silently fails.
+    let playwright_cwd = std::env::var("HOME")
+        .map(|h| format!("{}/samwise/Personal-Apps/Samwise", h))
+        .unwrap_or_else(|_| "/Users/mjohnst/samwise/Personal-Apps/Samwise".to_string());
+
     for attempt in 1..=2 {
         let output = async_cmd("npx")
             .args([
@@ -2746,6 +2797,7 @@ async fn take_screenshot(url: &str, output_path: &str, viewport: &str) -> Result
                 "--timeout", "30000",
                 url, output_path,
             ])
+            .current_dir(&playwright_cwd)
             .output()
             .await
             .map_err(|e| format!("Playwright failed: {}", e))?;
@@ -2754,7 +2806,12 @@ async fn take_screenshot(url: &str, output_path: &str, viewport: &str) -> Result
         }
         if attempt == 2 {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("playwright screenshot: {}", stderr.trim()));
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return Err(format!("playwright screenshot: {}", {
+                let s = if stderr.trim().is_empty() { stdout.to_string() } else { stderr.to_string() };
+                let s = s.trim();
+                if s.len() > 400 { s[s.len() - 400..].to_string() } else { s.to_string() }
+            }));
         }
         tokio::time::sleep(std::time::Duration::from_millis(750)).await;
     }

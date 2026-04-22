@@ -5,7 +5,7 @@
 	import { getTaskStore } from '$lib/stores/tasks.svelte';
 	import { getTheme } from '$lib/stores/theme.svelte';
 	import { formatTimeAgo } from '$lib/utils/relative-time';
-	import { safeInvoke } from '$lib/utils/tauri';
+	import { safeInvoke, openExternal } from '$lib/utils/tauri';
 	import CommentThread from './CommentThread.svelte';
 	import SubtaskChecklist from './SubtaskChecklist.svelte';
 
@@ -430,10 +430,9 @@
 				<!-- PR Link -->
 				{#if task.pr_url}
 					<div style="margin-bottom: 20px;">
-						<a
-							href={task.pr_url}
-							target="_blank"
-							rel="noopener"
+						<button
+							type="button"
+							onclick={() => openExternal(task.pr_url!)}
 							style="
 								display: inline-flex; align-items: center; gap: 8px;
 								padding: 8px 16px; border-radius: 8px;
@@ -441,6 +440,7 @@
 								border: 1px solid rgba(63, 185, 80, 0.2);
 								color: var(--accent-green); text-decoration: none;
 								font-size: 12px; font-weight: 600;
+								cursor: pointer;
 								transition: all 0.15s ease;
 								transform: {prBtnHovered ? 'translateY(-1px)' : 'none'};
 								box-shadow: {prBtnHovered ? '0 4px 12px rgba(63, 185, 80, 0.15)' : 'none'};
@@ -452,7 +452,7 @@
 								<path d="M7.177 3.073L9.573.677A.25.25 0 0110 .854v4.792a.25.25 0 01-.427.177L7.177 3.427a.25.25 0 010-.354zM3.75 2.5a.75.75 0 100 1.5.75.75 0 000-1.5zm-2.25.75a2.25 2.25 0 113 2.122v5.256a2.251 2.251 0 11-1.5 0V5.372A2.25 2.25 0 011.5 3.25zM11 2.5h-1V4h1a1 1 0 011 1v5.628a2.251 2.251 0 101.5 0V5A2.5 2.5 0 0011 2.5zm1 10.25a.75.75 0 111.5 0 .75.75 0 01-1.5 0zM3.75 12a.75.75 0 100 1.5.75.75 0 000-1.5z"/>
 							</svg>
 							View Pull Request
-						</a>
+						</button>
 					</div>
 				{/if}
 			</div>

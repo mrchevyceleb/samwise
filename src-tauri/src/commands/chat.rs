@@ -163,13 +163,49 @@ async fn chat_respond_inner(
         if let Some(mentioned) = mentioned_projects.first() {
             enriched["project"] = serde_json::Value::String(mentioned.clone());
         }
-        // Autonomous flow: if Sam picked a project (via @ mention or inference),
-        // go straight to queued. Matt's expectation is that Sam commits and starts.
-        // Only gate when no project is resolvable at all.
+
+        // Rescue: Claude sometimes says "queuing up for operly" in the text
+        // but omits the "project" field from the task JSON. When the JSON is
+        // missing a project, try to extract one by scanning Sam's reply text
+        // AND the user's message for any registered project name. Saves the
+        // task from landing in pending_confirmation when the intent was clear.
+        let has_project_now = enriched.get("project").and_then(|v| v.as_str()).map(|s| !s.is_empty()).unwrap_or(false);
+        if !has_project_now {
+            if let Some(ref proj_arr) = projects {
+                if let Some(arr) = proj_arr.as_array() {
+                    let mut names: Vec<String> = arr.iter()
+                        .filter_map(|p| p.get("name").and_then(|v| v.as_str()).map(str::to_string))
+                        .collect();
+                    names.sort_by_key(|n| std::cmp::Reverse(n.len()));
+                    let haystack = format!(
+                        "{}\n{}\n{}",
+                        user_message.to_lowercase(),
+                        clean_text.to_lowercase(),
+                        raw_response.to_lowercase()
+                    );
+                    for name in &names {
+                        let n_lower = name.to_lowercase();
+                        if haystack.contains(&n_lower) {
+                            enriched["project"] = serde_json::Value::String(name.clone());
+                            log::info!("[chat] inferred project '{}' from conversation text", name);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Autonomous flow: if Sam picked a project (via @ mention, JSON emit,
+        // or the text-inference rescue above), create the task as queued.
+        // If NO project could be resolved, skip task creation entirely — Sam
+        // should ask Matt to clarify in his chat reply rather than leaving
+        // a dead confirm-UI stub in the DB. Matt explicitly killed that UI.
         let has_project = enriched.get("project").and_then(|v| v.as_str()).map(|s| !s.is_empty()).unwrap_or(false);
-        enriched["status"] = serde_json::Value::String(
-            if has_project { "queued" } else { "pending_confirmation" }.to_string()
-        );
+        if !has_project {
+            log::warn!("[chat] Skipping task create: no project resolvable from JSON, @mention, or text inference. Sam should ask in reply.");
+            continue;
+        }
+        enriched["status"] = serde_json::Value::String("queued".to_string());
 
         // Backfill repo fields from project registry
         let project_name = enriched.get("project").and_then(|v| v.as_str()).unwrap_or("").to_string();

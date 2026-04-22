@@ -11,8 +11,46 @@ use tauri::Manager;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 
+/// Under launchd, PATH is whatever the plist hands us and nothing else.
+/// Claude Code CLI (and its own session hooks) spawn `sh -c "node ..."`
+/// subprocesses that rely on finding node/npm/etc. on PATH, so a thin
+/// plist PATH breaks hooks with "node: command not found".
+/// Canonicalize PATH for the whole process tree at startup by merging
+/// the inherited value with known-good bin dirs on macOS.
+fn normalize_path_env() {
+    #[cfg(target_os = "macos")]
+    {
+        let current = std::env::var("PATH").unwrap_or_default();
+        let needed = [
+            "/opt/homebrew/bin",
+            "/opt/homebrew/sbin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin",
+        ];
+        let mut parts: Vec<&str> = current.split(':').filter(|s| !s.is_empty()).collect();
+        for p in needed.iter() {
+            if !parts.iter().any(|x| x == p) {
+                parts.push(p);
+            }
+        }
+        let home = std::env::var("HOME").unwrap_or_default();
+        let user_bins = if !home.is_empty() {
+            vec![format!("{}/.local/bin", home), format!("{}/.cargo/bin", home), format!("{}/.nvm/versions/node/current/bin", home)]
+        } else {
+            vec![]
+        };
+        let mut final_parts: Vec<String> = user_bins;
+        final_parts.extend(parts.into_iter().map(String::from));
+        std::env::set_var("PATH", final_parts.join(":"));
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    normalize_path_env();
     tauri::Builder::default()
         .manage(AppState::new())
         .manage(ClaudeCodeState::default())
