@@ -1,4 +1,5 @@
 <script lang="ts">
+  type Uploaded = { url: string; name: string; mime: string };
   let { projects, onClose }: { projects: string[]; onClose: () => void } = $props();
 
   let title = $state('');
@@ -8,10 +9,42 @@
   let task_type = $state<'code' | 'research'>('code');
   let submitting = $state(false);
   let errorMsg = $state<string | null>(null);
+  let uploading = $state(0);
+  let attachments = $state<Uploaded[]>([]);
+
+  async function uploadFiles(files: FileList | null) {
+    if (!files || files.length === 0) return;
+    const list = Array.from(files);
+    uploading += list.length;
+    await Promise.all(
+      list.map(async (file) => {
+        try {
+          const form = new FormData();
+          form.append('file', file);
+          const res = await fetch('/api/upload-attachment', { method: 'POST', body: form });
+          if (!res.ok) {
+            const t = await res.text().catch(() => '');
+            errorMsg = `Upload failed for ${file.name}: ${t || res.status}`;
+            return;
+          }
+          const body = (await res.json()) as Uploaded;
+          attachments = [...attachments, body];
+        } catch (e) {
+          errorMsg = e instanceof Error ? e.message : String(e);
+        } finally {
+          uploading -= 1;
+        }
+      })
+    );
+  }
+
+  function removeAttachment(url: string) {
+    attachments = attachments.filter((a) => a.url !== url);
+  }
 
   async function submit(e: SubmitEvent) {
     e.preventDefault();
-    if (!title.trim() || submitting) return;
+    if (!title.trim() || submitting || uploading > 0) return;
     submitting = true;
     errorMsg = null;
     try {
@@ -23,7 +56,8 @@
           description: description.trim(),
           project: project || undefined,
           priority,
-          task_type
+          task_type,
+          attachments: attachments.map((a) => ({ url: a.url, name: a.name, mime: a.mime }))
         })
       });
       if (!res.ok) {
@@ -108,6 +142,46 @@
       </label>
     </div>
 
+    <div>
+      <label class="block text-xs text-slate-400 mb-1">
+        Attachments (images, PDFs — helps Sam see the bug)
+      </label>
+      <label class="flex items-center gap-2 rounded-lg border border-dashed border-white/15 bg-white/5 px-3 py-3 text-sm text-slate-300 hover:bg-white/10 cursor-pointer transition">
+        <span class="text-lg">📎</span>
+        <span class="flex-1">
+          {uploading > 0 ? `Uploading ${uploading}…` : 'Tap to attach files'}
+        </span>
+        <input
+          type="file"
+          multiple
+          accept="image/*,application/pdf"
+          capture="environment"
+          class="sr-only"
+          onchange={(e) => { uploadFiles((e.currentTarget as HTMLInputElement).files); (e.currentTarget as HTMLInputElement).value = ''; }}
+        />
+      </label>
+
+      {#if attachments.length > 0}
+        <ul class="mt-2 grid grid-cols-3 gap-2">
+          {#each attachments as a (a.url)}
+            <li class="relative rounded-lg overflow-hidden border border-white/10 bg-white/5 aspect-square">
+              {#if a.mime.startsWith('image/')}
+                <img src={a.url} alt={a.name} class="w-full h-full object-cover" loading="lazy" />
+              {:else}
+                <div class="w-full h-full grid place-items-center text-xs text-slate-300 p-2 text-center">{a.name}</div>
+              {/if}
+              <button
+                type="button"
+                onclick={() => removeAttachment(a.url)}
+                aria-label="remove"
+                class="absolute top-1 right-1 h-6 w-6 grid place-items-center rounded-full bg-black/70 text-slate-100 text-xs hover:bg-rose-500/80"
+              >✕</button>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    </div>
+
     <fieldset class="flex gap-2 text-xs text-slate-400">
       <legend class="sr-only">Task type</legend>
       {#each [{ v: 'code', l: '💻 Code' }, { v: 'research', l: '🔍 Research' }] as opt}
@@ -130,9 +204,9 @@
       >Cancel</button>
       <button
         type="submit"
-        disabled={submitting || !title.trim()}
+        disabled={submitting || uploading > 0 || !title.trim()}
         class="flex-1 rounded-lg bg-emerald-500/90 hover:bg-emerald-400 disabled:opacity-50 disabled:cursor-not-allowed px-3 py-2 text-sm font-medium text-slate-900 transition"
-      >{submitting ? 'Sending…' : '🚀 Queue it'}</button>
+      >{submitting ? 'Sending…' : uploading > 0 ? 'Uploading…' : '🚀 Queue it'}</button>
     </div>
   </form>
 </div>

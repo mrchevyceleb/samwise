@@ -12,6 +12,7 @@
   let comments = $derived(tasksStore.comments[task.id] ?? []);
   let before = $derived(task.screenshots_before ?? []);
   let after = $derived(task.screenshots_after ?? []);
+  let attachments = $derived(task.attachments ?? []);
 </script>
 
 <div
@@ -101,6 +102,25 @@
           <div class="rounded-lg border border-white/10 bg-white/5 text-slate-300 px-3 py-2 truncate">⎇ {task.branch}</div>
         {/if}
       </section>
+
+      {#if attachments.length > 0}
+        <section>
+          <h3 class="text-xs uppercase tracking-wide text-slate-400 mb-2">Attachments</h3>
+          <ul class="grid grid-cols-3 gap-2">
+            {#each attachments as a (a.url)}
+              <li class="rounded-lg overflow-hidden border border-white/10 bg-white/5 aspect-square">
+                <a href={a.url} target="_blank" rel="noopener" class="block w-full h-full">
+                  {#if a.mime.startsWith('image/')}
+                    <img src={a.url} alt={a.name} class="w-full h-full object-cover" loading="lazy" />
+                  {:else}
+                    <div class="w-full h-full grid place-items-center text-xs text-slate-300 p-2 text-center">{a.name}</div>
+                  {/if}
+                </a>
+              </li>
+            {/each}
+          </ul>
+        </section>
+      {/if}
 
       {#if before.length > 0 || after.length > 0}
         <section>

@@ -9,6 +9,12 @@ export type TaskStatus =
   | 'pending_confirmation';
 export type TaskPriority = 'critical' | 'high' | 'medium' | 'low';
 
+export interface Attachment {
+  url: string;
+  name: string;
+  mime: string;
+}
+
 export interface Subtask {
   id: string;
   title: string;
@@ -37,6 +43,7 @@ export interface AeTask {
   assignee: string;
   worker_id: string | null;
   subtasks: Subtask[] | null;
+  attachments: Attachment[] | null;
   failure_reason?: string | null;
   created_at: string;
   updated_at: string;

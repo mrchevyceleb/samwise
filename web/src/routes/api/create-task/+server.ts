@@ -31,7 +31,8 @@ export const POST: RequestHandler = async ({ request }) => {
       priority: payload.priority ?? 'medium',
       task_type: payload.task_type ?? 'code',
       source: 'web-board',
-      base_branch: typeof payload.base_branch === 'string' && payload.base_branch ? payload.base_branch : undefined
+      base_branch: typeof payload.base_branch === 'string' && payload.base_branch ? payload.base_branch : undefined,
+      attachments: Array.isArray(payload.attachments) ? payload.attachments : undefined
     })
   });
 

@@ -1096,6 +1096,27 @@ async fn execute_task(
         }
     }
 
+    // Materialize attachments: download each task.attachments[].url into a
+    // /tmp/samwise-attachments/<task_id>/ directory so Claude Code can read
+    // them as local files. Append the paths to the prompt so Claude knows
+    // to consult them (images carry info text can't).
+    let attachment_paths = materialize_task_attachments(&task_id, &task).await;
+    if !attachment_paths.is_empty() {
+        let lines: Vec<String> = attachment_paths
+            .iter()
+            .map(|p| format!("- {}", p.display()))
+            .collect();
+        prompt_parts.push(format!(
+            "## Attached files\nMatt attached {} file(s) to this task. Read them before doing anything else — they almost always contain the bug repro, design reference, or error screenshot that the description alone does not convey:\n{}\n",
+            attachment_paths.len(),
+            lines.join("\n")
+        ));
+        agent_comment(config, &task_id, &format!(
+            "Downloaded {} attachment(s) for this task.",
+            attachment_paths.len()
+        )).await;
+    }
+
     // The actual task
     if is_research {
         prompt_parts.push(format!(
@@ -1937,6 +1958,196 @@ async fn send_telegram(config: &SupabaseConfig, message: &str) {
     }
 }
 
+// ── Attachments ─────────────────────────────────────────────────────
+
+/// Upload raw bytes to the `task-attachments` Supabase Storage bucket and
+/// return the public URL. Used by the Telegram ingress path after it
+/// downloads a photo/document via Telegram's getFile API.
+async fn upload_bytes_to_task_attachments(
+    config: &SupabaseConfig,
+    bytes: Vec<u8>,
+    mime: &str,
+    suggested_name: Option<&str>,
+) -> Result<String, String> {
+    let key_prefix = uuid::Uuid::new_v4().to_string();
+    let ext = suggested_name
+        .and_then(|n| n.rfind('.').map(|i| n[i..].to_string()))
+        .unwrap_or_else(|| match mime {
+            "image/png" => ".png".into(),
+            "image/jpeg" | "image/jpg" => ".jpg".into(),
+            "image/gif" => ".gif".into(),
+            "image/webp" => ".webp".into(),
+            "image/svg+xml" => ".svg".into(),
+            "application/pdf" => ".pdf".into(),
+            _ => ".bin".into(),
+        });
+    let key = format!("{}{}", key_prefix, ext);
+    let url = format!(
+        "{}/storage/v1/object/task-attachments/{}",
+        config.url.trim_end_matches('/'),
+        key
+    );
+    let token = config
+        .service_role_key
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&config.anon_key);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("client: {}", e))?;
+    let resp = client
+        .post(&url)
+        .header("authorization", format!("Bearer {}", token))
+        .header("content-type", mime)
+        .header("x-upsert", "false")
+        .body(bytes)
+        .send()
+        .await
+        .map_err(|e| format!("storage upload: {}", e))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("storage {}: {}", status, body));
+    }
+    Ok(format!(
+        "{}/storage/v1/object/public/task-attachments/{}",
+        config.url.trim_end_matches('/'),
+        key
+    ))
+}
+
+/// Download an attachment URL to a local file under /tmp/samwise-attachments/<task_id>/
+/// so Claude Code can read it off disk. Returns (local_path, original_name).
+async fn download_attachment_for_task(
+    task_id: &str,
+    url: &str,
+    name_hint: Option<&str>,
+) -> Result<std::path::PathBuf, String> {
+    let dir = std::path::PathBuf::from(std::env::temp_dir())
+        .join("samwise-attachments")
+        .join(task_id);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return Err(format!("mkdir {}: {}", dir.display(), e));
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| format!("client: {}", e))?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("GET {}: {}", url, e))?;
+    if !resp.status().is_success() {
+        return Err(format!("GET {} returned {}", url, resp.status()));
+    }
+    let name = name_hint
+        .map(|s| s.to_string())
+        .or_else(|| {
+            url.rsplit('/')
+                .next()
+                .and_then(|s| s.split('?').next())
+                .map(|s| s.to_string())
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("{}.bin", uuid::Uuid::new_v4()));
+    let safe = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        .collect::<String>();
+    let path = dir.join(&safe);
+    let bytes = resp.bytes().await.map_err(|e| format!("body: {}", e))?;
+    std::fs::write(&path, &bytes).map_err(|e| format!("write {}: {}", path.display(), e))?;
+    Ok(path)
+}
+
+/// Pull task.attachments out of the raw JSON row and download each one to a
+/// per-task scratch dir. Returns the list of successfully downloaded local
+/// paths. Errors are logged but never fatal — a broken URL shouldn't kill
+/// the whole task.
+async fn materialize_task_attachments(
+    task_id: &str,
+    task: &serde_json::Value,
+) -> Vec<std::path::PathBuf> {
+    let Some(arr) = task.get("attachments").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in arr {
+        let url = entry.get("url").and_then(|v| v.as_str());
+        let name = entry.get("name").and_then(|v| v.as_str());
+        let Some(u) = url else { continue; };
+        match download_attachment_for_task(task_id, u, name).await {
+            Ok(p) => out.push(p),
+            Err(e) => log::warn!("[worker] attachment download failed ({}): {}", u, e),
+        }
+    }
+    out
+}
+
+/// Fetch a Telegram-hosted file by its `file_id` and return the raw bytes
+/// plus a best-guess mime/name. Telegram getFile returns a `file_path` which
+/// is then fetched from `https://api.telegram.org/file/bot<token>/<file_path>`.
+async fn download_telegram_file(
+    token: &str,
+    file_id: &str,
+) -> Result<(Vec<u8>, String, String), String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("client: {}", e))?;
+
+    // Step 1: getFile → file_path
+    let info_url = format!(
+        "https://api.telegram.org/bot{}/getFile?file_id={}",
+        token, file_id
+    );
+    let info: serde_json::Value = client
+        .get(&info_url)
+        .send()
+        .await
+        .map_err(|e| format!("getFile: {}", e))?
+        .json()
+        .await
+        .map_err(|e| format!("getFile body: {}", e))?;
+
+    let file_path = info
+        .get("result")
+        .and_then(|r| r.get("file_path"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("getFile missing file_path: {}", info))?;
+
+    // Step 2: download file
+    let dl_url = format!("https://api.telegram.org/file/bot{}/{}", token, file_path);
+    let resp = client
+        .get(&dl_url)
+        .send()
+        .await
+        .map_err(|e| format!("download: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("download {}: {}", dl_url, resp.status()));
+    }
+
+    let name = file_path.rsplit('/').next().unwrap_or("telegram-file").to_string();
+    let ext = name.rfind('.').map(|i| &name[i + 1..]).unwrap_or("").to_lowercase();
+    let mime = match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "pdf" => "application/pdf",
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "txt" => "text/plain",
+        _ => "application/octet-stream",
+    }
+    .to_string();
+
+    let bytes = resp.bytes().await.map_err(|e| format!("body: {}", e))?;
+    Ok((bytes.to_vec(), mime, name))
+}
+
 // ── Telegram Inbound ────────────────────────────────────────────────
 
 /// Check for new Telegram messages and process them through Sam's chat logic.
@@ -1987,7 +2198,11 @@ async fn check_telegram_messages(
     // arrive within a second. Treating each as its own conversation turn breaks
     // pastes of bug reports into 3-4 separate tasks. Instead, collect all text
     // messages from the configured chat in this poll batch and process as one.
+    // Photos/documents sent in the same batch are uploaded to storage and
+    // attached to a directly-created task (bypassing the chat flow since a
+    // screenshot almost always means "here's a bug, fix it").
     let mut combined_parts: Vec<String> = Vec::new();
+    let mut pending_file_ids: Vec<(String, Option<String>)> = Vec::new(); // (file_id, caption)
     let mut highest_update_id: i64 = 0;
 
     for update in results {
@@ -2003,6 +2218,37 @@ async fn check_telegram_messages(
         let chat_id_str = chat_id.map(|id| id.to_string()).unwrap_or_default();
         if chat_id_str != expected_chat_id { continue; }
 
+        let caption = message
+            .get("caption")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        // Photos: Telegram sends an array of sizes; take the largest (last).
+        if let Some(sizes) = message.get("photo").and_then(|v| v.as_array()) {
+            if let Some(largest) = sizes.last() {
+                if let Some(fid) = largest.get("file_id").and_then(|v| v.as_str()) {
+                    pending_file_ids.push((fid.to_string(), caption.clone()));
+                    if let Some(c) = caption.clone() { combined_parts.push(c); }
+                    continue;
+                }
+            }
+        }
+
+        // Documents (e.g. PDFs, images sent as files): also route to attachments
+        // when the mime looks like media. Non-media docs are ignored for now.
+        if let Some(doc) = message.get("document") {
+            let mime = doc.get("mime_type").and_then(|v| v.as_str()).unwrap_or("");
+            let is_media = mime.starts_with("image/") || mime == "application/pdf";
+            if is_media {
+                if let Some(fid) = doc.get("file_id").and_then(|v| v.as_str()) {
+                    pending_file_ids.push((fid.to_string(), caption.clone()));
+                    if let Some(c) = caption.clone() { combined_parts.push(c); }
+                    continue;
+                }
+            }
+        }
+
         if let Some(text) = message.get("text").and_then(|v| v.as_str()) {
             if !text.is_empty() {
                 combined_parts.push(text.to_string());
@@ -2015,6 +2261,78 @@ async fn check_telegram_messages(
     if highest_update_id > 0 {
         let mut guard = last_update_id.lock().await;
         *guard = Some(highest_update_id);
+    }
+
+    // Media branch: any photos/docs in this batch → create a task directly
+    // with attachments. The combined text (including caption) becomes the
+    // task body. This bypasses the chat flow because a screenshot almost
+    // always means "here's a bug, fix it".
+    if !pending_file_ids.is_empty() {
+        let mut stored: Vec<serde_json::Value> = Vec::new();
+        for (fid, _caption) in &pending_file_ids {
+            match download_telegram_file(&token, fid).await {
+                Ok((bytes, mime, name)) => {
+                    match upload_bytes_to_task_attachments(config, bytes, &mime, Some(&name)).await {
+                        Ok(url) => stored.push(serde_json::json!({
+                            "url": url, "name": name, "mime": mime,
+                        })),
+                        Err(e) => log::warn!("[worker] Telegram attachment upload failed: {}", e),
+                    }
+                }
+                Err(e) => log::warn!("[worker] Telegram getFile/download failed for {}: {}", fid, e),
+            }
+        }
+
+        let body_text = combined_parts.join("\n\n");
+        let (title, description) = if body_text.is_empty() {
+            (
+                format!("Image from Telegram ({} attached)", stored.len()),
+                "Matt sent images from Telegram with no caption. Open the attachments to see the bug/screenshot, then ask for clarification or proceed if the intent is obvious.".to_string(),
+            )
+        } else {
+            let first_line = body_text.lines().next().unwrap_or("Image from Telegram").chars().take(120).collect::<String>();
+            (first_line, body_text)
+        };
+
+        let mut task_row = serde_json::json!({
+            "title": title,
+            "description": description,
+            "status": "queued",
+            "priority": "medium",
+            "task_type": "code",
+            "source": "telegram",
+            "attachments": stored,
+        });
+        // Best-effort project inference via substring match on ae_projects.
+        if let Ok(projects) = supabase::fetch_projects(config).await {
+            if let Some(arr) = projects.as_array() {
+                let hay = format!("{}\n{}", task_row["title"].as_str().unwrap_or(""), task_row["description"].as_str().unwrap_or("")).to_lowercase();
+                let mut names: Vec<&str> = arr.iter()
+                    .filter_map(|p| p.get("name").and_then(|v| v.as_str()))
+                    .collect();
+                names.sort_by_key(|n| std::cmp::Reverse(n.len()));
+                if let Some(n) = names.into_iter().find(|n| hay.contains(&n.to_lowercase())) {
+                    task_row["project"] = serde_json::Value::String(n.to_string());
+                    if let Some(row) = arr.iter().find(|p| p.get("name").and_then(|v| v.as_str()) == Some(n)) {
+                        if let Some(v) = row.get("repo_url") { task_row["repo_url"] = v.clone(); }
+                        if let Some(v) = row.get("repo_path") { task_row["repo_path"] = v.clone(); }
+                        if let Some(v) = row.get("preview_url") { task_row["preview_url"] = v.clone(); }
+                    }
+                }
+            }
+        }
+
+        match supabase::create_task(config, &task_row).await {
+            Ok(_) => {
+                log::info!("[worker] Telegram: created task with {} attachment(s)", stored.len());
+                send_telegram(config, &format!(
+                    "Got it. Queued a task with {} attachment{}.",
+                    stored.len(), if stored.len() == 1 { "" } else { "s" }
+                )).await;
+            }
+            Err(e) => log::warn!("[worker] Telegram attachment task insert failed: {}", e),
+        }
+        return;
     }
 
     if combined_parts.is_empty() { return; }
