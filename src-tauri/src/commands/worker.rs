@@ -1217,6 +1217,64 @@ from Matt, stop without making changes and explain specifically what you need cl
                 }
             }
 
+            // 5c. Build check. Runs the project's build command (npm run build / cargo
+            // build, auto-detected) so logic bugs that break compilation or the bundle
+            // get caught before a PR is opened. One auto-fix pass with codex if the
+            // first build fails; if the second build still fails, bail out clearly
+            // instead of pushing broken code.
+            match run_build_check(&repo_path).await {
+                Ok(Some(cmd)) => {
+                    agent_comment(config, &task_id, &format!("Build passed ({}).", cmd)).await;
+                }
+                Ok(None) => {
+                    // No build command detected; nothing to gate on.
+                }
+                Err((cmd, log_tail)) => {
+                    agent_comment(config, &task_id, &format!(
+                        "Build failed ({}). Trying one codex-fix pass with the build output as context.", cmd
+                    )).await;
+                    let fix_prompt = format!(
+                        "/codex-fix\n\nThe project's build just failed. Fix the build errors only. Don't refactor anything else.\n\nBuild command: {}\n\nBuild output (tail):\n{}",
+                        cmd, log_tail
+                    );
+                    let retry_fix = run_claude_code_streaming(
+                        &repo_path, &fix_prompt, 30, 1200, config, &task_id, process_id_slot.clone()
+                    ).await;
+                    if let Err(e) = retry_fix {
+                        log::warn!("[worker] codex-fix (build retry) failed: {}", e);
+                    }
+                    // Stage and commit whatever codex-fix produced, even if stream errored.
+                    let _ = run_git(&["add", "-A"], &repo_path).await;
+                    let status_out = run_git(&["diff", "--cached", "--quiet"], &repo_path).await;
+                    if matches!(status_out, Err(_)) {
+                        // Exit non-zero from diff --quiet means there are staged changes.
+                        let _ = run_git(&["commit", "-m", "codex-fix: repair failing build"], &repo_path).await;
+                    }
+
+                    match run_build_check(&repo_path).await {
+                        Ok(_) => {
+                            agent_comment(config, &task_id, "Build passed on second try after codex-fix. Proceeding.").await;
+                        }
+                        Err((cmd2, log_tail2)) => {
+                            agent_comment(config, &task_id, &format!(
+                                "Build still failing ({}) after a codex-fix pass. Not opening a PR. Last output:\n\n```\n{}\n```",
+                                cmd2, log_tail2
+                            )).await;
+
+                            if let Some(h) = dev_server_handle.take() {
+                                let _ = dev_server::kill_dev_server(h).await;
+                            }
+                            let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                                "status": "failed",
+                                "failure_reason": format!("build failed: {}", cmd2),
+                                "updated_at": chrono::Utc::now().to_rfc3339(),
+                            })).await;
+                            return Err(format!("build failed: {}", cmd2));
+                        }
+                    }
+                }
+            }
+
             // 6. Take AFTER screenshots (may be re-taken inside the QA retry loop below)
             if let Some(ref preview) = preview_url {
                 agent_comment(config, &task_id, "Taking after screenshots...").await;
@@ -1502,6 +1560,71 @@ async fn main_repo_for_worktree(wt_str: &str) -> Option<String> {
 /// --head sam/<short_id>`, and remove worktrees whose PRs are merged or closed. Worktrees
 /// without a PR that are >48h old are treated as orphans (crashed task) and removed too.
 /// Returns (removed, kept).
+/// Detect the project type and run its build. Returns:
+/// - Ok(Some(cmd)) if a build ran and passed
+/// - Ok(None) if we didn't find anything to run (no gate)
+/// - Err((cmd, log_tail)) if the build ran and failed; log_tail is the last
+///   ~2000 chars of combined stdout+stderr so codex-fix has useful context.
+///
+/// Detection order (first match wins):
+///   package.json with a `build` script → npm run build
+///   Cargo.toml                         → cargo build
+///
+/// Kept deliberately narrow. Projects with non-standard builds can be
+/// opted out by removing their build script; a future `ae_projects.build_command`
+/// column could let Matt override per-project.
+async fn run_build_check(repo_path: &str) -> Result<Option<String>, (String, String)> {
+    let pkg = join_path(repo_path, "package.json");
+    let cargo = join_path(repo_path, "Cargo.toml");
+
+    let (cmd_label, prog, args): (String, &str, Vec<&str>) = if tokio::fs::metadata(&pkg).await.is_ok() {
+        let pkg_txt = tokio::fs::read_to_string(&pkg).await.unwrap_or_default();
+        let has_build = serde_json::from_str::<serde_json::Value>(&pkg_txt)
+            .ok()
+            .and_then(|v| v.get("scripts").and_then(|s| s.get("build")).cloned())
+            .is_some();
+        if !has_build {
+            return Ok(None);
+        }
+        ("npm run build".to_string(), "npm", vec!["run", "build"])
+    } else if tokio::fs::metadata(&cargo).await.is_ok() {
+        ("cargo build".to_string(), "cargo", vec!["build"])
+    } else {
+        return Ok(None);
+    };
+
+    // 15-minute cap so a wedged build can't freeze the whole worker.
+    let child = async_cmd(prog)
+        .args(&args)
+        .current_dir(repo_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output();
+
+    let out = match tokio::time::timeout(std::time::Duration::from_secs(900), child).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return Err((cmd_label, format!("spawn failed: {}", e))),
+        Err(_) => return Err((cmd_label, "build timed out after 15m".to_string())),
+    };
+
+    if out.status.success() {
+        return Ok(Some(cmd_label));
+    }
+
+    // Assemble a readable tail for codex-fix to chew on. Cargo and npm both
+    // dump errors near the end of stderr; grab the last stderr chunk and, if
+    // short, pad with stdout.
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let combined = if stderr.trim().is_empty() { stdout } else { stderr };
+    let tail = if combined.len() > 2000 {
+        combined[combined.len() - 2000..].to_string()
+    } else {
+        combined
+    };
+    Err((cmd_label, tail.trim().to_string()))
+}
+
 /// Reset any tasks stuck in `in_progress` back to `queued`. Runs at worker
 /// startup to recover from crashes (the sole worker exited mid-task, leaving
 /// the row claimed forever). Also clears claimed_by/claimed_at so the next
