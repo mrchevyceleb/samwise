@@ -46,6 +46,10 @@ export interface AeTask {
   updated_at: string;
   claimed_at: string | null;
   completed_at: string | null;
+  review_scores: Record<string, number> | null;
+  review_summary: string | null;
+  auto_merged: boolean | null;
+  auto_merge_blocked_reason: string | null;
 }
 
 export interface AeComment {

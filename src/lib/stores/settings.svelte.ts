@@ -76,6 +76,10 @@ export interface AppSettings {
   telegramNotifyTaskCompletedCode: boolean;
   telegramNotifyTaskCompletedResearch: boolean;
   telegramNotifyTaskFailed: boolean;
+  // Auto-merge gate
+  autoMergeEnabled: boolean;
+  autoMergeMinScore: number;
+  autoMergeMaxDiffLines: number;
 }
 
 export interface MCPServerConfig {
@@ -176,6 +180,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
   telegramNotifyTaskCompletedCode: true,
   telegramNotifyTaskCompletedResearch: true,
   telegramNotifyTaskFailed: true,
+  autoMergeEnabled: false,
+  autoMergeMinScore: 8,
+  autoMergeMaxDiffLines: 400,
 };
 
 // ---- Svelte 5 Runes State ----

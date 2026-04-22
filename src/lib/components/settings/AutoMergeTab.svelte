@@ -1,0 +1,114 @@
+<script lang="ts">
+  import { getSettingsStore, updateSetting } from '$lib/stores/settings.svelte';
+
+  const settingsStore = getSettingsStore();
+
+  let hovered = $state<string | null>(null);
+
+  let enabled = $derived(settingsStore.value.autoMergeEnabled);
+  let minScore = $derived(settingsStore.value.autoMergeMinScore);
+  let maxDiff = $derived(settingsStore.value.autoMergeMaxDiffLines);
+
+  function toggleEnabled() {
+    updateSetting('autoMergeEnabled', !enabled);
+  }
+
+  function setMinScore(v: number) {
+    if (Number.isFinite(v)) {
+      const clamped = Math.max(1, Math.min(10, Math.round(v)));
+      updateSetting('autoMergeMinScore', clamped);
+    }
+  }
+
+  function setMaxDiff(v: number) {
+    if (Number.isFinite(v)) {
+      const clamped = Math.max(1, Math.min(5000, Math.round(v)));
+      updateSetting('autoMergeMaxDiffLines', clamped);
+    }
+  }
+</script>
+
+<div style="display: flex; flex-direction: column; gap: 20px;">
+  <div style="font-size: 13px; font-weight: 600; color: var(--text-primary); padding-bottom: 4px; border-bottom: 1px solid var(--border-default);">
+    Auto-Merge Gate
+  </div>
+
+  <div style="font-size: 12px; color: var(--text-secondary); line-height: 1.5;">
+    After Sam opens a PR, run a Codex review (gpt-5.4, high reasoning) and auto-merge only when every gate passes.
+    Gates: feature toggle on, no blocker paths touched (migrations, worker.rs, chat.rs, auth/secret/token files, dep manifests),
+    diff under the line cap, the lowest review dimension at or above the minimum score, no review-flagged blockers, and CI green.
+    If any gate fails, the PR stays in review with a comment explaining why.
+  </div>
+
+  <!-- Master toggle -->
+  <div
+    style="display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; background: var(--bg-primary); border: 1px solid var(--border-default); border-radius: 10px;"
+    onmouseenter={() => hovered = 'master'}
+    onmouseleave={() => hovered = null}
+  >
+    <div>
+      <div style="font-size: 13px; font-weight: 600; color: var(--text-primary);">Auto-merge PRs when review passes</div>
+      <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">Off by default. Turn on once you trust the reviewer.</div>
+    </div>
+    <button
+      onclick={toggleEnabled}
+      role="switch"
+      aria-checked={enabled}
+      aria-label="Toggle auto-merge"
+      style="
+        position: relative; width: 44px; height: 24px; border-radius: 12px; cursor: pointer;
+        background: {enabled ? '#6366f1' : 'var(--bg-elevated)'};
+        border: 1px solid {enabled ? '#6366f1' : 'var(--border-default)'};
+        transition: all 0.2s ease;
+        transform: {hovered === 'master' ? 'scale(1.05)' : 'scale(1)'};
+      "
+    >
+      <span style="
+        position: absolute; top: 2px; left: {enabled ? '22px' : '2px'};
+        width: 18px; height: 18px; border-radius: 50%;
+        background: {enabled ? 'white' : 'var(--text-muted)'};
+        transition: all 0.2s ease;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+      "></span>
+    </button>
+  </div>
+
+  <!-- Numeric thresholds -->
+  <div style="display: flex; flex-direction: column; gap: 12px; opacity: {enabled ? 1 : 0.5}; transition: opacity 0.2s ease;">
+    <div style="display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; background: var(--bg-primary); border: 1px solid var(--border-default); border-radius: 8px;">
+      <div>
+        <div style="font-size: 13px; font-weight: 500; color: var(--text-primary);">Minimum score (1 to 10)</div>
+        <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">Lowest dimension across correctness, blast radius, test coverage, reversibility, and intent match. Default 8.</div>
+      </div>
+      <input
+        type="number"
+        min="1"
+        max="10"
+        step="1"
+        placeholder="8"
+        value={minScore}
+        disabled={!enabled}
+        oninput={(e) => setMinScore(parseInt((e.currentTarget as HTMLInputElement).value, 10))}
+        style="width: 72px; padding: 6px 8px; background: var(--bg-elevated); border: 1px solid var(--border-default); border-radius: 6px; color: var(--text-primary); font-size: 13px; text-align: right;"
+      />
+    </div>
+
+    <div style="display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; background: var(--bg-primary); border: 1px solid var(--border-default); border-radius: 8px;">
+      <div>
+        <div style="font-size: 13px; font-weight: 500; color: var(--text-primary);">Max diff lines</div>
+        <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">Combined additions plus deletions. Larger PRs always go to review. Default 400, max 5000.</div>
+      </div>
+      <input
+        type="number"
+        min="1"
+        max="5000"
+        step="50"
+        placeholder="400"
+        value={maxDiff}
+        disabled={!enabled}
+        oninput={(e) => setMaxDiff(parseInt((e.currentTarget as HTMLInputElement).value, 10))}
+        style="width: 96px; padding: 6px 8px; background: var(--bg-elevated); border: 1px solid var(--border-default); border-radius: 6px; color: var(--text-primary); font-size: 13px; text-align: right;"
+      />
+    </div>
+  </div>
+</div>

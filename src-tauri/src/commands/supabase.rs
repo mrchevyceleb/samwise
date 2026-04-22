@@ -139,6 +139,13 @@ pub async fn post_comment(config: &SupabaseConfig, comment: &Value) -> Result<Va
     handle_response(client.post(&rest_url(config, "ae_comments")).json(comment).send().await.map_err(|e| e.to_string())?).await
 }
 
+// ── Review log (internal) ───────────────────────────────────────────
+
+pub async fn insert_review_log(config: &SupabaseConfig, row: &Value) -> Result<Value, String> {
+    let client = build_client(config)?;
+    handle_response(client.post(&rest_url(config, "ae_review_log")).json(row).send().await.map_err(|e| e.to_string())?).await
+}
+
 // ── Messages (internal) ─────────────────────────────────────────────
 
 // Fixed UUID for the default Sam<->Matt conversation (matches chat.rs constant).

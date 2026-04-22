@@ -6,6 +6,7 @@ pub mod git;
 pub mod health;
 pub mod hello;
 pub mod playwright;
+pub mod review;
 pub mod settings;
 pub mod supabase;
 pub mod worker;
