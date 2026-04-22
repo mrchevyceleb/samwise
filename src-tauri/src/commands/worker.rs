@@ -192,6 +192,107 @@ pub struct WorkerStatusInfo {
 
 // ── Commands ────────────────────────────────────────────────────────
 
+/// Backend-only worker bootstrap. Runs at app startup so task pickup is
+/// independent of whether the Tauri window ever hydrates. Safe to call even
+/// if the worker is already running or Supabase isn't configured (no-op in
+/// both cases).
+/// Read settings.json and populate the in-memory SupabaseState if it is
+/// empty. Called synchronously during app setup() so the Tauri frontend sees
+/// a populated config on its very first `supabase_get_config` invoke.
+pub async fn hydrate_supabase_from_disk(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    let sb_state: tauri::State<'_, SupabaseState> = app.state();
+    let config = sb_state.get_config().await;
+    if !config.url.is_empty() && !config.anon_key.is_empty() {
+        return;
+    }
+    if let Some(loaded) = load_supabase_config_from_disk(app).await {
+        eprintln!(
+            "[hydrate] loaded Supabase config from settings.json (url_len={}, anon_len={})",
+            loaded.url.len(), loaded.anon_key.len()
+        );
+        let mut w = sb_state.config.write().await;
+        *w = loaded;
+    } else {
+        eprintln!("[hydrate] no Supabase config in settings.json; frontend will need Settings modal");
+    }
+}
+
+pub async fn autostart_worker(app: tauri::AppHandle) {
+    use tauri::Manager;
+
+    let worker_state: tauri::State<'_, WorkerState> = app.state();
+    if worker_state.running.load(Ordering::Relaxed) {
+        eprintln!("[worker autostart] already running, skipping");
+        return;
+    }
+
+    let sb_state: tauri::State<'_, SupabaseState> = app.state();
+    let config = sb_state.get_config().await;
+
+    let machine_name = std::env::var("SAMWISE_MACHINE_NAME")
+        .unwrap_or_else(|_| hostname_or_default());
+
+    worker_state.running.store(true, Ordering::Relaxed);
+    {
+        let mut name = worker_state.machine_name.lock().await;
+        *name = Some(machine_name.clone());
+    }
+
+    let running = Arc::clone(&worker_state.running);
+    let current_task = Arc::clone(&worker_state.current_task_id);
+    let last_tg_update = Arc::clone(&worker_state.last_telegram_update_id);
+    let current_pid = Arc::clone(&worker_state.current_process_id);
+    let sb_config_arc = Arc::clone(&sb_state.config);
+    let app_handle = app.clone();
+
+    log::info!("[worker] autostart: launching worker_loop as {}", machine_name);
+    tokio::spawn(async move {
+        worker_loop(running, current_task, last_tg_update, current_pid, machine_name, sb_config_arc, app_handle).await;
+    });
+}
+
+async fn load_supabase_config_from_disk(app: &tauri::AppHandle) -> Option<SupabaseConfig> {
+    use tauri::Manager;
+    let dir = app.path().app_data_dir().ok()?;
+    let path = dir.join("settings.json");
+    let raw = tokio::fs::read_to_string(&path).await.ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let get_str = |k: &str| -> String {
+        v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
+    };
+    let url = get_str("supabaseUrl");
+    let anon = get_str("supabaseAnonKey");
+    let service = {
+        let s = get_str("supabaseServiceRoleKey");
+        if s.is_empty() { None } else { Some(s) }
+    };
+    if url.is_empty() || anon.is_empty() { return None; }
+    Some(SupabaseConfig {
+        url,
+        anon_key: anon,
+        service_role_key: service,
+        telegram_bot_token: {
+            let t = get_str("telegramBotToken");
+            if t.is_empty() { None } else { Some(t) }
+        },
+        telegram_chat_id: {
+            let t = get_str("telegramChatId");
+            if t.is_empty() { None } else { Some(t) }
+        },
+    })
+}
+
+fn hostname_or_default() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "agent-one".to_string())
+}
+
 #[tauri::command]
 pub async fn worker_start(
     machine_name: String,
@@ -199,8 +300,12 @@ pub async fn worker_start(
     sb_state: tauri::State<'_, SupabaseState>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
+    // Idempotent: if the backend already autostarted the worker, treat a
+    // second call (from frontend onMount) as success so the UI can surface
+    // the live status instead of a confusing error toast.
     if state.running.load(Ordering::Relaxed) {
-        return Err("Worker is already running".to_string());
+        log::info!("[worker] worker_start called but worker already running (likely autostarted); no-op");
+        return Ok(());
     }
 
     // Verify Supabase is configured
@@ -1143,9 +1248,9 @@ from Matt, stop without making changes and explain specifically what you need cl
 
     let prompt = prompt_parts.join("\n");
 
-    // 30-minute timeout, 20 max turns. 20 is enough for any focused single-task edit
-    // and keeps Claude from drifting into open-ended exploration.
-    let claude_result = run_claude_code_streaming(&repo_path, &prompt, 20, 1800, config, &task_id, process_id_slot.clone()).await;
+    // 30-minute timeout, 100 max turns. 20 was too tight and made tasks with
+    // screenshots / multiple edits die mid-work with error_max_turns.
+    let claude_result = run_claude_code_streaming(&repo_path, &prompt, 100, 1800, config, &task_id, process_id_slot.clone()).await;
     // Clear PID after process completes
     { let mut pid = process_id_slot.lock().await; *pid = None; }
 

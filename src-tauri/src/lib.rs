@@ -127,6 +127,23 @@ pub fn run() {
                 })
                 .build(app)?;
 
+            // Auto-start the worker loop from the backend so task pickup works
+            // even when the Tauri window hasn't been shown (launchd respawn
+            // straight to tray, frontend never hydrates, AppShell.svelte never
+            // calls worker_start). Previously this was entirely frontend-gated
+            // and broke every time the app booted headless.
+            // Hydrate Supabase config from disk SYNCHRONOUSLY during setup so
+            // the frontend's onMount (which fires after setup returns) never
+            // sees an empty config. Then spawn the worker loop separately.
+            let app_handle_for_hydrate = app.handle().clone();
+            tauri::async_runtime::block_on(async {
+                commands::worker::hydrate_supabase_from_disk(&app_handle_for_hydrate).await;
+            });
+            let app_handle_for_worker = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                commands::worker::autostart_worker(app_handle_for_worker).await;
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
