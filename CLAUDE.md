@@ -69,7 +69,7 @@ npm run check          # Svelte type check
 - `models/` - Rust structs (FileNode, etc.)
 - `state.rs` - Shared app state
 
-### Supabase (project `iycloielqcjnjqddeuet`)
+### Supabase (project `meqtadfevxguishrlxyx`)
 Tables: `ae_tasks`, `ae_comments`, `ae_messages`, `ae_workers`, `ae_crons`, `ae_triggers`, `ae_projects`
 Secrets in Doppler project `agent-one`, config `prd`
 
