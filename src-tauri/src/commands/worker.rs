@@ -1639,7 +1639,7 @@ async fn recover_stuck_tasks(config: &SupabaseConfig) -> usize {
         let Some(id) = task.get("id").and_then(|v| v.as_str()) else { continue; };
         let updates = serde_json::json!({
             "status": "queued",
-            "claimed_by": serde_json::Value::Null,
+            "worker_id": serde_json::Value::Null,
             "claimed_at": serde_json::Value::Null,
         });
         if supabase::update_task(config, id, &updates).await.is_ok() {
@@ -2142,7 +2142,9 @@ async fn process_telegram_message(config: &SupabaseConfig, user_message: &str, m
     let prompt = chat::build_system_prompt(&board_ctx, &project_registry, &recent_chat, &effective_message);
 
     // 4. Call Claude Code CLI one-shot
-    let raw_response = match run_claude_code_opts(".", &prompt, 3, 90).await {
+    // 600s Claude timeout — matches chat.rs. Long Sentry dumps and big error
+    // pastes regularly push Opus past a minute; 90s was too tight.
+    let raw_response = match run_claude_code_opts(".", &prompt, 3, 600).await {
         Ok(r) => r,
         Err(e) => {
             log::warn!("[worker] Telegram chat response failed: {}", e);
@@ -2161,17 +2163,20 @@ async fn process_telegram_message(config: &SupabaseConfig, user_message: &str, m
     let (clean_text, task_requests) = chat::parse_chat_response(&raw_response);
 
     // 6. Create tasks - enrich with project registry data + handle @ mentions
+    // Mirrors chat.rs: if Sam picked a project (via @mention OR his own
+    // inference), task goes straight to queued. Only gate when we truly
+    // can't resolve a project.
     for req in &task_requests {
         let mut enriched = req.clone();
 
         // Override project with @ mention if present
         if let Some(mentioned) = mentioned_projects.first() {
             enriched["project"] = serde_json::Value::String(mentioned.clone());
-            enriched["status"] = serde_json::Value::String("queued".to_string());
-        } else {
-            // No @ mention: pending_confirmation
-            enriched["status"] = serde_json::Value::String("pending_confirmation".to_string());
         }
+        let has_project = enriched.get("project").and_then(|v| v.as_str()).map(|s| !s.is_empty()).unwrap_or(false);
+        enriched["status"] = serde_json::Value::String(
+            if has_project { "queued" } else { "pending_confirmation" }.to_string()
+        );
 
         // Backfill repo fields
         let project_name = enriched.get("project").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -2218,8 +2223,13 @@ async fn process_telegram_message(config: &SupabaseConfig, user_message: &str, m
     // 7b. Send response back via Telegram first
     send_telegram_plain(config, &response_text).await;
 
-    // 7c. If tasks created with pending_confirmation, send numbered project list via Telegram
-    if !task_requests.is_empty() && mentioned_projects.is_empty() {
+    // 7c. Only prompt for project when Sam truly couldn't pick one. If any
+    // task_request already has a project (from @mention or Sam's own
+    // inference), trust it — Sam mentions the choice in his reply already.
+    let any_task_unresolved = task_requests.iter().any(|r| {
+        r.get("project").and_then(|v| v.as_str()).map(|s| s.is_empty()).unwrap_or(true)
+    });
+    if any_task_unresolved && mentioned_projects.is_empty() {
         if let Some(arr) = projects_all.as_array() {
             if !arr.is_empty() {
                 let mut list = String::from("Which project?\n");
@@ -2516,6 +2526,44 @@ pub async fn run_claude_code_streaming(
     let config_clone = config.clone();
     let task_id_owned = task_id.to_string();
 
+    // Shared "last activity" timestamp. The stream parser updates it whenever
+    // it posts a progress comment; the heartbeat task reads it and posts a
+    // "still working" nudge when the stream goes quiet for too long (codex-fix,
+    // deep thinking, long tool calls). Prevents the UI from going silent.
+    let last_activity = std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+    let heartbeat_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let task_started_at = std::time::Instant::now();
+
+    // Heartbeat task
+    {
+        let last_activity_hb = last_activity.clone();
+        let alive_hb = heartbeat_alive.clone();
+        let config_hb = config.clone();
+        let task_id_hb = task_id.to_string();
+        tokio::spawn(async move {
+            use std::sync::atomic::Ordering;
+            let mut last_hb_post = std::time::Instant::now();
+            while alive_hb.load(Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                if !alive_hb.load(Ordering::Relaxed) { break; }
+                let quiet_for = {
+                    let guard = last_activity_hb.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.elapsed()
+                };
+                if quiet_for >= std::time::Duration::from_secs(120)
+                    && last_hb_post.elapsed() >= std::time::Duration::from_secs(120)
+                {
+                    let mins = task_started_at.elapsed().as_secs() / 60;
+                    let msg = format!("Still working. {} min in, nothing's hung.", mins);
+                    agent_comment(&config_hb, &task_id_hb, &msg).await;
+                    last_hb_post = std::time::Instant::now();
+                }
+            }
+        });
+    }
+
+    let last_activity_stream = last_activity.clone();
+
     // Read stdout line-by-line, parse stream-json, post progress comments
     let stdout_handle = tokio::spawn(async move {
         let mut result_text = String::new();
@@ -2608,6 +2656,10 @@ pub async fn run_claude_code_streaming(
                                 if last_comment_time.elapsed() >= MIN_COMMENT_INTERVAL {
                                     agent_comment(&config_clone, &task_id_owned, &progress).await;
                                     last_comment_time = std::time::Instant::now();
+                                    // Reset the heartbeat timer; real activity doesn't need a nudge.
+                                    if let Ok(mut g) = last_activity_stream.lock() {
+                                        *g = std::time::Instant::now();
+                                    }
                                 } else {
                                     log::debug!("[worker] Throttled progress: {}", progress);
                                 }
@@ -2639,21 +2691,42 @@ pub async fn run_claude_code_streaming(
             child.wait()
         ).await {
             Ok(Ok(s)) => s,
-            Ok(Err(e)) => return Err(format!("Claude Code process error: {}", e)),
+            Ok(Err(e)) => {
+                heartbeat_alive.store(false, std::sync::atomic::Ordering::Relaxed);
+                return Err(format!("Claude Code process error: {}", e));
+            }
             Err(_) => {
+                heartbeat_alive.store(false, std::sync::atomic::Ordering::Relaxed);
                 let _ = child.kill().await;
                 return Err(format!("Claude Code timed out after {}s", timeout_secs));
             }
         }
     } else {
-        child.wait().await.map_err(|e| format!("Claude Code process error: {}", e))?
+        match child.wait().await {
+            Ok(s) => s,
+            Err(e) => {
+                heartbeat_alive.store(false, std::sync::atomic::Ordering::Relaxed);
+                return Err(format!("Claude Code process error: {}", e));
+            }
+        }
     };
+
+    // Process exited cleanly. Shut the heartbeat down so it doesn't fire a
+    // stale "still working" message just as we're reporting success.
+    heartbeat_alive.store(false, std::sync::atomic::Ordering::Relaxed);
 
     let result_text = stdout_handle.await.unwrap_or_default();
     let stderr_text = stderr_handle.await.unwrap_or_default();
 
     if !status.success() {
-        return Err(format!("Claude Code failed (exit {}): {}", status, stderr_text.trim()));
+        let stderr = stderr_text.trim();
+        if let Some(msg) = detect_rate_limit(stderr).or_else(|| detect_rate_limit(&result_text)) {
+            return Err(msg);
+        }
+        return Err(format!("Claude Code failed (exit {}): {}", status, stderr));
+    }
+    if let Some(msg) = detect_rate_limit(&result_text) {
+        return Err(msg);
     }
 
     Ok(result_text.trim().to_string())
