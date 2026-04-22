@@ -1913,16 +1913,17 @@ async fn check_telegram_messages(
     let Some(results) = body.get("result").and_then(|r| r.as_array()) else { return; };
     if results.is_empty() { return; }
 
+    // Telegram splits long messages (>4096 chars) into multiple updates that all
+    // arrive within a second. Treating each as its own conversation turn breaks
+    // pastes of bug reports into 3-4 separate tasks. Instead, collect all text
+    // messages from the configured chat in this poll batch and process as one.
+    let mut combined_parts: Vec<String> = Vec::new();
+    let mut highest_update_id: i64 = 0;
+
     for update in results {
         let update_id = update.get("update_id").and_then(|v| v.as_i64()).unwrap_or(0);
+        if update_id > highest_update_id { highest_update_id = update_id; }
 
-        // Update the offset
-        {
-            let mut guard = last_update_id.lock().await;
-            *guard = Some(update_id);
-        }
-
-        // Extract message text
         let message = match update.get("message") {
             Some(m) => m,
             None => continue,
@@ -1930,22 +1931,36 @@ async fn check_telegram_messages(
 
         let chat_id = message.get("chat").and_then(|c| c.get("id")).and_then(|v| v.as_i64());
         let chat_id_str = chat_id.map(|id| id.to_string()).unwrap_or_default();
+        if chat_id_str != expected_chat_id { continue; }
 
-        // Only process messages from the configured chat
-        if chat_id_str != expected_chat_id {
-            continue;
+        if let Some(text) = message.get("text").and_then(|v| v.as_str()) {
+            if !text.is_empty() {
+                combined_parts.push(text.to_string());
+            }
         }
-
-        let text = match message.get("text").and_then(|v| v.as_str()) {
-            Some(t) if !t.is_empty() => t.to_string(),
-            _ => continue,
-        };
-
-        log::info!("[worker] Telegram message received: {}", &text[..text.len().min(50)]);
-
-        // Process through Sam's chat logic
-        process_telegram_message(config, &text, machine_name).await;
     }
+
+    // Advance offset past everything we saw, whether we processed text or not,
+    // so we don't re-fetch the same updates next tick.
+    if highest_update_id > 0 {
+        let mut guard = last_update_id.lock().await;
+        *guard = Some(highest_update_id);
+    }
+
+    if combined_parts.is_empty() { return; }
+
+    let combined_text = combined_parts.join("\n\n");
+    let part_count = combined_parts.len();
+    if part_count > 1 {
+        log::info!(
+            "[worker] Telegram: merged {} message parts into one conversation turn ({} chars)",
+            part_count, combined_text.len()
+        );
+    } else {
+        log::info!("[worker] Telegram message received: {}", &combined_text[..combined_text.len().min(50)]);
+    }
+
+    process_telegram_message(config, &combined_text, machine_name).await;
 }
 
 // ── Remote Chat Message Processing ───────────────────────────────────
