@@ -43,14 +43,15 @@ pub async fn chat_respond(
         return Err("Supabase not configured".to_string());
     }
 
-    // Wrap the entire chat flow in a 120s hard timeout so the UI never hangs forever.
-    // The Claude Code call inside has its own 90s timeout; the extra 30s covers Supabase I/O.
+    // Wrap the entire chat flow in a 630s hard timeout so the UI never hangs forever.
+    // The Claude Code call inside has its own 600s timeout; the extra 30s covers Supabase I/O.
+    // Opus on long context (Sentry dumps, log pastes) regularly runs multi-minute.
     match tokio::time::timeout(
-        std::time::Duration::from_secs(120),
+        std::time::Duration::from_secs(630),
         chat_respond_inner(config, user_message, &worker_state),
     ).await {
         Ok(result) => result,
-        Err(_) => Err("Sam took too long to respond (timed out after 2 minutes). Try again.".to_string()),
+        Err(_) => Err("Sam took too long to respond (timed out after 10.5 minutes). Try again.".to_string()),
     }
 }
 
@@ -141,8 +142,9 @@ async fn chat_respond_inner(
     let prompt = build_system_prompt(&board_context, &project_registry, &recent_chat, &effective_message);
 
     // 5. One-shot Claude Code call (same proven approach as the worker).
-    // Chat is conversational so limit to 3 turns and 90s timeout.
-    let raw_response = run_claude_code_opts(".", &prompt, 3, 90).await?;
+    // 3 turns, 600s timeout. Long error-log pastes and deep thinking can push
+    // Opus past several minutes; shorter timeouts just produce false failures.
+    let raw_response = run_claude_code_opts(".", &prompt, 3, 600).await?;
 
     // 6. Parse response for task creation
     let (clean_text, task_requests) = parse_chat_response(&raw_response);
@@ -160,12 +162,14 @@ async fn chat_respond_inner(
         // If @ mention was used, override the project field
         if let Some(mentioned) = mentioned_projects.first() {
             enriched["project"] = serde_json::Value::String(mentioned.clone());
-            // @ mention = explicit, skip confirmation
-            enriched["status"] = serde_json::Value::String("queued".to_string());
-        } else {
-            // No @ mention: set pending_confirmation so user must confirm repo
-            enriched["status"] = serde_json::Value::String("pending_confirmation".to_string());
         }
+        // Autonomous flow: if Sam picked a project (via @ mention or inference),
+        // go straight to queued. Matt's expectation is that Sam commits and starts.
+        // Only gate when no project is resolvable at all.
+        let has_project = enriched.get("project").and_then(|v| v.as_str()).map(|s| !s.is_empty()).unwrap_or(false);
+        enriched["status"] = serde_json::Value::String(
+            if has_project { "queued" } else { "pending_confirmation" }.to_string()
+        );
 
         // Backfill repo fields from project registry
         let project_name = enriched.get("project").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -450,10 +454,14 @@ If Matt asks you to BUILD, FIX, IMPLEMENT, REFACTOR, RESEARCH, INVESTIGATE, or D
 - project: the project/repo name if mentioned, otherwise omit
 - base_branch (optional): if Matt wants the worktree stacked on a feature branch instead of main/master, include e.g. "base_branch": "feature/payments". Leave out to default to the repo's main branch.
 
-## Project Confirmation
-If Matt tagged a project with @project-name, use that project (no need to confirm).
-If Matt did NOT use an @ tag, you MUST still pick the most likely project and include it in your task JSON. But also tell Matt which project you picked so he can confirm. Say something like: "I'm putting this on **project-name**. That right?"
-If you're unsure which project, ask Matt to clarify before creating the task.
+## Project Selection (Autonomous)
+Pick the project and get moving. Don't ask for confirmation — Matt can course-correct after if you're wrong.
+
+- If Matt used an @tag, use that project.
+- If he named the project in plain English ("fix this operly bug", "update banana-code"), use that project.
+- If it's clear from context (he's quoting an error from an app, or referring to a feature of one), use that project.
+- Mention which project you chose in your reply ("On it, queuing up for **operly**.") but don't ask permission.
+- ONLY ask for clarification if it's genuinely ambiguous (e.g. "fix the login bug" when 3 apps have login).
 
 Do NOT create tasks for simple questions, opinions, quick lookups, or general chat.
 When you create a task, mention it naturally in your response (e.g. "On it, I've queued that up.").

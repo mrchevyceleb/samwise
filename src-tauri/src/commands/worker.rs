@@ -337,16 +337,31 @@ async fn worker_loop(
         agent_chat(&config, "Hey, Sam here. I'm online and ready. Drop a task or just tell me what you need.").await;
     }
 
+    // Recover tasks stuck in `in_progress` from a prior crash. Samwise is
+    // single-active (one worker row, enforced by heartbeat), so any in_progress
+    // row at startup is orphaned and safe to re-queue.
+    {
+        let config = sb_config_arc.read().await.clone();
+        let recovered = recover_stuck_tasks(&config).await;
+        if recovered > 0 {
+            log::info!("[worker] startup recovered {} stuck task(s)", recovered);
+            agent_chat(&config, &format!(
+                "Picked up {} task{} that got stuck mid-run before I came back online. Re-queued.",
+                recovered, if recovered == 1 { "" } else { "s" }
+            )).await;
+        }
+    }
+
     // Sweep merged/closed PR worktrees on startup, and periodically thereafter.
     // Tick is ~5s; 4320 ticks = 6h cadence.
     const SWEEP_TICKS: u64 = 4320;
     {
-        let (removed, kept) = sweep_merged_worktrees().await;
+        let config = sb_config_arc.read().await.clone();
+        let (removed, kept) = sweep_worktrees_with_config(&config).await;
         if removed > 0 {
             log::info!("[worker] startup sweep removed {} worktree(s), kept {}", removed, kept);
-            let config = sb_config_arc.read().await.clone();
             agent_chat(&config, &format!(
-                "Cleaned up {} worktree{} whose PRs were merged or closed while I was away. {} still in flight.",
+                "Cleaned up {} worktree{} whose PRs were merged/closed or tasks failed while I was away. {} still in flight.",
                 removed, if removed == 1 { "" } else { "s" }, kept
             )).await;
         }
@@ -363,7 +378,7 @@ async fn worker_loop(
         if tick > 0 && tick % SWEEP_TICKS == 0 {
             let is_idle = current_task_id.lock().await.is_none();
             if is_idle {
-                let (removed, kept) = sweep_merged_worktrees().await;
+                let (removed, kept) = sweep_worktrees_with_config(&config).await;
                 if removed > 0 {
                     log::info!("[worker] periodic sweep removed {} worktree(s), kept {}", removed, kept);
                 }
@@ -1487,11 +1502,67 @@ async fn main_repo_for_worktree(wt_str: &str) -> Option<String> {
 /// --head sam/<short_id>`, and remove worktrees whose PRs are merged or closed. Worktrees
 /// without a PR that are >48h old are treated as orphans (crashed task) and removed too.
 /// Returns (removed, kept).
+/// Reset any tasks stuck in `in_progress` back to `queued`. Runs at worker
+/// startup to recover from crashes (the sole worker exited mid-task, leaving
+/// the row claimed forever). Also clears claimed_by/claimed_at so the next
+/// poll cycle picks them up normally.
+async fn recover_stuck_tasks(config: &SupabaseConfig) -> usize {
+    let Ok(tasks) = supabase::fetch_tasks(config, Some("in_progress")).await else {
+        return 0;
+    };
+    let Some(arr) = tasks.as_array() else { return 0; };
+    let mut recovered = 0usize;
+    for task in arr {
+        let Some(id) = task.get("id").and_then(|v| v.as_str()) else { continue; };
+        let updates = serde_json::json!({
+            "status": "queued",
+            "claimed_by": serde_json::Value::Null,
+            "claimed_at": serde_json::Value::Null,
+        });
+        if supabase::update_task(config, id, &updates).await.is_ok() {
+            recovered += 1;
+        }
+    }
+    recovered
+}
+
+/// Collect task-id → status map so the sweep can identify failed / vanished
+/// tasks whose worktrees should be cleaned up immediately (not waiting for
+/// the 48h orphan rule).
+async fn failed_task_ids(config: &SupabaseConfig) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(all) = supabase::fetch_tasks(config, None).await else { return out; };
+    if let Some(arr) = all.as_array() {
+        for t in arr {
+            let id = t.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let status = t.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if !id.is_empty() { out.insert(id, status); }
+        }
+    }
+    out
+}
+
 async fn sweep_merged_worktrees() -> (usize, usize) {
+    sweep_worktrees_inner(None).await
+}
+
+async fn sweep_worktrees_with_config(config: &SupabaseConfig) -> (usize, usize) {
+    sweep_worktrees_inner(Some(config)).await
+}
+
+async fn sweep_worktrees_inner(config: Option<&SupabaseConfig>) -> (usize, usize) {
     let root = worktrees_root();
     if tokio::fs::metadata(&root).await.is_err() {
         return (0, 0);
     }
+
+    // Fetch task status map once. Lets us identify failed or vanished tasks
+    // whose worktrees should be cleaned up immediately, and delete them
+    // without waiting for the 48h orphan rule to fire.
+    let task_statuses = match config {
+        Some(c) => failed_task_ids(c).await,
+        None => std::collections::HashMap::new(),
+    };
 
     let mut removed = 0usize;
     let mut kept = 0usize;
@@ -1517,42 +1588,62 @@ async fn sweep_merged_worktrees() -> (usize, usize) {
             };
             touched_main_repos.insert(main_repo.clone());
 
-            let pr_state = async_cmd("gh")
-                .args(["pr", "list", "--head", &branch, "--state", "all", "--json", "state", "--limit", "1"])
-                .current_dir(&main_repo)
-                .output().await;
+            // Task-status-driven removal. If the task row is failed OR the task
+            // is gone entirely (but we have a task map to check against), nuke
+            // the worktree immediately — no reason to keep a worktree for a
+            // task Matt will never revisit.
+            let task_match = task_statuses.get(&short_id);
+            let task_based_removal = match (config.is_some(), task_match) {
+                (true, Some(status)) if status == "failed" || status == "cancelled" => {
+                    Some(format!("task {}", status))
+                }
+                (true, None) if !task_statuses.is_empty() => {
+                    Some("task row gone".to_string())
+                }
+                _ => None,
+            };
 
-            let (should_remove, reason) = match pr_state {
-                Ok(out) if out.status.success() => {
-                    let body = String::from_utf8_lossy(&out.stdout);
-                    let body = body.trim();
-                    if body.contains("\"state\":\"MERGED\"") {
-                        (true, "PR merged")
-                    } else if body.contains("\"state\":\"CLOSED\"") {
-                        (true, "PR closed")
-                    } else if body == "[]" {
-                        let age_secs = wt_entry.metadata().await.ok()
-                            .and_then(|m| m.modified().ok())
-                            .and_then(|t| t.elapsed().ok())
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        if age_secs > 48 * 3600 {
-                            (true, "orphan (no PR, >48h)")
+            let (should_remove, reason) = if let Some(r) = task_based_removal {
+                (true, r)
+            } else {
+                // PR-driven removal (the pre-existing logic).
+                let pr_state = async_cmd("gh")
+                    .args(["pr", "list", "--head", &branch, "--state", "all", "--json", "state", "--limit", "1"])
+                    .current_dir(&main_repo)
+                    .output().await;
+
+                match pr_state {
+                    Ok(out) if out.status.success() => {
+                        let body = String::from_utf8_lossy(&out.stdout);
+                        let body = body.trim();
+                        if body.contains("\"state\":\"MERGED\"") {
+                            (true, "PR merged".to_string())
+                        } else if body.contains("\"state\":\"CLOSED\"") {
+                            (true, "PR closed".to_string())
+                        } else if body == "[]" {
+                            let age_secs = wt_entry.metadata().await.ok()
+                                .and_then(|m| m.modified().ok())
+                                .and_then(|t| t.elapsed().ok())
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            if age_secs > 48 * 3600 {
+                                (true, "orphan (no PR, >48h)".to_string())
+                            } else {
+                                (false, "no PR yet".to_string())
+                            }
                         } else {
-                            (false, "no PR yet")
+                            (false, "PR open".to_string())
                         }
-                    } else {
-                        (false, "PR open")
                     }
-                }
-                Ok(out) => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    log::warn!("[sweep] gh pr list failed for {}: {}", branch, stderr.trim());
-                    (false, "gh failed")
-                }
-                Err(e) => {
-                    log::warn!("[sweep] gh invocation failed: {}", e);
-                    (false, "gh failed")
+                    Ok(out) => {
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        log::warn!("[sweep] gh pr list failed for {}: {}", branch, stderr.trim());
+                        (false, "gh failed".to_string())
+                    }
+                    Err(e) => {
+                        log::warn!("[sweep] gh invocation failed: {}", e);
+                        (false, "gh failed".to_string())
+                    }
                 }
             };
 
@@ -1560,6 +1651,9 @@ async fn sweep_merged_worktrees() -> (usize, usize) {
                 log::info!("[sweep] removing worktree {} ({})", wt_str, reason);
                 let _ = run_git(&["worktree", "remove", "--force", &wt_str], &main_repo).await;
                 let _ = run_git(&["branch", "-D", &branch], &main_repo).await;
+                // Also delete the remote branch. Fails silently if it's already
+                // gone; intentional since we're being defensive, not assertive.
+                let _ = run_git(&["push", "origin", "--delete", &branch], &main_repo).await;
                 let _ = tokio::fs::remove_dir_all(&wt_path).await;
                 removed += 1;
             } else {
@@ -2211,10 +2305,45 @@ pub async fn run_claude_code_opts(cwd: &str, prompt: &str, max_turns: u32, timeo
     let stderr_text = stderr_handle.await.unwrap_or_default();
 
     if !status.success() {
-        return Err(format!("Claude Code failed (exit {}): {}", status, stderr_text.trim()));
+        let stderr = stderr_text.trim();
+        if let Some(msg) = detect_rate_limit(stderr).or_else(|| detect_rate_limit(stdout_text.trim())) {
+            return Err(msg);
+        }
+        return Err(format!("Claude Code failed (exit {}): {}", status, stderr));
+    }
+
+    // Some rate-limit errors show on stdout with exit=0. Catch those too.
+    if let Some(msg) = detect_rate_limit(stdout_text.trim()) {
+        return Err(msg);
     }
 
     Ok(stdout_text.trim().to_string())
+}
+
+/// Detect the common shapes of Claude/Anthropic rate-limit and quota errors.
+/// When matched, returns a surface-able message for Matt instead of letting
+/// the generic "Claude Code failed" swallow useful context. Returns None if
+/// the output doesn't look like a rate-limit failure.
+fn detect_rate_limit(text: &str) -> Option<String> {
+    if text.is_empty() { return None; }
+    let lower = text.to_lowercase();
+    let needles = [
+        "rate_limit_error",
+        "rate_limit_exceeded",
+        "rate limit",
+        "too many requests",
+        "usage limit",
+        "quota",
+        "429",
+        "overloaded_error",
+        "insufficient_quota",
+    ];
+    if needles.iter().any(|n| lower.contains(n)) {
+        // Trim to a readable snippet so Telegram/UI aren't spammed.
+        let short = if text.len() > 400 { &text[..400] } else { text };
+        return Some(format!("Hit a Claude rate / usage limit. Wait a few minutes and retry. Raw: {}", short.trim()));
+    }
+    None
 }
 
 /// Run Claude Code CLI with stream-json output, posting progress comments as it works.
