@@ -1236,10 +1236,26 @@ Make the code changes required by this task. You have approval to edit \
 any file in this repo \u{2014} do not ask for confirmation before writing.\n\n\
 Explore only what the task needs. Do not read the whole codebase or add \
 unrelated cleanup \u{2014} those will bloat the diff and slow review.\n\n\
-When you are done making changes, run:\n\
+When you are done making changes, stage everything and write a structured commit. \
+Use a HEREDOC so the body is multi-line:\n\
 ```\n\
-git add -A && git commit -m \"{title}\"\n\
+git add -A && git commit -m \"$(cat <<'EOF'\n\
+{title}\n\
+\n\
+What was fixed:\n\
+- <plain-English description of the bug or feature, from the user/customer POV>\n\
+\n\
+How it was fixed:\n\
+- <technical summary of the change: files/functions touched, approach, why>\n\
+\n\
+For Customer Success:\n\
+- <one or two sentences CS can paste to the customer explaining that it's fixed and what to expect now, in non-technical language>\n\
+EOF\n\
+)\"\n\
 ```\n\
+Fill in every section concretely. Do not use placeholders. If the task is a \
+non-customer-facing refactor, still write the \"For Customer Success\" line \
+but mark it as \"internal only, no customer message needed\".\n\n\
 Then stop. Do not open the PR yourself \u{2014} that is handled after this step.\n\n\
 If the task is genuinely ambiguous and you cannot proceed without a decision \
 from Matt, stop without making changes and explain specifically what you need clarified."
@@ -1859,9 +1875,15 @@ async fn recover_stuck_tasks(config: &SupabaseConfig) -> usize {
     recovered
 }
 
-/// Collect task-id → status map so the sweep can identify failed / vanished
-/// tasks whose worktrees should be cleaned up immediately (not waiting for
-/// the 48h orphan rule).
+/// Collect short-task-id → status map so the sweep can identify failed /
+/// vanished tasks whose worktrees should be cleaned up immediately (not
+/// waiting for the 48h orphan rule).
+///
+/// Keyed by `short_task_id` because worktree directories and branch names
+/// use the short form, not the full UUID. Previously this was keyed by the
+/// full UUID, which silently made every lookup miss and sent every worktree
+/// down the "task row gone" branch — the sweep then deleted remote branches
+/// and GitHub auto-closed the still-open PRs attached to them.
 async fn failed_task_ids(config: &SupabaseConfig) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
     let Ok(all) = supabase::fetch_tasks(config, None).await else { return out; };
@@ -1869,7 +1891,7 @@ async fn failed_task_ids(config: &SupabaseConfig) -> std::collections::HashMap<S
         for t in arr {
             let id = t.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let status = t.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            if !id.is_empty() { out.insert(id, status); }
+            if !id.is_empty() { out.insert(short_task_id(&id), status); }
         }
     }
     out
@@ -1936,56 +1958,66 @@ async fn sweep_worktrees_inner(config: Option<&SupabaseConfig>) -> (usize, usize
                 _ => None,
             };
 
-            let (should_remove, reason) = if let Some(r) = task_based_removal {
-                (true, r)
-            } else {
-                // PR-driven removal (the pre-existing logic).
-                let pr_state = async_cmd("gh")
-                    .args(["pr", "list", "--head", &branch, "--state", "all", "--json", "state", "--limit", "1"])
-                    .current_dir(&main_repo)
-                    .output().await;
+            // Always check PR state first. Even a task flagged failed or
+            // missing can have a PR Matt is reviewing — never kill the remote
+            // branch under an OPEN PR, because GitHub auto-closes it.
+            let pr_state_raw = async_cmd("gh")
+                .args(["pr", "list", "--head", &branch, "--state", "all", "--json", "state", "--limit", "1"])
+                .current_dir(&main_repo)
+                .output().await;
 
-                match pr_state {
-                    Ok(out) if out.status.success() => {
-                        let body = String::from_utf8_lossy(&out.stdout);
-                        let body = body.trim();
-                        if body.contains("\"state\":\"MERGED\"") {
-                            (true, "PR merged".to_string())
-                        } else if body.contains("\"state\":\"CLOSED\"") {
-                            (true, "PR closed".to_string())
-                        } else if body == "[]" {
-                            let age_secs = wt_entry.metadata().await.ok()
-                                .and_then(|m| m.modified().ok())
-                                .and_then(|t| t.elapsed().ok())
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
-                            if age_secs > 48 * 3600 {
-                                (true, "orphan (no PR, >48h)".to_string())
-                            } else {
-                                (false, "no PR yet".to_string())
-                            }
-                        } else {
-                            (false, "PR open".to_string())
-                        }
-                    }
-                    Ok(out) => {
-                        let stderr = String::from_utf8_lossy(&out.stderr);
-                        log::warn!("[sweep] gh pr list failed for {}: {}", branch, stderr.trim());
-                        (false, "gh failed".to_string())
-                    }
-                    Err(e) => {
-                        log::warn!("[sweep] gh invocation failed: {}", e);
-                        (false, "gh failed".to_string())
+            let pr_state: Option<String> = match pr_state_raw {
+                Ok(out) if out.status.success() => {
+                    let body = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if body.contains("\"state\":\"MERGED\"") { Some("MERGED".into()) }
+                    else if body.contains("\"state\":\"CLOSED\"") { Some("CLOSED".into()) }
+                    else if body.contains("\"state\":\"OPEN\"") { Some("OPEN".into()) }
+                    else if body == "[]" { Some("NONE".into()) }
+                    else { None }
+                }
+                Ok(out) => {
+                    log::warn!("[sweep] gh pr list failed for {}: {}", branch, String::from_utf8_lossy(&out.stderr).trim());
+                    None
+                }
+                Err(e) => {
+                    log::warn!("[sweep] gh invocation failed: {}", e);
+                    None
+                }
+            };
+
+            // Hard gate: an open PR always keeps the worktree + branch alive.
+            if pr_state.as_deref() == Some("OPEN") {
+                kept += 1;
+                continue;
+            }
+
+            let (should_remove, reason) = match (task_based_removal, pr_state.as_deref()) {
+                (_, Some("MERGED")) => (true, "PR merged".to_string()),
+                (_, Some("CLOSED")) => (true, "PR closed".to_string()),
+                (Some(r), _) => (true, r),
+                (None, Some("NONE")) => {
+                    let age_secs = wt_entry.metadata().await.ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.elapsed().ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    if age_secs > 48 * 3600 {
+                        (true, "orphan (no PR, >48h)".to_string())
+                    } else {
+                        (false, "no PR yet".to_string())
                     }
                 }
+                _ => (false, "gh failed".to_string()),
             };
 
             if should_remove {
                 log::info!("[sweep] removing worktree {} ({})", wt_str, reason);
                 let _ = run_git(&["worktree", "remove", "--force", &wt_str], &main_repo).await;
                 let _ = run_git(&["branch", "-D", &branch], &main_repo).await;
-                // Also delete the remote branch. Fails silently if it's already
-                // gone; intentional since we're being defensive, not assertive.
+                // Only delete the remote branch when we're sure no open PR is
+                // attached. The open-PR guard above already returned early,
+                // and PR-merged / PR-closed states mean the branch is already
+                // detached from a live review.
                 let _ = run_git(&["push", "origin", "--delete", &branch], &main_repo).await;
                 let _ = tokio::fs::remove_dir_all(&wt_path).await;
                 removed += 1;
@@ -2940,7 +2972,13 @@ pub async fn run_claude_code_opts(cwd: &str, prompt: &str, max_turns: u32, timeo
         cmd.arg("--max-turns").arg(max_turns.to_string());
     }
 
-    cmd.current_dir(cwd)
+    // Resolve cwd. Callers pass "." for "no particular repo" chat calls, but
+    // when Samwise.app is launched from Finder the inherited cwd is "/". Any
+    // filesystem walk the CLI does from there hits /Volumes and triggers the
+    // macOS "Allow network volumes" TCC prompt, which blocks the worker.
+    // Pin those calls to a stable per-user Samwise scratch dir instead.
+    let resolved_cwd = resolve_chat_cwd(cwd);
+    cmd.current_dir(&resolved_cwd)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
@@ -2990,6 +3028,9 @@ pub async fn run_claude_code_opts(cwd: &str, prompt: &str, max_turns: u32, timeo
 
     if !status.success() {
         let stderr = stderr_text.trim();
+        if let Some(msg) = detect_login_required(stderr).or_else(|| detect_login_required(stdout_text.trim())) {
+            return Err(msg);
+        }
         if let Some(msg) = detect_rate_limit(stderr).or_else(|| detect_rate_limit(stdout_text.trim())) {
             return Err(msg);
         }
@@ -3021,26 +3062,77 @@ pub async fn run_claude_code_opts(cwd: &str, prompt: &str, max_turns: u32, timeo
     Ok(stdout_text.trim().to_string())
 }
 
+/// Resolve the cwd for chat Claude Code invocations.
+///
+/// Callers pass "." to mean "no specific repo — just chat". When Samwise.app
+/// is launched from Finder the process cwd is "/", so "." makes the CLI walk
+/// the filesystem from root. That hits /Volumes/* and triggers the macOS
+/// "Allow network volumes" TCC prompt, which blocks the worker behind a modal
+/// the user has to dismiss on the Mac mini.
+///
+/// Resolution:
+/// - Absolute paths and non-"." relative paths pass through unchanged (task
+///   workers always supply a concrete repo path).
+/// - "." and "" are rewritten to $HOME/samwise, creating the dir if needed.
+///   Fall back to $HOME, then "/tmp" as a last resort. Never "/".
+fn resolve_chat_cwd(cwd: &str) -> String {
+    let trimmed = cwd.trim();
+    if !trimmed.is_empty() && trimmed != "." {
+        return trimmed.to_string();
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let scratch = std::path::PathBuf::from(&home).join("samwise");
+        let _ = std::fs::create_dir_all(&scratch);
+        if scratch.exists() {
+            return scratch.to_string_lossy().into_owned();
+        }
+        return home;
+    }
+    "/tmp".to_string()
+}
+
+/// Detect the Claude Code CLI "not logged in" state so Matt gets a clear
+/// instruction instead of a generic "Claude Code failed" message.
+fn detect_login_required(text: &str) -> Option<String> {
+    if text.is_empty() { return None; }
+    let lower = text.to_lowercase();
+    let needles = [
+        "not logged in",
+        "please run /login",
+        "run `claude /login`",
+        "run /login",
+    ];
+    if needles.iter().any(|n| lower.contains(n)) {
+        return Some("Claude Code CLI isn't logged in on this machine. Run `claude /login` in a terminal, then retry.".to_string());
+    }
+    None
+}
+
 /// Detect the common shapes of Claude/Anthropic rate-limit and quota errors.
 /// When matched, returns a surface-able message for Matt instead of letting
 /// the generic "Claude Code failed" swallow useful context. Returns None if
 /// the output doesn't look like a rate-limit failure.
+///
+/// Needles must be specific enough to not match natural-language task
+/// descriptions. "rate limit" / "quota" / "429" appear in bug reports Sam
+/// relays verbatim (e.g. "users hit 429 when..."), so we only match
+/// machine-generated error shapes: API error type strings, CLI banner text,
+/// or explicit HTTP status envelopes.
 fn detect_rate_limit(text: &str) -> Option<String> {
     if text.is_empty() { return None; }
     let lower = text.to_lowercase();
     let needles = [
         "rate_limit_error",
         "rate_limit_exceeded",
-        "rate limit",
-        "too many requests",
-        "usage limit",
-        "quota",
-        "429",
         "overloaded_error",
         "insufficient_quota",
+        "claude ai usage limit reached",
+        "\"status\":429",
+        "\"status\": 429",
+        "status code 429",
+        "http 429",
     ];
     if needles.iter().any(|n| lower.contains(n)) {
-        // Trim to a readable snippet so Telegram/UI aren't spammed.
         let short = if text.len() > 400 { &text[..400] } else { text };
         return Some(format!("Hit a Claude rate / usage limit. Wait a few minutes and retry. Raw: {}", short.trim()));
     }
@@ -3078,7 +3170,8 @@ pub async fn run_claude_code_streaming(
         cmd.arg("--max-turns").arg(max_turns.to_string());
     }
 
-    cmd.current_dir(cwd)
+    let resolved_cwd = resolve_chat_cwd(cwd);
+    cmd.current_dir(&resolved_cwd)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
@@ -3658,6 +3751,74 @@ async fn upload_screenshots_to_storage(
     Ok((urls, md))
 }
 
+/// Summarize the branch diff into three short sections for the PR body:
+/// what was fixed (user-visible), how it was fixed (technical), and a
+/// paste-ready Customer Success blurb. Best-effort — returns None on any
+/// failure so PR creation still proceeds.
+async fn summarize_pr_changes(
+    repo_path: &str,
+    base_branch: &str,
+    title: &str,
+    description: &str,
+) -> Option<String> {
+    // Grab the branch diff vs base. Cap the size so we don't blow past the
+    // CLI prompt limit on large refactors — the summary just gets a
+    // representative slice in that case.
+    let diff_out = async_cmd("git")
+        .args(["diff", &format!("origin/{}..HEAD", base_branch)])
+        .current_dir(repo_path)
+        .output()
+        .await
+        .ok()?;
+    if !diff_out.status.success() {
+        return None;
+    }
+    let mut diff = String::from_utf8_lossy(&diff_out.stdout).to_string();
+    const MAX_DIFF_BYTES: usize = 60_000;
+    let truncated = diff.len() > MAX_DIFF_BYTES;
+    if truncated {
+        diff.truncate(MAX_DIFF_BYTES);
+        diff.push_str("\n\n...[diff truncated]...\n");
+    }
+    if diff.trim().is_empty() {
+        return None;
+    }
+
+    let prompt = format!(
+        "You are summarizing a code change for a pull request Matt will review.\n\
+Return ONLY a single JSON object with exactly these keys, no prose, no markdown fence:\n\
+{{\n  \"what\": \"...\",\n  \"how\": \"...\",\n  \"customer_message\": \"...\"\n}}\n\n\
+Field rules:\n\
+- what: 1-3 short bullets (plain English, user/customer POV) describing the bug or feature. Lead with the observable symptom.\n\
+- how: 1-4 short bullets describing the technical change. Mention files or functions touched and the approach.\n\
+- customer_message: one or two plain-text sentences Customer Success can paste to the customer. No code terms, no markdown, no filenames, no apologies longer than needed. If the change is internal-only, set this to exactly \"internal only, no customer message needed\".\n\n\
+## Task title\n{title}\n\n## Task description\n{description}\n\n## Diff (base: {base_branch})\n```diff\n{diff}\n```\n",
+        title = title, description = description, base_branch = base_branch, diff = diff
+    );
+
+    let raw = run_claude_code_opts(repo_path, &prompt, 1, 180).await.ok()?;
+    let trimmed = raw.trim();
+    let json_start = trimmed.find('{')?;
+    let json_end = trimmed.rfind('}')?;
+    if json_end <= json_start { return None; }
+    let json_slice = &trimmed[json_start..=json_end];
+    let parsed: serde_json::Value = serde_json::from_str(json_slice).ok()?;
+    let what = parsed.get("what").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let how = parsed.get("how").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let cs = parsed.get("customer_message").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if what.is_empty() && how.is_empty() && cs.is_empty() { return None; }
+
+    let mut md = String::new();
+    md.push_str("### What was fixed\n");
+    md.push_str(if what.is_empty() { "_not provided_" } else { what });
+    md.push_str("\n\n### How it was fixed\n");
+    md.push_str(if how.is_empty() { "_not provided_" } else { how });
+    md.push_str("\n\n### For Customer Success\n");
+    md.push_str(if cs.is_empty() { "_not provided_" } else { cs });
+    md.push('\n');
+    Some(md)
+}
+
 /// Create a PR with before/after screenshots uploaded to Supabase Storage.
 async fn create_pr(
     config: &super::supabase::SupabaseConfig,
@@ -3737,6 +3898,16 @@ async fn create_pr(
 
     // Build PR body with Supabase Storage URLs instead of repo-relative paths
     let mut pr_body = format!("## {}\n\n{}\n\n", title, description);
+
+    // Ask Claude to summarize the diff into three sections Matt actually reads:
+    // what was fixed (customer-visible), how it was fixed (technical),
+    // and a paste-ready blurb for Customer Success. Best-effort: if the
+    // summarizer fails or returns junk, we still ship the PR without it.
+    if let Some(summary_md) = summarize_pr_changes(repo_path, &base_branch, title, description).await {
+        pr_body.push_str(&summary_md);
+        pr_body.push('\n');
+    }
+
     if has_screenshots {
         let (_, screenshot_md) = upload_screenshots_to_storage(config, task_id, screenshot_dir).await
             .unwrap_or_default();
