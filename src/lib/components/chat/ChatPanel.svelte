@@ -3,6 +3,7 @@
 	import { getChatStore } from '$lib/stores/chat.svelte';
 	import { getTaskStore } from '$lib/stores/tasks.svelte';
 	import { getTheme } from '$lib/stores/theme.svelte';
+	import { getLayout } from '$lib/stores/layout.svelte';
 	import ChatMessage from './ChatMessage.svelte';
 	import ChatInput from './ChatInput.svelte';
 	import AgentAvatar from './AgentAvatar.svelte';
@@ -10,6 +11,7 @@
 	const chat = getChatStore();
 	const taskStore = getTaskStore();
 	const theme = getTheme();
+	const layout = getLayout();
 
 	let messagesContainer = $state<HTMLDivElement | null>(null);
 	let minimized = $state(false);
@@ -98,6 +100,7 @@
 				transition: all 0.15s ease;
 			"
 			onclick={() => minimized = !minimized}
+			title={minimized ? 'Expand chat in place' : 'Minimize chat in place'}
 			aria-label={minimized ? 'Expand chat' : 'Minimize chat'}
 		>
 			<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
@@ -106,6 +109,24 @@
 				{:else}
 					<path d="M4 10l4-4 4 4"/>
 				{/if}
+			</svg>
+		</button>
+		<button
+			style="
+				width: 28px; height: 28px; display: flex; align-items: center; justify-content: center;
+				background: none; border: 1px solid {theme.c.borderDefault}; border-radius: 6px;
+				color: {theme.c.textMuted}; cursor: pointer;
+				transition: all 0.15s ease;
+			"
+			onclick={() => layout.toggleRightPanel()}
+			title="Collapse sidebar (Ctrl+/)"
+			aria-label="Collapse chat sidebar"
+			onmouseenter={(e) => (e.currentTarget as HTMLButtonElement).style.color = theme.c.textPrimary}
+			onmouseleave={(e) => (e.currentTarget as HTMLButtonElement).style.color = theme.c.textMuted}
+		>
+			<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+				<path d="M11 4l-5 4 5 4"/>
+				<path d="M3 3v10"/>
 			</svg>
 		</button>
 	</div>

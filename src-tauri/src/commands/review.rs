@@ -634,6 +634,9 @@ pub enum PrReviewVerdict {
 pub struct PrReviewResult {
     pub verdict: PrReviewVerdict,
     pub markdown: String,
+    /// True when the skill emitted `REQUIRES_HUMAN: yes`, signalling Matt
+    /// should handle the blockers rather than Sam's auto-fix loop.
+    pub requires_human: bool,
 }
 
 const SAMWISE_PR_REVIEW_TIMEOUT_SECS: u64 = 10 * 60;
@@ -684,6 +687,7 @@ pub async fn run_samwise_pr_review(
                 "Codex CLI isn't logged in on this machine. Run `codex login` in a terminal and drag the card out and back to re-trigger a review.\n\nRaw output:\n\n```\n{}\n```",
                 trim_to(&stdout, 2000)
             ),
+            requires_human: true,
         });
     }
     if combined_lower.contains("rate limit") || combined_lower.contains("rate_limit_error") || combined_lower.contains("overloaded_error") {
@@ -693,6 +697,7 @@ pub async fn run_samwise_pr_review(
                 "Codex hit a rate or usage limit. Leaving the card in Review; drag it out and back once things cool off to retry.\n\nRaw output:\n\n```\n{}\n```",
                 trim_to(&stdout, 2000)
             ),
+            requires_human: true,
         });
     }
 
@@ -705,56 +710,95 @@ pub async fn run_samwise_pr_review(
                 trim_to(&stderr, 1500),
                 trim_to(&stdout, 1500),
             ),
+            requires_human: true,
         });
     }
 
     // Parse for the last `VERDICT:` line.
-    let (verdict, body) = parse_pr_review_output(&stdout);
+    let (verdict, requires_human, body) = parse_pr_review_output(&stdout);
     Ok(PrReviewResult {
         verdict,
         markdown: body,
+        requires_human,
     })
 }
 
-fn parse_pr_review_output(raw: &str) -> (PrReviewVerdict, String) {
+fn parse_pr_review_output(raw: &str) -> (PrReviewVerdict, bool, String) {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return (
             PrReviewVerdict::Inconclusive,
+            true,
             "Codex returned no output.".to_string(),
         );
     }
 
-    // Walk lines from the bottom to find a VERDICT: line. Everything above is the markdown body.
+    // Walk lines from the bottom. VERDICT is the last non-empty line;
+    // REQUIRES_HUMAN may appear directly above it. Body is everything above
+    // the REQUIRES_HUMAN line (or the VERDICT line if REQUIRES_HUMAN is absent).
     let lines: Vec<&str> = trimmed.lines().collect();
+
+    let mut verdict_idx: Option<usize> = None;
+    let mut verdict = PrReviewVerdict::Inconclusive;
+
     for (idx, line) in lines.iter().enumerate().rev() {
         let stripped = line.trim();
         if stripped.is_empty() { continue; }
         let lower = stripped.to_lowercase();
         if let Some(rest) = lower.strip_prefix("verdict:") {
             let tag = rest.trim();
-            let verdict = if tag.starts_with("merge_now") {
+            verdict = if tag.starts_with("merge_now") {
                 PrReviewVerdict::MergeNow
             } else if tag.starts_with("fix_issues") {
                 PrReviewVerdict::FixIssues
             } else {
                 PrReviewVerdict::Inconclusive
             };
-            let body = lines[..idx].join("\n").trim_end().to_string();
-            let markdown = if body.is_empty() { stripped.to_string() } else { body };
-            return (verdict, markdown);
+            verdict_idx = Some(idx);
         }
-        // First non-empty line from the bottom wasn't a VERDICT — stop searching.
+        // Bottom-most non-empty line decides whether we matched; stop either way.
         break;
     }
 
-    (
-        PrReviewVerdict::Inconclusive,
-        format!(
-            "Codex didn't emit a VERDICT line. Leaving the card in Review.\n\nRaw output:\n\n```\n{}\n```",
-            trim_to(trimmed, 3000)
-        ),
-    )
+    let Some(v_idx) = verdict_idx else {
+        return (
+            PrReviewVerdict::Inconclusive,
+            true,
+            format!(
+                "Codex didn't emit a VERDICT line. Leaving the card in Review.\n\nRaw output:\n\n```\n{}\n```",
+                trim_to(trimmed, 3000)
+            ),
+        );
+    };
+
+    // Look for REQUIRES_HUMAN on the most-recent non-empty line above the verdict.
+    let mut requires_human = false;
+    let mut body_cut = v_idx;
+    for (idx, line) in lines[..v_idx].iter().enumerate().rev() {
+        let stripped = line.trim();
+        if stripped.is_empty() { continue; }
+        let lower = stripped.to_lowercase();
+        if let Some(rest) = lower.strip_prefix("requires_human:") {
+            requires_human = rest.trim().starts_with("yes");
+            body_cut = idx;
+        }
+        break;
+    }
+
+    let body = lines[..body_cut].join("\n").trim_end().to_string();
+    let markdown = if body.is_empty() {
+        lines[v_idx].trim().to_string()
+    } else {
+        body
+    };
+
+    // For merge_now verdicts, REQUIRES_HUMAN is irrelevant; force it to false
+    // so the caller doesn't over-gate on a clean PR.
+    if matches!(verdict, PrReviewVerdict::MergeNow) {
+        requires_human = false;
+    }
+
+    (verdict, requires_human, markdown)
 }
 
 /// Resolve the cwd for a Codex invocation. Callers pass the task's repo_path

@@ -9,6 +9,7 @@
   let minScore = $derived(settingsStore.value.autoMergeMinScore);
   let maxDiff = $derived(settingsStore.value.autoMergeMaxDiffLines);
   let prReviewEnabled = $derived(settingsStore.value.autoPrReviewEnabled);
+  let autoFixEnabled = $derived(settingsStore.value.autoFixFromFixesNeededEnabled);
 
   function toggleEnabled() {
     updateSetting('autoMergeEnabled', !enabled);
@@ -16,6 +17,10 @@
 
   function togglePrReviewEnabled() {
     updateSetting('autoPrReviewEnabled', !prReviewEnabled);
+  }
+
+  function toggleAutoFix() {
+    updateSetting('autoFixFromFixesNeededEnabled', !autoFixEnabled);
   }
 
   function setMinScore(v: number) {
@@ -157,6 +162,40 @@
         position: absolute; top: 2px; left: {prReviewEnabled ? '22px' : '2px'};
         width: 18px; height: 18px; border-radius: 50%;
         background: {prReviewEnabled ? 'white' : 'var(--text-muted)'};
+        transition: all 0.2s ease;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+      "></span>
+    </button>
+  </div>
+
+  <!-- Auto-fix loop -->
+  <div
+    style="display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; background: var(--bg-primary); border: 1px solid var(--border-default); border-radius: 10px; opacity: {enabled || !prReviewEnabled ? 0.5 : 1}; transition: opacity 0.2s ease;"
+    onmouseenter={() => hovered = 'autofix'}
+    onmouseleave={() => hovered = null}
+  >
+    <div>
+      <div style="font-size: 13px; font-weight: 600; color: var(--text-primary);">Auto-fix cards in Fixes Needed</div>
+      <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">When Codex returns fix_issues, Sam runs Claude Code on the same worktree, addresses the blockers, and pushes. Max 3 cycles per card. Skipped when Codex flags the blockers as needing human judgment.</div>
+    </div>
+    <button
+      onclick={toggleAutoFix}
+      disabled={enabled || !prReviewEnabled}
+      role="switch"
+      aria-checked={autoFixEnabled}
+      aria-label="Toggle auto-fix on fixes needed"
+      style="
+        position: relative; width: 44px; height: 24px; border-radius: 12px; cursor: {enabled || !prReviewEnabled ? 'not-allowed' : 'pointer'};
+        background: {autoFixEnabled ? '#6366f1' : 'var(--bg-elevated)'};
+        border: 1px solid {autoFixEnabled ? '#6366f1' : 'var(--border-default)'};
+        transition: all 0.2s ease;
+        transform: {hovered === 'autofix' && !enabled && prReviewEnabled ? 'scale(1.05)' : 'scale(1)'};
+      "
+    >
+      <span style="
+        position: absolute; top: 2px; left: {autoFixEnabled ? '22px' : '2px'};
+        width: 18px; height: 18px; border-radius: 50%;
+        background: {autoFixEnabled ? 'white' : 'var(--text-muted)'};
         transition: all 0.2s ease;
         box-shadow: 0 1px 3px rgba(0,0,0,0.3);
       "></span>

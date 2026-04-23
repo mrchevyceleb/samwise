@@ -555,8 +555,27 @@ async fn worker_loop(
                                         match &result {
                                             Ok(msg) => {
                                                 emit_worker_event(&app, "task_completed", msg, Some(&task_id));
-                                                // Proactive chat: announce completion
-                                                if msg.contains("PR created") {
+                                                // Proactive chat: announce completion.
+                                                // If a Codex review was just kicked off on the freshly-opened PR,
+                                                // don't ask "want me to pick up something else?" — the card is
+                                                // still being reviewed async. Signal that instead.
+                                                let completion_settings: Option<serde_json::Value> = if let Ok(data_dir) = app.path().app_data_dir() {
+                                                    let p = data_dir.join("settings.json");
+                                                    tokio::fs::read_to_string(&p).await.ok().and_then(|s| serde_json::from_str(&s).ok())
+                                                } else { None };
+                                                let auto_merge_on = completion_settings.as_ref()
+                                                    .and_then(|s| s.get("autoMergeEnabled"))
+                                                    .and_then(|v| v.as_bool()).unwrap_or(false);
+                                                let pr_review_on = completion_settings.as_ref()
+                                                    .and_then(|s| s.get("autoPrReviewEnabled"))
+                                                    .and_then(|v| v.as_bool()).unwrap_or(true);
+
+                                                if msg.contains("PR created") && pr_review_on && !auto_merge_on {
+                                                    agent_chat(&config, &format!(
+                                                        "PR's up for \"{}\": {}. Running Codex review now. I'll post the verdict and route the card in a minute — no need to pick up something new yet.",
+                                                        task_title, msg
+                                                    )).await;
+                                                } else if msg.contains("PR created") {
                                                     agent_chat(&config, &format!(
                                                         "Done with \"{}\". {} Want me to pick up something else?", task_title, msg
                                                     )).await;
@@ -625,6 +644,12 @@ async fn worker_loop(
                     .and_then(|s| serde_json::from_str(&s).ok())
             } else { None };
             sweep_pr_review_queue(&config, &settings).await;
+        }
+
+        // Sweep approved/review/fixes_needed cards whose GitHub PRs got merged
+        // or closed outside Sam's pipeline. Every ~60s (12 ticks).
+        if tick % 12 == 0 {
+            sweep_pr_merged_cards(&config).await;
         }
 
         tick += 1;
@@ -3836,12 +3861,284 @@ pub fn spawn_pr_review_task(
                     "updated_at": chrono::Utc::now().to_rfc3339(),
                 })).await;
                 notify_callback(&config, &task_id, "fixes_needed", Some(&pr_url), None);
+
+                // Kick the auto-fix loop if enabled, not flagged REQUIRES_HUMAN,
+                // and we're under the cycle cap. Runs detached so this callback
+                // returns fast.
+                maybe_spawn_auto_fix(
+                    config.clone(),
+                    task_id.clone(),
+                    pr_url.clone(),
+                    repo_path.clone(),
+                    result.markdown.clone(),
+                    result.requires_human,
+                ).await;
             }
             review::PrReviewVerdict::Inconclusive => {
                 // Leave in review. Markdown body was already posted as a comment above.
             }
         }
     });
+}
+
+/// Scan cards whose PR status on GitHub has advanced without Sam knowing
+/// — PR merged or closed while the card was still sitting in review /
+/// fixes_needed / approved — and move those cards to done. Runs on the
+/// poll-loop cadence. Never blocks: spawns one `gh pr view` per candidate
+/// and updates Supabase inline.
+pub async fn sweep_pr_merged_cards(config: &SupabaseConfig) {
+    // Candidate statuses: any state where the card is "waiting on Matt" but
+    // GitHub could have moved on. `review` is in scope for the case where
+    // Matt merges a PR before (or instead of) a Codex verdict landing.
+    let Ok(tasks) = supabase::fetch_tasks(config, None).await else { return };
+    let Some(arr) = tasks.as_array() else { return };
+
+    for task in arr {
+        let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        if !matches!(status, "approved" | "review" | "fixes_needed") { continue; }
+
+        let pr_url = task.get("pr_url").and_then(|v| v.as_str()).unwrap_or("");
+        let task_id = task.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if pr_url.is_empty() || task_id.is_empty() { continue; }
+
+        // Ask GitHub. Any failure = skip this tick; we'll retry next poll.
+        let out = async_cmd("gh")
+            .args(["pr", "view", pr_url, "--json", "state,mergedAt"])
+            .output().await;
+        let Ok(o) = out else { continue };
+        if !o.status.success() { continue; }
+        let body = String::from_utf8_lossy(&o.stdout);
+        let parsed: serde_json::Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let gh_state = parsed.get("state").and_then(|v| v.as_str()).unwrap_or("").to_uppercase();
+        let merged_at = parsed.get("mergedAt").and_then(|v| v.as_str()).unwrap_or("");
+
+        if gh_state == "MERGED" || !merged_at.is_empty() {
+            let _ = supabase::update_task(config, task_id, &serde_json::json!({
+                "status": "done",
+                "completed_at": chrono::Utc::now().to_rfc3339(),
+                "updated_at": chrono::Utc::now().to_rfc3339(),
+                "review_cycle_count": 0,
+            })).await;
+            notify_callback(config, task_id, "done", Some(pr_url), None);
+            agent_comment(config, task_id, "PR merged on GitHub. Moving the card to Done.").await;
+            continue;
+        }
+
+        if gh_state == "CLOSED" {
+            let _ = supabase::update_task(config, task_id, &serde_json::json!({
+                "status": "done",
+                "completed_at": chrono::Utc::now().to_rfc3339(),
+                "updated_at": chrono::Utc::now().to_rfc3339(),
+                "review_cycle_count": 0,
+            })).await;
+            notify_callback(config, task_id, "done", Some(pr_url), Some("PR closed without merging"));
+            agent_comment(config, task_id, "PR was closed without merging. Moving the card to Done.").await;
+            continue;
+        }
+        // OPEN / anything else: leave alone.
+    }
+}
+
+/// Decide whether to fire the auto-fix loop after a `fix_issues` verdict.
+/// Gated by the `autoFixFromFixesNeededEnabled` setting, Codex's
+/// `REQUIRES_HUMAN` flag, and a 3-cycle cap per card.
+async fn maybe_spawn_auto_fix(
+    config: SupabaseConfig,
+    task_id: String,
+    pr_url: String,
+    repo_path: String,
+    review_markdown: String,
+    requires_human: bool,
+) {
+    if requires_human {
+        agent_comment(&config, &task_id, "Codex flagged this as needing your judgment (REQUIRES_HUMAN: yes). Leaving in Fixes Needed for you.").await;
+        return;
+    }
+
+    // Read the setting from disk so the detached path doesn't need cached_settings plumbed in.
+    let home = std::env::var("HOME").unwrap_or_default();
+    let settings_path = std::path::PathBuf::from(&home)
+        .join("Library/Application Support/com.mattjohnston.agent-one/settings.json");
+    let settings_val: Option<serde_json::Value> = tokio::fs::read_to_string(&settings_path).await
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+    let auto_fix_on = settings_val.as_ref()
+        .and_then(|s| s.get("autoFixFromFixesNeededEnabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    if !auto_fix_on {
+        return;
+    }
+
+    // Cycle cap: read current count from the task row.
+    let cycle_count = match supabase::fetch_task(&config, &task_id).await {
+        Ok(Some(t)) => t.get("review_cycle_count").and_then(|v| v.as_i64()).unwrap_or(0),
+        _ => 0,
+    };
+    if cycle_count >= 3 {
+        agent_comment(&config, &task_id, "Hit the 3-cycle auto-fix cap on this PR. Stopping so I don't thrash — take a look when you get a sec.").await;
+        return;
+    }
+
+    spawn_auto_fix_task(config, task_id, pr_url, repo_path, review_markdown, cycle_count as u32);
+}
+
+/// Run Claude Code against the existing worktree with a prompt derived from
+/// the Codex review blockers, commit, and push. Updating the PR triggers
+/// the re-review watcher on the next poll tick.
+pub fn spawn_auto_fix_task(
+    config: SupabaseConfig,
+    task_id: String,
+    pr_url: String,
+    repo_path: String,
+    review_markdown: String,
+    prev_cycle_count: u32,
+) {
+    tokio::spawn(async move {
+        let new_cycle = prev_cycle_count + 1;
+
+        let _ = supabase::update_task(&config, &task_id, &serde_json::json!({
+            "status": "in_progress",
+            "review_cycle_count": new_cycle,
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+        })).await;
+        notify_callback(&config, &task_id, "in_progress", Some(&pr_url), None);
+
+        agent_comment(&config, &task_id, &format!(
+            "Running auto-fix cycle {}/3 on this PR. Feeding Codex's blocker list back to Claude Code.",
+            new_cycle
+        )).await;
+
+        // Build fix prompt. Focus Claude Code on the blockers only — not risks,
+        // not "not verified" items. The review markdown is already structured
+        // with ## Blockers so we can hand it over wholesale.
+        let prompt = format!(
+            "You are Sam fixing the blockers a Codex review flagged on this PR. \
+The repo is already checked out at this worktree, and you are on the PR's head branch.\n\n\
+## Codex review\n\n{}\n\n\
+## Instructions\n\
+Address every item under the `## Blockers` section above. Do NOT touch items \
+under `## Risks` or `## Not verified` unless they are also blockers. Do not \
+add new features, refactor unrelated code, or bump dependencies.\n\n\
+When you are done, stage and commit everything with a short structured body:\n\
+```\n\
+git add -A && git commit -m \"$(cat <<'EOF'\n\
+samwise: address review blockers (cycle {}/3)\n\n\
+Blockers addressed:\n\
+- <bullet per blocker>\n\n\
+How it was fixed:\n\
+- <bullet per change>\n\n\
+For Customer Success:\n\
+- <one plain sentence, or \"internal only, no customer message needed\">\n\
+EOF\n\
+)\"\n\
+```\n\n\
+Do not push — that is handled after this step. Do not open a second PR.\n\
+If a blocker is genuinely unfixable without Matt's input (e.g. needs a product \
+decision or schema change), stop and explain which blocker and why, without \
+making any other changes.",
+            review_markdown, new_cycle
+        );
+
+        let process_id_slot: Arc<tokio::sync::Mutex<Option<u32>>> = Arc::new(tokio::sync::Mutex::new(None));
+        let claude_result = run_claude_code_streaming(&repo_path, &prompt, 40, 900, &config, &task_id, process_id_slot).await;
+
+        match claude_result {
+            Ok(_) => {
+                // Push whatever Claude committed. Find the branch first.
+                let branch_out = async_cmd("git")
+                    .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                    .current_dir(&repo_path)
+                    .output().await;
+                let branch = branch_out.ok()
+                    .and_then(|o| if o.status.success() { String::from_utf8(o.stdout).ok() } else { None })
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+
+                if branch.is_empty() || branch == "HEAD" {
+                    fail_auto_fix(&config, &task_id, &pr_url, "couldn't resolve PR branch for push").await;
+                    return;
+                }
+
+                // Capture HEAD before push so we can detect whether Claude
+                // actually created a new commit. `git push` succeeds with
+                // "Everything up-to-date" on a no-op; without this check we'd
+                // flip the card back to review and burn a cycle on an
+                // unchanged PR.
+                let head_before_out = async_cmd("git")
+                    .args(["rev-parse", "HEAD"])
+                    .current_dir(&repo_path)
+                    .output().await;
+                let head_before = head_before_out.ok()
+                    .and_then(|o| if o.status.success() { String::from_utf8(o.stdout).ok() } else { None })
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+
+                let upstream_sha_out = async_cmd("git")
+                    .args(["rev-parse", &format!("origin/{}", branch)])
+                    .current_dir(&repo_path)
+                    .output().await;
+                let upstream_sha = upstream_sha_out.ok()
+                    .and_then(|o| if o.status.success() { String::from_utf8(o.stdout).ok() } else { None })
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+
+                if !head_before.is_empty() && !upstream_sha.is_empty() && head_before == upstream_sha {
+                    // No new commit versus the already-pushed PR head. Claude
+                    // either decided the blockers weren't fixable or did
+                    // nothing. Don't bounce the card back to review; leave in
+                    // fixes_needed with a clear comment so Matt knows.
+                    let _ = supabase::update_task(&config, &task_id, &serde_json::json!({
+                        "status": "fixes_needed",
+                        "updated_at": chrono::Utc::now().to_rfc3339(),
+                    })).await;
+                    notify_callback(&config, &task_id, "fixes_needed", Some(&pr_url), Some("no commit produced"));
+                    agent_comment(&config, &task_id, "Auto-fix run finished without producing a new commit — either Claude decided the blockers needed your call, or nothing was actionable from the review. Leaving in Fixes Needed.").await;
+                    return;
+                }
+
+                let push = async_cmd("git")
+                    .args(["push", "origin", &branch])
+                    .current_dir(&repo_path)
+                    .output().await;
+
+                match push {
+                    Ok(o) if o.status.success() => {
+                        // Clear last_pr_review_at so the watcher re-runs $samwise-pr-review on the updated PR.
+                        let _ = supabase::update_task(&config, &task_id, &serde_json::json!({
+                            "status": "review",
+                            "last_pr_review_at": serde_json::Value::Null,
+                            "updated_at": chrono::Utc::now().to_rfc3339(),
+                        })).await;
+                        notify_callback(&config, &task_id, "review", Some(&pr_url), None);
+                        agent_comment(&config, &task_id, "Pushed fixes. Codex will re-review on the next poll.").await;
+                    }
+                    Ok(o) => {
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        fail_auto_fix(&config, &task_id, &pr_url, &format!("git push failed: {}", stderr.trim())).await;
+                    }
+                    Err(e) => {
+                        fail_auto_fix(&config, &task_id, &pr_url, &format!("git push spawn failed: {}", e)).await;
+                    }
+                }
+            }
+            Err(e) => {
+                fail_auto_fix(&config, &task_id, &pr_url, &format!("Claude Code errored: {}", e)).await;
+            }
+        }
+    });
+}
+
+async fn fail_auto_fix(config: &SupabaseConfig, task_id: &str, pr_url: &str, reason: &str) {
+    let _ = supabase::update_task(config, task_id, &serde_json::json!({
+        "status": "fixes_needed",
+        "updated_at": chrono::Utc::now().to_rfc3339(),
+    })).await;
+    notify_callback(config, task_id, "fixes_needed", Some(pr_url), Some(reason));
+    agent_comment(config, task_id, &format!("Auto-fix attempt failed: {}. Leaving in Fixes Needed.", reason)).await;
 }
 
 /// Scan tasks in `review` status and fire `spawn_pr_review_task` for any

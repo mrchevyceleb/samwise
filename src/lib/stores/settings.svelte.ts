@@ -82,6 +82,10 @@ export interface AppSettings {
   autoMergeMaxDiffLines: number;
   // Codex $samwise-pr-review pass on PRs (only when auto-merge is off)
   autoPrReviewEnabled: boolean;
+  // When Codex returns fix_issues, auto-run Claude Code to address the
+  // blockers, commit, and push. Max 3 cycles per card. Skipped when Codex
+  // emits REQUIRES_HUMAN: yes (product/architecture calls).
+  autoFixFromFixesNeededEnabled: boolean;
 }
 
 export interface MCPServerConfig {
@@ -186,6 +190,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   autoMergeMinScore: 8,
   autoMergeMaxDiffLines: 400,
   autoPrReviewEnabled: true,
+  autoFixFromFixesNeededEnabled: true,
 };
 
 // ---- Svelte 5 Runes State ----
