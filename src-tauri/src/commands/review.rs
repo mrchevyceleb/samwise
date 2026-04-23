@@ -13,6 +13,14 @@ use super::supabase::{self, SupabaseConfig};
 
 const REVIEW_PROMPT: &str = include_str!("../../prompts/review.md");
 
+/// Model pin for every Codex CLI invocation Samwise makes. Kept in one
+/// place so upgrading the model is a single edit rather than a scavenger
+/// hunt across review.rs and worker.rs.
+pub const CODEX_MODEL: &str = "gpt-5.5";
+/// `-c` config argument for high reasoning effort. Matches the Codex CLI
+/// schema: `minimal | low | medium | high | xhigh`.
+pub const CODEX_REASONING_CONFIG: &str = "model_reasoning_effort=\"high\"";
+
 /// Hardcoded blocker path patterns. Any changed file matching any of these
 /// blocks auto-merge. Includes Samwise's own review infrastructure so Sam
 /// cannot weaken his own safety net in an auto-merged PR.
@@ -417,8 +425,8 @@ async fn run_codex_review(
     let mut cmd = async_cmd("codex");
     cmd.args([
         "exec",
-        "-m", "gpt-5.4",
-        "-c", "model_reasoning_effort=\"high\"",
+        "-m", CODEX_MODEL,
+        "-c", CODEX_REASONING_CONFIG,
         "-s", "read-only",
         "-c", "approval_policy=\"never\"",
         "--output-schema", &schema_path_str,
@@ -659,11 +667,15 @@ pub async fn run_samwise_pr_review(
     );
 
     let mut cmd = async_cmd("codex");
-    cmd.arg("exec")
-        .arg(&prompt)
-        .current_dir(&cwd)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+    cmd.args([
+        "exec",
+        "-m", CODEX_MODEL,
+        "-c", CODEX_REASONING_CONFIG,
+    ])
+    .arg(&prompt)
+    .current_dir(&cwd)
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped());
 
     let child = cmd.spawn().map_err(|e| format!("failed to spawn codex: {}", e))?;
     let out = match tokio::time::timeout(
