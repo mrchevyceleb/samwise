@@ -617,6 +617,181 @@ async fn log_decision(
     }
 }
 
+// ── $samwise-pr-review (Codex CLI skill) ────────────────────────────
+//
+// Lightweight automated review used when auto-merge is disabled. Runs the
+// `samwise-pr-review` skill via `codex exec`, parses the strict output
+// template for a VERDICT line, and hands the markdown body back to the
+// caller for a Sam comment. Never merges, never makes changes.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrReviewVerdict {
+    MergeNow,
+    FixIssues,
+    Inconclusive,
+}
+
+pub struct PrReviewResult {
+    pub verdict: PrReviewVerdict,
+    pub markdown: String,
+}
+
+const SAMWISE_PR_REVIEW_TIMEOUT_SECS: u64 = 10 * 60;
+
+/// Run `$samwise-pr-review` via the Codex CLI. Returns a verdict and the
+/// markdown body Sam should post as a comment. Never panics; any unexpected
+/// condition collapses to `Inconclusive` with the raw output captured so
+/// Matt can see what happened.
+pub async fn run_samwise_pr_review(
+    pr_url: &str,
+    repo_path: &str,
+) -> Result<PrReviewResult, String> {
+    if !is_safe_pr_url(pr_url) {
+        return Err(format!("refusing pr_url that doesn't match the github shape: {}", pr_url));
+    }
+    let cwd = resolve_codex_cwd(repo_path);
+    let prompt = format!(
+        "Use $samwise-pr-review on {}. Emit only the skill output per its template, no preamble, no follow-up.",
+        pr_url
+    );
+
+    let mut cmd = async_cmd("codex");
+    cmd.arg("exec")
+        .arg(&prompt)
+        .current_dir(&cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let child = cmd.spawn().map_err(|e| format!("failed to spawn codex: {}", e))?;
+    let out = match tokio::time::timeout(
+        Duration::from_secs(SAMWISE_PR_REVIEW_TIMEOUT_SECS),
+        child.wait_with_output(),
+    ).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return Err(format!("codex wait failed: {}", e)),
+        Err(_) => return Err("codex timed out".to_string()),
+    };
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    // Login / rate-limit detection so we surface a clear reason in the Sam comment.
+    let combined_lower = format!("{}\n{}", stdout.to_lowercase(), stderr.to_lowercase());
+    if combined_lower.contains("not logged in") || combined_lower.contains("please run /login") || combined_lower.contains("codex login") {
+        return Ok(PrReviewResult {
+            verdict: PrReviewVerdict::Inconclusive,
+            markdown: format!(
+                "Codex CLI isn't logged in on this machine. Run `codex login` in a terminal and drag the card out and back to re-trigger a review.\n\nRaw output:\n\n```\n{}\n```",
+                trim_to(&stdout, 2000)
+            ),
+        });
+    }
+    if combined_lower.contains("rate limit") || combined_lower.contains("rate_limit_error") || combined_lower.contains("overloaded_error") {
+        return Ok(PrReviewResult {
+            verdict: PrReviewVerdict::Inconclusive,
+            markdown: format!(
+                "Codex hit a rate or usage limit. Leaving the card in Review; drag it out and back once things cool off to retry.\n\nRaw output:\n\n```\n{}\n```",
+                trim_to(&stdout, 2000)
+            ),
+        });
+    }
+
+    if !out.status.success() {
+        return Ok(PrReviewResult {
+            verdict: PrReviewVerdict::Inconclusive,
+            markdown: format!(
+                "Codex review exited with {}. Leaving the card in Review.\n\nStderr:\n```\n{}\n```\n\nStdout tail:\n```\n{}\n```",
+                out.status,
+                trim_to(&stderr, 1500),
+                trim_to(&stdout, 1500),
+            ),
+        });
+    }
+
+    // Parse for the last `VERDICT:` line.
+    let (verdict, body) = parse_pr_review_output(&stdout);
+    Ok(PrReviewResult {
+        verdict,
+        markdown: body,
+    })
+}
+
+fn parse_pr_review_output(raw: &str) -> (PrReviewVerdict, String) {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return (
+            PrReviewVerdict::Inconclusive,
+            "Codex returned no output.".to_string(),
+        );
+    }
+
+    // Walk lines from the bottom to find a VERDICT: line. Everything above is the markdown body.
+    let lines: Vec<&str> = trimmed.lines().collect();
+    for (idx, line) in lines.iter().enumerate().rev() {
+        let stripped = line.trim();
+        if stripped.is_empty() { continue; }
+        let lower = stripped.to_lowercase();
+        if let Some(rest) = lower.strip_prefix("verdict:") {
+            let tag = rest.trim();
+            let verdict = if tag.starts_with("merge_now") {
+                PrReviewVerdict::MergeNow
+            } else if tag.starts_with("fix_issues") {
+                PrReviewVerdict::FixIssues
+            } else {
+                PrReviewVerdict::Inconclusive
+            };
+            let body = lines[..idx].join("\n").trim_end().to_string();
+            let markdown = if body.is_empty() { stripped.to_string() } else { body };
+            return (verdict, markdown);
+        }
+        // First non-empty line from the bottom wasn't a VERDICT — stop searching.
+        break;
+    }
+
+    (
+        PrReviewVerdict::Inconclusive,
+        format!(
+            "Codex didn't emit a VERDICT line. Leaving the card in Review.\n\nRaw output:\n\n```\n{}\n```",
+            trim_to(trimmed, 3000)
+        ),
+    )
+}
+
+/// Resolve the cwd for a Codex invocation. Callers pass the task's repo_path
+/// which is usually a valid git worktree; fall back to $HOME/samwise for
+/// cases where the task has no repo resolved. Never pass `/` — see the
+/// detailed reasoning on `resolve_chat_cwd` in worker.rs for the TCC
+/// network-volumes prompt story.
+fn resolve_codex_cwd(repo_path: &str) -> String {
+    let trimmed = repo_path.trim();
+    if !trimmed.is_empty() && std::path::Path::new(trimmed).exists() {
+        return trimmed.to_string();
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let scratch = std::path::PathBuf::from(&home).join("samwise");
+        let _ = std::fs::create_dir_all(&scratch);
+        if scratch.exists() {
+            return scratch.to_string_lossy().into_owned();
+        }
+        return home;
+    }
+    "/tmp".to_string()
+}
+
+fn trim_to(s: &str, max: usize) -> String {
+    if s.len() <= max { return s.to_string(); }
+    // Walk backward to the nearest char boundary so we never slice through a
+    // multi-byte UTF-8 codepoint. Codex output routinely includes emojis and
+    // non-ASCII glyphs, so a naive `s[..max]` can panic here.
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = s[..end].to_string();
+    out.push_str("\n…[truncated]");
+    out
+}
+
 fn uuid_like() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

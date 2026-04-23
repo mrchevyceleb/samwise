@@ -332,6 +332,7 @@ pub async fn build_board_context(
     let mut in_progress = Vec::new();
     let mut testing = Vec::new();
     let mut review = Vec::new();
+    let mut fixes_needed = Vec::new();
     let mut approved = Vec::new();
     let mut pending_confirm = Vec::new();
 
@@ -354,6 +355,7 @@ pub async fn build_board_context(
             "in_progress" => in_progress.push(desc),
             "testing" => testing.push(desc),
             "review" => review.push(desc),
+            "fixes_needed" => fixes_needed.push(desc),
             "approved" => approved.push(desc),
             "pending_confirmation" => pending_confirm.push(desc),
             _ => {}
@@ -361,8 +363,8 @@ pub async fn build_board_context(
     }
 
     ctx.push_str(&format!(
-        "Queued: {} | In Progress: {} | Testing: {} | Review: {} | Approved: {}{}\n",
-        queued.len(), in_progress.len(), testing.len(), review.len(), approved.len(),
+        "Queued: {} | In Progress: {} | Testing: {} | Review: {} | Fixes Needed: {} | Ready to Merge: {}{}\n",
+        queued.len(), in_progress.len(), testing.len(), review.len(), fixes_needed.len(), approved.len(),
         if pending_confirm.is_empty() { String::new() } else { format!(" | Pending Confirmation: {}", pending_confirm.len()) }
     ));
 
@@ -371,8 +373,9 @@ pub async fn build_board_context(
         ("In Progress", &in_progress),
         ("Testing", &testing),
         ("Review", &review),
+        ("Fixes Needed", &fixes_needed),
         ("Queued", &queued),
-        ("Approved", &approved),
+        ("Ready to Merge", &approved),
     ];
 
     for (label, tasks) in all_active {

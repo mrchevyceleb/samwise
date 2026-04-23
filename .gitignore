@@ -23,3 +23,7 @@ vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .agent-one/
 supabase/.temp/
+
+# Claude Code local state
+.claude/scheduled_tasks.lock
+.claude/settings.local.json

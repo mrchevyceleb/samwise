@@ -82,6 +82,13 @@ pub async fn fetch_tasks(config: &SupabaseConfig, status_filter: Option<&str>) -
     handle_response(client.get(&url).send().await.map_err(|e| e.to_string())?).await
 }
 
+pub async fn fetch_task(config: &SupabaseConfig, id: &str) -> Result<Option<Value>, String> {
+    let client = build_client(config)?;
+    let url = format!("{}?id=eq.{}&limit=1", rest_url(config, "ae_tasks"), id);
+    let val: Value = handle_response(client.get(&url).send().await.map_err(|e| e.to_string())?).await?;
+    Ok(val.as_array().and_then(|a| a.first().cloned()))
+}
+
 pub async fn create_task(config: &SupabaseConfig, task: &Value) -> Result<Value, String> {
     let client = build_client(config)?;
     handle_response(client.post(&rest_url(config, "ae_tasks")).json(task).send().await.map_err(|e| e.to_string())?).await

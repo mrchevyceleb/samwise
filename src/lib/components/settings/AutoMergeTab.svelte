@@ -8,9 +8,14 @@
   let enabled = $derived(settingsStore.value.autoMergeEnabled);
   let minScore = $derived(settingsStore.value.autoMergeMinScore);
   let maxDiff = $derived(settingsStore.value.autoMergeMaxDiffLines);
+  let prReviewEnabled = $derived(settingsStore.value.autoPrReviewEnabled);
 
   function toggleEnabled() {
     updateSetting('autoMergeEnabled', !enabled);
+  }
+
+  function togglePrReviewEnabled() {
+    updateSetting('autoPrReviewEnabled', !prReviewEnabled);
   }
 
   function setMinScore(v: number) {
@@ -110,5 +115,51 @@
         style="width: 96px; padding: 6px 8px; background: var(--bg-elevated); border: 1px solid var(--border-default); border-radius: 6px; color: var(--text-primary); font-size: 13px; text-align: right;"
       />
     </div>
+  </div>
+
+  <!-- Codex $samwise-pr-review pass (runs only when auto-merge is OFF) -->
+  <div style="font-size: 13px; font-weight: 600; color: var(--text-primary); padding-bottom: 4px; border-top: 1px solid var(--border-default); padding-top: 20px; margin-top: 4px;">
+    Codex PR Review (when auto-merge is off)
+  </div>
+
+  <div style="font-size: 12px; color: var(--text-secondary); line-height: 1.5;">
+    When auto-merge is off, Sam runs <code>$samwise-pr-review</code> via the Codex CLI on every new PR
+    and moves the card to <strong>Ready to Merge</strong> or <strong>Fixes Needed</strong> based on the verdict.
+    Cards you drag back from Fixes Needed to Review get re-reviewed automatically.
+    If Codex can't produce a verdict (rate limit, logged out, timeout), the card stays in Review
+    and Sam posts the raw output as a comment.
+  </div>
+
+  <div
+    style="display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; background: var(--bg-primary); border: 1px solid var(--border-default); border-radius: 10px; opacity: {enabled ? 0.5 : 1}; transition: opacity 0.2s ease;"
+    onmouseenter={() => hovered = 'prreview'}
+    onmouseleave={() => hovered = null}
+  >
+    <div>
+      <div style="font-size: 13px; font-weight: 600; color: var(--text-primary);">Auto-run $samwise-pr-review on new PRs</div>
+      <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">Disabled while auto-merge is on (auto-merge already runs its own Codex review).</div>
+    </div>
+    <button
+      onclick={togglePrReviewEnabled}
+      disabled={enabled}
+      role="switch"
+      aria-checked={prReviewEnabled}
+      aria-label="Toggle Codex PR review"
+      style="
+        position: relative; width: 44px; height: 24px; border-radius: 12px; cursor: {enabled ? 'not-allowed' : 'pointer'};
+        background: {prReviewEnabled ? '#6366f1' : 'var(--bg-elevated)'};
+        border: 1px solid {prReviewEnabled ? '#6366f1' : 'var(--border-default)'};
+        transition: all 0.2s ease;
+        transform: {hovered === 'prreview' && !enabled ? 'scale(1.05)' : 'scale(1)'};
+      "
+    >
+      <span style="
+        position: absolute; top: 2px; left: {prReviewEnabled ? '22px' : '2px'};
+        width: 18px; height: 18px; border-radius: 50%;
+        background: {prReviewEnabled ? 'white' : 'var(--text-muted)'};
+        transition: all 0.2s ease;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+      "></span>
+    </button>
   </div>
 </div>

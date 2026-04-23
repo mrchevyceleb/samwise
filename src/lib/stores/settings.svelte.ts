@@ -80,6 +80,8 @@ export interface AppSettings {
   autoMergeEnabled: boolean;
   autoMergeMinScore: number;
   autoMergeMaxDiffLines: number;
+  // Codex $samwise-pr-review pass on PRs (only when auto-merge is off)
+  autoPrReviewEnabled: boolean;
 }
 
 export interface MCPServerConfig {
@@ -183,6 +185,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   autoMergeEnabled: false,
   autoMergeMinScore: 8,
   autoMergeMaxDiffLines: 400,
+  autoPrReviewEnabled: true,
 };
 
 // ---- Svelte 5 Runes State ----

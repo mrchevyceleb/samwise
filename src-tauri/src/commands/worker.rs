@@ -614,6 +614,19 @@ async fn worker_loop(
             expire_pending_confirmations(&config).await;
         }
 
+        // Sweep the PR-review queue every ~30s (6 ticks). Picks up cards that
+        // just entered review (fresh PRs) and cards you dragged back from
+        // fixes_needed -> review so they get re-reviewed automatically.
+        if tick % 6 == 0 {
+            let settings: Option<serde_json::Value> = if let Ok(data_dir) = app.path().app_data_dir() {
+                let settings_path = data_dir.join("settings.json");
+                tokio::fs::read_to_string(&settings_path).await
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+            } else { None };
+            sweep_pr_review_queue(&config, &settings).await;
+        }
+
         tick += 1;
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
@@ -1027,6 +1040,7 @@ async fn execute_task(
         "status": "in_progress",
         "updated_at": chrono::Utc::now().to_rfc3339(),
     })).await;
+    notify_callback(config, &task_id, "in_progress", None, None);
 
     emit_worker_event(app, "task_working", &format!("Working on: {}", title), Some(&task_id));
     if notify_task_started {
@@ -1296,6 +1310,7 @@ from Matt, stop without making changes and explain specifically what you need cl
                 "status": "review",
                 "updated_at": chrono::Utc::now().to_rfc3339(),
             })).await;
+            notify_callback(config, &task_id, "review", None, None);
             if let Some(h) = dev_server_handle.take() { let _ = dev_server::kill_dev_server(h).await; }
             // Leave the worktree in place; daily sweep will reap it after 48h if no PR shows up.
             return Ok("No changes made; routed to review".to_string());
@@ -1329,6 +1344,7 @@ from Matt, stop without making changes and explain specifically what you need cl
                     "completed_at": chrono::Utc::now().to_rfc3339(),
                     "updated_at": chrono::Utc::now().to_rfc3339(),
                 })).await;
+                notify_callback(config, &task_id, "done", None, None);
                 if notify_task_completed_research {
                     send_telegram(config, &format!(
                         "Finished analysis on *{}*\\. Full report saved as an artifact\\.",
@@ -1441,12 +1457,14 @@ from Matt, stop without making changes and explain specifically what you need cl
                             if let Some(h) = dev_server_handle.take() {
                                 let _ = dev_server::kill_dev_server(h).await;
                             }
+                            let reason = format!("build failed: {}", cmd2);
                             let _ = supabase::update_task(config, &task_id, &serde_json::json!({
                                 "status": "failed",
-                                "failure_reason": format!("build failed: {}", cmd2),
+                                "failure_reason": &reason,
                                 "updated_at": chrono::Utc::now().to_rfc3339(),
                             })).await;
-                            return Err(format!("build failed: {}", cmd2));
+                            notify_callback(config, &task_id, "failed", None, Some(&reason));
+                            return Err(reason);
                         }
                     }
                 }
@@ -1684,6 +1702,7 @@ When done, run `git add -A && git commit -m \"fix: address QA feedback\"` and st
                         "pr_url": pr_url,
                         "updated_at": chrono::Utc::now().to_rfc3339(),
                     })).await;
+                    notify_callback(config, &task_id, "review", Some(&pr_url), None);
                     agent_comment(config, &task_id, &format!("PR's up: {}. Let me know if you want any changes.", pr_url)).await;
                     if notify_task_completed_code {
                         send_telegram(config, &format!(
@@ -1699,6 +1718,7 @@ When done, run `git add -A && git commit -m \"fix: address QA feedback\"` and st
                     ).await;
                     match outcome {
                         review::AutoMergeOutcome::Merged => {
+                            notify_callback(config, &task_id, "done", Some(&pr_url), None);
                             agent_comment(config, &task_id, "Auto-merged. All gates green.").await;
                             if notify_task_completed_code {
                                 send_telegram(config, &format!(
@@ -1721,6 +1741,21 @@ When done, run `git add -A && git commit -m \"fix: address QA feedback\"` and st
                         review::AutoMergeOutcome::Skipped => {}
                     }
 
+                    // Codex $samwise-pr-review pass. Only runs when auto-merge is OFF —
+                    // when auto-merge is on, try_auto_merge already did its own Codex pass
+                    // and either merged or left a blocked reason on the card.
+                    let auto_merge_on = cached_settings.as_ref()
+                        .and_then(|s| s.get("autoMergeEnabled"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let auto_pr_review_on = cached_settings.as_ref()
+                        .and_then(|s| s.get("autoPrReviewEnabled"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    if !auto_merge_on && auto_pr_review_on {
+                        spawn_pr_review_task(config.clone(), task_id.clone(), pr_url.clone(), repo_path.clone());
+                    }
+
                     Ok(format!("PR created: {}", pr_url))
                 }
                 Err(e) => {
@@ -1728,6 +1763,7 @@ When done, run `git add -A && git commit -m \"fix: address QA feedback\"` and st
                         "status": "review",
                         "updated_at": chrono::Utc::now().to_rfc3339(),
                     })).await;
+                    notify_callback(config, &task_id, "review", None, None);
                     agent_comment(config, &task_id, &format!("Code changes are done but PR creation failed: {}. You can push manually.", e)).await;
                     if notify_task_completed_code {
                         send_telegram(config, &format!(
@@ -1745,6 +1781,7 @@ When done, run `git add -A && git commit -m \"fix: address QA feedback\"` and st
                 "status": "failed",
                 "updated_at": chrono::Utc::now().to_rfc3339(),
             })).await;
+            notify_callback(config, &task_id, "failed", None, Some(&e));
             agent_comment(config, &task_id, &format!("Ran into an issue: {}. You might want to re-queue this or take a look.", e)).await;
             if notify_task_failed {
                 send_telegram(config, &format!(
@@ -3749,6 +3786,210 @@ async fn upload_screenshots_to_storage(
     }
 
     Ok((urls, md))
+}
+
+/// Spawn a detached Codex `$samwise-pr-review` run for a task. On verdict,
+/// update the task status (approved / fixes_needed) or leave it in review
+/// (inconclusive) and post the markdown body as a Sam comment. Always
+/// stamps `last_pr_review_at` so the poll-loop watcher doesn't re-fire on
+/// the same card.
+pub fn spawn_pr_review_task(
+    config: SupabaseConfig,
+    task_id: String,
+    pr_url: String,
+    repo_path: String,
+) {
+    tokio::spawn(async move {
+        // Stamp first so the poll-loop watcher (which also triggers on fixes_needed
+        // -> review) doesn't double-fire before the codex run finishes.
+        let _ = supabase::update_task(&config, &task_id, &serde_json::json!({
+            "last_pr_review_at": chrono::Utc::now().to_rfc3339(),
+        })).await;
+
+        agent_comment(&config, &task_id, "Running $samwise-pr-review on this PR — hang tight, Codex takes a minute.").await;
+
+        let result = match review::run_samwise_pr_review(&pr_url, &repo_path).await {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!("[pr-review] run failed for task {}: {}", task_id, e);
+                agent_comment(&config, &task_id, &format!("Codex review errored: {}. Leaving the card in Review.", e)).await;
+                return;
+            }
+        };
+
+        // Post the markdown body verbatim so Matt (and CS) can read the findings.
+        if !result.markdown.trim().is_empty() {
+            agent_comment(&config, &task_id, &result.markdown).await;
+        }
+
+        match result.verdict {
+            review::PrReviewVerdict::MergeNow => {
+                let _ = supabase::update_task(&config, &task_id, &serde_json::json!({
+                    "status": "approved",
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                })).await;
+                notify_callback(&config, &task_id, "approved", Some(&pr_url), None);
+            }
+            review::PrReviewVerdict::FixIssues => {
+                let _ = supabase::update_task(&config, &task_id, &serde_json::json!({
+                    "status": "fixes_needed",
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                })).await;
+                notify_callback(&config, &task_id, "fixes_needed", Some(&pr_url), None);
+            }
+            review::PrReviewVerdict::Inconclusive => {
+                // Leave in review. Markdown body was already posted as a comment above.
+            }
+        }
+    });
+}
+
+/// Scan tasks in `review` status and fire `spawn_pr_review_task` for any
+/// that have a PR URL and whose `updated_at` is newer than
+/// `last_pr_review_at`. Called once per worker poll tick. Only fires when
+/// auto-merge is off and autoPrReviewEnabled is on.
+pub async fn sweep_pr_review_queue(
+    config: &SupabaseConfig,
+    cached_settings: &Option<serde_json::Value>,
+) {
+    let auto_merge_on = cached_settings.as_ref()
+        .and_then(|s| s.get("autoMergeEnabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let auto_pr_review_on = cached_settings.as_ref()
+        .and_then(|s| s.get("autoPrReviewEnabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    if auto_merge_on || !auto_pr_review_on {
+        return;
+    }
+
+    let Ok(tasks) = supabase::fetch_tasks(config, Some("review")).await else { return };
+    let Some(arr) = tasks.as_array() else { return };
+
+    for task in arr {
+        let task_id = task.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let pr_url = task.get("pr_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let repo_path = task.get("repo_path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if task_id.is_empty() || pr_url.is_empty() { continue; }
+
+        let updated_at = task.get("updated_at").and_then(|v| v.as_str()).unwrap_or("");
+        let last_review = task.get("last_pr_review_at").and_then(|v| v.as_str());
+
+        // Fire if never reviewed, OR updated_at > last_pr_review_at (card moved back in).
+        let should_run = match last_review {
+            None => true,
+            Some(last) if !last.is_empty() => {
+                match (
+                    chrono::DateTime::parse_from_rfc3339(updated_at),
+                    chrono::DateTime::parse_from_rfc3339(last),
+                ) {
+                    (Ok(u), Ok(l)) => u > l,
+                    _ => true,
+                }
+            }
+            _ => true,
+        };
+        if !should_run { continue; }
+
+        spawn_pr_review_task(config.clone(), task_id, pr_url, repo_path);
+    }
+}
+
+/// Fire a signed HTTP callback for a task status transition, if the task
+/// carries a `callback_url`. No-op otherwise. Runs in the background so a
+/// slow or flaky callback endpoint never blocks the worker loop.
+///
+/// Payload:
+/// ```json
+/// {
+///   "task_id": "...",
+///   "status": "in_progress" | "review" | "done" | "failed",
+///   "title": "...",
+///   "project": "...",
+///   "pr_url": "..." | null,
+///   "failure_reason": "..." | null,
+///   "timestamp": "2026-04-23T..."
+/// }
+/// ```
+///
+/// Signature: if `callback_secret` is set on the task, an HMAC-SHA256 of the
+/// raw JSON body is sent as `X-Samwise-Signature: sha256=<hex>`. The caller
+/// can verify by recomputing against the shared secret.
+pub fn notify_callback(
+    config: &SupabaseConfig,
+    task_id: &str,
+    status: &str,
+    pr_url: Option<&str>,
+    failure_reason: Option<&str>,
+) {
+    let cfg = config.clone();
+    let task_id = task_id.to_string();
+    let status = status.to_string();
+    let pr_url = pr_url.map(|s| s.to_string());
+    let failure_reason = failure_reason.map(|s| s.to_string());
+
+    tokio::spawn(async move {
+        let task = match supabase::fetch_task(&cfg, &task_id).await {
+            Ok(Some(t)) => t,
+            Ok(None) => return,
+            Err(e) => {
+                log::warn!("[callback] fetch_task({}) failed: {}", task_id, e);
+                return;
+            }
+        };
+        let callback_url = match task.get("callback_url").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return,
+        };
+        let callback_secret = task.get("callback_secret").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let title = task.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let project = task.get("project").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+        let payload = serde_json::json!({
+            "task_id": task_id,
+            "status": status,
+            "title": title,
+            "project": project,
+            "pr_url": pr_url,
+            "failure_reason": failure_reason,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        });
+        let body = match serde_json::to_string(&payload) {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("[callback] serialize failed: {}", e);
+                return;
+            }
+        };
+
+        let mut req = reqwest::Client::new()
+            .post(&callback_url)
+            .header("content-type", "application/json")
+            .header("user-agent", "samwise-worker/1");
+        if let Some(secret) = callback_secret.as_deref() {
+            use hmac::{Hmac, Mac};
+            use sha2::Sha256;
+            type HmacSha256 = Hmac<Sha256>;
+            if let Ok(mut mac) = HmacSha256::new_from_slice(secret.as_bytes()) {
+                mac.update(body.as_bytes());
+                let sig = hex::encode(mac.finalize().into_bytes());
+                req = req.header("x-samwise-signature", format!("sha256={}", sig));
+            }
+        }
+        req = req.body(body);
+
+        match tokio::time::timeout(std::time::Duration::from_secs(10), req.send()).await {
+            Ok(Ok(resp)) => {
+                let status_code = resp.status();
+                if !status_code.is_success() {
+                    log::warn!("[callback] {} -> {} for task {}", callback_url, status_code, task_id);
+                }
+            }
+            Ok(Err(e)) => log::warn!("[callback] {} failed: {}", callback_url, e),
+            Err(_) => log::warn!("[callback] {} timed out", callback_url),
+        }
+    });
 }
 
 /// Summarize the branch diff into three short sections for the PR body:

@@ -34,6 +34,8 @@ type Body = {
   source?: string;
   base_branch?: string;
   attachments?: AttachmentInput[];
+  callback_url?: string;
+  callback_secret?: string;
 };
 
 type StoredAttachment = { url: string; name: string; mime: string };
@@ -225,6 +227,19 @@ Deno.serve(async (req) => {
   }
 
   if (body.base_branch) task.base_branch = body.base_branch;
+
+  if (typeof body.callback_url === "string") {
+    const cb = body.callback_url.trim();
+    if (cb) {
+      if (!/^https?:\/\//i.test(cb)) {
+        return json(400, { error: "callback_url must be http:// or https://" });
+      }
+      task.callback_url = cb;
+      if (typeof body.callback_secret === "string" && body.callback_secret.trim()) {
+        task.callback_secret = body.callback_secret.trim();
+      }
+    }
+  }
 
   if (Array.isArray(body.attachments) && body.attachments.length > 0) {
     const stored: StoredAttachment[] = [];
