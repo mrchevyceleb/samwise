@@ -36,7 +36,8 @@ npm run check          # Svelte type check
 
 ## Build Rules
 
-- **Always rebuild after pushing changes.** Run `npx tauri build` after any commit/push so the production binary stays current on each host. The binary is used on machines without the dev environment (viewer mode).
+- **Always rebuild AND deploy after pushing changes.** Run `bin/deploy.sh` after any commit/push. `npx tauri build` alone is NOT enough — the rebuilt bundle lands at `src-tauri/target/release/bundle/macos/SamWise.app`, but Matt runs `/Applications/SamWise.app` (launchd-managed). `bin/deploy.sh` handles the full cycle: `doppler run -- npx tauri build` → stop the running instance → replace `/Applications/SamWise.app` → `launchctl kickstart`. Anything less and the production binary stays stale while the source code moves on.
+- The frontend source of truth for board columns is `src/lib/types.ts` (Tauri app) AND `web/src/lib/types.ts` (separate SvelteKit viewer under `web/`). Changes to statuses or labels must be applied to BOTH. Same rule for any other shared-shaped data — treat `web/` as its own app with its own types.
 
 ## Architecture
 

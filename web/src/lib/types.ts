@@ -3,6 +3,7 @@ export type TaskStatus =
   | 'in_progress'
   | 'testing'
   | 'review'
+  | 'fixes_needed'
   | 'approved'
   | 'done'
   | 'failed'
@@ -63,6 +64,7 @@ export const STATUSES: TaskStatus[] = [
   'in_progress',
   'testing',
   'review',
+  'fixes_needed',
   'approved',
   'done',
   'failed'
@@ -73,7 +75,8 @@ export const STATUS_LABEL: Record<TaskStatus, string> = {
   in_progress: 'In Progress',
   testing: 'Testing',
   review: 'Review',
-  approved: 'Approved',
+  fixes_needed: 'Fixes Needed',
+  approved: 'Ready to Merge',
   done: 'Done',
   failed: 'Failed',
   pending_confirmation: 'Awaiting Confirmation'

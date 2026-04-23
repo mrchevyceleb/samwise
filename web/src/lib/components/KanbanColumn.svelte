@@ -10,6 +10,7 @@
     in_progress: 'bg-sky-400',
     testing: 'bg-amber-400',
     review: 'bg-violet-400',
+    fixes_needed: 'bg-orange-400',
     approved: 'bg-emerald-400',
     done: 'bg-emerald-500',
     failed: 'bg-rose-500',
