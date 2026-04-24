@@ -4260,13 +4260,22 @@ making any other changes.",
                     // No new commit versus the already-pushed PR head. Claude
                     // either decided the blockers weren't fixable or did
                     // nothing. Don't bounce the card back to review; leave in
-                    // fixes_needed with a clear comment so Matt knows.
+                    // fixes_needed with a clear comment so Matt knows. This is
+                    // a terminal state for the auto-fix cycle, so fire a
+                    // telegram like every other terminal branch — without it
+                    // the card sits silently in Fixes Needed and Matt has no
+                    // way to know auto-fix gave up.
                     let _ = supabase::update_task(&config, &task_id, &serde_json::json!({
                         "status": "fixes_needed",
                         "updated_at": chrono::Utc::now().to_rfc3339(),
                     })).await;
                     notify_callback(&config, &task_id, "fixes_needed", Some(&pr_url), Some("no commit produced"));
                     agent_comment(&config, &task_id, "Auto-fix run finished without producing a new commit — either Claude decided the blockers needed your call, or nothing was actionable from the review. Leaving in Fixes Needed.").await;
+                    send_terminal_telegram(
+                        &config, &task_id,
+                        &format!("Fixes needed: {}", pr_url),
+                        "Auto-fix ran but Claude didn't produce a commit. Your call on the blockers.",
+                    ).await;
                     return;
                 }
 

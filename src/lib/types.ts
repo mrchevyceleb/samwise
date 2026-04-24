@@ -140,6 +140,7 @@ export const KANBAN_COLUMNS: KanbanColumn[] = [
   { status: 'fixes_needed', label: 'Fixes Needed', color: '#f97316', glowColor: 'rgba(249, 115, 22, 0.18)', icon: '!!' },
   { status: 'approved', label: 'Ready to Merge', color: '#58a6ff', glowColor: 'rgba(88, 166, 255, 0.15)', icon: '++' },
   { status: 'done', label: 'Done', color: '#8b949e', glowColor: 'rgba(139, 148, 158, 0.1)', icon: 'ok' },
+  { status: 'failed', label: 'Failed', color: '#f85149', glowColor: 'rgba(248, 81, 73, 0.2)', icon: 'X' },
 ];
 
 export const PRIORITY_COLORS: Record<TaskPriority, string> = {
