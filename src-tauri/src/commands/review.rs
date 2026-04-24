@@ -16,7 +16,10 @@ const REVIEW_PROMPT: &str = include_str!("../../prompts/review.md");
 /// Model pin for every Codex CLI invocation Samwise makes. Kept in one
 /// place so upgrading the model is a single edit rather than a scavenger
 /// hunt across review.rs and worker.rs.
-pub const CODEX_MODEL: &str = "gpt-5.5";
+///
+/// Was "gpt-5.5" briefly but that's not live on Matt's Codex account yet
+/// (reviews fail with exit status 1 before running). Back on 5.4.
+pub const CODEX_MODEL: &str = "gpt-5.4";
 /// `-c` config argument for high reasoning effort. Matches the Codex CLI
 /// schema: `minimal | low | medium | high | xhigh`.
 pub const CODEX_REASONING_CONFIG: &str = "model_reasoning_effort=\"high\"";

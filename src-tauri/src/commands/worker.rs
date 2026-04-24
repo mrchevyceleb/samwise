@@ -1303,9 +1303,10 @@ from Matt, stop without making changes and explain specifically what you need cl
 
     let prompt = prompt_parts.join("\n");
 
-    // 30-minute timeout, 100 max turns. 20 was too tight and made tasks with
-    // screenshots / multiple edits die mid-work with error_max_turns.
-    let claude_result = run_claude_code_streaming(&repo_path, &prompt, 100, 1800, config, &task_id, process_id_slot.clone()).await;
+    // 30-minute timeout, UNLIMITED turns. A hard cap just surfaces as
+    // error_max_turns mid-run on complex tasks — the timeout is the real
+    // guard. Pass 0 so `--max-turns` is omitted entirely.
+    let claude_result = run_claude_code_streaming(&repo_path, &prompt, 0, 1800, config, &task_id, process_id_slot.clone()).await;
     // Clear PID after process completes
     { let mut pid = process_id_slot.lock().await; *pid = None; }
 
@@ -1397,7 +1398,7 @@ from Matt, stop without making changes and explain specifically what you need cl
 
             agent_comment(config, &task_id, "Running /codex-fix for a review pass before QA...").await;
             let codex_result = run_claude_code_streaming(
-                &repo_path, "/codex-fix", 30, 1200, config, &task_id, process_id_slot.clone()
+                &repo_path, "/codex-fix", 0, 1200, config, &task_id, process_id_slot.clone()
             ).await;
             { let mut pid = process_id_slot.lock().await; *pid = None; }
             // If codex-fix itself was cancelled mid-run, bail out.
@@ -1451,7 +1452,7 @@ from Matt, stop without making changes and explain specifically what you need cl
                         cmd, log_tail
                     );
                     let retry_fix = run_claude_code_streaming(
-                        &repo_path, &fix_prompt, 30, 1200, config, &task_id, process_id_slot.clone()
+                        &repo_path, &fix_prompt, 0, 1200, config, &task_id, process_id_slot.clone()
                     ).await;
                     if matches!(&retry_fix, Err(e) if e == "TASK_CANCELLED") {
                         log::info!("[worker] Task {} cancelled during build-retry codex-fix; stopping", task_id);
@@ -1645,7 +1646,7 @@ When done, run `git add -A && git commit -m \"fix: address QA feedback\"` and st
                             );
 
                             let fix_result = run_claude_code_streaming(
-                                &repo_path, &fix_prompt, 15, 900, config, &task_id, process_id_slot.clone()
+                                &repo_path, &fix_prompt, 0, 900, config, &task_id, process_id_slot.clone()
                             ).await;
                             { let mut pid = process_id_slot.lock().await; *pid = None; }
                             if matches!(&fix_result, Err(e) if e == "TASK_CANCELLED") {
@@ -1729,7 +1730,23 @@ When done, run `git add -A && git commit -m \"fix: address QA feedback\"` and st
                     })).await;
                     notify_callback(config, &task_id, "review", Some(&pr_url), None);
                     agent_comment(config, &task_id, &format!("PR's up: {}. Let me know if you want any changes.", pr_url)).await;
-                    if notify_task_completed_code {
+
+                    // Only fire the "PR's up" Telegram now if there's no
+                    // downstream automation coming (no auto-merge gate, no
+                    // auto-pr-review pass). Otherwise the terminal path in
+                    // try_auto_merge / spawn_pr_review_task owns the
+                    // telegram so Matt only gets pinged once the whole
+                    // pipeline is done.
+                    let auto_merge_on_for_telegram = cached_settings.as_ref()
+                        .and_then(|s| s.get("autoMergeEnabled"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let pr_review_on_for_telegram = cached_settings.as_ref()
+                        .and_then(|s| s.get("autoPrReviewEnabled"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    let has_downstream = auto_merge_on_for_telegram || pr_review_on_for_telegram;
+                    if notify_task_completed_code && !has_downstream {
                         send_telegram(config, &format!(
                             "PR's up for *{}*: {}",
                             escape_markdown_v2(&title),
@@ -1762,6 +1779,14 @@ When done, run `git add -A && git commit -m \"fix: address QA feedback\"` and st
                             }
                             let _ = supabase::update_task(config, &task_id, &updates).await;
                             agent_comment(config, &task_id, &format!("Auto-merge blocked: {}", reason)).await;
+                            if notify_task_completed_code {
+                                send_telegram(config, &format!(
+                                    "Auto-merge blocked for *{}* — your call: {}\\.\nReason: {}",
+                                    escape_markdown_v2(&title),
+                                    escape_markdown_v2(&pr_url),
+                                    escape_markdown_v2(reason.as_str()),
+                                )).await;
+                            }
                         }
                         review::AutoMergeOutcome::Skipped => {}
                     }
@@ -3602,6 +3627,18 @@ async fn take_screenshot(url: &str, output_path: &str, viewport: &str) -> Result
         .map(|h| format!("{}/samwise/Personal-Apps/Samwise", h))
         .unwrap_or_else(|_| "/Users/mjohnst/samwise/Personal-Apps/Samwise".to_string());
 
+    // Give Chromium an isolated user-data-dir inside Samwise's own container
+    // area so it never touches ~/Library/Application Support/Google/Chrome or
+    // ~/Library/Application Support/Chromium. Under macOS Sequoia's stricter
+    // TCC, reading another app's Application Support triggers the "SamWise
+    // would like to access data from other apps" prompt and blocks the
+    // worker until Matt dismisses it. A fresh scratch dir per run avoids
+    // state leakage too.
+    let samwise_scratch = std::env::var("HOME")
+        .map(|h| format!("{}/Library/Application Support/com.mattjohnston.agent-one/playwright-profile", h))
+        .unwrap_or_else(|_| "/tmp/samwise-playwright-profile".to_string());
+    let _ = tokio::fs::create_dir_all(&samwise_scratch).await;
+
     for attempt in 1..=2 {
         let output = async_cmd("npx")
             .args([
@@ -3618,7 +3655,10 @@ async fn take_screenshot(url: &str, output_path: &str, viewport: &str) -> Result
                 "--user-agent", "Mozilla/5.0 SamWise-QA",
                 url, output_path,
             ])
-            .env("PLAYWRIGHT_CHROMIUM_ARGS", "--disable-features=MediaSessionService,MediaRouter,MediaFoundationVideoCapture,HardwareMediaKeyHandling --mute-audio --disable-audio-output --use-fake-ui-for-media-stream --deny-permission-prompts --no-default-browser-check --disable-sync --disable-background-networking")
+            .env("PLAYWRIGHT_CHROMIUM_ARGS", format!(
+                "--user-data-dir={} --disable-features=MediaSessionService,MediaRouter,MediaFoundationVideoCapture,HardwareMediaKeyHandling --mute-audio --disable-audio-output --use-fake-ui-for-media-stream --deny-permission-prompts --no-default-browser-check --disable-sync --disable-background-networking --no-first-run --password-store=basic --use-mock-keychain",
+                samwise_scratch
+            ))
             .current_dir(&playwright_cwd)
             .output()
             .await
@@ -3854,6 +3894,11 @@ pub fn spawn_pr_review_task(
                     "updated_at": chrono::Utc::now().to_rfc3339(),
                 })).await;
                 notify_callback(&config, &task_id, "approved", Some(&pr_url), None);
+                send_terminal_telegram(
+                    &config, &task_id,
+                    &format!("Ready to merge: {}", pr_url),
+                    "Codex gave the green light. Your turn to hit merge.",
+                ).await;
             }
             review::PrReviewVerdict::FixIssues => {
                 let _ = supabase::update_task(&config, &task_id, &serde_json::json!({
@@ -3864,7 +3909,8 @@ pub fn spawn_pr_review_task(
 
                 // Kick the auto-fix loop if enabled, not flagged REQUIRES_HUMAN,
                 // and we're under the cycle cap. Runs detached so this callback
-                // returns fast.
+                // returns fast. That path fires its own telegram on the
+                // terminal state (caps, REQUIRES_HUMAN, or disabled).
                 maybe_spawn_auto_fix(
                     config.clone(),
                     task_id.clone(),
@@ -3876,9 +3922,55 @@ pub fn spawn_pr_review_task(
             }
             review::PrReviewVerdict::Inconclusive => {
                 // Leave in review. Markdown body was already posted as a comment above.
+                send_terminal_telegram(
+                    &config, &task_id,
+                    &format!("Codex review inconclusive: {}", pr_url),
+                    "PR is sitting in Review. Details in the card comments.",
+                ).await;
             }
         }
     });
+}
+
+/// Fire a Telegram notification at the end of Sam's automation for a task.
+/// Reads the notify-task-completed-code setting so it respects Matt's
+/// notification preferences. Includes the task title for context.
+async fn send_terminal_telegram(
+    config: &SupabaseConfig,
+    task_id: &str,
+    headline: &str,
+    detail: &str,
+) {
+    // Gated by the same flag that used to fire the PR-open telegram.
+    let home = std::env::var("HOME").unwrap_or_default();
+    let settings_path = std::path::PathBuf::from(&home)
+        .join("Library/Application Support/com.mattjohnston.agent-one/settings.json");
+    let settings_val: Option<serde_json::Value> = tokio::fs::read_to_string(&settings_path).await
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+    let master = settings_val.as_ref()
+        .and_then(|s| s.get("telegramNotificationsEnabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    if !master { return; }
+    let notify_completed = settings_val.as_ref()
+        .and_then(|s| s.get("telegramNotifyTaskCompletedCode"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    if !notify_completed { return; }
+
+    let title = match supabase::fetch_task(config, task_id).await {
+        Ok(Some(t)) => t.get("title").and_then(|v| v.as_str()).unwrap_or("untitled").to_string(),
+        _ => "untitled".to_string(),
+    };
+
+    let msg = format!(
+        "*{}*\n{}\n_{}_",
+        escape_markdown_v2(&title),
+        escape_markdown_v2(headline),
+        escape_markdown_v2(detail),
+    );
+    send_telegram(config, &msg).await;
 }
 
 /// Scan cards whose PR status on GitHub has advanced without Sam knowing
@@ -3955,6 +4047,11 @@ async fn maybe_spawn_auto_fix(
 ) {
     if requires_human {
         agent_comment(&config, &task_id, "Codex flagged this as needing your judgment (REQUIRES_HUMAN: yes). Leaving in Fixes Needed for you.").await;
+        send_terminal_telegram(
+            &config, &task_id,
+            &format!("Needs your judgment: {}", pr_url),
+            "Codex flagged blockers that need a product/architecture call.",
+        ).await;
         return;
     }
 
@@ -3970,6 +4067,11 @@ async fn maybe_spawn_auto_fix(
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
     if !auto_fix_on {
+        send_terminal_telegram(
+            &config, &task_id,
+            &format!("Fixes needed: {}", pr_url),
+            "Auto-fix is off. Details in the card comments.",
+        ).await;
         return;
     }
 
@@ -3980,6 +4082,11 @@ async fn maybe_spawn_auto_fix(
     };
     if cycle_count >= 3 {
         agent_comment(&config, &task_id, "Hit the 3-cycle auto-fix cap on this PR. Stopping so I don't thrash — take a look when you get a sec.").await;
+        send_terminal_telegram(
+            &config, &task_id,
+            &format!("Auto-fix capped: {}", pr_url),
+            "3 auto-fix cycles and Codex still sees blockers. Your call.",
+        ).await;
         return;
     }
 
@@ -4011,6 +4118,37 @@ pub fn spawn_auto_fix_task(
             "Running auto-fix cycle {}/3 on this PR. Feeding Codex's blocker list back to Claude Code.",
             new_cycle
         )).await;
+
+        // Pre-flight: make sure the worktree is on `sam/<short_id>` before we
+        // hand it to Claude Code. The sweep path used to pass Matt's main
+        // checkout here, which sat on main — Claude would then commit to main
+        // and the post-run branch-guard would kill the push. That's fixed at
+        // the sweep, but this guard means any other path that gets the wrong
+        // directory still fails loud instead of quietly producing a main-
+        // branch commit.
+        let expected_branch = task_branch_name(&short_task_id(&task_id));
+        let checkout = async_cmd("git")
+            .args(["checkout", &expected_branch])
+            .current_dir(&repo_path)
+            .output().await;
+        match checkout {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                fail_auto_fix(
+                    &config, &task_id, &pr_url,
+                    &format!("pre-flight checkout '{}' failed: {}", expected_branch, stderr.trim()),
+                ).await;
+                return;
+            }
+            Err(e) => {
+                fail_auto_fix(
+                    &config, &task_id, &pr_url,
+                    &format!("pre-flight checkout '{}' spawn failed: {}", expected_branch, e),
+                ).await;
+                return;
+            }
+        }
 
         // Build fix prompt. Focus Claude Code on the blockers only — not risks,
         // not "not verified" items. The review markdown is already structured
@@ -4044,7 +4182,7 @@ making any other changes.",
         );
 
         let process_id_slot: Arc<tokio::sync::Mutex<Option<u32>>> = Arc::new(tokio::sync::Mutex::new(None));
-        let claude_result = run_claude_code_streaming(&repo_path, &prompt, 40, 900, &config, &task_id, process_id_slot).await;
+        let claude_result = run_claude_code_streaming(&repo_path, &prompt, 0, 900, &config, &task_id, process_id_slot).await;
 
         match claude_result {
             Ok(_) => {
@@ -4060,6 +4198,25 @@ making any other changes.",
 
                 if branch.is_empty() || branch == "HEAD" {
                     fail_auto_fix(&config, &task_id, &pr_url, "couldn't resolve PR branch for push").await;
+                    return;
+                }
+
+                // HARD SAFETY GUARD: auto-fix is only ever allowed to push to
+                // Sam's own task branch (`sam/<short_id>`). If the worktree
+                // somehow ended up on main/master or any other branch, abort
+                // instead of pushing. GitHub rejected the first accidental
+                // `main -> main` push we saw (non-fast-forward), but we
+                // cannot trust GitHub to be the last line of defense.
+                let short_id = short_task_id(&task_id);
+                let expected_branch = task_branch_name(&short_id);
+                if branch != expected_branch {
+                    fail_auto_fix(
+                        &config, &task_id, &pr_url,
+                        &format!(
+                            "refusing to push: worktree on '{}' but auto-fix may only push to '{}'",
+                            branch, expected_branch
+                        ),
+                    ).await;
                     return;
                 }
 
@@ -4139,6 +4296,11 @@ async fn fail_auto_fix(config: &SupabaseConfig, task_id: &str, pr_url: &str, rea
     })).await;
     notify_callback(config, task_id, "fixes_needed", Some(pr_url), Some(reason));
     agent_comment(config, task_id, &format!("Auto-fix attempt failed: {}. Leaving in Fixes Needed.", reason)).await;
+    send_terminal_telegram(
+        config, task_id,
+        &format!("Auto-fix failed: {}", pr_url),
+        &format!("Reason: {}", reason),
+    ).await;
 }
 
 /// Scan tasks in `review` status and fire `spawn_pr_review_task` for any
@@ -4167,8 +4329,8 @@ pub async fn sweep_pr_review_queue(
     for task in arr {
         let task_id = task.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let pr_url = task.get("pr_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let repo_path = task.get("repo_path").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        if task_id.is_empty() || pr_url.is_empty() { continue; }
+        let main_repo_path = task.get("repo_path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if task_id.is_empty() || pr_url.is_empty() || main_repo_path.is_empty() { continue; }
 
         let updated_at = task.get("updated_at").and_then(|v| v.as_str()).unwrap_or("");
         let last_review = task.get("last_pr_review_at").and_then(|v| v.as_str());
@@ -4188,6 +4350,26 @@ pub async fn sweep_pr_review_queue(
             _ => true,
         };
         if !should_run { continue; }
+
+        // Use the task's worktree, not Matt's main checkout. Matt's checkout sits
+        // on main and passing it straight through had auto-fix running Claude Code
+        // against main — so any fix commits went to main, and the branch-guard
+        // correctly refused the push, killing the auto-fix cycle.
+        let repo_name = std::path::Path::new(&main_repo_path)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "repo".to_string());
+        let short_id = short_task_id(&task_id);
+        let worktree_path = worktrees_root().join(&repo_name).join(&short_id);
+        let repo_path = if worktree_path.is_dir() {
+            worktree_path.to_string_lossy().into_owned()
+        } else {
+            log::warn!(
+                "[pr-review-sweep] worktree missing for task {} at {}; skipping",
+                task_id, worktree_path.display()
+            );
+            continue;
+        };
 
         spawn_pr_review_task(config.clone(), task_id, pr_url, repo_path);
     }
@@ -4464,13 +4646,45 @@ async fn create_pr(
         .await
         .map_err(|e| format!("gh pr create failed: {}", e))?;
 
-    if !pr.status.success() {
-        let stderr = String::from_utf8_lossy(&pr.stderr);
-        return Err(format!("gh pr create failed: {}", stderr));
-    }
+    let pr_url = if pr.status.success() {
+        String::from_utf8_lossy(&pr.stdout).trim().to_string()
+    } else {
+        let stderr = String::from_utf8_lossy(&pr.stderr).to_string();
+        // Re-queued task: PR already exists for this branch. The push above just
+        // updated it with the new commits, so look up the URL and refresh the body
+        // (screenshots, summary) instead of erroring out.
+        if stderr.contains("already exists") {
+            let existing = async_cmd("gh")
+                .args(["pr", "view", &branch_name, "--json", "url", "-q", ".url"])
+                .current_dir(repo_path)
+                .output()
+                .await
+                .map_err(|e| format!("gh pr view failed: {}", e))?;
+            if !existing.status.success() {
+                let view_err = String::from_utf8_lossy(&existing.stderr);
+                return Err(format!(
+                    "gh pr create failed (already exists) and gh pr view failed: {}",
+                    view_err
+                ));
+            }
+            let url = String::from_utf8_lossy(&existing.stdout).trim().to_string();
+            if url.is_empty() {
+                return Err(format!("gh pr create failed: {}", stderr));
+            }
+            // Refresh the body so re-runs get the latest screenshots and summary.
+            let _ = async_cmd("gh")
+                .args(["pr", "edit", &branch_name, "--body", &pr_body])
+                .current_dir(repo_path)
+                .output()
+                .await;
+            url
+        } else {
+            return Err(format!("gh pr create failed: {}", stderr));
+        }
+    };
 
     // Clean up local screenshot directory
     let _ = tokio::fs::remove_dir_all(screenshot_dir).await;
 
-    Ok(String::from_utf8_lossy(&pr.stdout).trim().to_string())
+    Ok(pr_url)
 }

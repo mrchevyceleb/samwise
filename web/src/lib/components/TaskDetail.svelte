@@ -2,6 +2,7 @@
   import type { AeTask } from '$lib/types';
   import { PRIORITY_COLOR, STATUS_LABEL } from '$lib/types';
   import { tasksStore } from '$lib/stores/tasks.svelte';
+  import LinkRow from './LinkRow.svelte';
 
   let { task, onClose }: { task: AeTask; onClose: () => void } = $props();
 
@@ -82,21 +83,33 @@
         </section>
       {/if}
 
-      <section class="grid grid-cols-2 gap-2 text-xs">
+      <section class="flex flex-col gap-2 text-xs">
         {#if task.pr_url}
-          <a href={task.pr_url} target="_blank" rel="noopener" class="rounded-lg border border-violet-500/30 bg-violet-500/15 text-violet-100 px-3 py-2 hover:bg-violet-500/25 transition">
-            🔗 PR{task.pr_number ? ` #${task.pr_number}` : ''}
-          </a>
+          <LinkRow
+            label={`PR${task.pr_number ? ` #${task.pr_number}` : ''}`}
+            url={task.pr_url}
+            icon="🔗"
+            colorClass="border-violet-500/30 bg-violet-500/15 text-violet-100"
+            hoverClass="hover:bg-violet-500/25"
+          />
         {/if}
         {#if task.preview_url}
-          <a href={task.preview_url} target="_blank" rel="noopener" class="rounded-lg border border-sky-500/30 bg-sky-500/15 text-sky-100 px-3 py-2 hover:bg-sky-500/25 transition">
-            👀 Preview
-          </a>
+          <LinkRow
+            label="Preview"
+            url={task.preview_url}
+            icon="👀"
+            colorClass="border-sky-500/30 bg-sky-500/15 text-sky-100"
+            hoverClass="hover:bg-sky-500/25"
+          />
         {/if}
         {#if task.repo_url}
-          <a href={task.repo_url} target="_blank" rel="noopener" class="rounded-lg border border-white/10 bg-white/5 text-slate-200 px-3 py-2 hover:bg-white/10 transition">
-            📁 Repo
-          </a>
+          <LinkRow
+            label="Repo"
+            url={task.repo_url}
+            icon="📁"
+            colorClass="border-white/10 bg-white/5 text-slate-200"
+            hoverClass="hover:bg-white/10"
+          />
         {/if}
         {#if task.branch}
           <div class="rounded-lg border border-white/10 bg-white/5 text-slate-300 px-3 py-2 truncate">⎇ {task.branch}</div>

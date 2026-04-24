@@ -1,6 +1,66 @@
+use std::path::Path;
 use std::process::Stdio;
 use tokio::process::Child;
 use crate::process::async_cmd;
+
+/// Single-quote a string for safe embedding in `sh -c` / `cmd /C` input.
+/// Used for the --scope argument on the custom-command path where we're
+/// building a shell string. Paths with spaces or special characters stay
+/// intact.
+fn shell_quote(s: &str) -> String {
+    // Simple POSIX-style single-quote. Replace any embedded single quote
+    // with the '\'' escape sequence. Works for both sh -c and cmd /C since
+    // Windows interprets the whole thing as one token either way.
+    let escaped = s.replace('\'', "'\\''");
+    format!("'{}'", escaped)
+}
+
+/// Resolve the "main" repo that hosts the Doppler scope. Sam runs dev
+/// servers in per-task worktrees under `~/samwise/worktrees/<repo>/<id>`,
+/// but Matt's Doppler configs are scoped to the original checkout paths
+/// (e.g. `/Users/mjohnst/Documents/KG-Apps/operly`). Worktrees share the
+/// same git metadata as the main repo, so `git rev-parse --git-common-dir`
+/// returns `<main>/.git`; its parent is the path Doppler knows about.
+///
+/// Returns the worktree path unchanged when git resolution fails (e.g. no
+/// git, or the path isn't a worktree at all).
+async fn resolve_main_repo(worktree: &str) -> String {
+    let out = async_cmd("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .current_dir(worktree)
+        .output()
+        .await;
+    let Ok(o) = out else { return worktree.to_string(); };
+    if !o.status.success() { return worktree.to_string(); }
+    let common = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    if common.is_empty() { return worktree.to_string(); }
+    let abs = if Path::new(&common).is_absolute() {
+        std::path::PathBuf::from(&common)
+    } else {
+        Path::new(worktree).join(&common)
+    };
+    abs.parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| worktree.to_string())
+}
+
+/// Check whether Doppler is configured for the given scope (main repo path).
+/// Uses `doppler configure get enclave.project --scope <path> --plain` which
+/// returns the project name for that scope (or nothing if no scope exists).
+/// Returns the scope path when doppler is configured so the caller can pass
+/// it to `doppler run --scope`.
+async fn doppler_scope_for(main_repo: &str) -> Option<String> {
+    if which::which("doppler").is_err() { return None; }
+    let out = async_cmd("doppler")
+        .args(["configure", "get", "enclave.project", "--scope", main_repo, "--plain"])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() { return None; }
+    let project = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if project.is_empty() { return None; }
+    Some(main_repo.to_string())
+}
 
 pub struct DevServerHandle {
     pub child: Child,
@@ -161,27 +221,55 @@ pub async fn start_dev_server(
 
     let is_custom = custom_with_port.is_some();
 
+    // Sam runs dev in a per-task worktree, but Doppler's scope is keyed to
+    // the main repo path. Resolve the main, then ask Doppler whether it has
+    // a scope for it. When present, every spawn is wrapped with
+    // `doppler run --scope <main> --` so env vars resolve correctly.
+    let main_repo = resolve_main_repo(repo_path).await;
+    let doppler_scope = doppler_scope_for(&main_repo).await;
+    if doppler_scope.is_some() {
+        log::info!("[dev_server] wrapping dev server with `doppler run --scope {}` (main repo of worktree {})", main_repo, repo_path);
+    } else {
+        log::info!("[dev_server] no doppler scope found for main repo {}; running dev server bare", main_repo);
+    }
+
     let mut cmd = if is_custom {
-        // Custom command: execute via shell to handle paths with spaces and complex commands
+        // Custom command: execute via shell to handle paths with spaces and complex commands.
+        // Prefix with `doppler run --scope <path> --` when the main repo has a Doppler scope.
+        let shell_script = if let Some(scope) = doppler_scope.as_deref() {
+            format!("doppler run --scope {} -- {}", shell_quote(scope), npm_script)
+        } else {
+            npm_script.clone()
+        };
         #[cfg(target_os = "windows")]
         {
             let mut c = async_cmd("cmd");
-            c.args(["/C", &npm_script]);
+            c.args(["/C", &shell_script]);
             c
         }
         #[cfg(not(target_os = "windows"))]
         {
             let mut c = async_cmd("sh");
-            c.args(["-c", &npm_script]);
+            c.args(["-c", &shell_script]);
             c
         }
     } else {
-        // npm run {script} with port injection
+        // npm run {script} with port injection.
         let script_content = read_script_content(repo_path, &npm_script).await?;
         let port_style = detect_port_style(&script_content);
 
-        let mut c = async_cmd("npm");
-        c.args(["run", &npm_script, "--"]);
+        // When Doppler has a scope, the outer program is `doppler run --scope
+        // <main> --` and the `npm` invocation moves into its args. Port
+        // flags / env handling are preserved.
+        let mut c = if let Some(scope) = doppler_scope.as_deref() {
+            let mut c0 = async_cmd("doppler");
+            c0.args(["run", "--scope", scope, "--", "npm", "run", &npm_script, "--"]);
+            c0
+        } else {
+            let mut c0 = async_cmd("npm");
+            c0.args(["run", &npm_script, "--"]);
+            c0
+        };
 
         match port_style {
             PortStyle::DashDashPort => {
@@ -191,9 +279,18 @@ pub async fn start_dev_server(
                 c.args(["-p", &port.to_string()]);
             }
             PortStyle::EnvVar => {
-                // For react-scripts, remove the "--" separator and use env var
-                let mut c2 = async_cmd("npm");
-                c2.args(["run", &npm_script]);
+                // react-scripts style: no `--` separator, port comes via env var.
+                // Rebuild without the trailing `--` so react-scripts doesn't see
+                // an unexpected empty argument.
+                let mut c2 = if let Some(scope) = doppler_scope.as_deref() {
+                    let mut cc = async_cmd("doppler");
+                    cc.args(["run", "--scope", scope, "--", "npm", "run", &npm_script]);
+                    cc
+                } else {
+                    let mut cc = async_cmd("npm");
+                    cc.args(["run", &npm_script]);
+                    cc
+                };
                 c2.env("PORT", port.to_string());
                 c = c2;
             }
