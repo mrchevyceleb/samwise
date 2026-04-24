@@ -44,7 +44,7 @@
   </div>
 
   <div style="font-size: 12px; color: var(--text-secondary); line-height: 1.5;">
-    After Sam opens a PR, run a Codex review (gpt-5.4, high reasoning) and auto-merge only when every gate passes.
+    After Sam opens a PR, run a Codex review (gpt-5.5, xhigh reasoning) and auto-merge only when every gate passes.
     Gates: feature toggle on, no blocker paths touched (migrations, worker.rs, chat.rs, auth/secret/token files, dep manifests),
     diff under the line cap, the lowest review dimension at or above the minimum score, no review-flagged blockers, and CI green.
     If any gate fails, the PR stays in review with a comment explaining why.

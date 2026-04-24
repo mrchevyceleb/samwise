@@ -17,12 +17,10 @@ const REVIEW_PROMPT: &str = include_str!("../../prompts/review.md");
 /// place so upgrading the model is a single edit rather than a scavenger
 /// hunt across review.rs and worker.rs.
 ///
-/// Was "gpt-5.5" briefly but that's not live on Matt's Codex account yet
-/// (reviews fail with exit status 1 before running). Back on 5.4.
-pub const CODEX_MODEL: &str = "gpt-5.4";
-/// `-c` config argument for high reasoning effort. Matches the Codex CLI
+pub const CODEX_MODEL: &str = "gpt-5.5";
+/// `-c` config argument for Codex reasoning effort. Matches the Codex CLI
 /// schema: `minimal | low | medium | high | xhigh`.
-pub const CODEX_REASONING_CONFIG: &str = "model_reasoning_effort=\"high\"";
+pub const CODEX_REASONING_CONFIG: &str = "model_reasoning_effort=\"xhigh\"";
 
 /// Hardcoded blocker path patterns. Any changed file matching any of these
 /// blocks auto-merge. Includes Samwise's own review infrastructure so Sam
