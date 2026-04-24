@@ -3882,6 +3882,19 @@ pub fn spawn_pr_review_task(
             }
         };
 
+        // One-line headline so Matt can see the verdict at a glance without
+        // scrolling or reading the whole markdown body. Post BEFORE the body
+        // so it appears at the top of the review section in the activity log.
+        let headline = match result.verdict {
+            review::PrReviewVerdict::MergeNow =>
+                "Codex says: **MERGE**. Moving to Ready to Merge.".to_string(),
+            review::PrReviewVerdict::FixIssues =>
+                "Codex says: **FIX**. Moving to Fixes Needed. Blockers in the review below.".to_string(),
+            review::PrReviewVerdict::Inconclusive =>
+                "Codex says: **INCONCLUSIVE**. Leaving in Review — no clean verdict.".to_string(),
+        };
+        agent_comment(&config, &task_id, &headline).await;
+
         // Post the markdown body verbatim so Matt (and CS) can read the findings.
         if !result.markdown.trim().is_empty() {
             agent_comment(&config, &task_id, &result.markdown).await;
