@@ -1,6 +1,6 @@
 <script lang="ts">
-  import type { AeTask } from '$lib/types';
-  import { PRIORITY_COLOR, STATUS_LABEL } from '$lib/types';
+  import type { AeTask, TaskStatus } from '$lib/types';
+  import { PRIORITY_COLOR, STATUS_LABEL, STATUSES } from '$lib/types';
   import { tasksStore } from '$lib/stores/tasks.svelte';
   import LinkRow from './LinkRow.svelte';
 
@@ -34,9 +34,19 @@
     <header class="sticky top-0 z-10 px-4 py-3 bg-slate-900/90 backdrop-blur border-b border-white/10 flex items-start gap-3">
       <div class="flex-1 min-w-0">
         <div class="flex items-center gap-2 flex-wrap">
-          <span class="text-[10px] uppercase tracking-wide rounded-md border px-1.5 py-0.5 border-white/20 text-slate-300">
-            {STATUS_LABEL[task.status] ?? task.status}
-          </span>
+          <select
+            value={task.status}
+            onchange={(e) => {
+              const next = (e.currentTarget as HTMLSelectElement).value as TaskStatus;
+              if (next !== task.status) tasksStore.setStatus(task.id, next);
+            }}
+            class="text-[10px] uppercase tracking-wide rounded-md border px-1.5 py-0.5 border-white/20 bg-slate-900 text-slate-200 focus:outline-none focus:border-white/40"
+            aria-label="Move task"
+          >
+            {#each STATUSES as s}
+              <option value={s}>{STATUS_LABEL[s]}</option>
+            {/each}
+          </select>
           <span class="text-[10px] uppercase tracking-wide rounded-md border px-1.5 py-0.5 {PRIORITY_COLOR[task.priority]}">
             {task.priority}
           </span>

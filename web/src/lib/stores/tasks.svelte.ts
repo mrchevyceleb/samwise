@@ -1,5 +1,5 @@
 import { supabase } from '$lib/supabase';
-import type { AeTask, AeComment } from '$lib/types';
+import type { AeTask, AeComment, TaskStatus } from '$lib/types';
 
 class TasksStore {
   tasks = $state<AeTask[]>([]);
@@ -80,6 +80,36 @@ class TasksStore {
       : [...list, row];
     merged.sort((a, b) => a.created_at.localeCompare(b.created_at));
     this.comments = { ...this.comments, [row.task_id]: merged };
+  }
+
+  async setStatus(taskId: string, status: TaskStatus) {
+    const idx = this.tasks.findIndex((t) => t.id === taskId);
+    if (idx < 0) return;
+    const prev = this.tasks[idx];
+    if (prev.status === status) return;
+
+    // Optimistic local update so the card moves instantly instead of waiting
+    // on the realtime echo. The postgres_changes payload will overwrite this
+    // with the server's canonical row.
+    const next = this.tasks.slice();
+    next[idx] = { ...prev, status, updated_at: new Date().toISOString() };
+    this.tasks = next;
+
+    const { error } = await supabase
+      .from('ae_tasks')
+      .update({ status, updated_at: new Date().toISOString() })
+      .eq('id', taskId);
+
+    if (error) {
+      // Roll back. Use a fresh index lookup in case realtime moved things.
+      const curIdx = this.tasks.findIndex((t) => t.id === taskId);
+      if (curIdx >= 0) {
+        const rev = this.tasks.slice();
+        rev[curIdx] = prev;
+        this.tasks = rev;
+      }
+      this.error = error.message;
+    }
   }
 
   async loadCommentsFor(taskId: string) {

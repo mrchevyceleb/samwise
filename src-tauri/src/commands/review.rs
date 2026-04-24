@@ -669,11 +669,19 @@ pub async fn run_samwise_pr_review(
         pr_url
     );
 
+    // workspace-write + never-approve so Codex can actually run `gh pr view`
+    // against the target PR. Without this it falls back to its default
+    // read-only/no-network sandbox, can't hit GitHub, and flags "merge
+    // readiness unconfirmed" as a blocker — which isn't a code issue and
+    // leaves the card in Fixes Needed with nothing for Claude to fix.
+    // The skill's own hard constraints forbid any mutating commands.
     let mut cmd = async_cmd("codex");
     cmd.args([
         "exec",
         "-m", CODEX_MODEL,
         "-c", CODEX_REASONING_CONFIG,
+        "-s", "workspace-write",
+        "-c", "approval_policy=\"never\"",
     ])
     .arg(&prompt)
     .current_dir(&cwd)
@@ -693,30 +701,33 @@ pub async fn run_samwise_pr_review(
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
 
-    // Login / rate-limit detection so we surface a clear reason in the Sam comment.
-    let combined_lower = format!("{}\n{}", stdout.to_lowercase(), stderr.to_lowercase());
-    if combined_lower.contains("not logged in") || combined_lower.contains("please run /login") || combined_lower.contains("codex login") {
-        return Ok(PrReviewResult {
-            verdict: PrReviewVerdict::Inconclusive,
-            markdown: format!(
-                "Codex CLI isn't logged in on this machine. Run `codex login` in a terminal and drag the card out and back to re-trigger a review.\n\nRaw output:\n\n```\n{}\n```",
-                trim_to(&stdout, 2000)
-            ),
-            requires_human: true,
-        });
-    }
-    if combined_lower.contains("rate limit") || combined_lower.contains("rate_limit_error") || combined_lower.contains("overloaded_error") {
-        return Ok(PrReviewResult {
-            verdict: PrReviewVerdict::Inconclusive,
-            markdown: format!(
-                "Codex hit a rate or usage limit. Leaving the card in Review; drag it out and back once things cool off to retry.\n\nRaw output:\n\n```\n{}\n```",
-                trim_to(&stdout, 2000)
-            ),
-            requires_human: true,
-        });
-    }
-
+    // Login / rate-limit detection is only meaningful when Codex actually
+    // failed. A successful exit (status 0) means Codex produced a real
+    // review; the words "rate limit" can legitimately appear in that
+    // review's prose or in Codex's usage-status lines on stderr, and
+    // matching them would incorrectly kick a clean PR into Inconclusive.
     if !out.status.success() {
+        let combined_lower = format!("{}\n{}", stdout.to_lowercase(), stderr.to_lowercase());
+        if combined_lower.contains("not logged in") || combined_lower.contains("please run /login") || combined_lower.contains("codex login") {
+            return Ok(PrReviewResult {
+                verdict: PrReviewVerdict::Inconclusive,
+                markdown: format!(
+                    "Codex CLI isn't logged in on this machine. Run `codex login` in a terminal and drag the card out and back to re-trigger a review.\n\nRaw output:\n\n```\n{}\n```",
+                    trim_to(&stdout, 2000)
+                ),
+                requires_human: true,
+            });
+        }
+        if combined_lower.contains("rate limit") || combined_lower.contains("rate_limit_error") || combined_lower.contains("overloaded_error") {
+            return Ok(PrReviewResult {
+                verdict: PrReviewVerdict::Inconclusive,
+                markdown: format!(
+                    "Codex hit a rate or usage limit. Leaving the card in Review; drag it out and back once things cool off to retry.\n\nRaw output:\n\n```\n{}\n```",
+                    trim_to(&stdout, 2000)
+                ),
+                requires_human: true,
+            });
+        }
         return Ok(PrReviewResult {
             verdict: PrReviewVerdict::Inconclusive,
             markdown: format!(

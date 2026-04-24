@@ -17,8 +17,16 @@
 
 <button
   type="button"
+  draggable="true"
+  ondragstart={(e) => {
+    if (!e.dataTransfer) return;
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('application/x-samwise-task', task.id);
+    // Plain text fallback for browsers that ignore custom MIME types.
+    e.dataTransfer.setData('text/plain', task.id);
+  }}
   onclick={() => onOpen(task)}
-  class="group w-full text-left rounded-xl border border-white/10 bg-white/5 p-3 backdrop-blur hover:bg-white/10 hover:scale-[1.01] hover:-translate-y-0.5 active:scale-[0.99] transition-all shadow-sm"
+  class="group w-full text-left rounded-xl border border-white/10 bg-white/5 p-3 backdrop-blur hover:bg-white/10 hover:scale-[1.01] hover:-translate-y-0.5 active:scale-[0.99] transition-all shadow-sm cursor-grab active:cursor-grabbing"
 >
   <div class="flex items-start justify-between gap-2">
     <div class="text-sm font-medium text-slate-100 line-clamp-2">{task.title}</div>
