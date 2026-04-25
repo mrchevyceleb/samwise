@@ -19,6 +19,7 @@
 	let minimizeHovered = $state(false);
 	let maximizeHovered = $state(false);
 	let closeHovered = $state(false);
+	let themeHovered = $state(false);
 
 	async function minimize() {
 		try {
@@ -107,6 +108,25 @@
 
 	<!-- Right: Window controls -->
 	<div style="display: flex; align-items: center; gap: 2px; min-width: 100px; justify-content: flex-end;">
+		<button
+			style="width: 32px; height: 26px; display: flex; align-items: center; justify-content: center; border: none; background: {themeHovered ? theme.c.bgElevated : 'transparent'}; color: {theme.c.textSecondary}; border-radius: 6px; cursor: pointer; transition: all 0.15s ease; margin-right: 4px;"
+			onmouseenter={() => themeHovered = true}
+			onmouseleave={() => themeHovered = false}
+			onclick={() => theme.toggle()}
+			aria-label={theme.isDark ? 'Switch to light theme' : 'Switch to dark theme'}
+			title={theme.isDark ? 'Switch to light theme' : 'Switch to dark theme'}
+		>
+			{#if theme.isDark}
+				<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+					<circle cx="12" cy="12" r="4"/>
+					<path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/>
+				</svg>
+			{:else}
+				<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+					<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+				</svg>
+			{/if}
+		</button>
 		<button
 			style="width: 32px; height: 26px; display: flex; align-items: center; justify-content: center; border: none; background: {minimizeHovered ? theme.c.bgElevated : 'transparent'}; color: {theme.c.textSecondary}; border-radius: 6px; cursor: pointer; font-size: 16px; transition: all 0.15s ease;"
 			onmouseenter={() => minimizeHovered = true}
