@@ -66,28 +66,79 @@ async fn scope_has_doppler_project(scope: &str) -> bool {
 }
 
 /// Check likely Doppler scopes for a worktree. Samwise keeps worktrees under
-/// `~/samwise/worktrees/<repo>/<task>` and the shared git dir under
-/// `~/samwise/KG-Apps/<repo>`, while Matt's Doppler scopes are commonly saved
-/// on the original checkout under `~/Documents/KG-Apps/<repo>`. Checking only
-/// the git-common-dir path silently launches apps without Supabase/Vite env,
-/// which produces loading-splash screenshots and false visual QA failures.
+/// `~/samwise/worktrees/<repo>/<task>`, while Matt's Doppler scopes are often
+/// saved on the original checkout under `~/Documents/<app-family>/<repo>`.
+/// Checking only the git-common-dir path silently launches apps without
+/// Supabase/Vite env, which produces loading-splash screenshots and false
+/// visual QA failures.
 async fn doppler_scope_for(main_repo: &str, worktree: &str) -> Option<String> {
-    for scope in candidate_doppler_scopes(main_repo, worktree) {
-        if scope_has_doppler_project(&scope).await {
+    let explicitly_configured_scopes = configured_doppler_scopes().await;
+    for scope in candidate_doppler_scopes(main_repo, worktree, &explicitly_configured_scopes) {
+        if explicitly_configured_scopes.iter().any(|configured| configured == &scope)
+            || scope_has_doppler_project(&scope).await
+        {
             return Some(scope);
         }
     }
     None
 }
 
-fn candidate_doppler_scopes(main_repo: &str, worktree: &str) -> Vec<String> {
+async fn configured_doppler_scopes() -> Vec<String> {
+    if which::which("doppler").is_err() { return Vec::new(); }
+    let out = async_cmd("doppler")
+        .args(["configure", "--all", "--json"])
+        .output()
+        .await
+        .ok();
+    let Some(out) = out else { return Vec::new(); };
+    if !out.status.success() { return Vec::new(); }
+
+    let parsed: serde_json::Value = match serde_json::from_slice(&out.stdout) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    let Some(obj) = parsed.as_object() else { return Vec::new(); };
+    obj.iter()
+        .filter_map(|(scope, config)| {
+            if scope == "/" || !doppler_config_can_run(config) {
+                return None;
+            }
+            Some(scope.to_string())
+        })
+        .collect()
+}
+
+fn doppler_config_can_run(config: &serde_json::Value) -> bool {
+    if ["enclave.project", "project"]
+        .iter()
+        .any(|key| config.get(*key).and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false))
+    {
+        return true;
+    }
+
+    config
+        .get("token")
+        .and_then(|v| v.as_str())
+        .map(|token| token.starts_with("dp.st."))
+        .unwrap_or(false)
+}
+
+fn candidate_doppler_scopes(
+    main_repo: &str,
+    worktree: &str,
+    explicitly_configured_scopes: &[String],
+) -> Vec<String> {
     let mut scopes = Vec::new();
     push_unique(&mut scopes, main_repo.to_string());
     push_unique(&mut scopes, worktree.to_string());
 
+    let repo_names = repo_names_for_doppler(main_repo, worktree);
+    add_matching_configured_scopes(&mut scopes, &repo_names, explicitly_configured_scopes);
+    add_documents_repo_scopes(&mut scopes, &repo_names);
+
     for path in [main_repo, worktree] {
-        add_documents_kg_scope(&mut scopes, path);
-        add_worktree_repo_name_scope(&mut scopes, path);
+        add_mirrored_documents_scope(&mut scopes, path);
     }
 
     scopes
@@ -99,22 +150,72 @@ fn push_unique(scopes: &mut Vec<String>, scope: String) {
     }
 }
 
-fn add_documents_kg_scope(scopes: &mut Vec<String>, path: &str) {
-    let Ok(home) = std::env::var("HOME") else { return; };
-    let marker = format!("{}/samwise/KG-Apps/", home);
-    let Some(repo_name) = path.strip_prefix(&marker) else { return; };
-    let repo_name = repo_name.split('/').next().unwrap_or("").trim();
-    if repo_name.is_empty() { return; }
-    push_unique(scopes, format!("{}/Documents/KG-Apps/{}", home, repo_name));
+fn repo_names_for_doppler(main_repo: &str, worktree: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for path in [main_repo, worktree] {
+        if let Some(name) = Path::new(path).file_name().and_then(|s| s.to_str()) {
+            push_unique(&mut names, name.to_string());
+        }
+        if let Some(name) = samwise_worktree_repo_name(path) {
+            push_unique(&mut names, name);
+        }
+    }
+    names
 }
 
-fn add_worktree_repo_name_scope(scopes: &mut Vec<String>, path: &str) {
-    let Ok(home) = std::env::var("HOME") else { return; };
+fn samwise_worktree_repo_name(path: &str) -> Option<String> {
+    let Ok(home) = std::env::var("HOME") else { return None; };
     let marker = format!("{}/samwise/worktrees/", home);
-    let Some(rest) = path.strip_prefix(&marker) else { return; };
+    let rest = path.strip_prefix(&marker)?;
     let repo_name = rest.split('/').next().unwrap_or("").trim();
-    if repo_name.is_empty() { return; }
-    push_unique(scopes, format!("{}/Documents/KG-Apps/{}", home, repo_name));
+    if repo_name.is_empty() { return None; }
+    Some(repo_name.to_string())
+}
+
+fn add_matching_configured_scopes(
+    scopes: &mut Vec<String>,
+    repo_names: &[String],
+    explicitly_configured_scopes: &[String],
+) {
+    for scope in explicitly_configured_scopes {
+        let Some(name) = Path::new(scope).file_name().and_then(|s| s.to_str()) else { continue; };
+        if repo_names.iter().any(|repo_name| repo_name == name) {
+            push_unique(scopes, scope.to_string());
+        }
+    }
+}
+
+fn add_documents_repo_scopes(scopes: &mut Vec<String>, repo_names: &[String]) {
+    let Some(home) = dirs::home_dir() else { return; };
+    let documents = home.join("Documents");
+    let Ok(entries) = std::fs::read_dir(documents) else { return; };
+
+    for entry in entries.flatten() {
+        let Ok(metadata) = entry.metadata() else { continue; };
+        if !metadata.is_dir() { continue; }
+        for repo_name in repo_names {
+            let candidate = entry.path().join(repo_name);
+            if candidate.is_dir() {
+                push_unique(scopes, candidate.to_string_lossy().into_owned());
+            }
+        }
+    }
+}
+
+fn add_mirrored_documents_scope(scopes: &mut Vec<String>, path: &str) {
+    let Ok(home) = std::env::var("HOME") else { return; };
+    let marker = format!("{}/samwise/", home);
+    let Some(rest) = path.strip_prefix(&marker) else { return; };
+    let mut parts = rest.split('/');
+    let Some(bucket) = parts.next().filter(|s| !s.is_empty() && *s != "worktrees") else { return; };
+    let Some(repo_name) = parts.next().filter(|s| !s.is_empty()) else { return; };
+
+    push_unique(scopes, format!("{}/Documents/{}/{}", home, bucket, repo_name));
+
+    if let Some(prefix) = bucket.strip_suffix("-Apps") {
+        let project_bucket = format!("{}-PROJECTS", prefix.to_ascii_uppercase());
+        push_unique(scopes, format!("{}/Documents/{}/{}", home, project_bucket, repo_name));
+    }
 }
 
 pub struct DevServerHandle {
