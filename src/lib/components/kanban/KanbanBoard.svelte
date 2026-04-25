@@ -28,12 +28,16 @@
 
 	let columnsContainer = $state<HTMLDivElement | null>(null);
 
-	/** Auto-poll comments for active tasks so card previews update live */
+	/** Auto-poll comments for active/reviewed tasks so card summaries update live */
 	let commentPollInterval: ReturnType<typeof setInterval> | null = null;
 
 	function pollActiveComments() {
 		const activeTasks = taskStore.tasks.filter(
-			t => t.status === 'in_progress' || t.status === 'testing' || t.status === 'review'
+			t => t.status === 'in_progress'
+				|| t.status === 'testing'
+				|| t.status === 'review'
+				|| t.status === 'fixes_needed'
+				|| t.status === 'approved'
 		);
 		for (const task of activeTasks) {
 			commentStore.fetchComments(task.id);

@@ -20,6 +20,7 @@ class TasksStore {
       if (error) throw error;
       this.tasks = (data ?? []) as AeTask[];
       this.loading = false;
+      this.prefetchReviewComments();
     } catch (e: unknown) {
       this.error = e instanceof Error ? e.message : String(e);
       this.loading = false;
@@ -58,6 +59,7 @@ class TasksStore {
     } else {
       this.tasks = [row, ...this.tasks];
     }
+    if (this.shouldPrefetchComments(row)) void this.loadCommentsFor(row.id);
   }
 
   private applyCommentChange(payload: { eventType: string; new: Record<string, unknown>; old: Record<string, unknown> }) {
@@ -82,22 +84,23 @@ class TasksStore {
     this.comments = { ...this.comments, [row.task_id]: merged };
   }
 
-  async setStatus(taskId: string, status: TaskStatus) {
+  async updateTask(taskId: string, updates: Partial<AeTask>) {
     const idx = this.tasks.findIndex((t) => t.id === taskId);
     if (idx < 0) return;
     const prev = this.tasks[idx];
-    if (prev.status === status) return;
+    const now = new Date().toISOString();
+    const payload = { ...updates, updated_at: now };
 
     // Optimistic local update so the card moves instantly instead of waiting
     // on the realtime echo. The postgres_changes payload will overwrite this
     // with the server's canonical row.
     const next = this.tasks.slice();
-    next[idx] = { ...prev, status, updated_at: new Date().toISOString() };
+    next[idx] = { ...prev, ...payload };
     this.tasks = next;
 
     const { error } = await supabase
       .from('ae_tasks')
-      .update({ status, updated_at: new Date().toISOString() })
+      .update(payload)
       .eq('id', taskId);
 
     if (error) {
@@ -112,6 +115,14 @@ class TasksStore {
     }
   }
 
+  async setStatus(taskId: string, status: TaskStatus) {
+    const task = this.tasks.find((t) => t.id === taskId);
+    if (!task || task.status === status) return;
+    const updates: Partial<AeTask> = { status };
+    if (status === 'done') updates.completed_at = new Date().toISOString();
+    await this.updateTask(taskId, updates);
+  }
+
   async loadCommentsFor(taskId: string) {
     if (this.comments[taskId]) return;
     const { data } = await supabase
@@ -120,6 +131,16 @@ class TasksStore {
       .eq('task_id', taskId)
       .order('created_at', { ascending: true });
     this.comments = { ...this.comments, [taskId]: (data ?? []) as AeComment[] };
+  }
+
+  private shouldPrefetchComments(task: AeTask) {
+    return !!task.pr_url && (task.status === 'review' || task.status === 'fixes_needed' || task.status === 'approved');
+  }
+
+  private prefetchReviewComments() {
+    for (const task of this.tasks) {
+      if (this.shouldPrefetchComments(task)) void this.loadCommentsFor(task.id);
+    }
   }
 
   destroy() {

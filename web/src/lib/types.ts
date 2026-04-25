@@ -33,6 +33,7 @@ export interface AeTask {
   source: string;
   task_type: string;
   repo_url: string | null;
+  repo_path: string | null;
   branch: string | null;
   base_branch: string | null;
   preview_url: string | null;
@@ -43,12 +44,21 @@ export interface AeTask {
   visual_qa_result: { pass: boolean; explanation: string } | null;
   assignee: string;
   worker_id: string | null;
+  trigger_id?: string | null;
+  cron_id?: string | null;
+  context: Record<string, unknown> | null;
   subtasks: Subtask[] | null;
   attachments: Attachment[] | null;
   failure_reason?: string | null;
   created_at: string;
   updated_at: string;
   completed_at: string | null;
+  claimed_at?: string | null;
+  review_scores: Record<string, number> | null;
+  review_summary: string | null;
+  auto_merged: boolean | null;
+  auto_merge_blocked_reason: string | null;
+  last_pr_review_at?: string | null;
 }
 
 export interface AeComment {

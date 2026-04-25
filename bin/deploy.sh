@@ -33,15 +33,15 @@ check_inflight() {
     fi
 
     # Tasks claimed and still running, OR cards in review whose codex run is
-    # recent (<12 min). The codex review timeout is 10 minutes, so the window
+    # recent (<25 min). The codex review timeout is 20 minutes, so the window
     # must be wider than that or we'd clear the guard while a review is still
-    # active between minutes 5-10 and kill its child process.
+    # active and kill its child process.
     local RESP
     RESP=$(curl -sS -G \
         -H "apikey: $SB_KEY" \
         -H "Authorization: Bearer $SB_KEY" \
         --data-urlencode "select=id,title,status,last_pr_review_at" \
-        --data-urlencode "or=(status.eq.in_progress,and(status.eq.review,last_pr_review_at.gt.$(date -u -v-12M +%Y-%m-%dT%H:%M:%SZ)))" \
+        --data-urlencode "or=(status.eq.in_progress,and(status.eq.review,last_pr_review_at.gt.$(date -u -v-25M +%Y-%m-%dT%H:%M:%SZ)))" \
         "$SB_URL/rest/v1/ae_tasks" || echo "[]")
 
     if [ "$RESP" = "[]" ] || [ -z "$RESP" ]; then

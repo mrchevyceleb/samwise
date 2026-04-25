@@ -3,7 +3,14 @@
 	import type { AeTask, TaskStatus, TaskPriority } from '$lib/types';
 	import { PRIORITY_COLORS, KANBAN_COLUMNS } from '$lib/types';
 	import { getTaskStore } from '$lib/stores/tasks.svelte';
+	import { getCommentStore } from '$lib/stores/comments.svelte';
 	import { getTheme } from '$lib/stores/theme.svelte';
+	import {
+		extractReviewActionPanel,
+		getUiStamp,
+		isReviewActionStatus,
+		nextCopilotStampContext,
+	} from '$lib/utils/review-actions';
 	import { formatTimeAgo } from '$lib/utils/relative-time';
 	import { safeInvoke, openExternal } from '$lib/utils/tauri';
 	import CommentThread from './CommentThread.svelte';
@@ -25,6 +32,7 @@
 
 	let { task, onClose }: Props = $props();
 	const taskStore = getTaskStore();
+	const commentStore = getCommentStore();
 	const theme = getTheme();
 
 	// Editing states
@@ -37,8 +45,10 @@
 	let requeueHovered = $state(false);
 	let stopHovered = $state(false);
 	let restartHovered = $state(false);
+	let markDoneHovered = $state(false);
 	let stopping = $state(false);
 	let restarting = $state(false);
+	let markingDone = $state(false);
 	let prBtnHovered = $state(false);
 
 	// Tabs: "details" or "report"
@@ -47,6 +57,7 @@
 	let loadingArtifacts = $state(false);
 
 	onMount(async () => {
+		commentStore.fetchComments(task.id);
 		// Fetch artifacts for this task
 		loadingArtifacts = true;
 		try {
@@ -77,6 +88,10 @@
 	let hasAfter = $derived(task.screenshots_after && task.screenshots_after.length > 0);
 	let hasScreenshots = $derived(hasBefore || hasAfter);
 	let hasVisualQA = $derived(task.visual_qa_result !== null);
+	let comments = $derived(commentStore.getComments(task.id));
+	let reviewPanel = $derived(extractReviewActionPanel(task, comments));
+	let uiStamp = $derived(getUiStamp(task));
+	let showReviewActions = $derived(isReviewActionStatus(task.status) && !!(reviewPanel || task.pr_url));
 
 	async function saveTitle() {
 		if (editTitle.trim() && editTitle !== task.title) {
@@ -102,6 +117,20 @@
 
 	async function handleRequeue() {
 		await taskStore.moveTask(task.id, 'queued');
+	}
+
+	async function handleMarkDone() {
+		markingDone = true;
+		try {
+			await taskStore.moveTask(task.id, 'done');
+			onClose();
+		} finally {
+			markingDone = false;
+		}
+	}
+
+	async function handleToggleCopilotStamp() {
+		await taskStore.updateTask(task.id, { context: nextCopilotStampContext(task) });
 	}
 
 	async function handleStop() {
@@ -144,6 +173,13 @@
 	function formatDate(iso: string | null): string {
 		if (!iso) return '-';
 		return new Date(iso).toLocaleString();
+	}
+
+	function verdictColor(verdict: string | undefined): string {
+		if (verdict === 'merge') return '#3fb950';
+		if (verdict === 'fix' || verdict === 'blocked') return '#f0883e';
+		if (verdict === 'errored') return '#f85149';
+		return '#58a6ff';
 	}
 
 	const priorities: { value: TaskPriority; label: string; color: string }[] = [
@@ -312,6 +348,106 @@
 					>
 						{task.title}
 						<span style="font-size: 11px; color: var(--text-muted); font-weight: 400; margin-left: 8px;">click to edit</span>
+					</div>
+				{/if}
+
+				{#if reviewPanel && isReviewActionStatus(task.status)}
+					<div style="
+						margin-bottom: 18px; padding: 14px; border-radius: 14px;
+						background: linear-gradient(135deg, {verdictColor(reviewPanel.verdict)}22, rgba(99, 102, 241, 0.09));
+						border: 1px solid {verdictColor(reviewPanel.verdict)}55;
+						box-shadow: inset 0 1px 0 rgba(255,255,255,0.08), 0 12px 30px rgba(0,0,0,0.10);
+					">
+						<div style="display: flex; align-items: flex-start; gap: 10px; margin-bottom: 10px;">
+							<div style="flex: 1;">
+								<div style="
+									font-size: 11px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.6px;
+									color: {verdictColor(reviewPanel.verdict)};
+									margin-bottom: 4px;
+								">
+									{reviewPanel.label}
+								</div>
+								<div style="font-size: 13px; color: var(--text-primary); line-height: 1.45; font-weight: 600;">
+									{reviewPanel.why}
+								</div>
+							</div>
+							{#if uiStamp}
+								<span style="
+									padding: 4px 8px; border-radius: 999px;
+									background: rgba(88, 166, 255, 0.18);
+									border: 1px solid rgba(88, 166, 255, 0.35);
+									color: #8cc8ff; font-size: 10px; font-weight: 900;
+									text-transform: uppercase; letter-spacing: 0.4px;
+									white-space: nowrap;
+								">
+									Copilot Review
+								</span>
+							{/if}
+						</div>
+
+						<div style="
+							padding: 9px 10px; margin-bottom: 12px; border-radius: 9px;
+							background: rgba(0,0,0,0.14);
+							border: 1px solid rgba(255,255,255,0.08);
+							color: {reviewPanel.hasDeploymentCallout ? 'var(--accent-orange)' : 'var(--text-muted)'};
+							font-size: 12px; line-height: 1.45; font-weight: 700;
+						">
+							Deployment: {reviewPanel.deployment}
+						</div>
+
+						<div style="display: flex; flex-wrap: wrap; gap: 8px;">
+							{#if task.pr_url}
+								<button
+									type="button"
+									onclick={() => openExternal(task.pr_url!)}
+									style="
+										display: inline-flex; align-items: center; gap: 7px;
+										padding: 8px 12px; border-radius: 9px;
+										background: rgba(63, 185, 80, 0.10);
+										border: 1px solid rgba(63, 185, 80, 0.26);
+										color: var(--accent-green);
+										font-size: 12px; font-weight: 800;
+										cursor: pointer; font-family: var(--font-ui);
+									"
+								>
+									Open PR
+								</button>
+							{/if}
+							{#if task.status !== 'done'}
+								<button
+									type="button"
+									onclick={handleToggleCopilotStamp}
+									style="
+										display: inline-flex; align-items: center; gap: 7px;
+										padding: 8px 12px; border-radius: 9px;
+										background: {uiStamp ? 'rgba(88, 166, 255, 0.18)' : 'rgba(88, 166, 255, 0.08)'};
+										border: 1px solid {uiStamp ? 'rgba(88, 166, 255, 0.45)' : 'rgba(88, 166, 255, 0.22)'};
+										color: #8cc8ff;
+										font-size: 12px; font-weight: 800;
+										cursor: pointer; font-family: var(--font-ui);
+									"
+								>
+									{uiStamp ? 'Remove Copilot Stamp' : 'Stamp Copilot Review'}
+								</button>
+								<button
+									type="button"
+									onclick={handleMarkDone}
+									disabled={markingDone}
+									style="
+										display: inline-flex; align-items: center; gap: 7px;
+										padding: 8px 12px; border-radius: 9px;
+										background: rgba(63, 185, 80, 0.10);
+										border: 1px solid rgba(63, 185, 80, 0.26);
+										color: var(--accent-green);
+										font-size: 12px; font-weight: 900;
+										cursor: {markingDone ? 'wait' : 'pointer'}; font-family: var(--font-ui);
+										opacity: {markingDone ? '0.65' : '1'};
+									"
+								>
+									{markingDone ? 'Marking Done...' : 'Mark Done'}
+								</button>
+							{/if}
+						</div>
 					</div>
 				{/if}
 
@@ -590,6 +726,27 @@
 
 				<!-- Actions -->
 				<div style="border-top: 1px solid var(--border-subtle); padding-top: 12px; display: flex; flex-direction: column; gap: 6px;">
+					{#if showReviewActions && task.status !== 'done'}
+						<button
+							style="
+								width: 100%; padding: 8px 12px; border-radius: 8px;
+								background: {markDoneHovered ? 'rgba(63, 185, 80, 0.14)' : 'rgba(63, 185, 80, 0.08)'};
+								border: 1px solid rgba(63, 185, 80, 0.25);
+								color: var(--accent-green); font-size: 11px; font-weight: 800;
+								font-family: var(--font-ui); cursor: {markingDone ? 'wait' : 'pointer'};
+								transition: all 0.15s ease;
+								transform: {markDoneHovered && !markingDone ? 'translateY(-1px)' : 'none'};
+								opacity: {markingDone ? '0.6' : '1'};
+							"
+							onmouseenter={() => markDoneHovered = true}
+							onmouseleave={() => markDoneHovered = false}
+							onclick={handleMarkDone}
+							disabled={markingDone}
+						>
+							{markingDone ? 'Marking Done...' : 'Mark Done'}
+						</button>
+					{/if}
+
 					{#if isStoppable}
 						<button
 							style="

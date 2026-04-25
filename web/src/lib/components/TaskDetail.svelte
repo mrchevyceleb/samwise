@@ -2,6 +2,12 @@
   import type { AeTask, TaskStatus } from '$lib/types';
   import { PRIORITY_COLOR, STATUS_LABEL, STATUSES } from '$lib/types';
   import { tasksStore } from '$lib/stores/tasks.svelte';
+  import {
+    extractReviewActionPanel,
+    getUiStamp,
+    isReviewActionStatus,
+    nextCopilotStampContext
+  } from '$lib/utils/review-actions';
   import LinkRow from './LinkRow.svelte';
 
   let { task, onClose }: { task: AeTask; onClose: () => void } = $props();
@@ -14,6 +20,28 @@
   let before = $derived(task.screenshots_before ?? []);
   let after = $derived(task.screenshots_after ?? []);
   let attachments = $derived(task.attachments ?? []);
+  let reviewPanel = $derived(extractReviewActionPanel(task, comments));
+  let uiStamp = $derived(getUiStamp(task));
+
+  function verdictColor(verdict: string | undefined) {
+    if (verdict === 'merge') return '#34d399';
+    if (verdict === 'fix' || verdict === 'blocked') return '#fb923c';
+    if (verdict === 'errored') return '#fb7185';
+    return '#60a5fa';
+  }
+
+  function openPr() {
+    if (task.pr_url) window.open(task.pr_url, '_blank', 'noopener');
+  }
+
+  async function toggleCopilotStamp() {
+    await tasksStore.updateTask(task.id, { context: nextCopilotStampContext(task) });
+  }
+
+  async function markDone() {
+    await tasksStore.setStatus(task.id, 'done');
+    onClose();
+  }
 </script>
 
 <div
@@ -65,6 +93,59 @@
     </header>
 
     <div class="px-4 py-4 space-y-4">
+      {#if reviewPanel && isReviewActionStatus(task.status)}
+        <section
+          class="rounded-2xl border p-3 shadow-inner"
+          style="border-color: {verdictColor(reviewPanel.verdict)}66; background: linear-gradient(135deg, {verdictColor(reviewPanel.verdict)}22, rgba(14, 165, 233, 0.08));"
+        >
+          <div class="flex items-start gap-3">
+            <div class="min-w-0 flex-1">
+              <div class="text-[10px] font-black uppercase tracking-wide" style="color: {verdictColor(reviewPanel.verdict)};">
+                {reviewPanel.label}
+              </div>
+              <p class="mt-1 text-sm font-semibold leading-snug text-slate-100">{reviewPanel.why}</p>
+            </div>
+            {#if uiStamp}
+              <span class="shrink-0 rounded-full border border-sky-400/40 bg-sky-400/15 px-2 py-0.5 text-[10px] font-black uppercase tracking-wide text-sky-200">
+                Copilot Review
+              </span>
+            {/if}
+          </div>
+
+          <div class="mt-3 rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-xs font-bold leading-snug {reviewPanel.hasDeploymentCallout ? 'text-amber-200' : 'text-slate-400'}">
+            Deployment: {reviewPanel.deployment}
+          </div>
+
+          <div class="mt-3 flex flex-wrap gap-2">
+            {#if task.pr_url}
+              <button
+                type="button"
+                onclick={openPr}
+                class="rounded-lg border border-emerald-300/30 bg-emerald-400/10 px-3 py-2 text-xs font-black text-emerald-100 hover:bg-emerald-400/15"
+              >
+                Open PR
+              </button>
+            {/if}
+            {#if task.status !== 'done'}
+              <button
+                type="button"
+                onclick={toggleCopilotStamp}
+                class="rounded-lg border px-3 py-2 text-xs font-black text-sky-100 {uiStamp ? 'border-sky-300/50 bg-sky-400/20' : 'border-sky-300/25 bg-sky-400/10 hover:bg-sky-400/15'}"
+              >
+                {uiStamp ? 'Remove Copilot Stamp' : 'Stamp Copilot Review'}
+              </button>
+              <button
+                type="button"
+                onclick={markDone}
+                class="rounded-lg border border-emerald-300/30 bg-emerald-400/10 px-3 py-2 text-xs font-black text-emerald-100 hover:bg-emerald-400/15"
+              >
+                Mark Done
+              </button>
+            {/if}
+          </div>
+        </section>
+      {/if}
+
       {#if task.description}
         <section>
           <h3 class="text-xs uppercase tracking-wide text-slate-400 mb-1">Description</h3>

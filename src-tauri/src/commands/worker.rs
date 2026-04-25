@@ -1287,6 +1287,11 @@ What was fixed:\n\
 How it was fixed:\n\
 - <technical summary of the change: files/functions touched, approach, why>\n\
 \n\
+Deployment required:\n\
+- Railway server: <yes/no/unknown> - <plain reason, including service name if yes>\n\
+- Supabase migrations: <yes/no/unknown> - <plain reason, including migration filenames if yes>\n\
+- Supabase Edge Functions: <yes/no/unknown> - <plain reason, including function names if yes>\n\
+\n\
 For Customer Success:\n\
 - <one or two sentences CS can paste to the customer explaining that it's fixed and what to expect now, in non-technical language>\n\
 EOF\n\
@@ -1294,7 +1299,10 @@ EOF\n\
 ```\n\
 Fill in every section concretely. Do not use placeholders. If the task is a \
 non-customer-facing refactor, still write the \"For Customer Success\" line \
-but mark it as \"internal only, no customer message needed\".\n\n\
+but mark it as \"internal only, no customer message needed\". The deployment \
+section must be crystal clear: use \"no\" when the PR does not require that \
+deployment path, \"yes\" when it does, and \"unknown\" only when the codebase \
+does not provide enough evidence.\n\n\
 Then stop. Do not open the PR yourself \u{2014} that is handled after this step.\n\n\
 If the task is genuinely ambiguous and you cannot proceed without a decision \
 from Matt, stop without making changes and explain specifically what you need clarified."
@@ -4182,11 +4190,17 @@ Blockers addressed:\n\
 - <bullet per blocker>\n\n\
 How it was fixed:\n\
 - <bullet per change>\n\n\
+Deployment required:\n\
+- Railway server: <yes/no/unknown> - <plain reason, including service name if yes>\n\
+- Supabase migrations: <yes/no/unknown> - <plain reason, including migration filenames if yes>\n\
+- Supabase Edge Functions: <yes/no/unknown> - <plain reason, including function names if yes>\n\n\
 For Customer Success:\n\
 - <one plain sentence, or \"internal only, no customer message needed\">\n\
 EOF\n\
 )\"\n\
-```\n\n\
+```\n\
+Do not leave placeholders in the deployment section; say \"no\" explicitly when \
+Railway, Supabase migrations, or Edge Functions do not need deployment.\n\n\
 Do not push — that is handled after this step. Do not open a second PR.\n\
 If a blocker is genuinely unfixable without Matt's input (e.g. needs a product \
 decision or schema change), stop and explain which blocker and why, without \

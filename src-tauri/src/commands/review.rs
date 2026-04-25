@@ -52,7 +52,7 @@ const MAX_DIFF_BYTES: usize = 50_000;
 const CI_POLL_INTERVAL_SECS: u64 = 30;
 const CI_POLL_MAX_SECS: u64 = 15 * 60;
 const CI_MIN_OBSERVATIONS: u32 = 2; // don't trust an empty/first poll
-const CODEX_TIMEOUT_SECS: u64 = 10 * 60;
+const CODEX_TIMEOUT_SECS: u64 = 20 * 60;
 // Random delimiter so a malicious diff can't fake review JSON by closing a ``` fence.
 const DIFF_DELIMITER: &str = "===SAMWISE-DIFF-9f3c2a8b1d7e===";
 
@@ -648,7 +648,7 @@ pub struct PrReviewResult {
     pub requires_human: bool,
 }
 
-const SAMWISE_PR_REVIEW_TIMEOUT_SECS: u64 = 10 * 60;
+const SAMWISE_PR_REVIEW_TIMEOUT_SECS: u64 = 20 * 60;
 
 /// Run `$samwise-pr-review` via the Codex CLI. Returns a verdict and the
 /// markdown body Sam should post as a comment. Never panics; any unexpected
@@ -663,7 +663,7 @@ pub async fn run_samwise_pr_review(
     }
     let cwd = resolve_codex_cwd(repo_path);
     let prompt = format!(
-        "Use $samwise-pr-review on {}. Emit only the skill output per its template, no preamble, no follow-up.",
+        "Use $samwise-pr-review on {}. Emit only the skill output per its template, no preamble, no follow-up. The report must include the Deployment Required section with explicit Railway server, Supabase migrations, and Supabase Edge Functions yes/no/unknown lines.",
         pr_url
     );
 
@@ -686,25 +686,56 @@ pub async fn run_samwise_pr_review(
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::piped());
 
-    let child = cmd.spawn().map_err(|e| format!("failed to spawn codex: {}", e))?;
-    let out = match tokio::time::timeout(
+    let mut child = cmd.spawn().map_err(|e| format!("failed to spawn codex: {}", e))?;
+
+    let stdout = child.stdout.take();
+    let stdout_handle = tokio::spawn(async move {
+        let mut output = String::new();
+        if let Some(mut reader) = stdout {
+            use tokio::io::AsyncReadExt;
+            let _ = reader.read_to_string(&mut output).await;
+        }
+        output
+    });
+
+    let stderr = child.stderr.take();
+    let stderr_handle = tokio::spawn(async move {
+        let mut output = String::new();
+        if let Some(mut reader) = stderr {
+            use tokio::io::AsyncReadExt;
+            let _ = reader.read_to_string(&mut output).await;
+        }
+        output
+    });
+
+    let status = match tokio::time::timeout(
         Duration::from_secs(SAMWISE_PR_REVIEW_TIMEOUT_SECS),
-        child.wait_with_output(),
+        child.wait(),
     ).await {
-        Ok(Ok(o)) => o,
+        Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err(format!("codex wait failed: {}", e)),
-        Err(_) => return Err("codex timed out".to_string()),
+        Err(_) => {
+            let _ = child.kill().await;
+            let stdout = stdout_handle.await.unwrap_or_default();
+            let stderr = stderr_handle.await.unwrap_or_default();
+            return Err(format!(
+                "codex timed out after {}s. Stderr tail: {} Stdout tail: {}",
+                SAMWISE_PR_REVIEW_TIMEOUT_SECS,
+                trim_to(stderr.trim(), 800),
+                trim_to(stdout.trim(), 800),
+            ));
+        }
     };
 
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let stdout = stdout_handle.await.unwrap_or_default();
+    let stderr = stderr_handle.await.unwrap_or_default();
 
     // Login / rate-limit detection is only meaningful when Codex actually
     // failed. A successful exit (status 0) means Codex produced a real
     // review; the words "rate limit" can legitimately appear in that
     // review's prose or in Codex's usage-status lines on stderr, and
     // matching them would incorrectly kick a clean PR into Inconclusive.
-    if !out.status.success() {
+    if !status.success() {
         let combined_lower = format!("{}\n{}", stdout.to_lowercase(), stderr.to_lowercase());
         if combined_lower.contains("not logged in") || combined_lower.contains("please run /login") || combined_lower.contains("codex login") {
             return Ok(PrReviewResult {
@@ -730,7 +761,7 @@ pub async fn run_samwise_pr_review(
             verdict: PrReviewVerdict::Inconclusive,
             markdown: format!(
                 "Codex review exited with {}. Leaving the card in Review.\n\nStderr:\n```\n{}\n```\n\nStdout tail:\n```\n{}\n```",
-                out.status,
+                status,
                 trim_to(&stderr, 1500),
                 trim_to(&stdout, 1500),
             ),

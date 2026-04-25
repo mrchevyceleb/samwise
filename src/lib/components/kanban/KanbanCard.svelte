@@ -5,6 +5,13 @@
 	import { getCommentStore } from '$lib/stores/comments.svelte';
 	import { getDragStore } from '$lib/stores/drag.svelte';
 	import { getTheme } from '$lib/stores/theme.svelte';
+	import { getTaskStore } from '$lib/stores/tasks.svelte';
+	import {
+		extractReviewActionPanel,
+		getUiStamp,
+		isReviewActionStatus,
+		nextCopilotStampContext,
+	} from '$lib/utils/review-actions';
 	import { formatTimeAgo } from '$lib/utils/relative-time';
 	import { openExternal } from '$lib/utils/tauri';
 
@@ -18,6 +25,7 @@
 	const commentStore = getCommentStore();
 	const drag = getDragStore();
 	const theme = getTheme();
+	const taskStore = getTaskStore();
 
 	let hovered = $state(false);
 	let mouseDownAt = $state<{ x: number; y: number } | null>(null);
@@ -34,6 +42,10 @@
 	let isBeingDragged = $derived(drag.dragging && drag.draggedTask?.id === task.id);
 	let isWorking = $derived(task.status === 'in_progress' || task.status === 'testing');
 	let latestComment = $derived(commentStore.getLatestComment(task.id));
+	let comments = $derived(commentStore.getComments(task.id));
+	let reviewPanel = $derived(extractReviewActionPanel(task, comments));
+	let uiStamp = $derived(getUiStamp(task));
+	let showReviewActions = $derived(isReviewActionStatus(task.status) && !!(reviewPanel || task.pr_url));
 	let qaResult = $derived(task.visual_qa_result);
 	let subtasks = $derived(task.subtasks || []);
 	let subtaskTotal = $derived(subtasks.length);
@@ -81,7 +93,7 @@
 	function handleMouseDown(e: MouseEvent) {
 		// Only left click, not on links
 		if (e.button !== 0) return;
-		if ((e.target as HTMLElement).closest('a')) return;
+		if ((e.target as HTMLElement).closest('a,button')) return;
 		mouseDownAt = { x: e.clientX, y: e.clientY };
 	}
 
@@ -108,6 +120,31 @@
 		e.preventDefault();
 		e.stopPropagation();
 		onContextMenu?.(task, e.clientX, e.clientY);
+	}
+
+	async function markDone(e: MouseEvent) {
+		e.preventDefault();
+		e.stopPropagation();
+		await taskStore.moveTask(task.id, 'done');
+	}
+
+	async function toggleCopilotStamp(e: MouseEvent) {
+		e.preventDefault();
+		e.stopPropagation();
+		await taskStore.updateTask(task.id, { context: nextCopilotStampContext(task) });
+	}
+
+	function openPr(e: MouseEvent) {
+		e.preventDefault();
+		e.stopPropagation();
+		if (task.pr_url) openExternal(task.pr_url);
+	}
+
+	function verdictColor(verdict: string | undefined): string {
+		if (verdict === 'merge') return '#3fb950';
+		if (verdict === 'fix' || verdict === 'blocked') return '#f0883e';
+		if (verdict === 'errored') return '#f85149';
+		return '#58a6ff';
 	}
 </script>
 
@@ -147,6 +184,71 @@
 	">
 		{task.title}
 	</div>
+
+	{#if uiStamp}
+		<div style="
+			display: inline-flex; align-items: center; gap: 5px;
+			margin-bottom: 8px; padding: 3px 8px; border-radius: 999px;
+			background: linear-gradient(135deg, rgba(88, 166, 255, 0.18), rgba(63, 185, 80, 0.12));
+			border: 1px solid rgba(88, 166, 255, 0.35);
+			color: #8cc8ff; font-size: 10px; font-weight: 900;
+			text-transform: uppercase; letter-spacing: 0.45px;
+		">
+			Copilot Review
+		</div>
+	{/if}
+
+	{#if reviewPanel && isReviewActionStatus(task.status)}
+		<div style="
+			margin-bottom: 9px; padding: 9px; border-radius: 10px;
+			background: linear-gradient(135deg, {verdictColor(reviewPanel.verdict)}22, rgba(99, 102, 241, 0.08));
+			border: 1px solid {verdictColor(reviewPanel.verdict)}55;
+			box-shadow: inset 0 1px 0 rgba(255,255,255,0.08);
+		">
+			<div style="display: flex; align-items: center; gap: 6px; margin-bottom: 6px;">
+				<span style="
+					font-size: 10px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.45px;
+					color: {verdictColor(reviewPanel.verdict)};
+				">
+					{reviewPanel.label}
+				</span>
+				<div style="flex: 1;"></div>
+				{#if task.pr_url}
+					<button
+						type="button"
+						style="
+							padding: 3px 7px; border-radius: 6px;
+							border: 1px solid rgba(255,255,255,0.12);
+							background: rgba(0,0,0,0.18);
+							color: var(--text-primary);
+							font-size: 10px; font-weight: 800;
+							cursor: pointer;
+						"
+						onmousedown={(e) => e.stopPropagation()}
+						onclick={openPr}
+					>
+						PR
+					</button>
+				{/if}
+			</div>
+			<div style="
+				font-size: 11px; color: var(--text-secondary); line-height: 1.35;
+				display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+				overflow: hidden;
+			">
+				{reviewPanel.why}
+			</div>
+			<div style="
+				margin-top: 6px; font-size: 10px; line-height: 1.3;
+				color: {reviewPanel.hasDeploymentCallout ? 'var(--accent-orange)' : 'var(--text-muted)'};
+				font-weight: 700;
+				display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+				overflow: hidden;
+			">
+				Deploy: {reviewPanel.deployment}
+			</div>
+		</div>
+	{/if}
 
 	<!-- Priority + Project row -->
 	<div style="display: flex; align-items: center; gap: 5px; flex-wrap: wrap; margin-bottom: 8px;">
@@ -222,6 +324,43 @@
 			border: 1px solid {qaResult.pass ? 'rgba(63, 185, 80, 0.2)' : 'rgba(248, 81, 73, 0.2)'};
 		">
 			{qaResult.pass ? 'QA Passed' : 'QA Failed'}
+		</div>
+	{/if}
+
+	{#if showReviewActions && task.status !== 'done'}
+		<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 8px;">
+			<button
+				type="button"
+				style="
+					display: flex; align-items: center; justify-content: center; gap: 5px;
+					padding: 7px 8px; border-radius: 8px;
+					background: {uiStamp ? 'rgba(88, 166, 255, 0.18)' : 'rgba(88, 166, 255, 0.07)'};
+					border: 1px solid {uiStamp ? 'rgba(88, 166, 255, 0.45)' : 'rgba(88, 166, 255, 0.2)'};
+					color: #8cc8ff;
+					font-size: 10px; font-weight: 900; font-family: var(--font-ui);
+					cursor: pointer; transition: all 0.15s ease;
+				"
+				onmousedown={(e) => e.stopPropagation()}
+				onclick={toggleCopilotStamp}
+			>
+				{uiStamp ? 'Unstamp' : 'Copilot Review'}
+			</button>
+			<button
+				type="button"
+				style="
+					display: flex; align-items: center; justify-content: center; gap: 5px;
+					padding: 7px 8px; border-radius: 8px;
+					background: rgba(63, 185, 80, 0.08);
+					border: 1px solid rgba(63, 185, 80, 0.24);
+					color: var(--accent-green);
+					font-size: 10px; font-weight: 900; font-family: var(--font-ui);
+					cursor: pointer; transition: all 0.15s ease;
+				"
+				onmousedown={(e) => e.stopPropagation()}
+				onclick={markDone}
+			>
+				Mark Done
+			</button>
 		</div>
 	{/if}
 
