@@ -3653,8 +3653,10 @@ async fn take_screenshot(url: &str, output_path: &str, viewport: &str) -> Result
                 "playwright", "screenshot",
                 "--browser", "chromium",
                 "--viewport-size", viewport,
-                // Give the SPA a beat to mount before the snapshot.
-                "--wait-for-timeout", "2000",
+                // Give the SPA time to finish auth/Supabase hydration before
+                // the snapshot. Two seconds was routinely catching Operly's
+                // splash screen even when the dev server had the right env.
+                "--wait-for-timeout", "6000",
                 "--timeout", "30000",
                 // Chromium probes macOS for media devices on launch, which
                 // triggers the "Apple Music" / microphone / camera TCC

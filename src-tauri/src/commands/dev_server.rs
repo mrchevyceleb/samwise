@@ -44,22 +44,77 @@ async fn resolve_main_repo(worktree: &str) -> String {
         .unwrap_or_else(|| worktree.to_string())
 }
 
-/// Check whether Doppler is configured for the given scope (main repo path).
+/// Check whether Doppler is configured for the given scope path.
 /// Uses `doppler configure get enclave.project --scope <path> --plain` which
 /// returns the project name for that scope (or nothing if no scope exists).
-/// Returns the scope path when doppler is configured so the caller can pass
-/// it to `doppler run --scope`.
-async fn doppler_scope_for(main_repo: &str) -> Option<String> {
-    if which::which("doppler").is_err() { return None; }
-    let out = async_cmd("doppler")
-        .args(["configure", "get", "enclave.project", "--scope", main_repo, "--plain"])
-        .output()
-        .await
-        .ok()?;
-    if !out.status.success() { return None; }
-    let project = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if project.is_empty() { return None; }
-    Some(main_repo.to_string())
+async fn scope_has_doppler_project(scope: &str) -> bool {
+    if which::which("doppler").is_err() { return false; }
+    for key in ["enclave.project", "project"] {
+        let out = async_cmd("doppler")
+            .args(["configure", "get", key, "--scope", scope, "--plain"])
+            .output()
+            .await
+            .ok();
+        let Some(out) = out else { continue; };
+        if !out.status.success() { continue; }
+        let project = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !project.is_empty() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check likely Doppler scopes for a worktree. Samwise keeps worktrees under
+/// `~/samwise/worktrees/<repo>/<task>` and the shared git dir under
+/// `~/samwise/KG-Apps/<repo>`, while Matt's Doppler scopes are commonly saved
+/// on the original checkout under `~/Documents/KG-Apps/<repo>`. Checking only
+/// the git-common-dir path silently launches apps without Supabase/Vite env,
+/// which produces loading-splash screenshots and false visual QA failures.
+async fn doppler_scope_for(main_repo: &str, worktree: &str) -> Option<String> {
+    for scope in candidate_doppler_scopes(main_repo, worktree) {
+        if scope_has_doppler_project(&scope).await {
+            return Some(scope);
+        }
+    }
+    None
+}
+
+fn candidate_doppler_scopes(main_repo: &str, worktree: &str) -> Vec<String> {
+    let mut scopes = Vec::new();
+    push_unique(&mut scopes, main_repo.to_string());
+    push_unique(&mut scopes, worktree.to_string());
+
+    for path in [main_repo, worktree] {
+        add_documents_kg_scope(&mut scopes, path);
+        add_worktree_repo_name_scope(&mut scopes, path);
+    }
+
+    scopes
+}
+
+fn push_unique(scopes: &mut Vec<String>, scope: String) {
+    if !scope.is_empty() && !scopes.iter().any(|s| s == &scope) {
+        scopes.push(scope);
+    }
+}
+
+fn add_documents_kg_scope(scopes: &mut Vec<String>, path: &str) {
+    let Ok(home) = std::env::var("HOME") else { return; };
+    let marker = format!("{}/samwise/KG-Apps/", home);
+    let Some(repo_name) = path.strip_prefix(&marker) else { return; };
+    let repo_name = repo_name.split('/').next().unwrap_or("").trim();
+    if repo_name.is_empty() { return; }
+    push_unique(scopes, format!("{}/Documents/KG-Apps/{}", home, repo_name));
+}
+
+fn add_worktree_repo_name_scope(scopes: &mut Vec<String>, path: &str) {
+    let Ok(home) = std::env::var("HOME") else { return; };
+    let marker = format!("{}/samwise/worktrees/", home);
+    let Some(rest) = path.strip_prefix(&marker) else { return; };
+    let repo_name = rest.split('/').next().unwrap_or("").trim();
+    if repo_name.is_empty() { return; }
+    push_unique(scopes, format!("{}/Documents/KG-Apps/{}", home, repo_name));
 }
 
 pub struct DevServerHandle {
@@ -226,9 +281,9 @@ pub async fn start_dev_server(
     // a scope for it. When present, every spawn is wrapped with
     // `doppler run --scope <main> --` so env vars resolve correctly.
     let main_repo = resolve_main_repo(repo_path).await;
-    let doppler_scope = doppler_scope_for(&main_repo).await;
-    if doppler_scope.is_some() {
-        log::info!("[dev_server] wrapping dev server with `doppler run --scope {}` (main repo of worktree {})", main_repo, repo_path);
+    let doppler_scope = doppler_scope_for(&main_repo, repo_path).await;
+    if let Some(scope) = doppler_scope.as_deref() {
+        log::info!("[dev_server] wrapping dev server with `doppler run --scope {}` (main repo of worktree {})", scope, repo_path);
     } else {
         log::info!("[dev_server] no doppler scope found for main repo {}; running dev server bare", main_repo);
     }
