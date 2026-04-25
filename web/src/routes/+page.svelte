@@ -10,14 +10,43 @@
   let showNew = $state(false);
   let query = $state('');
   let projectFilter = $state('');
+  let buildVersion = $state('');
+  let versionTimer: ReturnType<typeof setInterval> | null = null;
 
-  onMount(() => { tasksStore.init(); });
-  onDestroy(() => { tasksStore.destroy(); });
+  async function checkBuildVersion(reloadOnChange: boolean) {
+    try {
+      const res = await fetch(`/_app/version.json?ts=${Date.now()}`, { cache: 'no-store' });
+      if (!res.ok) return;
+      const data = (await res.json()) as { version?: string };
+      if (!data.version) return;
+      if (!buildVersion) {
+        buildVersion = data.version;
+        return;
+      }
+      if (reloadOnChange && data.version !== buildVersion) {
+        window.location.reload();
+      }
+    } catch (e) {
+      console.warn('[version] check failed', e);
+    }
+  }
+
+  onMount(() => {
+    tasksStore.init();
+    checkBuildVersion(false);
+    versionTimer = setInterval(() => checkBuildVersion(true), 60_000);
+  });
+
+  onDestroy(() => {
+    tasksStore.destroy();
+    if (versionTimer) clearInterval(versionTimer);
+  });
 
   let tasks = $derived(tasksStore.tasks);
   let projects = $derived(
     Array.from(new Set(tasks.map((t) => t.project).filter(Boolean))).sort() as string[]
   );
+  let buildLabel = $derived(buildVersion ? buildVersion.slice(-6) : '');
   let filtered = $derived.by(() => {
     const q = query.trim().toLowerCase();
     return tasks.filter((t) => {
@@ -61,6 +90,9 @@
         <span class="h-1.5 w-1.5 rounded-full {tasksStore.connected ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'}"></span>
         {tasksStore.connected ? 'live' : 'connecting'}
       </div>
+      {#if buildLabel}
+        <div class="hidden sm:block text-[10px] uppercase tracking-wide text-slate-500">build {buildLabel}</div>
+      {/if}
       <div class="ml-auto flex items-center gap-2">
         <input
           type="search"
