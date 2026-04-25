@@ -289,6 +289,111 @@ async fn fetch_pr_files(pr_url: &str, repo_path: &str) -> Result<Vec<String>, St
     Ok(names)
 }
 
+async fn collect_pr_review_context(pr_url: &str, cwd: &str) -> String {
+    let output = async_cmd("gh")
+        .args([
+            "pr",
+            "view",
+            pr_url,
+            "--json",
+            "state,mergeable,reviewDecision,statusCheckRollup,mergedAt,headRefName,headRefOid",
+        ])
+        .current_dir(cwd)
+        .output()
+        .await;
+
+    let output = match output {
+        Ok(o) => o,
+        Err(e) => return format!("- GitHub status preflight unavailable: failed to spawn gh: {}", e),
+    };
+    if !output.status.success() {
+        return format!(
+            "- GitHub status preflight unavailable: {}",
+            trim_to(String::from_utf8_lossy(&output.stderr).trim(), 800)
+        );
+    }
+
+    let parsed: Value = match serde_json::from_slice(&output.stdout) {
+        Ok(v) => v,
+        Err(e) => return format!("- GitHub status preflight unavailable: failed to parse gh output: {}", e),
+    };
+
+    let state = parsed.get("state").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let mergeable = parsed.get("mergeable").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let review_decision = parsed.get("reviewDecision").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or("none");
+    let merged_at = parsed.get("mergedAt").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or("none");
+    let head_ref = parsed.get("headRefName").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let head_sha = parsed.get("headRefOid").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let short_sha = if head_sha.len() >= 7 { &head_sha[..7] } else { head_sha };
+
+    let mut out = format!(
+        "- State: {}\n- Merged at: {}\n- Mergeable: {}\n- Review decision: {}\n- Head: {} ({})",
+        state, merged_at, mergeable, review_decision, head_ref, short_sha
+    );
+    out.push('\n');
+    out.push_str(&summarize_status_check_rollup(&parsed));
+    out
+}
+
+fn summarize_status_check_rollup(pr: &Value) -> String {
+    let Some(checks) = pr.get("statusCheckRollup").and_then(|v| v.as_array()) else {
+        return "- Checks: unavailable".to_string();
+    };
+    if checks.is_empty() {
+        return "- Checks: none reported".to_string();
+    }
+
+    let mut success = 0usize;
+    let mut pending = 0usize;
+    let mut failed = 0usize;
+    let mut other = 0usize;
+    let mut lines = Vec::new();
+
+    for check in checks {
+        let name = check.get("name")
+            .or_else(|| check.get("context"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("unnamed check");
+        let status = check_status_label(check);
+        match status.as_str() {
+            "SUCCESS" | "NEUTRAL" | "SKIPPED" => success += 1,
+            "PENDING" | "EXPECTED" | "QUEUED" | "IN_PROGRESS" | "REQUESTED" | "WAITING" => pending += 1,
+            "FAILURE" | "FAILED" | "ERROR" | "CANCELLED" | "TIMED_OUT" | "ACTION_REQUIRED" => failed += 1,
+            _ => other += 1,
+        }
+        if lines.len() < 12 {
+            lines.push(format!("  - {}: {}", name, status));
+        }
+    }
+
+    let mut out = format!(
+        "- Checks: {} total, {} success/skipped, {} pending, {} failed, {} other",
+        checks.len(), success, pending, failed, other
+    );
+    for line in lines {
+        out.push('\n');
+        out.push_str(&line);
+    }
+    if checks.len() > 12 {
+        out.push_str(&format!("\n  - ...{} more checks omitted", checks.len() - 12));
+    }
+    out
+}
+
+fn check_status_label(check: &Value) -> String {
+    for key in ["conclusion", "state", "status"] {
+        if let Some(value) = check.get(key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            let upper = value.to_uppercase();
+            if upper == "COMPLETED" {
+                continue;
+            }
+            return upper;
+        }
+    }
+    "UNKNOWN".to_string()
+}
+
 fn check_blocker_paths(files: &[String]) -> Option<String> {
     let name_regex = regex::Regex::new(BLOCKER_FILENAME_REGEX).ok();
 
@@ -662,9 +767,11 @@ pub async fn run_samwise_pr_review(
         return Err(format!("refusing pr_url that doesn't match the github shape: {}", pr_url));
     }
     let cwd = resolve_codex_cwd(repo_path);
+    let host_pr_context = collect_pr_review_context(pr_url, &cwd).await;
     let prompt = format!(
-        "Use $samwise-pr-review on {}. Emit only the skill output per its template, no preamble, no follow-up. The report must include the Deployment Required section with explicit Railway server, Supabase migrations, and Supabase Edge Functions yes/no/unknown lines.",
-        pr_url
+        "Use $samwise-pr-review on {}. Emit only the skill output per its template, no preamble, no follow-up. The report must include the Deployment Required section with explicit Railway server, Supabase migrations, and Supabase Edge Functions yes/no/unknown lines.\n\nSamwise host preflight, collected outside the Codex sandbox:\n{}\n\nUse the host preflight as trusted PR/check context. If your own GitHub tooling is unavailable but the host preflight confirms checks are green, do not create a blocker solely for that tooling failure. If you cannot inspect the code/diff well enough to make a recommendation, emit VERDICT: inconclusive instead of VERDICT: fix_issues.",
+        pr_url,
+        host_pr_context
     );
 
     // workspace-write + never-approve so Codex can actually run `gh pr view`
@@ -675,6 +782,7 @@ pub async fn run_samwise_pr_review(
     // The skill's own hard constraints forbid any mutating commands.
     let mut cmd = async_cmd("codex");
     cmd.args([
+        "--search",
         "exec",
         "-m", CODEX_MODEL,
         "-c", CODEX_REASONING_CONFIG,
@@ -770,7 +878,7 @@ pub async fn run_samwise_pr_review(
     }
 
     // Parse for the last `VERDICT:` line.
-    let (verdict, requires_human, body) = parse_pr_review_output(&stdout);
+    let (verdict, requires_human, body) = normalize_pr_review_result(parse_pr_review_output(&stdout));
     Ok(PrReviewResult {
         verdict,
         markdown: body,
@@ -854,6 +962,120 @@ fn parse_pr_review_output(raw: &str) -> (PrReviewVerdict, bool, String) {
     }
 
     (verdict, requires_human, markdown)
+}
+
+fn normalize_pr_review_result(
+    parsed: (PrReviewVerdict, bool, String),
+) -> (PrReviewVerdict, bool, String) {
+    let (verdict, requires_human, mut markdown) = parsed;
+    if !matches!(verdict, PrReviewVerdict::FixIssues) {
+        return (verdict, requires_human, markdown);
+    }
+
+    if has_substantive_blocker(&markdown) {
+        return (verdict, requires_human, markdown);
+    }
+
+    if !markdown.ends_with('\n') {
+        markdown.push('\n');
+    }
+    markdown.push_str("\nSamwise note: Codex emitted `fix_issues` without any substantive blocker bullets. Treating this as inconclusive so the card stays in Review instead of creating non-actionable Fixes Needed work.");
+    (PrReviewVerdict::Inconclusive, true, markdown)
+}
+
+fn has_substantive_blocker(markdown: &str) -> bool {
+    let blockers = markdown_section_lines(markdown, "Blockers");
+    blockers.iter().any(|line| is_substantive_blocker(line))
+}
+
+fn is_substantive_blocker(raw: &str) -> bool {
+    let line = raw.trim().trim_start_matches('-').trim();
+    if line.is_empty() || line.eq_ignore_ascii_case("<none>") {
+        return false;
+    }
+    !is_verification_only_blocker(line)
+}
+
+fn is_verification_only_blocker(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    let verification_markers = [
+        "could not be verified",
+        "could not verify",
+        "couldn't verify",
+        "could not be confirmed",
+        "could not confirm",
+        "could not be fetched",
+        "could not be retrieved",
+        "not verified",
+        "not accessible",
+        "unable to verify",
+        "cannot verify",
+        "status checks",
+        "check runs",
+        "mergeability",
+        "github",
+        "gh ",
+        "ci ",
+        "migration execution",
+        "not applied",
+        "not run locally",
+        "not installed locally",
+        "hold merge until",
+    ];
+    if !verification_markers.iter().any(|marker| lower.contains(marker)) {
+        return false;
+    }
+
+    let code_issue_markers = [
+        "allows ",
+        "breaks ",
+        "bypass",
+        "clears ",
+        "crash",
+        "does not ",
+        "doesn't ",
+        "exposes ",
+        "fails to ",
+        "incorrect",
+        "leak",
+        "missing ",
+        "not wrapped",
+        "over-broad",
+        "panic",
+        "purges ",
+        "race",
+        "regression",
+        "signs out",
+        "still ",
+        "throws ",
+        "unsafe",
+        "wrong",
+    ];
+    !code_issue_markers.iter().any(|marker| lower.contains(marker))
+}
+
+fn markdown_section_lines<'a>(markdown: &'a str, heading: &str) -> Vec<&'a str> {
+    let target = format!("## {}", heading).to_lowercase();
+    let mut in_section = false;
+    let mut lines = Vec::new();
+
+    for line in markdown.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("## ") {
+            if in_section {
+                break;
+            }
+            if trimmed.to_lowercase() == target {
+                in_section = true;
+            }
+            continue;
+        }
+        if in_section && !trimmed.is_empty() {
+            lines.push(trimmed);
+        }
+    }
+
+    lines
 }
 
 /// Resolve the cwd for a Codex invocation. Callers pass the task's repo_path

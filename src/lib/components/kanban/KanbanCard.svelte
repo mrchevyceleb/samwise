@@ -175,6 +175,31 @@
 	onkeydown={(e) => { if (e.key === 'Enter') onClick?.(task); }}
 	oncontextmenu={handleContextMenu}
 >
+	{#if uiStamp}
+		<div style="
+			display: flex; align-items: center; justify-content: space-between; gap: 8px;
+			margin: -2px -2px 10px -2px; padding: 8px 10px; border-radius: 12px;
+			background: linear-gradient(135deg, rgba(56, 189, 248, 0.30), rgba(34, 197, 94, 0.18));
+			border: 1px solid rgba(125, 211, 252, 0.68);
+			box-shadow: 0 0 22px rgba(56, 189, 248, 0.20), inset 0 1px 0 rgba(255,255,255,0.16);
+		">
+			<span style="
+				color: #d9f7ff; font-size: 11px; font-weight: 950;
+				text-transform: uppercase; letter-spacing: 0.55px;
+			">
+				Waiting on Copilot Review
+			</span>
+			<span style="
+				padding: 2px 6px; border-radius: 999px;
+				background: rgba(2, 6, 23, 0.36); color: #7dd3fc;
+				border: 1px solid rgba(125, 211, 252, 0.45);
+				font-size: 9px; font-weight: 950; letter-spacing: 0.45px;
+			">
+				STAMPED
+			</span>
+		</div>
+	{/if}
+
 	<!-- Title (truncated to 2 lines) -->
 	<div style="
 		font-size: 14px; font-weight: 600; color: var(--text-primary);
@@ -184,19 +209,6 @@
 	">
 		{task.title}
 	</div>
-
-	{#if uiStamp}
-		<div style="
-			display: inline-flex; align-items: center; gap: 5px;
-			margin-bottom: 8px; padding: 3px 8px; border-radius: 999px;
-			background: linear-gradient(135deg, rgba(88, 166, 255, 0.18), rgba(63, 185, 80, 0.12));
-			border: 1px solid rgba(88, 166, 255, 0.35);
-			color: #8cc8ff; font-size: 10px; font-weight: 900;
-			text-transform: uppercase; letter-spacing: 0.45px;
-		">
-			Copilot Review
-		</div>
-	{/if}
 
 	{#if reviewPanel && isReviewActionStatus(task.status)}
 		<div style="
