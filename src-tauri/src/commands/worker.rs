@@ -4160,6 +4160,10 @@ async fn run_merge_deploy_workflow(
         .await
         .map_err(|e| MergeDeployError::new(format!("failed to read PR state: {}", e), false))?;
 
+    preflight_supabase_deploy_context(repo_path, &files)
+        .await
+        .map_err(|e| MergeDeployError::new(e, pr_merged))?;
+
     if !pr_merged {
         if !should_merge_if_open {
             return Err(MergeDeployError::new("PR is not merged yet, and this request is only allowed to deploy an already-merged PR.", false));
@@ -4181,6 +4185,9 @@ async fn run_merge_deploy_workflow(
 
     let default_branch = detect_default_branch(repo_path).await;
     let deploy_path = prepare_deploy_checkout(repo_path, task_id, &default_branch)
+        .await
+        .map_err(|e| MergeDeployError::new(e, pr_merged))?;
+    ensure_supabase_link_state(repo_path, &deploy_path, &files)
         .await
         .map_err(|e| MergeDeployError::new(e, pr_merged))?;
     let plan = build_deploy_plan(&deploy_path, &files)
@@ -4221,10 +4228,13 @@ async fn gh_pr_is_merged(pr_url: &str, repo_path: &str) -> Result<bool, String> 
 }
 
 async fn prepare_deploy_checkout(repo_path: &str, task_id: &str, default_branch: &str) -> Result<String, String> {
-    let deploy_path = task_worktree_path(repo_path, task_id)
-        .filter(|p| p.is_dir())
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| repo_path.to_string());
+    run_git(&["fetch", "origin", "--prune"], repo_path).await?;
+
+    let deploy_path = if let Some(path) = task_worktree_path(repo_path, task_id).filter(|p| p.is_dir()) {
+        path.to_string_lossy().into_owned()
+    } else {
+        ensure_temp_deploy_worktree(repo_path, task_id, default_branch).await?
+    };
 
     let dirty = run_git(&["status", "--porcelain"], &deploy_path).await?;
     if !dirty.trim().is_empty() {
@@ -4232,12 +4242,8 @@ async fn prepare_deploy_checkout(repo_path: &str, task_id: &str, default_branch:
     }
 
     run_git(&["fetch", "origin", "--prune"], &deploy_path).await?;
-    if deploy_path == repo_path {
-        run_git(&["checkout", default_branch], &deploy_path).await?;
-        run_git(&["pull", "--ff-only", "origin", default_branch], &deploy_path).await?;
-    } else {
-        run_git(&["checkout", "--detach", &format!("origin/{}", default_branch)], &deploy_path).await?;
-    }
+    let origin_ref = format!("origin/{}", default_branch);
+    run_git(&["checkout", "--detach", &origin_ref], &deploy_path).await?;
     Ok(deploy_path)
 }
 
@@ -4252,12 +4258,19 @@ async fn build_deploy_plan(repo_path: &str, files: &[String]) -> Result<DeployPl
             push_unique_string(&mut plan.supabase_functions, name);
         }
     }
+    if files.iter().any(|f| f.starts_with("supabase/functions/_shared/")) {
+        for name in discover_edge_function_names(repo_path).await {
+            push_unique_string(&mut plan.supabase_functions, name);
+        }
+    }
+
+    let supabase_project_ref = read_supabase_project_ref(repo_path).await;
 
     if !plan.supabase_migrations.is_empty() {
         plan.commands.push(DeployCommand {
             category: "supabase_migrations",
             label: format!("Supabase migrations ({})", plan.supabase_migrations.join(", ")),
-            command: "npx --yes supabase db push".to_string(),
+            command: supabase_db_push_command(),
             cwd: repo_path.to_string(),
         });
     }
@@ -4266,7 +4279,7 @@ async fn build_deploy_plan(repo_path: &str, files: &[String]) -> Result<DeployPl
         plan.commands.push(DeployCommand {
             category: "supabase_edge_functions",
             label: format!("Supabase Edge Function {}", function_name),
-            command: format!("npx --yes supabase functions deploy {}", shell_quote_simple(function_name)),
+            command: supabase_function_deploy_command(function_name, supabase_project_ref.as_deref()),
             cwd: repo_path.to_string(),
         });
     }
@@ -4433,10 +4446,228 @@ fn task_worktree_path(main_repo_path: &str, task_id: &str) -> Option<PathBuf> {
     Some(worktrees_root().join(repo_name).join(short_task_id(task_id)))
 }
 
+fn deploy_worktree_path(main_repo_path: &str, task_id: &str) -> Option<PathBuf> {
+    let repo_name = Path::new(main_repo_path).file_name()?.to_string_lossy().into_owned();
+    Some(worktrees_root().join(repo_name).join(format!(".deploy-{}", short_task_id(task_id))))
+}
+
+async fn ensure_temp_deploy_worktree(
+    main_repo_path: &str,
+    task_id: &str,
+    default_branch: &str,
+) -> Result<String, String> {
+    let path = deploy_worktree_path(main_repo_path, task_id)
+        .ok_or_else(|| format!("cannot derive deploy worktree path from {}", main_repo_path))?;
+    let path_str = path.to_string_lossy().into_owned();
+
+    if path.is_dir() {
+        if run_git(&["rev-parse", "--git-dir"], &path_str).await.is_ok() {
+            return Ok(path_str);
+        }
+        tokio::fs::remove_dir_all(&path)
+            .await
+            .map_err(|e| format!("remove stale deploy worktree dir {}: {}", path.display(), e))?;
+    } else if tokio::fs::metadata(&path).await.is_ok() {
+        tokio::fs::remove_file(&path)
+            .await
+            .map_err(|e| format!("remove stale deploy worktree file {}: {}", path.display(), e))?;
+    }
+
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("create deploy worktree parent {}: {}", parent.display(), e))?;
+    }
+
+    let _ = run_git(&["worktree", "prune"], main_repo_path).await;
+    let origin_ref = format!("origin/{}", default_branch);
+    run_git(
+        &["worktree", "add", "--force", "--detach", &path_str, &origin_ref],
+        main_repo_path,
+    )
+    .await?;
+    Ok(path_str)
+}
+
+#[derive(Debug, Default)]
+struct SupabaseEnvPresence {
+    has_db_url: bool,
+    has_project_ref: bool,
+}
+
+async fn preflight_supabase_deploy_context(repo_path: &str, files: &[String]) -> Result<(), String> {
+    let needs_migrations = files.iter().any(|f| f.starts_with("supabase/migrations/") && f.ends_with(".sql"));
+    let needs_functions = files.iter().any(|f| f.starts_with("supabase/functions/"));
+    if !needs_migrations && !needs_functions {
+        return Ok(());
+    }
+
+    if read_supabase_project_ref(repo_path).await.is_some() {
+        return Ok(());
+    }
+
+    let env = detect_supabase_env(repo_path).await;
+    let mut missing = Vec::new();
+    if needs_migrations && !env.has_db_url {
+        missing.push("SUPABASE_DB_URL for migration deploys");
+    }
+    if needs_functions && !env.has_project_ref {
+        missing.push("SUPABASE_PROJECT_REF or SUPABASE_PROJECT_ID for Edge Function deploys");
+    }
+
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Supabase files changed, but no linked supabase/.temp/project-ref was found and {} is not available via the deploy environment/Doppler; refusing to merge because post-merge deployment would fail.",
+            missing.join(" and ")
+        ))
+    }
+}
+
+async fn ensure_supabase_link_state(
+    source_repo_path: &str,
+    deploy_path: &str,
+    files: &[String],
+) -> Result<(), String> {
+    let has_supabase_changes = files.iter().any(|f| {
+        f.starts_with("supabase/migrations/") || f.starts_with("supabase/functions/")
+    });
+    if !has_supabase_changes {
+        return Ok(());
+    }
+
+    let source_temp = Path::new(source_repo_path).join("supabase").join(".temp");
+    if !source_temp.is_dir() {
+        return Ok(());
+    }
+
+    let target_temp = Path::new(deploy_path).join("supabase").join(".temp");
+    if source_temp == target_temp {
+        return Ok(());
+    }
+
+    tokio::fs::create_dir_all(&target_temp)
+        .await
+        .map_err(|e| format!("create Supabase link state dir {}: {}", target_temp.display(), e))?;
+
+    let mut entries = tokio::fs::read_dir(&source_temp)
+        .await
+        .map_err(|e| format!("read Supabase link state {}: {}", source_temp.display(), e))?;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| format!("read Supabase link state entry: {}", e))?
+    {
+        let file_type = entry
+            .file_type()
+            .await
+            .map_err(|e| format!("read Supabase link state file type: {}", e))?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let target = target_temp.join(entry.file_name());
+        tokio::fs::copy(entry.path(), &target)
+            .await
+            .map_err(|e| format!("copy Supabase link state to {}: {}", target.display(), e))?;
+    }
+
+    Ok(())
+}
+
+async fn read_supabase_project_ref(repo_path: &str) -> Option<String> {
+    let path = Path::new(repo_path).join("supabase").join(".temp").join("project-ref");
+    let raw = tokio::fs::read_to_string(path).await.ok()?;
+    let value = raw.trim();
+    if value.is_empty() { None } else { Some(value.to_string()) }
+}
+
+async fn detect_supabase_env(repo_path: &str) -> SupabaseEnvPresence {
+    let script = r#"if [ -n "${SUPABASE_DB_URL:-}" ]; then echo db_url=1; fi
+if [ -n "${SUPABASE_PROJECT_REF:-}" ] || [ -n "${SUPABASE_PROJECT_ID:-}" ]; then echo project_ref=1; fi"#;
+    let output = probe_deploy_shell(repo_path, script).await.unwrap_or_default();
+    SupabaseEnvPresence {
+        has_db_url: output.lines().any(|line| line.trim() == "db_url=1"),
+        has_project_ref: output.lines().any(|line| line.trim() == "project_ref=1"),
+    }
+}
+
+async fn probe_deploy_shell(repo_path: &str, script: &str) -> Result<String, String> {
+    let doppler_scope = dev_server::doppler_scope_for_checkout(repo_path).await;
+    let mut cmd = if let Some(scope) = doppler_scope.as_deref() {
+        let mut c = async_cmd("doppler");
+        c.args(["run", "--scope", scope, "--", "sh", "-lc", script]);
+        c
+    } else {
+        let mut c = async_cmd("sh");
+        c.args(["-lc", script]);
+        c
+    };
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        cmd.current_dir(repo_path)
+            .env("CI", "true")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output(),
+    )
+    .await
+    .map_err(|_| "deploy environment probe timed out".to_string())?
+    .map_err(|e| format!("spawn deploy environment probe: {}", e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "deploy environment probe failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 fn edge_function_name(file: &str) -> Option<String> {
     let rest = file.strip_prefix("supabase/functions/")?;
     let name = rest.split('/').next()?.trim();
-    if name.is_empty() { None } else { Some(name.to_string()) }
+    if is_deployable_edge_function_name(name) { Some(name.to_string()) } else { None }
+}
+
+async fn discover_edge_function_names(repo_path: &str) -> Vec<String> {
+    let dir = Path::new(repo_path).join("supabase").join("functions");
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else { return Vec::new(); };
+    let mut names = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Ok(file_type) = entry.file_type().await else { continue; };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if is_deployable_edge_function_name(&name) {
+            push_unique_string(&mut names, name);
+        }
+    }
+    names.sort();
+    names
+}
+
+fn is_deployable_edge_function_name(name: &str) -> bool {
+    !name.is_empty() && name != "_shared" && !name.starts_with('.')
+}
+
+fn supabase_db_push_command() -> String {
+    "if [ -n \"${SUPABASE_DB_URL:-}\" ]; then npx --yes supabase db push --db-url \"$SUPABASE_DB_URL\"; else npx --yes supabase db push; fi".to_string()
+}
+
+fn supabase_function_deploy_command(function_name: &str, project_ref: Option<&str>) -> String {
+    let function_name = shell_quote_simple(function_name);
+    if let Some(project_ref) = project_ref.filter(|value| !value.trim().is_empty()) {
+        return format!(
+            "npx --yes supabase functions deploy {} --project-ref {}",
+            function_name,
+            shell_quote_simple(project_ref.trim())
+        );
+    }
+    format!(
+        "if [ -n \"${{SUPABASE_PROJECT_REF:-}}\" ]; then npx --yes supabase functions deploy {0} --project-ref \"$SUPABASE_PROJECT_REF\"; elif [ -n \"${{SUPABASE_PROJECT_ID:-}}\" ]; then npx --yes supabase functions deploy {0} --project-ref \"$SUPABASE_PROJECT_ID\"; else npx --yes supabase functions deploy {0}; fi",
+        function_name
+    )
 }
 
 fn is_server_deploy_path(file: &str) -> bool {
@@ -4496,9 +4727,33 @@ fn path_relative_to(path: &Path, base: &str) -> String {
 
 fn railway_root_matches_file(root_rel: &str, file: &str) -> bool {
     if root_rel.is_empty() {
-        return is_server_deploy_path(file);
+        return is_root_railway_deploy_path(file);
     }
     file == root_rel || file.starts_with(&format!("{}/", root_rel))
+}
+
+fn is_root_railway_deploy_path(file: &str) -> bool {
+    let file = file.trim_start_matches("./");
+    if file.is_empty() {
+        return false;
+    }
+    if is_server_deploy_path(file) {
+        return true;
+    }
+    if file.starts_with("supabase/")
+        || file.starts_with(".github/")
+        || file.starts_with(".vscode/")
+        || file.starts_with("docs/")
+        || file.starts_with("screenshots/")
+        || file.starts_with("test-results/")
+    {
+        return false;
+    }
+    let basename = file.rsplit('/').next().unwrap_or(file);
+    !matches!(
+        basename,
+        "README.md" | "CHANGELOG.md" | "LICENSE" | "AGENTS.md" | "CLAUDE.md"
+    )
 }
 
 fn push_unique_string(items: &mut Vec<String>, value: String) {
