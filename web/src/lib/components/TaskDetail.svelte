@@ -6,10 +6,15 @@
     extractReviewActionPanel,
     getUiStamp,
     getMergeDeployState,
+    getMergeConflictFixState,
+    isMergeConflictError,
+    isMergeConflictFixBusy,
     isReviewActionStatus,
     isMergeDeployBusy,
+    mergeConflictFixButtonLabel,
     mergeDeployButtonLabel,
     nextManualInProgressStampContext,
+    requestMergeConflictFixContext,
     requestMergeDeployContext
   } from '$lib/utils/review-actions';
   import LinkRow from './LinkRow.svelte';
@@ -27,8 +32,16 @@
   let reviewPanel = $derived(extractReviewActionPanel(task, comments));
   let uiStamp = $derived(getUiStamp(task));
   let mergeDeployState = $derived(getMergeDeployState(task));
+  let mergeConflictFixState = $derived(getMergeConflictFixState(task));
   let mergeDeployRequestError = $state<string | null>(null);
+  let mergeConflictFixRequestError = $state<string | null>(null);
   let canMergeDeploy = $derived(!!task.pr_url && (task.status === 'approved' || mergeDeployState.status === 'failed'));
+  let canRequestMergeConflictFix = $derived(
+    !!task.pr_url &&
+    mergeDeployState.status === 'failed' &&
+    isMergeConflictError(mergeDeployState.error) &&
+    !isMergeConflictFixBusy(mergeConflictFixState)
+  );
 
   function verdictColor(verdict: string | undefined) {
     if (verdict === 'merge') return '#34d399';
@@ -51,6 +64,15 @@
     const ok = await tasksStore.updateTask(task.id, { context: requestMergeDeployContext(task) });
     if (!ok) {
       mergeDeployRequestError = tasksStore.error || 'Could not queue Merge + Deploy.';
+    }
+  }
+
+  async function requestMergeConflictFix() {
+    if (!canRequestMergeConflictFix) return;
+    mergeConflictFixRequestError = null;
+    const ok = await tasksStore.updateTask(task.id, { context: requestMergeConflictFixContext(task) });
+    if (!ok) {
+      mergeConflictFixRequestError = tasksStore.error || 'Could not queue Sam conflict recovery.';
     }
   }
 
@@ -158,11 +180,26 @@
               >
                 {canMergeDeploy ? mergeDeployButtonLabel(mergeDeployState) : 'Mark Done'}
               </button>
+              {#if canRequestMergeConflictFix || isMergeConflictFixBusy(mergeConflictFixState) || mergeConflictFixRequestError || mergeConflictFixState.error}
+                <button
+                  type="button"
+                  onclick={requestMergeConflictFix}
+                  disabled={isMergeConflictFixBusy(mergeConflictFixState)}
+                  class="rounded-lg border border-amber-300/40 bg-gradient-to-r from-orange-400/20 to-teal-400/10 px-3 py-2 text-xs font-black text-orange-100 {isMergeConflictFixBusy(mergeConflictFixState) ? 'opacity-70 cursor-wait' : 'hover:bg-orange-400/20'}"
+                >
+                  {mergeConflictFixButtonLabel(mergeConflictFixState)}
+                </button>
+              {/if}
             {/if}
           </div>
           {#if mergeDeployRequestError || mergeDeployState.error}
             <div class="mt-3 whitespace-pre-wrap rounded-xl border border-rose-400/35 bg-rose-500/10 px-3 py-2 text-xs font-bold leading-snug text-rose-100">
               Merge + Deploy failed: {mergeDeployRequestError || mergeDeployState.error}
+            </div>
+          {/if}
+          {#if mergeConflictFixRequestError || mergeConflictFixState.error}
+            <div class="mt-3 whitespace-pre-wrap rounded-xl border border-amber-400/35 bg-orange-500/10 px-3 py-2 text-xs font-bold leading-snug text-orange-100">
+              Sam conflict recovery failed: {mergeConflictFixRequestError || mergeConflictFixState.error}
             </div>
           {/if}
         </section>

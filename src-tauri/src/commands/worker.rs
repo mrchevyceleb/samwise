@@ -43,6 +43,11 @@ const MERGE_DEPLOY_COMPLETED_AT_KEY: &str = "samwise_merge_deploy_completed_at";
 const MERGE_DEPLOY_STATUS_KEY: &str = "samwise_merge_deploy_status";
 const MERGE_DEPLOY_ERROR_KEY: &str = "samwise_merge_deploy_error";
 const MERGE_DEPLOY_PLAN_KEY: &str = "samwise_merge_deploy_plan";
+const MERGE_CONFLICT_FIX_REQUESTED_AT_KEY: &str = "samwise_merge_conflict_fix_requested_at";
+const MERGE_CONFLICT_FIX_STARTED_AT_KEY: &str = "samwise_merge_conflict_fix_started_at";
+const MERGE_CONFLICT_FIX_COMPLETED_AT_KEY: &str = "samwise_merge_conflict_fix_completed_at";
+const MERGE_CONFLICT_FIX_STATUS_KEY: &str = "samwise_merge_conflict_fix_status";
+const MERGE_CONFLICT_FIX_ERROR_KEY: &str = "samwise_merge_conflict_fix_error";
 
 /// External edge function that closes the upstream ticket (Operly triage,
 /// Banana triage, Sentry issue) after Sam ships and the deploy is green.
@@ -665,6 +670,7 @@ async fn worker_loop(
         // web UI. The browser only writes a context flag; this local worker
         // owns GitHub/Railway/Supabase credentials and executes the workflow.
         if tick % 2 == 0 {
+            sweep_merge_conflict_fix_requests(&config).await;
             sweep_merge_deploy_requests(&config).await;
         }
 
@@ -4017,6 +4023,356 @@ async fn send_terminal_telegram(
         escape_markdown_v2(detail),
     );
     send_telegram(config, &msg).await;
+}
+
+/// Pick up merge-conflict recovery requests written by the UI. This is separate
+/// from ordinary auto-fix because the PR has already passed Codex review; the
+/// blocker is GitHub refusing the merge until the branch is updated.
+pub async fn sweep_merge_conflict_fix_requests(config: &SupabaseConfig) {
+    let Ok(tasks) = supabase::fetch_tasks(config, None).await else { return };
+    let Some(arr) = tasks.as_array() else { return };
+
+    for task in arr {
+        let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        if !matches!(status, "approved" | "fixes_needed" | "review") { continue; }
+        if !merge_conflict_fix_request_is_pending(task) { continue; }
+        start_merge_conflict_fix_task(config, task.clone()).await;
+    }
+}
+
+async fn start_merge_conflict_fix_task(config: &SupabaseConfig, task: Value) {
+    let task_id = task.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let pr_url = task.get("pr_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if task_id.is_empty() || pr_url.is_empty() { return; }
+
+    let mut context = task_context_object(&task);
+    context.insert(MERGE_CONFLICT_FIX_STATUS_KEY.to_string(), Value::String("running".to_string()));
+    context.insert(MERGE_CONFLICT_FIX_STARTED_AT_KEY.to_string(), Value::String(chrono::Utc::now().to_rfc3339()));
+    context.insert(MERGE_CONFLICT_FIX_ERROR_KEY.to_string(), Value::Null);
+    let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+        "status": "in_progress",
+        "context": Value::Object(context),
+        "updated_at": chrono::Utc::now().to_rfc3339(),
+    })).await;
+    notify_callback(config, &task_id, "in_progress", Some(&pr_url), None);
+    agent_comment(config, &task_id, "Sam is resolving merge conflicts, updating the PR branch, then retrying Merge + Deploy.").await;
+
+    let config_clone = config.clone();
+    tokio::spawn(async move {
+        match run_merge_conflict_fix_workflow(&config_clone, &task).await {
+            Ok(summary) => {
+                let latest_task = supabase::fetch_task(&config_clone, &task_id).await.ok().flatten().unwrap_or_else(|| task.clone());
+                let mut context = task_context_object(&latest_task);
+                context.insert(MERGE_CONFLICT_FIX_STATUS_KEY.to_string(), Value::String("succeeded".to_string()));
+                context.insert(MERGE_CONFLICT_FIX_COMPLETED_AT_KEY.to_string(), Value::String(chrono::Utc::now().to_rfc3339()));
+                context.insert(MERGE_CONFLICT_FIX_ERROR_KEY.to_string(), Value::Null);
+                context.insert(MERGE_DEPLOY_REQUESTED_AT_KEY.to_string(), Value::String(chrono::Utc::now().to_rfc3339()));
+                context.insert(MERGE_DEPLOY_STATUS_KEY.to_string(), Value::String("requested".to_string()));
+                context.insert(MERGE_DEPLOY_ERROR_KEY.to_string(), Value::Null);
+
+                let _ = supabase::update_task(&config_clone, &task_id, &serde_json::json!({
+                    "status": "approved",
+                    "context": Value::Object(context),
+                    "failure_reason": Value::Null,
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                })).await;
+                notify_callback(&config_clone, &task_id, "approved", Some(&pr_url), None);
+                agent_comment(&config_clone, &task_id, &format!("Merge conflicts resolved and PR branch pushed.\n\n{}\n\nRetrying Merge + Deploy now.", summary)).await;
+
+                let latest_task = supabase::fetch_task(&config_clone, &task_id).await.ok().flatten().unwrap_or_else(|| latest_task.clone());
+                start_merge_deploy_task(
+                    &config_clone,
+                    latest_task,
+                    true,
+                    "Merge conflicts were resolved and pushed. Retrying Merge + Deploy.",
+                ).await;
+            }
+            Err(err) => {
+                let latest_task = supabase::fetch_task(&config_clone, &task_id).await.ok().flatten().unwrap_or_else(|| task.clone());
+                let mut context = task_context_object(&latest_task);
+                context.insert(MERGE_CONFLICT_FIX_STATUS_KEY.to_string(), Value::String("failed".to_string()));
+                context.insert(MERGE_CONFLICT_FIX_COMPLETED_AT_KEY.to_string(), Value::String(chrono::Utc::now().to_rfc3339()));
+                context.insert(MERGE_CONFLICT_FIX_ERROR_KEY.to_string(), Value::String(truncate(&err, 900)));
+                let _ = supabase::update_task(&config_clone, &task_id, &serde_json::json!({
+                    "status": "fixes_needed",
+                    "context": Value::Object(context),
+                    "failure_reason": format!("Sam conflict recovery failed: {}", truncate(&err, 1000)),
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                })).await;
+                notify_callback(&config_clone, &task_id, "fixes_needed", Some(&pr_url), Some(&err));
+                agent_comment(&config_clone, &task_id, &format!("Sam conflict recovery failed. Leaving this card in Fixes Needed.\n\nReason: {}", truncate(&err, 1800))).await;
+            }
+        }
+    });
+}
+
+async fn run_merge_conflict_fix_workflow(
+    config: &SupabaseConfig,
+    task: &Value,
+) -> Result<String, String> {
+    let task_id = task.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let pr_url = task.get("pr_url").and_then(|v| v.as_str()).unwrap_or("");
+    let main_repo_path = task.get("repo_path").and_then(|v| v.as_str()).unwrap_or("");
+    if task_id.is_empty() {
+        return Err("task id missing".to_string());
+    }
+    if !review::is_safe_pr_url(pr_url) {
+        return Err(format!("unsafe or missing PR URL: {}", pr_url));
+    }
+    if main_repo_path.is_empty() || !Path::new(main_repo_path).is_dir() {
+        return Err(format!("repo_path is missing or not a directory: {}", main_repo_path));
+    }
+
+    let (repo_path, head_branch, base_branch) = prepare_conflict_fix_worktree(main_repo_path, task_id, pr_url).await?;
+    let origin_base = format!("origin/{}", base_branch);
+    agent_comment(
+        config,
+        task_id,
+        &format!("Updating `{}` with `{}` in `{}`.", head_branch, origin_base, repo_path),
+    ).await;
+
+    let (merge_ok, merge_stdout, merge_stderr) = run_git_capture(&["merge", "--no-edit", &origin_base], &repo_path).await?;
+    if !merge_ok {
+        let conflict_files = run_git(&["diff", "--name-only", "--diff-filter=U"], &repo_path).await.unwrap_or_default();
+        let merge_output = format!("{}\n{}", merge_stdout.trim(), merge_stderr.trim());
+        agent_comment(
+            config,
+            task_id,
+            &format!(
+                "Git reported merge conflicts while updating the PR branch. Asking Sam to resolve them.\n\nConflicted files:\n```\n{}\n```\n\nMerge output:\n```\n{}\n```",
+                if conflict_files.trim().is_empty() { "(unknown)" } else { conflict_files.trim() },
+                truncate(merge_output.trim(), 1600)
+            ),
+        ).await;
+
+        let prompt = merge_conflict_fix_prompt(&head_branch, &base_branch, &merge_output, &conflict_files);
+        let process_id_slot: Arc<tokio::sync::Mutex<Option<u32>>> = Arc::new(tokio::sync::Mutex::new(None));
+        run_claude_code_streaming(&repo_path, &prompt, 0, 1200, config, task_id, process_id_slot)
+            .await
+            .map_err(|e| format!("Sam conflict resolution errored: {}", e))?;
+    }
+
+    let unmerged = run_git(&["diff", "--name-only", "--diff-filter=U"], &repo_path).await.unwrap_or_default();
+    if !unmerged.trim().is_empty() {
+        return Err(format!("unresolved merge conflicts remain:\n{}", unmerged.trim()));
+    }
+    ensure_no_conflict_markers(&repo_path).await?;
+
+    let dirty = run_git(&["status", "--porcelain"], &repo_path).await?;
+    if !dirty.trim().is_empty() {
+        run_git(&["add", "-A"], &repo_path).await?;
+        let message = merge_conflict_resolution_commit_message(pr_url, main_repo_path, &repo_path).await;
+        run_git(&["commit", "-m", &message], &repo_path).await?;
+    }
+
+    let head_sha = run_git(&["rev-parse", "HEAD"], &repo_path).await?;
+    let origin_head_ref = format!("origin/{}", head_branch);
+    let origin_sha = run_git(&["rev-parse", &origin_head_ref], &repo_path).await.unwrap_or_default();
+    let pushed = if head_sha.trim() != origin_sha.trim() {
+        let dst = format!("HEAD:refs/heads/{}", head_branch);
+        run_git(&["push", "origin", &dst], &repo_path).await?;
+        true
+    } else {
+        false
+    };
+
+    Ok(format!(
+        "- Branch: `{}`\n- Base merged in: `{}`\n- Push needed: {}\n- New head: `{}`",
+        head_branch,
+        origin_base,
+        if pushed { "yes" } else { "no" },
+        head_sha.trim()
+    ))
+}
+
+async fn prepare_conflict_fix_worktree(
+    main_repo_path: &str,
+    task_id: &str,
+    pr_url: &str,
+) -> Result<(String, String, String), String> {
+    let (head_branch, base_branch) = fetch_pr_branch_info(pr_url, main_repo_path).await?;
+    run_git(&["fetch", "origin", "--prune"], main_repo_path).await?;
+
+    let path = task_worktree_path(main_repo_path, task_id)
+        .ok_or_else(|| format!("cannot derive task worktree path from {}", main_repo_path))?;
+    let path_str = path.to_string_lossy().into_owned();
+
+    if !path.is_dir() {
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await
+                .map_err(|e| format!("create worktree parent dir: {}", e))?;
+        }
+        let origin_head = format!("origin/{}", head_branch);
+        run_git(
+            &[
+                "worktree", "add", "--force",
+                "-B", &head_branch,
+                &path_str,
+                &origin_head,
+            ],
+            main_repo_path,
+        ).await?;
+    } else if run_git(&["rev-parse", "--git-dir"], &path_str).await.is_err() {
+        return Err(format!("task worktree path exists but is not a git worktree: {}", path_str));
+    }
+
+    let dirty = run_git(&["status", "--porcelain"], &path_str).await?;
+    if !dirty.trim().is_empty() {
+        return Err(format!("task worktree is dirty at {}; refusing to resolve conflicts over local changes:\n{}", path_str, dirty));
+    }
+
+    run_git(&["fetch", "origin", "--prune"], &path_str).await?;
+    let head_ref = format!("refs/heads/{}", head_branch);
+    let origin_head = format!("origin/{}", head_branch);
+    if run_git(&["rev-parse", "--verify", &head_ref], &path_str).await.is_ok() {
+        run_git(&["checkout", &head_branch], &path_str).await?;
+    } else {
+        run_git(&["checkout", "-b", &head_branch, &origin_head], &path_str).await?;
+    }
+    run_git(&["merge", "--ff-only", &origin_head], &path_str).await?;
+
+    Ok((path_str, head_branch, base_branch))
+}
+
+async fn fetch_pr_branch_info(pr_url: &str, repo_path: &str) -> Result<(String, String), String> {
+    let output = async_cmd("gh")
+        .args(["pr", "view", pr_url, "--json", "headRefName,baseRefName"])
+        .current_dir(repo_path)
+        .output()
+        .await
+        .map_err(|e| format!("spawn gh: {}", e))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let parsed: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("parse gh pr view: {}", e))?;
+    let head = parsed.get("headRefName").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let base = parsed.get("baseRefName").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if head.is_empty() || base.is_empty() {
+        return Err("GitHub PR branch info was missing headRefName/baseRefName".to_string());
+    }
+    Ok((head.to_string(), base.to_string()))
+}
+
+async fn run_git_capture(args: &[&str], repo_path: &str) -> Result<(bool, String, String), String> {
+    let output = async_cmd("git")
+        .args(args)
+        .current_dir(repo_path)
+        .output()
+        .await
+        .map_err(|e| format!("git {:?}: {}", args, e))?;
+    Ok((
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    ))
+}
+
+fn merge_conflict_fix_prompt(head_branch: &str, base_branch: &str, merge_output: &str, conflict_files: &str) -> String {
+    format!(
+        "You are Sam resolving merge conflicts on an already-approved PR so Samwise can merge and deploy it.\n\n\
+Current branch: `{}`\n\
+Base branch being merged in: `origin/{}`\n\n\
+Git has already attempted the merge and left conflicts in this worktree.\n\n\
+Conflicted files:\n```\n{}\n```\n\n\
+Merge output:\n```\n{}\n```\n\n\
+Instructions:\n\
+- Resolve the merge conflicts only. Preserve the PR's intended behavior and the current base branch behavior.\n\
+- Do not add unrelated features, refactor unrelated code, or bump dependencies.\n\
+- Remove all conflict markers.\n\
+- Run the smallest relevant validation you can identify from the repo.\n\
+- Stage the resolved files and complete the merge commit.\n\
+- Do not push. Do not merge the GitHub PR. Samwise will push and retry Merge + Deploy after you finish.\n\n\
+Use this commit message shape:\n\
+```\n\
+samwise: resolve merge conflicts before merge\n\n\
+Conflict resolution:\n\
+- <brief bullets explaining what you kept/changed>\n\n\
+Validation:\n\
+- <commands run, or why not run>\n\n\
+Deployment required:\n\
+- Railway server: <yes/no/unknown> - <plain reason, including service name if yes>\n\
+- Supabase migrations: <yes/no/unknown> - <plain reason, including migration filenames if yes>\n\
+- Supabase Edge Functions: <yes/no/unknown> - <plain reason, including function names if yes>\n\
+```\n\n\
+If the conflict is not safely resolvable without Matt's judgment, stop and explain why without making unrelated changes.",
+        head_branch,
+        base_branch,
+        if conflict_files.trim().is_empty() { "(unknown)" } else { conflict_files.trim() },
+        truncate(merge_output.trim(), 1800)
+    )
+}
+
+async fn ensure_no_conflict_markers(repo_path: &str) -> Result<(), String> {
+    let output = async_cmd("git")
+        .args(["grep", "-n", "-E", "^(<<<<<<<|>>>>>>>)", "--", "."])
+        .current_dir(repo_path)
+        .output()
+        .await
+        .map_err(|e| format!("spawn git grep: {}", e))?;
+    if output.status.success() {
+        return Err(format!(
+            "conflict markers remain:\n{}",
+            truncate(&String::from_utf8_lossy(&output.stdout), 1200)
+        ));
+    }
+    if output.status.code() == Some(1) {
+        return Ok(());
+    }
+    Err(format!("git grep for conflict markers failed: {}", String::from_utf8_lossy(&output.stderr).trim()))
+}
+
+async fn merge_conflict_resolution_commit_message(pr_url: &str, main_repo_path: &str, repo_path: &str) -> String {
+    let files = review::fetch_pr_files(pr_url, main_repo_path).await.unwrap_or_default();
+    let plan = build_deploy_plan(repo_path, &files).await.ok();
+    let (railway, migrations, functions) = if let Some(plan) = plan {
+        deployment_commit_lines(&plan)
+    } else {
+        (
+            "unknown - Samwise could not inspect the deploy plan before committing".to_string(),
+            "unknown - Samwise could not inspect the deploy plan before committing".to_string(),
+            "unknown - Samwise could not inspect the deploy plan before committing".to_string(),
+        )
+    };
+    format!(
+        "samwise: resolve merge conflicts before merge\n\n\
+Conflict resolution:\n\
+- Completed the base-branch merge so GitHub can merge this PR.\n\n\
+Deployment required:\n\
+- Railway server: {}\n\
+- Supabase migrations: {}\n\
+- Supabase Edge Functions: {}",
+        railway, migrations, functions
+    )
+}
+
+fn deployment_commit_lines(plan: &DeployPlan) -> (String, String, String) {
+    let railway = if plan.railway_reasons.is_empty() {
+        "no - no Railway server deploy path matched the PR files".to_string()
+    } else {
+        format!("yes - {}", plan.railway_reasons.join("; "))
+    };
+    let migrations = if plan.supabase_migrations.is_empty() {
+        "no - no supabase/migrations/*.sql files changed".to_string()
+    } else {
+        format!("yes - {}", plan.supabase_migrations.join(", "))
+    };
+    let functions = if plan.supabase_functions.is_empty() {
+        "no - no supabase/functions/<name>/ files changed".to_string()
+    } else {
+        format!("yes - {}", plan.supabase_functions.join(", "))
+    };
+    (railway, migrations, functions)
+}
+
+fn merge_conflict_fix_request_is_pending(task: &Value) -> bool {
+    let context = task.get("context").and_then(|v| v.as_object());
+    let Some(context) = context else { return false; };
+    let status = context.get(MERGE_CONFLICT_FIX_STATUS_KEY).and_then(|v| v.as_str()).unwrap_or("");
+    if status == "running" || status == "succeeded" {
+        return false;
+    }
+    status == "requested" && context.get(MERGE_CONFLICT_FIX_REQUESTED_AT_KEY).and_then(|v| v.as_str()).is_some()
 }
 
 #[derive(Debug, Clone)]

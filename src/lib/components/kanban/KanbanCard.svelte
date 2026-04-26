@@ -10,10 +10,15 @@
 		extractReviewActionPanel,
 		getUiStamp,
 		getMergeDeployState,
+		getMergeConflictFixState,
+		isMergeConflictError,
+		isMergeConflictFixBusy,
 		isReviewActionStatus,
 		isMergeDeployBusy,
+		mergeConflictFixButtonLabel,
 		mergeDeployButtonLabel,
 		nextManualInProgressStampContext,
+		requestMergeConflictFixContext,
 		requestMergeDeployContext,
 	} from '$lib/utils/review-actions';
 	import { formatTimeAgo } from '$lib/utils/relative-time';
@@ -50,9 +55,17 @@
 	let reviewPanel = $derived(extractReviewActionPanel(task, comments));
 	let uiStamp = $derived(getUiStamp(task));
 	let mergeDeployState = $derived(getMergeDeployState(task));
+	let mergeConflictFixState = $derived(getMergeConflictFixState(task));
 	let mergeDeployRequestError = $state<string | null>(null);
+	let mergeConflictFixRequestError = $state<string | null>(null);
 	let showReviewActions = $derived(isReviewActionStatus(task.status) && !!(reviewPanel || task.pr_url));
 	let canMergeDeploy = $derived(!!task.pr_url && (task.status === 'approved' || mergeDeployState.status === 'failed'));
+	let canRequestMergeConflictFix = $derived(
+		!!task.pr_url &&
+		mergeDeployState.status === 'failed' &&
+		isMergeConflictError(mergeDeployState.error) &&
+		!isMergeConflictFixBusy(mergeConflictFixState)
+	);
 	let qaResult = $derived(task.visual_qa_result);
 	let originBadge = $derived(
 		task.origin_system && task.origin_system !== 'manual'
@@ -154,6 +167,17 @@
 		const ok = await taskStore.updateTask(task.id, { context: requestMergeDeployContext(task) });
 		if (!ok) {
 			mergeDeployRequestError = taskStore.error || 'Could not queue Merge + Deploy.';
+		}
+	}
+
+	async function requestMergeConflictFix(e: MouseEvent) {
+		e.preventDefault();
+		e.stopPropagation();
+		if (!canRequestMergeConflictFix) return;
+		mergeConflictFixRequestError = null;
+		const ok = await taskStore.updateTask(task.id, { context: requestMergeConflictFixContext(task) });
+		if (!ok) {
+			mergeConflictFixRequestError = taskStore.error || 'Could not queue Sam conflict recovery.';
 		}
 	}
 
@@ -444,6 +468,37 @@
 				overflow: hidden;
 			">
 				Merge + Deploy failed: {mergeDeployRequestError || mergeDeployState.error}
+			</div>
+		{/if}
+		{#if canRequestMergeConflictFix || isMergeConflictFixBusy(mergeConflictFixState) || mergeConflictFixRequestError || mergeConflictFixState.error}
+			<button
+				type="button"
+				style="
+					width: 100%; margin-top: 7px; padding: 8px 9px; border-radius: 9px;
+					background: linear-gradient(135deg, rgba(251, 146, 60, 0.22), rgba(20, 184, 166, 0.14));
+					border: 1px solid rgba(251, 191, 36, 0.42);
+					color: #fed7aa;
+					font-size: 10px; font-weight: 950; font-family: var(--font-ui);
+					cursor: {isMergeConflictFixBusy(mergeConflictFixState) ? 'wait' : 'pointer'};
+					opacity: {isMergeConflictFixBusy(mergeConflictFixState) ? '0.72' : '1'};
+				"
+				onmousedown={(e) => e.stopPropagation()}
+				onclick={requestMergeConflictFix}
+				disabled={isMergeConflictFixBusy(mergeConflictFixState)}
+			>
+				{mergeConflictFixButtonLabel(mergeConflictFixState)}
+			</button>
+		{/if}
+		{#if mergeConflictFixRequestError || mergeConflictFixState.error}
+			<div style="
+				margin-top: 7px; padding: 7px 8px; border-radius: 8px;
+				background: rgba(251, 146, 60, 0.12);
+				border: 1px solid rgba(251, 191, 36, 0.34);
+				color: #fed7aa; font-size: 10px; font-weight: 750; line-height: 1.35;
+				display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+				overflow: hidden;
+			">
+				Sam conflict recovery failed: {mergeConflictFixRequestError || mergeConflictFixState.error}
 			</div>
 		{/if}
 	{/if}

@@ -7,6 +7,10 @@ export const MERGE_DEPLOY_REQUESTED_AT_KEY = 'samwise_merge_deploy_requested_at'
 export const MERGE_DEPLOY_STARTED_AT_KEY = 'samwise_merge_deploy_started_at';
 export const MERGE_DEPLOY_STATUS_KEY = 'samwise_merge_deploy_status';
 export const MERGE_DEPLOY_ERROR_KEY = 'samwise_merge_deploy_error';
+export const MERGE_CONFLICT_FIX_REQUESTED_AT_KEY = 'samwise_merge_conflict_fix_requested_at';
+export const MERGE_CONFLICT_FIX_STARTED_AT_KEY = 'samwise_merge_conflict_fix_started_at';
+export const MERGE_CONFLICT_FIX_STATUS_KEY = 'samwise_merge_conflict_fix_status';
+export const MERGE_CONFLICT_FIX_ERROR_KEY = 'samwise_merge_conflict_fix_error';
 
 export type ReviewVerdict = 'merge' | 'fix' | 'inconclusive' | 'errored' | 'blocked';
 
@@ -20,9 +24,17 @@ export interface ReviewActionPanel {
 }
 
 export type MergeDeployStatus = 'requested' | 'running' | 'succeeded' | 'failed';
+export type MergeConflictFixStatus = 'requested' | 'running' | 'succeeded' | 'failed';
 
 export interface MergeDeployState {
 	status: MergeDeployStatus | null;
+	requestedAt: string | null;
+	startedAt: string | null;
+	error: string | null;
+}
+
+export interface MergeConflictFixState {
+	status: MergeConflictFixStatus | null;
 	requestedAt: string | null;
 	startedAt: string | null;
 	error: string | null;
@@ -65,6 +77,46 @@ export function requestMergeDeployContext(task: Pick<AeTask, 'context'>): Record
 		[MERGE_DEPLOY_STATUS_KEY]: 'requested',
 		[MERGE_DEPLOY_ERROR_KEY]: null,
 	};
+}
+
+export function getMergeConflictFixState(task: Pick<AeTask, 'context'>): MergeConflictFixState {
+	const context = task.context ?? {};
+	const rawStatus = context[MERGE_CONFLICT_FIX_STATUS_KEY];
+	const status: MergeConflictFixStatus | null =
+		rawStatus === 'requested' || rawStatus === 'running' || rawStatus === 'succeeded' || rawStatus === 'failed'
+			? rawStatus
+			: null;
+	return {
+		status,
+		requestedAt: stringValue(context[MERGE_CONFLICT_FIX_REQUESTED_AT_KEY]),
+		startedAt: stringValue(context[MERGE_CONFLICT_FIX_STARTED_AT_KEY]),
+		error: stringValue(context[MERGE_CONFLICT_FIX_ERROR_KEY]),
+	};
+}
+
+export function isMergeConflictError(error: string | null): boolean {
+	if (!error) return false;
+	return /merge conflicts?|mergepullrequest|not mergeable/i.test(error);
+}
+
+export function requestMergeConflictFixContext(task: Pick<AeTask, 'context'>): Record<string, unknown> {
+	return {
+		...(task.context ?? {}),
+		[MERGE_CONFLICT_FIX_REQUESTED_AT_KEY]: new Date().toISOString(),
+		[MERGE_CONFLICT_FIX_STATUS_KEY]: 'requested',
+		[MERGE_CONFLICT_FIX_ERROR_KEY]: null,
+	};
+}
+
+export function mergeConflictFixButtonLabel(state: MergeConflictFixState): string {
+	if (state.status === 'running') return 'Sam Resolving...';
+	if (state.status === 'requested') return 'Sam Queued';
+	if (state.status === 'failed') return 'Retry Sam Fix + Merge';
+	return 'Ask Sam to Fix + Merge';
+}
+
+export function isMergeConflictFixBusy(state: MergeConflictFixState): boolean {
+	return state.status === 'requested' || state.status === 'running';
 }
 
 export function mergeDeployButtonLabel(state: MergeDeployState): string {

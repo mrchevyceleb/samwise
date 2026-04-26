@@ -9,10 +9,15 @@
 		extractReviewActionPanel,
 		getUiStamp,
 		getMergeDeployState,
+		getMergeConflictFixState,
+		isMergeConflictError,
+		isMergeConflictFixBusy,
 		isReviewActionStatus,
 		isMergeDeployBusy,
+		mergeConflictFixButtonLabel,
 		mergeDeployButtonLabel,
 		nextManualInProgressStampContext,
+		requestMergeConflictFixContext,
 		requestMergeDeployContext,
 	} from '$lib/utils/review-actions';
 	import { formatTimeAgo } from '$lib/utils/relative-time';
@@ -56,6 +61,8 @@
 	let markingDone = $state(false);
 	let requestingMergeDeploy = $state(false);
 	let mergeDeployRequestError = $state<string | null>(null);
+	let requestingMergeConflictFix = $state(false);
+	let mergeConflictFixRequestError = $state<string | null>(null);
 	let prBtnHovered = $state(false);
 
 	// Tabs: "details" or "report"
@@ -99,8 +106,15 @@
 	let reviewPanel = $derived(extractReviewActionPanel(task, comments));
 	let uiStamp = $derived(getUiStamp(task));
 	let mergeDeployState = $derived(getMergeDeployState(task));
+	let mergeConflictFixState = $derived(getMergeConflictFixState(task));
 	let showReviewActions = $derived(isReviewActionStatus(task.status) && !!(reviewPanel || task.pr_url));
 	let canMergeDeploy = $derived(!!task.pr_url && (task.status === 'approved' || mergeDeployState.status === 'failed'));
+	let canRequestMergeConflictFix = $derived(
+		!!task.pr_url &&
+		mergeDeployState.status === 'failed' &&
+		isMergeConflictError(mergeDeployState.error) &&
+		!isMergeConflictFixBusy(mergeConflictFixState)
+	);
 	let originBadge = $derived(
 		task.origin_system && task.origin_system !== 'manual'
 			? ORIGIN_BADGES[task.origin_system]
@@ -158,6 +172,20 @@
 			}
 		} finally {
 			requestingMergeDeploy = false;
+		}
+	}
+
+	async function handleRequestMergeConflictFix() {
+		if (!canRequestMergeConflictFix || requestingMergeConflictFix) return;
+		requestingMergeConflictFix = true;
+		mergeConflictFixRequestError = null;
+		try {
+			const ok = await taskStore.updateTask(task.id, { context: requestMergeConflictFixContext(task) });
+			if (!ok) {
+				mergeConflictFixRequestError = taskStore.error || 'Could not queue Sam conflict recovery.';
+			}
+		} finally {
+			requestingMergeConflictFix = false;
 		}
 	}
 
@@ -507,12 +535,31 @@
 											opacity: {requestingMergeDeploy || isMergeDeployBusy(mergeDeployState) ? '0.68' : '1'};
 										"
 									>
-										{requestingMergeDeploy ? 'Queueing...' : mergeDeployButtonLabel(mergeDeployState)}
-									</button>
-								{:else}
-									<button
-										type="button"
-										onclick={handleMarkDone}
+								{requestingMergeDeploy ? 'Queueing...' : mergeDeployButtonLabel(mergeDeployState)}
+							</button>
+							{#if canRequestMergeConflictFix || isMergeConflictFixBusy(mergeConflictFixState) || mergeConflictFixRequestError || mergeConflictFixState.error}
+								<button
+									type="button"
+									onclick={handleRequestMergeConflictFix}
+									disabled={requestingMergeConflictFix || isMergeConflictFixBusy(mergeConflictFixState)}
+									style="
+										display: inline-flex; align-items: center; gap: 7px;
+										padding: 8px 12px; border-radius: 9px;
+										background: linear-gradient(135deg, rgba(251, 146, 60, 0.20), rgba(20, 184, 166, 0.12));
+										border: 1px solid rgba(251, 191, 36, 0.40);
+										color: #fed7aa;
+										font-size: 12px; font-weight: 900;
+										cursor: {requestingMergeConflictFix || isMergeConflictFixBusy(mergeConflictFixState) ? 'wait' : 'pointer'}; font-family: var(--font-ui);
+										opacity: {requestingMergeConflictFix || isMergeConflictFixBusy(mergeConflictFixState) ? '0.68' : '1'};
+									"
+								>
+									{requestingMergeConflictFix ? 'Queueing Sam...' : mergeConflictFixButtonLabel(mergeConflictFixState)}
+								</button>
+							{/if}
+						{:else}
+							<button
+								type="button"
+								onclick={handleMarkDone}
 										disabled={markingDone}
 										style="
 											display: inline-flex; align-items: center; gap: 7px;
@@ -539,6 +586,17 @@
 								white-space: pre-wrap;
 							">
 								Merge + Deploy failed: {mergeDeployRequestError || mergeDeployState.error}
+							</div>
+						{/if}
+						{#if mergeConflictFixRequestError || mergeConflictFixState.error}
+							<div style="
+								margin-top: 10px; padding: 10px 12px; border-radius: 10px;
+								background: rgba(251, 146, 60, 0.12);
+								border: 1px solid rgba(251, 191, 36, 0.34);
+								color: #fed7aa; font-size: 12px; font-weight: 750; line-height: 1.4;
+								white-space: pre-wrap;
+							">
+								Sam conflict recovery failed: {mergeConflictFixRequestError || mergeConflictFixState.error}
 							</div>
 						{/if}
 					</div>
@@ -858,6 +916,23 @@
 						>
 							{canMergeDeploy ? (requestingMergeDeploy ? 'Queueing...' : mergeDeployButtonLabel(mergeDeployState)) : (markingDone ? 'Marking Done...' : 'Mark Done')}
 						</button>
+						{#if canRequestMergeConflictFix || isMergeConflictFixBusy(mergeConflictFixState) || mergeConflictFixRequestError || mergeConflictFixState.error}
+							<button
+								style="
+									width: 100%; padding: 8px 12px; border-radius: 8px;
+									background: linear-gradient(135deg, rgba(251, 146, 60, 0.18), rgba(20, 184, 166, 0.10));
+									border: 1px solid rgba(251, 191, 36, 0.36);
+									color: #fed7aa; font-size: 11px; font-weight: 850;
+									font-family: var(--font-ui); cursor: {requestingMergeConflictFix || isMergeConflictFixBusy(mergeConflictFixState) ? 'wait' : 'pointer'};
+									transition: all 0.15s ease;
+									opacity: {requestingMergeConflictFix || isMergeConflictFixBusy(mergeConflictFixState) ? '0.65' : '1'};
+								"
+								onclick={handleRequestMergeConflictFix}
+								disabled={requestingMergeConflictFix || isMergeConflictFixBusy(mergeConflictFixState)}
+							>
+								{requestingMergeConflictFix ? 'Queueing Sam...' : mergeConflictFixButtonLabel(mergeConflictFixState)}
+							</button>
+						{/if}
 						{#if mergeDeployRequestError || mergeDeployState.error}
 							<div style="
 								padding: 8px 10px; border-radius: 8px;
@@ -867,6 +942,17 @@
 								white-space: pre-wrap;
 							">
 								Merge + Deploy failed: {mergeDeployRequestError || mergeDeployState.error}
+							</div>
+						{/if}
+						{#if mergeConflictFixRequestError || mergeConflictFixState.error}
+							<div style="
+								padding: 8px 10px; border-radius: 8px;
+								background: rgba(251, 146, 60, 0.12);
+								border: 1px solid rgba(251, 191, 36, 0.34);
+								color: #fed7aa; font-size: 11px; font-weight: 750; line-height: 1.35;
+								white-space: pre-wrap;
+							">
+								Sam conflict recovery failed: {mergeConflictFixRequestError || mergeConflictFixState.error}
 							</div>
 						{/if}
 					{/if}
