@@ -1,7 +1,8 @@
 import type { AeComment, AeTask } from '$lib/types';
 
 export const UI_STAMP_KEY = 'samwise_ui_stamp';
-export const COPILOT_REVIEW_STAMP = 'copilot_review';
+export const MANUAL_IN_PROGRESS_STAMP = 'manual_in_progress';
+const LEGACY_COPILOT_REVIEW_STAMP = 'copilot_review';
 
 export type ReviewVerdict = 'merge' | 'fix' | 'inconclusive' | 'errored' | 'blocked';
 
@@ -14,17 +15,18 @@ export interface ReviewActionPanel {
 	source: 'samwise-pr-review' | 'auto-merge' | 'error';
 }
 
-export function getUiStamp(task: Pick<AeTask, 'context'>): typeof COPILOT_REVIEW_STAMP | null {
-	return task.context?.[UI_STAMP_KEY] === COPILOT_REVIEW_STAMP ? COPILOT_REVIEW_STAMP : null;
+export function getUiStamp(task: Pick<AeTask, 'context'>): typeof MANUAL_IN_PROGRESS_STAMP | null {
+	const stamp = task.context?.[UI_STAMP_KEY];
+	return stamp === MANUAL_IN_PROGRESS_STAMP || stamp === LEGACY_COPILOT_REVIEW_STAMP ? MANUAL_IN_PROGRESS_STAMP : null;
 }
 
-export function nextCopilotStampContext(task: Pick<AeTask, 'context'>): Record<string, unknown> | null {
+export function nextManualInProgressStampContext(task: Pick<AeTask, 'context'>): Record<string, unknown> | null {
 	const context = { ...(task.context ?? {}) };
 	if (getUiStamp(task)) {
 		delete context[UI_STAMP_KEY];
 		return Object.keys(context).length > 0 ? context : null;
 	}
-	context[UI_STAMP_KEY] = COPILOT_REVIEW_STAMP;
+	context[UI_STAMP_KEY] = MANUAL_IN_PROGRESS_STAMP;
 	return context;
 }
 

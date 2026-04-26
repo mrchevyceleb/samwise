@@ -10,7 +10,7 @@
 		extractReviewActionPanel,
 		getUiStamp,
 		isReviewActionStatus,
-		nextCopilotStampContext,
+		nextManualInProgressStampContext,
 	} from '$lib/utils/review-actions';
 	import { formatTimeAgo } from '$lib/utils/relative-time';
 	import { openExternal } from '$lib/utils/tauri';
@@ -128,10 +128,10 @@
 		await taskStore.moveTask(task.id, 'done');
 	}
 
-	async function toggleCopilotStamp(e: MouseEvent) {
+	async function toggleManualInProgressStamp(e: MouseEvent) {
 		e.preventDefault();
 		e.stopPropagation();
-		await taskStore.updateTask(task.id, { context: nextCopilotStampContext(task) });
+		await taskStore.updateTask(task.id, { context: nextManualInProgressStampContext(task) });
 	}
 
 	function openPr(e: MouseEvent) {
@@ -179,23 +179,23 @@
 		<div style="
 			display: flex; align-items: center; justify-content: space-between; gap: 8px;
 			margin: -2px -2px 10px -2px; padding: 8px 10px; border-radius: 12px;
-			background: linear-gradient(135deg, rgba(56, 189, 248, 0.30), rgba(34, 197, 94, 0.18));
-			border: 1px solid rgba(125, 211, 252, 0.68);
-			box-shadow: 0 0 22px rgba(56, 189, 248, 0.20), inset 0 1px 0 rgba(255,255,255,0.16);
+			background: linear-gradient(135deg, rgba(249, 115, 22, 0.38), rgba(245, 158, 11, 0.20));
+			border: 1px solid rgba(253, 186, 116, 0.72);
+			box-shadow: 0 0 24px rgba(249, 115, 22, 0.24), inset 0 1px 0 rgba(255,255,255,0.18);
 		">
 			<span style="
-				color: #d9f7ff; font-size: 11px; font-weight: 950;
+				color: #fff7ed; font-size: 11px; font-weight: 950;
 				text-transform: uppercase; letter-spacing: 0.55px;
 			">
-				Waiting on Copilot Review
+				Manual In Progress
 			</span>
 			<span style="
 				padding: 2px 6px; border-radius: 999px;
-				background: rgba(2, 6, 23, 0.36); color: #7dd3fc;
-				border: 1px solid rgba(125, 211, 252, 0.45);
+				background: rgba(2, 6, 23, 0.36); color: #fdba74;
+				border: 1px solid rgba(253, 186, 116, 0.45);
 				font-size: 9px; font-weight: 950; letter-spacing: 0.45px;
 			">
-				STAMPED
+				MINE
 			</span>
 		</div>
 	{/if}
@@ -346,16 +346,16 @@
 				style="
 					display: flex; align-items: center; justify-content: center; gap: 5px;
 					padding: 7px 8px; border-radius: 8px;
-					background: {uiStamp ? 'rgba(88, 166, 255, 0.18)' : 'rgba(88, 166, 255, 0.07)'};
-					border: 1px solid {uiStamp ? 'rgba(88, 166, 255, 0.45)' : 'rgba(88, 166, 255, 0.2)'};
-					color: #8cc8ff;
+					background: {uiStamp ? 'rgba(249, 115, 22, 0.22)' : 'rgba(249, 115, 22, 0.08)'};
+					border: 1px solid {uiStamp ? 'rgba(253, 186, 116, 0.54)' : 'rgba(253, 186, 116, 0.24)'};
+					color: #fdba74;
 					font-size: 10px; font-weight: 900; font-family: var(--font-ui);
 					cursor: pointer; transition: all 0.15s ease;
 				"
 				onmousedown={(e) => e.stopPropagation()}
-				onclick={toggleCopilotStamp}
+				onclick={toggleManualInProgressStamp}
 			>
-				{uiStamp ? 'Unstamp' : 'Copilot Review'}
+				{uiStamp ? 'Clear Stamp' : 'In Progress'}
 			</button>
 			<button
 				type="button"

@@ -9,7 +9,7 @@
 		extractReviewActionPanel,
 		getUiStamp,
 		isReviewActionStatus,
-		nextCopilotStampContext,
+		nextManualInProgressStampContext,
 	} from '$lib/utils/review-actions';
 	import { formatTimeAgo } from '$lib/utils/relative-time';
 	import { safeInvoke, openExternal } from '$lib/utils/tauri';
@@ -129,8 +129,8 @@
 		}
 	}
 
-	async function handleToggleCopilotStamp() {
-		await taskStore.updateTask(task.id, { context: nextCopilotStampContext(task) });
+	async function handleToggleManualInProgressStamp() {
+		await taskStore.updateTask(task.id, { context: nextManualInProgressStampContext(task) });
 	}
 
 	async function handleStop() {
@@ -374,13 +374,13 @@
 							{#if uiStamp}
 								<span style="
 									padding: 4px 8px; border-radius: 999px;
-									background: rgba(88, 166, 255, 0.18);
-									border: 1px solid rgba(88, 166, 255, 0.35);
-									color: #8cc8ff; font-size: 10px; font-weight: 900;
+									background: rgba(249, 115, 22, 0.20);
+									border: 1px solid rgba(253, 186, 116, 0.42);
+									color: #fdba74; font-size: 10px; font-weight: 900;
 									text-transform: uppercase; letter-spacing: 0.4px;
 									white-space: nowrap;
 								">
-									Copilot Review
+									Manual In Progress
 								</span>
 							{/if}
 						</div>
@@ -416,18 +416,18 @@
 							{#if task.status !== 'done'}
 								<button
 									type="button"
-									onclick={handleToggleCopilotStamp}
+									onclick={handleToggleManualInProgressStamp}
 									style="
 										display: inline-flex; align-items: center; gap: 7px;
 										padding: 8px 12px; border-radius: 9px;
-										background: {uiStamp ? 'rgba(88, 166, 255, 0.18)' : 'rgba(88, 166, 255, 0.08)'};
-										border: 1px solid {uiStamp ? 'rgba(88, 166, 255, 0.45)' : 'rgba(88, 166, 255, 0.22)'};
-										color: #8cc8ff;
+										background: {uiStamp ? 'rgba(249, 115, 22, 0.20)' : 'rgba(249, 115, 22, 0.08)'};
+										border: 1px solid {uiStamp ? 'rgba(253, 186, 116, 0.48)' : 'rgba(253, 186, 116, 0.22)'};
+										color: #fdba74;
 										font-size: 12px; font-weight: 800;
 										cursor: pointer; font-family: var(--font-ui);
 									"
 								>
-									{uiStamp ? 'Remove Copilot Stamp' : 'Stamp Copilot Review'}
+									{uiStamp ? 'Clear In Progress Stamp' : 'Stamp In Progress'}
 								</button>
 								<button
 									type="button"
