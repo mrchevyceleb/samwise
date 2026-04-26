@@ -8,6 +8,7 @@ export type MessageRole = 'user' | 'agent' | 'system';
 export type CommentAuthor = 'matt' | 'agent' | 'system';
 export type WorkerStatus = 'online' | 'offline' | 'busy';
 export type TriggerSourceType = 'supabase' | 'webhook' | 'github' | 'triage';
+export type OriginSystem = 'operly_triage' | 'banana_triage' | 'sentry' | 'manual';
 
 export interface Subtask {
 	id: string;
@@ -51,7 +52,38 @@ export interface AeTask {
   auto_merged: boolean | null;
   auto_merge_blocked_reason: string | null;
   failure_reason?: string | null;
+  origin_system?: OriginSystem | null;
+  origin_id?: string | null;
+  origin_url?: string | null;
 }
+
+export interface OriginBadgeMeta {
+  label: string;
+  color: string;
+  bg: string;
+  border: string;
+}
+
+export const ORIGIN_BADGES: Record<Exclude<OriginSystem, 'manual'>, OriginBadgeMeta> = {
+  operly_triage: {
+    label: 'Operly',
+    color: '#a78bfa',
+    bg: 'rgba(167, 139, 250, 0.10)',
+    border: 'rgba(167, 139, 250, 0.32)',
+  },
+  banana_triage: {
+    label: 'Banana',
+    color: '#facc15',
+    bg: 'rgba(250, 204, 21, 0.10)',
+    border: 'rgba(250, 204, 21, 0.30)',
+  },
+  sentry: {
+    label: 'Sentry',
+    color: '#fb7185',
+    bg: 'rgba(251, 113, 133, 0.10)',
+    border: 'rgba(251, 113, 133, 0.30)',
+  },
+};
 
 export interface AeComment {
   id: string;

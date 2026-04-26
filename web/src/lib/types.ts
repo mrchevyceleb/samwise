@@ -9,6 +9,7 @@ export type TaskStatus =
   | 'failed'
   | 'pending_confirmation';
 export type TaskPriority = 'critical' | 'high' | 'medium' | 'low';
+export type OriginSystem = 'operly_triage' | 'banana_triage' | 'sentry' | 'manual';
 
 export interface Attachment {
   url: string;
@@ -59,7 +60,22 @@ export interface AeTask {
   auto_merged: boolean | null;
   auto_merge_blocked_reason: string | null;
   last_pr_review_at?: string | null;
+  origin_system?: OriginSystem | null;
+  origin_id?: string | null;
+  origin_url?: string | null;
 }
+
+export const ORIGIN_LABEL: Record<Exclude<OriginSystem, 'manual'>, string> = {
+  operly_triage: 'Operly',
+  banana_triage: 'Banana',
+  sentry: 'Sentry'
+};
+
+export const ORIGIN_BADGE_CLASS: Record<Exclude<OriginSystem, 'manual'>, string> = {
+  operly_triage: 'bg-violet-500/10 text-violet-200 border-violet-400/30',
+  banana_triage: 'bg-amber-400/10 text-amber-200 border-amber-300/30',
+  sentry: 'bg-rose-500/10 text-rose-200 border-rose-400/30'
+};
 
 export interface AeComment {
   id: string;

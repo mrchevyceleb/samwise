@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import type { AeTask, TaskStatus, TaskPriority } from '$lib/types';
-	import { PRIORITY_COLORS, KANBAN_COLUMNS } from '$lib/types';
+	import { PRIORITY_COLORS, KANBAN_COLUMNS, ORIGIN_BADGES } from '$lib/types';
 	import { getTaskStore } from '$lib/stores/tasks.svelte';
 	import { getCommentStore } from '$lib/stores/comments.svelte';
 	import { getTheme } from '$lib/stores/theme.svelte';
@@ -100,6 +100,11 @@
 	let mergeDeployState = $derived(getMergeDeployState(task));
 	let showReviewActions = $derived(isReviewActionStatus(task.status) && !!(reviewPanel || task.pr_url));
 	let canMergeDeploy = $derived(!!task.pr_url && (task.status === 'approved' || mergeDeployState.status === 'failed'));
+	let originBadge = $derived(
+		task.origin_system && task.origin_system !== 'manual'
+			? ORIGIN_BADGES[task.origin_system]
+			: null
+	);
 
 	async function saveTitle() {
 		if (editTitle.trim() && editTitle !== task.title) {
@@ -268,6 +273,40 @@
 				">
 					{task.source}
 				</span>
+			{/if}
+
+			{#if originBadge}
+				{#if task.origin_url}
+					<a
+						href={task.origin_url}
+						title="Open source ticket in {originBadge.label}"
+						onclick={(e) => { e.preventDefault(); openExternal(task.origin_url!); }}
+						style="
+							padding: 4px 9px; border-radius: 6px;
+							background: {originBadge.bg}; color: {originBadge.color};
+							border: 1px solid {originBadge.border};
+							font-size: 10px; font-weight: 700; text-decoration: none;
+							display: inline-flex; align-items: center; gap: 5px;
+						"
+					>
+						<span style="width: 6px; height: 6px; border-radius: 50%; background: {originBadge.color};"></span>
+						{originBadge.label}
+					</a>
+				{:else}
+					<span
+						title="From {originBadge.label}"
+						style="
+							padding: 4px 9px; border-radius: 6px;
+							background: {originBadge.bg}; color: {originBadge.color};
+							border: 1px solid {originBadge.border};
+							font-size: 10px; font-weight: 700;
+							display: inline-flex; align-items: center; gap: 5px;
+						"
+					>
+						<span style="width: 6px; height: 6px; border-radius: 50%; background: {originBadge.color};"></span>
+						{originBadge.label}
+					</span>
+				{/if}
 			{/if}
 
 			<div style="flex: 1;"></div>
@@ -716,6 +755,26 @@
 						<span style="color: var(--text-muted); width: 60px;">Source</span>
 						<span style="color: var(--text-secondary);">{task.source}</span>
 					</div>
+
+					<!-- Origin (Operly / Banana / Sentry) -->
+					{#if originBadge}
+						<div style="display: flex; align-items: flex-start; gap: 6px;">
+							<span style="color: var(--text-muted); width: 60px; flex-shrink: 0;">Origin</span>
+							{#if task.origin_url}
+								<a
+									href={task.origin_url}
+									onclick={(e) => { e.preventDefault(); openExternal(task.origin_url!); }}
+									style="color: {originBadge.color}; font-weight: 600; text-decoration: none; word-break: break-all;"
+								>
+									{originBadge.label}{task.origin_id ? ` · ${task.origin_id.slice(0, 8)}` : ''}
+								</a>
+							{:else}
+								<span style="color: {originBadge.color}; font-weight: 600;">
+									{originBadge.label}{task.origin_id ? ` · ${task.origin_id.slice(0, 8)}` : ''}
+								</span>
+							{/if}
+						</div>
+					{/if}
 
 					<!-- Repo URL -->
 					{#if task.repo_url}

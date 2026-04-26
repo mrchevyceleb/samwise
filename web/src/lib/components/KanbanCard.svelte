@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { AeTask } from '$lib/types';
-  import { PRIORITY_COLOR } from '$lib/types';
+  import { PRIORITY_COLOR, ORIGIN_LABEL, ORIGIN_BADGE_CLASS } from '$lib/types';
   import { tasksStore } from '$lib/stores/tasks.svelte';
   import {
     extractReviewActionPanel,
@@ -20,6 +20,11 @@
   let mergeDeployState = $derived(getMergeDeployState(task));
   let showReviewActions = $derived(isReviewActionStatus(task.status) && !!(reviewPanel || task.pr_url));
   let canMergeDeploy = $derived(!!task.pr_url && (task.status === 'approved' || mergeDeployState.status === 'failed'));
+  let originKey = $derived(
+    task.origin_system && task.origin_system !== 'manual'
+      ? (task.origin_system as 'operly_triage' | 'banana_triage' | 'sentry')
+      : null
+  );
 
   function relTime(iso: string) {
     const d = Date.now() - new Date(iso).getTime();
@@ -123,8 +128,33 @@
     </div>
   {/if}
 
-  {#if task.project}
-    <div class="mt-2 text-xs text-slate-400">📦 {task.project}</div>
+  {#if task.project || originKey}
+    <div class="mt-2 flex flex-wrap items-center gap-1.5 text-xs text-slate-400">
+      {#if task.project}
+        <span>📦 {task.project}</span>
+      {/if}
+      {#if originKey}
+        {#if task.origin_url}
+          <a
+            href={task.origin_url}
+            target="_blank"
+            rel="noopener"
+            onclick={(e) => e.stopPropagation()}
+            class="rounded-md border px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide hover:opacity-90 {ORIGIN_BADGE_CLASS[originKey]}"
+            title="Open source ticket in {ORIGIN_LABEL[originKey]}"
+          >
+            {ORIGIN_LABEL[originKey]}
+          </a>
+        {:else}
+          <span
+            class="rounded-md border px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide {ORIGIN_BADGE_CLASS[originKey]}"
+            title="From {ORIGIN_LABEL[originKey]}"
+          >
+            {ORIGIN_LABEL[originKey]}
+          </span>
+        {/if}
+      {/if}
+    </div>
   {/if}
 
   {#if task.subtasks && task.subtasks.length > 0}

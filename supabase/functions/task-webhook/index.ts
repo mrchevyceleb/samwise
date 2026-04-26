@@ -3,7 +3,8 @@
 //
 // Auth: `x-webhook-secret` header must equal TASK_WEBHOOK_SECRET env var.
 // Minimum body: { title, description }
-// Optional body: project, priority, task_type, source, base_branch, attachments
+// Optional body: project, priority, task_type, source, base_branch, attachments,
+//   origin_system, origin_id, origin_url
 //
 // Attachments: array. Each entry may be either
 //   - a plain string URL, or
@@ -25,6 +26,8 @@ type AttachmentInput =
   | string
   | { url?: string; data?: string; name?: string; mime?: string };
 
+type OriginSystem = "operly_triage" | "banana_triage" | "sentry" | "manual";
+
 type Body = {
   title?: string;
   description?: string;
@@ -36,7 +39,17 @@ type Body = {
   attachments?: AttachmentInput[];
   callback_url?: string;
   callback_secret?: string;
+  origin_system?: OriginSystem;
+  origin_id?: string;
+  origin_url?: string;
 };
+
+const ORIGIN_SYSTEMS: ReadonlySet<OriginSystem> = new Set([
+  "operly_triage",
+  "banana_triage",
+  "sentry",
+  "manual",
+]);
 
 type StoredAttachment = { url: string; name: string; mime: string };
 
@@ -238,6 +251,30 @@ Deno.serve(async (req) => {
       if (typeof body.callback_secret === "string" && body.callback_secret.trim()) {
         task.callback_secret = body.callback_secret.trim();
       }
+    }
+  }
+
+  if (typeof body.origin_system === "string") {
+    const os = body.origin_system.trim() as OriginSystem;
+    if (os) {
+      if (!ORIGIN_SYSTEMS.has(os)) {
+        return json(400, {
+          error: `origin_system must be one of: ${[...ORIGIN_SYSTEMS].join(", ")}`,
+        });
+      }
+      task.origin_system = os;
+    }
+  }
+  if (typeof body.origin_id === "string" && body.origin_id.trim()) {
+    task.origin_id = body.origin_id.trim();
+  }
+  if (typeof body.origin_url === "string") {
+    const ou = body.origin_url.trim();
+    if (ou) {
+      if (!/^https?:\/\//i.test(ou)) {
+        return json(400, { error: "origin_url must be http:// or https://" });
+      }
+      task.origin_url = ou;
     }
   }
 

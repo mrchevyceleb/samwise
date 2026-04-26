@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import type { AeTask, Subtask } from '$lib/types';
-	import { PRIORITY_COLORS } from '$lib/types';
+	import { PRIORITY_COLORS, ORIGIN_BADGES } from '$lib/types';
 	import { getCommentStore } from '$lib/stores/comments.svelte';
 	import { getDragStore } from '$lib/stores/drag.svelte';
 	import { getTheme } from '$lib/stores/theme.svelte';
@@ -53,6 +53,11 @@
 	let showReviewActions = $derived(isReviewActionStatus(task.status) && !!(reviewPanel || task.pr_url));
 	let canMergeDeploy = $derived(!!task.pr_url && (task.status === 'approved' || mergeDeployState.status === 'failed'));
 	let qaResult = $derived(task.visual_qa_result);
+	let originBadge = $derived(
+		task.origin_system && task.origin_system !== 'manual'
+			? ORIGIN_BADGES[task.origin_system]
+			: null
+	);
 	let subtasks = $derived(task.subtasks || []);
 	let subtaskTotal = $derived(subtasks.length);
 	let subtaskDone = $derived(subtasks.filter((s: Subtask) => s.done).length);
@@ -296,6 +301,41 @@
 			">
 				{task.project}
 			</span>
+		{/if}
+
+		<!-- Origin badge (Operly / Banana / Sentry) -->
+		{#if originBadge}
+			{#if task.origin_url}
+				<a
+					href={task.origin_url}
+					title="Open source ticket in {originBadge.label}"
+					onclick={(e) => { e.stopPropagation(); e.preventDefault(); openExternal(task.origin_url!); }}
+					onmousedown={(e) => e.stopPropagation()}
+					style="
+						font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 5px;
+						background: {originBadge.bg}; color: {originBadge.color};
+						border: 1px solid {originBadge.border};
+						text-decoration: none; cursor: pointer;
+						display: inline-flex; align-items: center; gap: 4px;
+					"
+				>
+					<span style="width: 5px; height: 5px; border-radius: 50%; background: {originBadge.color};"></span>
+					{originBadge.label}
+				</a>
+			{:else}
+				<span
+					title="From {originBadge.label}"
+					style="
+						font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 5px;
+						background: {originBadge.bg}; color: {originBadge.color};
+						border: 1px solid {originBadge.border};
+						display: inline-flex; align-items: center; gap: 4px;
+					"
+				>
+					<span style="width: 5px; height: 5px; border-radius: 50%; background: {originBadge.color};"></span>
+					{originBadge.label}
+				</span>
+			{/if}
 		{/if}
 
 		<div style="flex: 1;"></div>

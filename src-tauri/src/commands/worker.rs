@@ -44,6 +44,12 @@ const MERGE_DEPLOY_STATUS_KEY: &str = "samwise_merge_deploy_status";
 const MERGE_DEPLOY_ERROR_KEY: &str = "samwise_merge_deploy_error";
 const MERGE_DEPLOY_PLAN_KEY: &str = "samwise_merge_deploy_plan";
 
+/// External edge function that closes the upstream ticket (Operly triage,
+/// Banana triage, Sentry issue) after Sam ships and the deploy is green.
+/// Lives outside the Samwise Supabase project; URL is the source of truth.
+const CLOSE_ORIGIN_TICKET_URL: &str =
+    "https://iycloielqcjnjqddeuet.supabase.co/functions/v1/close-origin-ticket";
+
 async fn run_git(args: &[&str], repo_path: &str) -> Result<String, String> {
     let output = async_cmd("git")
         .args(args)
@@ -4094,6 +4100,9 @@ async fn start_merge_deploy_task(
                     "failure_reason": Value::Null,
                 })).await;
                 notify_callback(&config_clone, &task_id, "done", Some(&pr_url), None);
+                let origin_system = latest_task.get("origin_system").and_then(|v| v.as_str()).unwrap_or("");
+                let origin_id = latest_task.get("origin_id").and_then(|v| v.as_str()).unwrap_or("");
+                close_origin_ticket(&config_clone, &task_id, origin_system, origin_id, &pr_url);
                 agent_comment(&config_clone, &task_id, &format!("Merge + Deploy complete. Moving the card to Done.\n\n{}", summary)).await;
             }
             Err(err) => {
@@ -5049,6 +5058,86 @@ pub fn notify_callback(
             Ok(Err(e)) => log::warn!("[callback] {} failed: {}", callback_url, e),
             Err(_) => log::warn!("[callback] {} timed out", callback_url),
         }
+    });
+}
+
+/// After merge+deploy is green, close the upstream origin ticket (Operly
+/// triage, Banana triage, Sentry issue). The closeout edge function does the
+/// real work — we just hand it the origin pointer plus the merged PR. Skips
+/// `manual` and tasks without origin metadata. Failures do not retry inline:
+/// a comment is posted on the Sam task so Matt can re-fire from the queue UI.
+fn close_origin_ticket(
+    config: &SupabaseConfig,
+    task_id: &str,
+    origin_system: &str,
+    origin_id: &str,
+    pr_url: &str,
+) {
+    if origin_system.is_empty() || origin_system == "manual" || origin_id.is_empty() {
+        return;
+    }
+
+    let cfg = config.clone();
+    let task_id = task_id.to_string();
+    let origin_system = origin_system.to_string();
+    let origin_id = origin_id.to_string();
+    let pr_url = pr_url.to_string();
+
+    tokio::spawn(async move {
+        let payload = serde_json::json!({
+            "system": origin_system,
+            "origin_id": origin_id,
+            "pr_url": pr_url,
+            "task_id": task_id,
+        });
+
+        let req = reqwest::Client::new()
+            .post(CLOSE_ORIGIN_TICKET_URL)
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", cfg.anon_key))
+            .header("apikey", cfg.anon_key.clone())
+            .header("user-agent", "samwise-worker/1")
+            .json(&payload);
+
+        let send = tokio::time::timeout(std::time::Duration::from_secs(15), req.send()).await;
+        let (status_label, error_detail): (String, Option<String>) = match send {
+            Ok(Ok(resp)) => {
+                let status = resp.status();
+                if status.is_success() {
+                    log::info!(
+                        "[close-origin] {} ticket {} closed for task {}",
+                        origin_system, origin_id, task_id
+                    );
+                    return;
+                }
+                let body = resp
+                    .text()
+                    .await
+                    .unwrap_or_else(|e| format!("(read body failed: {})", e));
+                (status.to_string(), Some(truncate(body.trim(), 400).to_string()))
+            }
+            Ok(Err(e)) => ("network error".to_string(), Some(e.to_string())),
+            Err(_) => ("timeout".to_string(), Some("no response within 15s".to_string())),
+        };
+
+        log::warn!(
+            "[close-origin] failed for task {} ({} / {}): {} — {}",
+            task_id,
+            origin_system,
+            origin_id,
+            status_label,
+            error_detail.as_deref().unwrap_or("")
+        );
+
+        let comment = format!(
+            "Closeout failed: {}{}. Run manually.",
+            status_label,
+            error_detail
+                .as_deref()
+                .map(|d| format!(" — {}", d))
+                .unwrap_or_default(),
+        );
+        agent_comment(&cfg, &task_id, &comment).await;
     });
 }
 
