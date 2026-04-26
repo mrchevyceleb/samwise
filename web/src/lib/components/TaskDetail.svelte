@@ -5,8 +5,12 @@
   import {
     extractReviewActionPanel,
     getUiStamp,
+    getMergeDeployState,
     isReviewActionStatus,
-    nextCopilotStampContext
+    isMergeDeployBusy,
+    mergeDeployButtonLabel,
+    nextManualInProgressStampContext,
+    requestMergeDeployContext
   } from '$lib/utils/review-actions';
   import LinkRow from './LinkRow.svelte';
 
@@ -22,6 +26,8 @@
   let attachments = $derived(task.attachments ?? []);
   let reviewPanel = $derived(extractReviewActionPanel(task, comments));
   let uiStamp = $derived(getUiStamp(task));
+  let mergeDeployState = $derived(getMergeDeployState(task));
+  let canMergeDeploy = $derived(!!task.pr_url && (task.status === 'approved' || mergeDeployState.status === 'failed'));
 
   function verdictColor(verdict: string | undefined) {
     if (verdict === 'merge') return '#34d399';
@@ -34,8 +40,13 @@
     if (task.pr_url) window.open(task.pr_url, '_blank', 'noopener');
   }
 
-  async function toggleCopilotStamp() {
-    await tasksStore.updateTask(task.id, { context: nextCopilotStampContext(task) });
+  async function toggleManualInProgressStamp() {
+    await tasksStore.updateTask(task.id, { context: nextManualInProgressStampContext(task) });
+  }
+
+  async function requestMergeDeploy() {
+    if (!canMergeDeploy || isMergeDeployBusy(mergeDeployState)) return;
+    await tasksStore.updateTask(task.id, { context: requestMergeDeployContext(task) });
   }
 
   async function markDone() {
@@ -106,8 +117,8 @@
               <p class="mt-1 text-sm font-semibold leading-snug text-slate-100">{reviewPanel.why}</p>
             </div>
             {#if uiStamp}
-              <span class="shrink-0 rounded-full border border-sky-400/40 bg-sky-400/15 px-2 py-0.5 text-[10px] font-black uppercase tracking-wide text-sky-200">
-                Copilot Review
+              <span class="shrink-0 rounded-full border border-orange-400/40 bg-orange-400/15 px-2 py-0.5 text-[10px] font-black uppercase tracking-wide text-orange-200">
+                Manual In Progress
               </span>
             {/if}
           </div>
@@ -129,17 +140,18 @@
             {#if task.status !== 'done'}
               <button
                 type="button"
-                onclick={toggleCopilotStamp}
-                class="rounded-lg border px-3 py-2 text-xs font-black text-sky-100 {uiStamp ? 'border-sky-300/50 bg-sky-400/20' : 'border-sky-300/25 bg-sky-400/10 hover:bg-sky-400/15'}"
+                onclick={toggleManualInProgressStamp}
+                class="rounded-lg border px-3 py-2 text-xs font-black text-orange-100 {uiStamp ? 'border-orange-300/50 bg-orange-400/20' : 'border-orange-300/25 bg-orange-400/10 hover:bg-orange-400/15'}"
               >
-                {uiStamp ? 'Remove Copilot Stamp' : 'Stamp Copilot Review'}
+                {uiStamp ? 'Clear In Progress Stamp' : 'Stamp In Progress'}
               </button>
               <button
                 type="button"
-                onclick={markDone}
-                class="rounded-lg border border-emerald-300/30 bg-emerald-400/10 px-3 py-2 text-xs font-black text-emerald-100 hover:bg-emerald-400/15"
+                onclick={canMergeDeploy ? requestMergeDeploy : markDone}
+                disabled={isMergeDeployBusy(mergeDeployState)}
+                class="rounded-lg border px-3 py-2 text-xs font-black {canMergeDeploy ? 'border-cyan-300/35 bg-cyan-400/10 text-cyan-100 hover:bg-cyan-400/15' : 'border-emerald-300/30 bg-emerald-400/10 text-emerald-100 hover:bg-emerald-400/15'} {isMergeDeployBusy(mergeDeployState) ? 'opacity-70 cursor-wait' : ''}"
               >
-                Mark Done
+                {canMergeDeploy ? mergeDeployButtonLabel(mergeDeployState) : 'Mark Done'}
               </button>
             {/if}
           </div>

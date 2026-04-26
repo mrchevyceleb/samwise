@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
@@ -34,6 +36,13 @@ impl Default for WorkerState {
 fn join_path(dir: &str, name: &str) -> String {
     std::path::Path::new(dir).join(name).to_string_lossy().into_owned()
 }
+
+const MERGE_DEPLOY_REQUESTED_AT_KEY: &str = "samwise_merge_deploy_requested_at";
+const MERGE_DEPLOY_STARTED_AT_KEY: &str = "samwise_merge_deploy_started_at";
+const MERGE_DEPLOY_COMPLETED_AT_KEY: &str = "samwise_merge_deploy_completed_at";
+const MERGE_DEPLOY_STATUS_KEY: &str = "samwise_merge_deploy_status";
+const MERGE_DEPLOY_ERROR_KEY: &str = "samwise_merge_deploy_error";
+const MERGE_DEPLOY_PLAN_KEY: &str = "samwise_merge_deploy_plan";
 
 async fn run_git(args: &[&str], repo_path: &str) -> Result<String, String> {
     let output = async_cmd("git")
@@ -646,8 +655,16 @@ async fn worker_loop(
             sweep_pr_review_queue(&config, &settings).await;
         }
 
+        // Pick up Merge + Deploy requests from either the desktop UI or the
+        // web UI. The browser only writes a context flag; this local worker
+        // owns GitHub/Railway/Supabase credentials and executes the workflow.
+        if tick % 2 == 0 {
+            sweep_merge_deploy_requests(&config).await;
+        }
+
         // Sweep approved/review/fixes_needed cards whose GitHub PRs got merged
-        // or closed outside Sam's pipeline. Every ~60s (12 ticks).
+        // or closed outside Sam's pipeline. Merged PRs run the same post-merge
+        // deploy plan before the card moves to Done. Every ~60s (12 ticks).
         if tick % 12 == 0 {
             sweep_pr_merged_cards(&config).await;
         }
@@ -3996,11 +4013,515 @@ async fn send_terminal_telegram(
     send_telegram(config, &msg).await;
 }
 
+#[derive(Debug, Clone)]
+struct DeployCommand {
+    category: &'static str,
+    label: String,
+    command: String,
+    cwd: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DeployPlan {
+    commands: Vec<DeployCommand>,
+    railway_reasons: Vec<String>,
+    supabase_migrations: Vec<String>,
+    supabase_functions: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct MergeDeployError {
+    message: String,
+    pr_merged: bool,
+}
+
+impl MergeDeployError {
+    fn new(message: impl Into<String>, pr_merged: bool) -> Self {
+        Self { message: message.into(), pr_merged }
+    }
+}
+
+/// Pick up merge/deploy requests written by the desktop or web UI. The UI only
+/// mutates task.context; this worker owns the privileged local CLIs.
+pub async fn sweep_merge_deploy_requests(config: &SupabaseConfig) {
+    let Ok(tasks) = supabase::fetch_tasks(config, None).await else { return };
+    let Some(arr) = tasks.as_array() else { return };
+
+    for task in arr {
+        let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        if !matches!(status, "approved" | "fixes_needed" | "review") { continue; }
+        if !merge_deploy_request_is_pending(task) { continue; }
+        start_merge_deploy_task(config, task.clone(), status == "approved", "Merge + Deploy requested from the UI.").await;
+    }
+}
+
+async fn start_merge_deploy_task(
+    config: &SupabaseConfig,
+    task: Value,
+    should_merge_if_open: bool,
+    start_comment: &str,
+) {
+    let task_id = task.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let pr_url = task.get("pr_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if task_id.is_empty() || pr_url.is_empty() { return; }
+
+    let mut context = task_context_object(&task);
+    context.insert(MERGE_DEPLOY_STATUS_KEY.to_string(), Value::String("running".to_string()));
+    context.insert(MERGE_DEPLOY_STARTED_AT_KEY.to_string(), Value::String(chrono::Utc::now().to_rfc3339()));
+    context.insert(MERGE_DEPLOY_ERROR_KEY.to_string(), Value::Null);
+    let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+        "context": Value::Object(context),
+        "updated_at": chrono::Utc::now().to_rfc3339(),
+    })).await;
+
+    agent_comment(config, &task_id, start_comment).await;
+
+    let config_clone = config.clone();
+    tokio::spawn(async move {
+        match run_merge_deploy_workflow(&config_clone, &task, should_merge_if_open).await {
+            Ok(summary) => {
+                let latest_task = supabase::fetch_task(&config_clone, &task_id).await.ok().flatten().unwrap_or_else(|| task.clone());
+                let mut context = task_context_object(&latest_task);
+                context.insert(MERGE_DEPLOY_STATUS_KEY.to_string(), Value::String("succeeded".to_string()));
+                context.insert(MERGE_DEPLOY_COMPLETED_AT_KEY.to_string(), Value::String(chrono::Utc::now().to_rfc3339()));
+                context.insert(MERGE_DEPLOY_ERROR_KEY.to_string(), Value::Null);
+                let _ = supabase::update_task(&config_clone, &task_id, &serde_json::json!({
+                    "status": "done",
+                    "completed_at": chrono::Utc::now().to_rfc3339(),
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                    "review_cycle_count": 0,
+                    "context": Value::Object(context),
+                    "failure_reason": Value::Null,
+                })).await;
+                notify_callback(&config_clone, &task_id, "done", Some(&pr_url), None);
+                agent_comment(&config_clone, &task_id, &format!("Merge + Deploy complete. Moving the card to Done.\n\n{}", summary)).await;
+            }
+            Err(err) => {
+                let latest_task = supabase::fetch_task(&config_clone, &task_id).await.ok().flatten().unwrap_or_else(|| task.clone());
+                let mut context = task_context_object(&latest_task);
+                context.insert(MERGE_DEPLOY_STATUS_KEY.to_string(), Value::String("failed".to_string()));
+                context.insert(MERGE_DEPLOY_COMPLETED_AT_KEY.to_string(), Value::String(chrono::Utc::now().to_rfc3339()));
+                context.insert(MERGE_DEPLOY_ERROR_KEY.to_string(), Value::String(truncate(&err.message, 900)));
+                let next_status = if err.pr_merged { "fixes_needed" } else { "approved" };
+                let _ = supabase::update_task(&config_clone, &task_id, &serde_json::json!({
+                    "status": next_status,
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                    "context": Value::Object(context),
+                    "failure_reason": format!("Merge + Deploy failed: {}", truncate(&err.message, 1000)),
+                })).await;
+                notify_callback(&config_clone, &task_id, next_status, Some(&pr_url), Some(&err.message));
+                agent_comment(
+                    &config_clone,
+                    &task_id,
+                    &format!(
+                        "Merge + Deploy failed{}. Leaving this card in {}.\n\nReason: {}",
+                        if err.pr_merged { " after the PR was merged" } else { "" },
+                        if err.pr_merged { "Fixes Needed" } else { "Ready to Merge" },
+                        truncate(&err.message, 1800)
+                    ),
+                ).await;
+            }
+        }
+    });
+}
+
+async fn run_merge_deploy_workflow(
+    config: &SupabaseConfig,
+    task: &Value,
+    should_merge_if_open: bool,
+) -> Result<String, MergeDeployError> {
+    let task_id = task.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let pr_url = task.get("pr_url").and_then(|v| v.as_str()).unwrap_or("");
+    let repo_path = task.get("repo_path").and_then(|v| v.as_str()).unwrap_or("");
+    if task_id.is_empty() {
+        return Err(MergeDeployError::new("task id missing", false));
+    }
+    if !review::is_safe_pr_url(pr_url) {
+        return Err(MergeDeployError::new(format!("unsafe or missing PR URL: {}", pr_url), false));
+    }
+    if repo_path.is_empty() || !Path::new(repo_path).is_dir() {
+        return Err(MergeDeployError::new(format!("repo_path is missing or not a directory: {}", repo_path), false));
+    }
+
+    let files = review::fetch_pr_files(pr_url, repo_path)
+        .await
+        .map_err(|e| MergeDeployError::new(format!("failed to list PR files: {}", e), false))?;
+
+    let mut pr_merged = gh_pr_is_merged(pr_url, repo_path)
+        .await
+        .map_err(|e| MergeDeployError::new(format!("failed to read PR state: {}", e), false))?;
+
+    if !pr_merged {
+        if !should_merge_if_open {
+            return Err(MergeDeployError::new("PR is not merged yet, and this request is only allowed to deploy an already-merged PR.", false));
+        }
+        let head_sha = review::fetch_pr_head_sha(pr_url, repo_path)
+            .await
+            .map_err(|e| MergeDeployError::new(format!("failed to read PR head SHA: {}", e), false))?;
+        match review::wait_for_ci(pr_url, repo_path).await {
+            Ok(true) => {}
+            Ok(false) => return Err(MergeDeployError::new("non-Vercel CI checks are not green; merge blocked", false)),
+            Err(e) => return Err(MergeDeployError::new(format!("CI check failed before merge: {}", e), false)),
+        }
+        review::gh_merge(pr_url, repo_path, &head_sha)
+            .await
+            .map_err(|e| MergeDeployError::new(format!("GitHub merge failed: {}", e), false))?;
+        pr_merged = true;
+        agent_comment(config, task_id, "PR merged on GitHub. Preparing post-merge deploy plan.").await;
+    }
+
+    let default_branch = detect_default_branch(repo_path).await;
+    let deploy_path = prepare_deploy_checkout(repo_path, task_id, &default_branch)
+        .await
+        .map_err(|e| MergeDeployError::new(e, pr_merged))?;
+    let plan = build_deploy_plan(&deploy_path, &files)
+        .await
+        .map_err(|e| MergeDeployError::new(e, pr_merged))?;
+
+    persist_deploy_plan(config, task_id, &plan).await;
+    agent_comment(config, task_id, &format!("Post-merge deploy plan:\n\n{}", deploy_plan_markdown(&plan))).await;
+
+    if plan.commands.is_empty() {
+        return Ok("No Railway server, Supabase migration, or Supabase Edge Function deploy steps were detected for this PR.".to_string());
+    }
+
+    for command in &plan.commands {
+        run_deploy_command(command)
+            .await
+            .map_err(|e| MergeDeployError::new(e, pr_merged))?;
+    }
+
+    Ok(deploy_plan_markdown(&plan))
+}
+
+async fn gh_pr_is_merged(pr_url: &str, repo_path: &str) -> Result<bool, String> {
+    let output = async_cmd("gh")
+        .args(["pr", "view", pr_url, "--json", "state,mergedAt"])
+        .current_dir(repo_path)
+        .output()
+        .await
+        .map_err(|e| format!("spawn gh: {}", e))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let parsed: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("parse gh pr view: {}", e))?;
+    let state = parsed.get("state").and_then(|v| v.as_str()).unwrap_or("").to_uppercase();
+    let merged_at = parsed.get("mergedAt").and_then(|v| v.as_str()).unwrap_or("");
+    Ok(state == "MERGED" || !merged_at.is_empty())
+}
+
+async fn prepare_deploy_checkout(repo_path: &str, task_id: &str, default_branch: &str) -> Result<String, String> {
+    let deploy_path = task_worktree_path(repo_path, task_id)
+        .filter(|p| p.is_dir())
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| repo_path.to_string());
+
+    let dirty = run_git(&["status", "--porcelain"], &deploy_path).await?;
+    if !dirty.trim().is_empty() {
+        return Err(format!("deployment checkout is dirty at {}; refusing to deploy over local changes", deploy_path));
+    }
+
+    run_git(&["fetch", "origin", "--prune"], &deploy_path).await?;
+    if deploy_path == repo_path {
+        run_git(&["checkout", default_branch], &deploy_path).await?;
+        run_git(&["pull", "--ff-only", "origin", default_branch], &deploy_path).await?;
+    } else {
+        run_git(&["checkout", "--detach", &format!("origin/{}", default_branch)], &deploy_path).await?;
+    }
+    Ok(deploy_path)
+}
+
+async fn build_deploy_plan(repo_path: &str, files: &[String]) -> Result<DeployPlan, String> {
+    let mut plan = DeployPlan::default();
+
+    for file in files {
+        if file.starts_with("supabase/migrations/") && file.ends_with(".sql") {
+            push_unique_string(&mut plan.supabase_migrations, file.clone());
+        }
+        if let Some(name) = edge_function_name(file) {
+            push_unique_string(&mut plan.supabase_functions, name);
+        }
+    }
+
+    if !plan.supabase_migrations.is_empty() {
+        plan.commands.push(DeployCommand {
+            category: "supabase_migrations",
+            label: format!("Supabase migrations ({})", plan.supabase_migrations.join(", ")),
+            command: "npx --yes supabase db push".to_string(),
+            cwd: repo_path.to_string(),
+        });
+    }
+
+    for function_name in &plan.supabase_functions {
+        plan.commands.push(DeployCommand {
+            category: "supabase_edge_functions",
+            label: format!("Supabase Edge Function {}", function_name),
+            command: format!("npx --yes supabase functions deploy {}", shell_quote_simple(function_name)),
+            cwd: repo_path.to_string(),
+        });
+    }
+
+    let package_scripts = read_package_scripts(repo_path).await;
+    let touches_tools = files.iter().any(|f| f.starts_with("tools-server/"));
+    let touches_server = files.iter().any(|f| is_server_deploy_path(f));
+
+    if touches_tools && package_scripts.iter().any(|s| s == "tools:deploy") {
+        plan.railway_reasons.push("tools-server/ changed; using npm run tools:deploy".to_string());
+        plan.commands.push(DeployCommand {
+            category: "railway",
+            label: "Railway tools-server".to_string(),
+            command: "npm run tools:deploy".to_string(),
+            cwd: repo_path.to_string(),
+        });
+    }
+
+    if touches_server && package_scripts.iter().any(|s| s == "server:deploy") {
+        plan.railway_reasons.push("server/root deploy files changed; using npm run server:deploy".to_string());
+        plan.commands.push(DeployCommand {
+            category: "railway",
+            label: "Railway server".to_string(),
+            command: "npm run server:deploy".to_string(),
+            cwd: repo_path.to_string(),
+        });
+    }
+
+    if !plan.commands.iter().any(|c| c.category == "railway") {
+        for root in discover_railway_roots(repo_path) {
+            let rel = path_relative_to(&root, repo_path);
+            let matches_root = files.iter().any(|f| railway_root_matches_file(&rel, f));
+            if !matches_root { continue; }
+            let label = if rel.is_empty() { "Railway server".to_string() } else { format!("Railway server ({})", rel) };
+            let command = if rel.is_empty() {
+                "railway up --detach".to_string()
+            } else {
+                format!("railway up --detach --path-as-root {}", shell_quote_simple(&rel))
+            };
+            plan.railway_reasons.push(format!("{} changed; using {}", if rel.is_empty() { "Railway root".to_string() } else { rel.clone() }, command));
+            plan.commands.push(DeployCommand {
+                category: "railway",
+                label,
+                command,
+                cwd: repo_path.to_string(),
+            });
+        }
+    }
+
+    Ok(plan)
+}
+
+async fn run_deploy_command(command: &DeployCommand) -> Result<(), String> {
+    log::info!("[merge-deploy] running {} in {}: {}", command.label, command.cwd, command.command);
+    let doppler_scope = dev_server::doppler_scope_for_checkout(&command.cwd).await;
+    let mut cmd = if let Some(scope) = doppler_scope.as_deref() {
+        let mut c = async_cmd("doppler");
+        c.args(["run", "--scope", scope, "--", "sh", "-lc", &command.command]);
+        c
+    } else {
+        let mut c = async_cmd("sh");
+        c.args(["-lc", &command.command]);
+        c
+    };
+    cmd.current_dir(&command.cwd)
+        .env("CI", "true")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let output = tokio::time::timeout(std::time::Duration::from_secs(20 * 60), cmd.output())
+        .await
+        .map_err(|_| format!("{} timed out after 20 minutes", command.label))?
+        .map_err(|e| format!("spawn {}: {}", command.label, e))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = redact_secrets(&String::from_utf8_lossy(&output.stderr));
+    let stdout = redact_secrets(&String::from_utf8_lossy(&output.stdout));
+    Err(format!(
+        "{} failed with {}. stderr: {} stdout: {}",
+        command.label,
+        output.status,
+        truncate(stderr.trim(), 900),
+        truncate(stdout.trim(), 500)
+    ))
+}
+
+async fn persist_deploy_plan(config: &SupabaseConfig, task_id: &str, plan: &DeployPlan) {
+    let commands: Vec<Value> = plan.commands.iter().map(|c| serde_json::json!({
+        "category": c.category,
+        "label": c.label,
+        "command": c.command,
+        "cwd": c.cwd,
+    })).collect();
+    if let Ok(Some(task)) = supabase::fetch_task(config, task_id).await {
+        let mut context = task_context_object(&task);
+        context.insert(MERGE_DEPLOY_PLAN_KEY.to_string(), serde_json::json!({
+            "railway_reasons": &plan.railway_reasons,
+            "supabase_migrations": &plan.supabase_migrations,
+            "supabase_functions": &plan.supabase_functions,
+            "commands": commands,
+        }));
+        let _ = supabase::update_task(config, task_id, &serde_json::json!({
+            "context": Value::Object(context),
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+        })).await;
+    }
+}
+
+fn deploy_plan_markdown(plan: &DeployPlan) -> String {
+    let railway = if plan.railway_reasons.is_empty() {
+        "no - no Railway server deploy path matched the PR files".to_string()
+    } else {
+        format!("yes - {}", plan.railway_reasons.join("; "))
+    };
+    let migrations = if plan.supabase_migrations.is_empty() {
+        "no - no supabase/migrations/*.sql files changed".to_string()
+    } else {
+        format!("yes - {}", plan.supabase_migrations.join(", "))
+    };
+    let functions = if plan.supabase_functions.is_empty() {
+        "no - no supabase/functions/<name>/ files changed".to_string()
+    } else {
+        format!("yes - {}", plan.supabase_functions.join(", "))
+    };
+    let commands = if plan.commands.is_empty() {
+        "Commands: none".to_string()
+    } else {
+        format!(
+            "Commands:\n{}",
+            plan.commands.iter()
+                .map(|c| format!("- {}: `{}` in `{}`", c.label, c.command, c.cwd))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+    format!(
+        "- Railway server: {}\n- Supabase migrations: {}\n- Supabase Edge Functions: {}\n\n{}",
+        railway, migrations, functions, commands
+    )
+}
+
+fn merge_deploy_request_is_pending(task: &Value) -> bool {
+    let context = task.get("context").and_then(|v| v.as_object());
+    let Some(context) = context else { return false; };
+    let status = context.get(MERGE_DEPLOY_STATUS_KEY).and_then(|v| v.as_str()).unwrap_or("");
+    if status == "running" || status == "succeeded" {
+        return false;
+    }
+    status == "requested" && context.get(MERGE_DEPLOY_REQUESTED_AT_KEY).and_then(|v| v.as_str()).is_some()
+}
+
+fn task_context_object(task: &Value) -> serde_json::Map<String, Value> {
+    task.get("context")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn task_worktree_path(main_repo_path: &str, task_id: &str) -> Option<PathBuf> {
+    let repo_name = Path::new(main_repo_path).file_name()?.to_string_lossy().into_owned();
+    Some(worktrees_root().join(repo_name).join(short_task_id(task_id)))
+}
+
+fn edge_function_name(file: &str) -> Option<String> {
+    let rest = file.strip_prefix("supabase/functions/")?;
+    let name = rest.split('/').next()?.trim();
+    if name.is_empty() { None } else { Some(name.to_string()) }
+}
+
+fn is_server_deploy_path(file: &str) -> bool {
+    file.starts_with("server/")
+        || matches!(
+            file,
+            "Dockerfile" | "railway.json" | "railway.toml" | "nixpacks.toml" | ".railway-redeploy" |
+            "package.json" | "package-lock.json" | "tsconfig.server.json"
+        )
+}
+
+async fn read_package_scripts(repo_path: &str) -> Vec<String> {
+    let path = Path::new(repo_path).join("package.json");
+    let Ok(raw) = tokio::fs::read_to_string(path).await else { return Vec::new(); };
+    let Ok(parsed) = serde_json::from_str::<Value>(&raw) else { return Vec::new(); };
+    parsed.get("scripts")
+        .and_then(|v| v.as_object())
+        .map(|obj| obj.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn discover_railway_roots(repo_path: &str) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    discover_railway_roots_inner(Path::new(repo_path), Path::new(repo_path), 0, &mut roots);
+    roots
+}
+
+fn discover_railway_roots_inner(root: &Path, dir: &Path, depth: usize, roots: &mut Vec<PathBuf>) {
+    if depth > 3 { return; }
+    let name = dir.file_name().and_then(|v| v.to_str()).unwrap_or("");
+    if matches!(name, ".git" | "node_modules" | "dist" | "build" | ".next" | "target") {
+        return;
+    }
+    if dir.join("railway.json").is_file() || dir.join("railway.toml").is_file() {
+        if !roots.iter().any(|p| p == dir) {
+            roots.push(dir.to_path_buf());
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return; };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            discover_railway_roots_inner(root, &path, depth + 1, roots);
+        }
+    }
+    if depth == 0 && root.join("nixpacks.toml").is_file() && !roots.iter().any(|p| p == root) {
+        roots.push(root.to_path_buf());
+    }
+}
+
+fn path_relative_to(path: &Path, base: &str) -> String {
+    path.strip_prefix(base)
+        .ok()
+        .map(|p| p.to_string_lossy().trim_matches('/').to_string())
+        .unwrap_or_default()
+}
+
+fn railway_root_matches_file(root_rel: &str, file: &str) -> bool {
+    if root_rel.is_empty() {
+        return is_server_deploy_path(file);
+    }
+    file == root_rel || file.starts_with(&format!("{}/", root_rel))
+}
+
+fn push_unique_string(items: &mut Vec<String>, value: String) {
+    if !items.iter().any(|item| item == &value) {
+        items.push(value);
+    }
+}
+
+fn shell_quote_simple(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn redact_secrets(value: &str) -> String {
+    let mut out = value.to_string();
+    let patterns = [
+        r"(?i)(token|key|secret|password)=([^\s]+)",
+        r"(?i)(bearer\s+)[A-Za-z0-9._\-]+",
+        r"dp\.st\.[A-Za-z0-9._\-]+",
+        r"eyJ[A-Za-z0-9._\-]+",
+    ];
+    for pattern in patterns {
+        if let Ok(re) = regex::Regex::new(pattern) {
+            out = re.replace_all(&out, "$1<redacted>").to_string();
+        }
+    }
+    out
+}
+
 /// Scan cards whose PR status on GitHub has advanced without Sam knowing
 /// — PR merged or closed while the card was still sitting in review /
-/// fixes_needed / approved — and move those cards to done. Runs on the
-/// poll-loop cadence. Never blocks: spawns one `gh pr view` per candidate
-/// and updates Supabase inline.
+/// fixes_needed / approved. Merged PRs run the post-merge deploy plan before
+/// moving to done. Runs on the poll-loop cadence.
 pub async fn sweep_pr_merged_cards(config: &SupabaseConfig) {
     // Candidate statuses: any state where the card is "waiting on Matt" but
     // GitHub could have moved on. `review` is in scope for the case where
@@ -4031,14 +4552,31 @@ pub async fn sweep_pr_merged_cards(config: &SupabaseConfig) {
         let merged_at = parsed.get("mergedAt").and_then(|v| v.as_str()).unwrap_or("");
 
         if gh_state == "MERGED" || !merged_at.is_empty() {
-            let _ = supabase::update_task(config, task_id, &serde_json::json!({
-                "status": "done",
-                "completed_at": chrono::Utc::now().to_rfc3339(),
-                "updated_at": chrono::Utc::now().to_rfc3339(),
-                "review_cycle_count": 0,
-            })).await;
-            notify_callback(config, task_id, "done", Some(pr_url), None);
-            agent_comment(config, task_id, "PR merged on GitHub. Moving the card to Done.").await;
+            let md_status = task
+                .get("context")
+                .and_then(|v| v.as_object())
+                .and_then(|c| c.get(MERGE_DEPLOY_STATUS_KEY))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if md_status == "running" || md_status == "failed" {
+                continue;
+            }
+            if md_status == "succeeded" {
+                let _ = supabase::update_task(config, task_id, &serde_json::json!({
+                    "status": "done",
+                    "completed_at": chrono::Utc::now().to_rfc3339(),
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                    "review_cycle_count": 0,
+                })).await;
+                notify_callback(config, task_id, "done", Some(pr_url), None);
+                continue;
+            }
+            start_merge_deploy_task(
+                config,
+                task.clone(),
+                false,
+                "PR merged on GitHub. Running post-merge deploy plan before moving the card to Done.",
+            ).await;
             continue;
         }
 

@@ -230,7 +230,7 @@ pub async fn try_auto_merge(
 
 // ── helpers ──────────────────────────────────────────────────────────
 
-fn is_safe_pr_url(pr_url: &str) -> bool {
+pub fn is_safe_pr_url(pr_url: &str) -> bool {
     // Permit only standard GitHub PR URLs. Prevents leading '-' or metacharacter
     // surprises if a future caller passes something exotic.
     let re = match regex::Regex::new(r"^https://github\.com/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+/pull/\d+$") {
@@ -240,7 +240,7 @@ fn is_safe_pr_url(pr_url: &str) -> bool {
     re.is_match(pr_url)
 }
 
-async fn fetch_pr_head_sha(pr_url: &str, repo_path: &str) -> Result<String, String> {
+pub async fn fetch_pr_head_sha(pr_url: &str, repo_path: &str) -> Result<String, String> {
     let output = async_cmd("gh")
         .args(["pr", "view", pr_url, "--json", "headRefOid"])
         .current_dir(repo_path)
@@ -269,7 +269,7 @@ async fn fetch_pr_diff(pr_url: &str, repo_path: &str) -> Result<String, String> 
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-async fn fetch_pr_files(pr_url: &str, repo_path: &str) -> Result<Vec<String>, String> {
+pub async fn fetch_pr_files(pr_url: &str, repo_path: &str) -> Result<Vec<String>, String> {
     let output = async_cmd("gh")
         .args(["pr", "view", pr_url, "--json", "files"])
         .current_dir(repo_path)
@@ -626,7 +626,7 @@ fn min_across_dimensions(scores: &Value) -> Option<i64> {
 /// pass, Ok(false) if any fail or if we time out. Require at least 2 polls before
 /// trusting an "empty / all pass" result, so checks that haven't registered yet
 /// don't short-circuit the gate.
-async fn wait_for_ci(pr_url: &str, repo_path: &str) -> Result<bool, String> {
+pub async fn wait_for_ci(pr_url: &str, repo_path: &str) -> Result<bool, String> {
     let start = std::time::Instant::now();
     let max = Duration::from_secs(CI_POLL_MAX_SECS);
     let interval = Duration::from_secs(CI_POLL_INTERVAL_SECS);
@@ -656,7 +656,16 @@ async fn wait_for_ci(pr_url: &str, repo_path: &str) -> Result<bool, String> {
                 let mut all_done = true;
                 let mut any_fail = false;
                 let mut any_pass = false;
+                let mut considered_checks = 0usize;
                 for c in &checks {
+                    let name = c.get("name")
+                        .or_else(|| c.get("context"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if is_ignored_vercel_check(name) {
+                        continue;
+                    }
+                    considered_checks += 1;
                     let bucket = c.get("bucket").and_then(|v| v.as_str()).unwrap_or("");
                     match bucket {
                         "pass" => { any_pass = true; }
@@ -664,6 +673,10 @@ async fn wait_for_ci(pr_url: &str, repo_path: &str) -> Result<bool, String> {
                         "fail" | "cancel" => { any_fail = true; }
                         _ => { all_done = false; }
                     }
+                }
+                if considered_checks == 0 {
+                    log::info!("[review] only ignored Vercel checks on PR {}; treating CI as pass", pr_url);
+                    return Ok(true);
                 }
                 if any_fail { return Ok(false); }
                 if all_done && any_pass { return Ok(true); }
@@ -684,7 +697,7 @@ async fn wait_for_ci(pr_url: &str, repo_path: &str) -> Result<bool, String> {
     }
 }
 
-async fn gh_merge(pr_url: &str, repo_path: &str, head_sha: &str) -> Result<(), String> {
+pub async fn gh_merge(pr_url: &str, repo_path: &str, head_sha: &str) -> Result<(), String> {
     // --match-head-commit rejects if anyone pushed after our review.
     let output = async_cmd("gh")
         .args([

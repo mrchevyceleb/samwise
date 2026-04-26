@@ -8,8 +8,12 @@
 	import {
 		extractReviewActionPanel,
 		getUiStamp,
+		getMergeDeployState,
 		isReviewActionStatus,
+		isMergeDeployBusy,
+		mergeDeployButtonLabel,
 		nextManualInProgressStampContext,
+		requestMergeDeployContext,
 	} from '$lib/utils/review-actions';
 	import { formatTimeAgo } from '$lib/utils/relative-time';
 	import { safeInvoke, openExternal } from '$lib/utils/tauri';
@@ -46,9 +50,11 @@
 	let stopHovered = $state(false);
 	let restartHovered = $state(false);
 	let markDoneHovered = $state(false);
+	let mergeDeployHovered = $state(false);
 	let stopping = $state(false);
 	let restarting = $state(false);
 	let markingDone = $state(false);
+	let requestingMergeDeploy = $state(false);
 	let prBtnHovered = $state(false);
 
 	// Tabs: "details" or "report"
@@ -91,7 +97,9 @@
 	let comments = $derived(commentStore.getComments(task.id));
 	let reviewPanel = $derived(extractReviewActionPanel(task, comments));
 	let uiStamp = $derived(getUiStamp(task));
+	let mergeDeployState = $derived(getMergeDeployState(task));
 	let showReviewActions = $derived(isReviewActionStatus(task.status) && !!(reviewPanel || task.pr_url));
+	let canMergeDeploy = $derived(!!task.pr_url && (task.status === 'approved' || mergeDeployState.status === 'failed'));
 
 	async function saveTitle() {
 		if (editTitle.trim() && editTitle !== task.title) {
@@ -131,6 +139,16 @@
 
 	async function handleToggleManualInProgressStamp() {
 		await taskStore.updateTask(task.id, { context: nextManualInProgressStampContext(task) });
+	}
+
+	async function handleRequestMergeDeploy() {
+		if (!canMergeDeploy || requestingMergeDeploy || isMergeDeployBusy(mergeDeployState)) return;
+		requestingMergeDeploy = true;
+		try {
+			await taskStore.updateTask(task.id, { context: requestMergeDeployContext(task) });
+		} finally {
+			requestingMergeDeploy = false;
+		}
 	}
 
 	async function handleStop() {
@@ -429,23 +447,43 @@
 								>
 									{uiStamp ? 'Clear In Progress Stamp' : 'Stamp In Progress'}
 								</button>
-								<button
-									type="button"
-									onclick={handleMarkDone}
-									disabled={markingDone}
-									style="
-										display: inline-flex; align-items: center; gap: 7px;
-										padding: 8px 12px; border-radius: 9px;
-										background: rgba(63, 185, 80, 0.10);
-										border: 1px solid rgba(63, 185, 80, 0.26);
-										color: var(--accent-green);
-										font-size: 12px; font-weight: 900;
-										cursor: {markingDone ? 'wait' : 'pointer'}; font-family: var(--font-ui);
-										opacity: {markingDone ? '0.65' : '1'};
-									"
-								>
-									{markingDone ? 'Marking Done...' : 'Mark Done'}
-								</button>
+								{#if canMergeDeploy}
+									<button
+										type="button"
+										onclick={handleRequestMergeDeploy}
+										disabled={requestingMergeDeploy || isMergeDeployBusy(mergeDeployState)}
+										style="
+											display: inline-flex; align-items: center; gap: 7px;
+											padding: 8px 12px; border-radius: 9px;
+											background: rgba(34, 211, 238, 0.11);
+											border: 1px solid rgba(103, 232, 249, 0.32);
+											color: #67e8f9;
+											font-size: 12px; font-weight: 900;
+											cursor: {requestingMergeDeploy || isMergeDeployBusy(mergeDeployState) ? 'wait' : 'pointer'}; font-family: var(--font-ui);
+											opacity: {requestingMergeDeploy || isMergeDeployBusy(mergeDeployState) ? '0.68' : '1'};
+										"
+									>
+										{requestingMergeDeploy ? 'Queueing...' : mergeDeployButtonLabel(mergeDeployState)}
+									</button>
+								{:else}
+									<button
+										type="button"
+										onclick={handleMarkDone}
+										disabled={markingDone}
+										style="
+											display: inline-flex; align-items: center; gap: 7px;
+											padding: 8px 12px; border-radius: 9px;
+											background: rgba(63, 185, 80, 0.10);
+											border: 1px solid rgba(63, 185, 80, 0.26);
+											color: var(--accent-green);
+											font-size: 12px; font-weight: 900;
+											cursor: {markingDone ? 'wait' : 'pointer'}; font-family: var(--font-ui);
+											opacity: {markingDone ? '0.65' : '1'};
+										"
+									>
+										{markingDone ? 'Marking Done...' : 'Mark Done'}
+									</button>
+								{/if}
 							{/if}
 						</div>
 					</div>
@@ -730,20 +768,20 @@
 						<button
 							style="
 								width: 100%; padding: 8px 12px; border-radius: 8px;
-								background: {markDoneHovered ? 'rgba(63, 185, 80, 0.14)' : 'rgba(63, 185, 80, 0.08)'};
-								border: 1px solid rgba(63, 185, 80, 0.25);
-								color: var(--accent-green); font-size: 11px; font-weight: 800;
-								font-family: var(--font-ui); cursor: {markingDone ? 'wait' : 'pointer'};
+								background: {canMergeDeploy ? (mergeDeployHovered ? 'rgba(34, 211, 238, 0.16)' : 'rgba(34, 211, 238, 0.09)') : (markDoneHovered ? 'rgba(63, 185, 80, 0.14)' : 'rgba(63, 185, 80, 0.08)')};
+								border: 1px solid {canMergeDeploy ? 'rgba(103, 232, 249, 0.32)' : 'rgba(63, 185, 80, 0.25)'};
+								color: {canMergeDeploy ? '#67e8f9' : 'var(--accent-green)'}; font-size: 11px; font-weight: 800;
+								font-family: var(--font-ui); cursor: {markingDone || requestingMergeDeploy || isMergeDeployBusy(mergeDeployState) ? 'wait' : 'pointer'};
 								transition: all 0.15s ease;
-								transform: {markDoneHovered && !markingDone ? 'translateY(-1px)' : 'none'};
-								opacity: {markingDone ? '0.6' : '1'};
+								transform: {(canMergeDeploy ? mergeDeployHovered : markDoneHovered) && !markingDone && !requestingMergeDeploy && !isMergeDeployBusy(mergeDeployState) ? 'translateY(-1px)' : 'none'};
+								opacity: {markingDone || requestingMergeDeploy || isMergeDeployBusy(mergeDeployState) ? '0.6' : '1'};
 							"
-							onmouseenter={() => markDoneHovered = true}
-							onmouseleave={() => markDoneHovered = false}
-							onclick={handleMarkDone}
-							disabled={markingDone}
+							onmouseenter={() => { markDoneHovered = true; mergeDeployHovered = true; }}
+							onmouseleave={() => { markDoneHovered = false; mergeDeployHovered = false; }}
+							onclick={canMergeDeploy ? handleRequestMergeDeploy : handleMarkDone}
+							disabled={markingDone || requestingMergeDeploy || isMergeDeployBusy(mergeDeployState)}
 						>
-							{markingDone ? 'Marking Done...' : 'Mark Done'}
+							{canMergeDeploy ? (requestingMergeDeploy ? 'Queueing...' : mergeDeployButtonLabel(mergeDeployState)) : (markingDone ? 'Marking Done...' : 'Mark Done')}
 						</button>
 					{/if}
 

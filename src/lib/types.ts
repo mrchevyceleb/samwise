@@ -50,6 +50,7 @@ export interface AeTask {
   review_summary: string | null;
   auto_merged: boolean | null;
   auto_merge_blocked_reason: string | null;
+  failure_reason?: string | null;
 }
 
 export interface AeComment {

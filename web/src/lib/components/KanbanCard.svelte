@@ -5,15 +5,21 @@
   import {
     extractReviewActionPanel,
     getUiStamp,
+    getMergeDeployState,
     isReviewActionStatus,
-    nextCopilotStampContext
+    isMergeDeployBusy,
+    mergeDeployButtonLabel,
+    nextManualInProgressStampContext,
+    requestMergeDeployContext
   } from '$lib/utils/review-actions';
   let { task, onOpen }: { task: AeTask; onOpen: (t: AeTask) => void } = $props();
 
   let comments = $derived(tasksStore.comments[task.id] ?? []);
   let reviewPanel = $derived(extractReviewActionPanel(task, comments));
   let uiStamp = $derived(getUiStamp(task));
+  let mergeDeployState = $derived(getMergeDeployState(task));
   let showReviewActions = $derived(isReviewActionStatus(task.status) && !!(reviewPanel || task.pr_url));
+  let canMergeDeploy = $derived(!!task.pr_url && (task.status === 'approved' || mergeDeployState.status === 'failed'));
 
   function relTime(iso: string) {
     const d = Date.now() - new Date(iso).getTime();
@@ -38,9 +44,15 @@
     if (task.pr_url) window.open(task.pr_url, '_blank', 'noopener');
   }
 
-  async function toggleCopilotStamp(e: MouseEvent) {
+  async function toggleManualInProgressStamp(e: MouseEvent) {
     e.stopPropagation();
-    await tasksStore.updateTask(task.id, { context: nextCopilotStampContext(task) });
+    await tasksStore.updateTask(task.id, { context: nextManualInProgressStampContext(task) });
+  }
+
+  async function requestMergeDeploy(e: MouseEvent) {
+    e.stopPropagation();
+    if (!canMergeDeploy || isMergeDeployBusy(mergeDeployState)) return;
+    await tasksStore.updateTask(task.id, { context: requestMergeDeployContext(task) });
   }
 
   async function markDone(e: MouseEvent) {
@@ -65,13 +77,13 @@
   class="group w-full text-left rounded-xl border border-white/10 bg-white/5 p-3 backdrop-blur hover:bg-white/10 hover:scale-[1.01] hover:-translate-y-0.5 active:scale-[0.99] transition-all shadow-sm cursor-grab active:cursor-grabbing"
 >
   {#if uiStamp}
-    <div class="mb-2 rounded-xl border border-sky-300/70 bg-gradient-to-r from-sky-400/25 via-cyan-300/15 to-emerald-300/20 px-2.5 py-2 shadow-lg shadow-sky-950/30">
+    <div class="mb-2 rounded-xl border border-orange-300/70 bg-gradient-to-r from-orange-400/30 via-amber-300/15 to-rose-300/20 px-2.5 py-2 shadow-lg shadow-orange-950/30">
       <div class="flex items-center justify-between gap-2">
-        <span class="text-[11px] font-black uppercase tracking-[0.16em] text-sky-50">
-          Waiting on Copilot Review
+        <span class="text-[11px] font-black uppercase tracking-[0.16em] text-orange-50">
+          Manual In Progress
         </span>
-        <span class="rounded-full border border-sky-200/40 bg-black/25 px-1.5 py-0.5 text-[9px] font-black uppercase tracking-wide text-sky-100">
-          Stamped
+        <span class="rounded-full border border-orange-200/40 bg-black/25 px-1.5 py-0.5 text-[9px] font-black uppercase tracking-wide text-orange-100">
+          Mine
         </span>
       </div>
     </div>
@@ -129,17 +141,18 @@
     <div class="mt-2 grid grid-cols-2 gap-1.5">
       <button
         type="button"
-        onclick={toggleCopilotStamp}
-        class="rounded-lg border px-2 py-1.5 text-[10px] font-black text-sky-100 transition {uiStamp ? 'border-sky-300/50 bg-sky-400/20' : 'border-sky-300/25 bg-sky-400/10 hover:bg-sky-400/15'}"
+        onclick={toggleManualInProgressStamp}
+        class="rounded-lg border px-2 py-1.5 text-[10px] font-black text-orange-100 transition {uiStamp ? 'border-orange-300/50 bg-orange-400/20' : 'border-orange-300/25 bg-orange-400/10 hover:bg-orange-400/15'}"
       >
-        {uiStamp ? 'Unstamp' : 'Copilot Review'}
+        {uiStamp ? 'Clear Stamp' : 'In Progress'}
       </button>
       <button
         type="button"
-        onclick={markDone}
-        class="rounded-lg border border-emerald-300/30 bg-emerald-400/10 px-2 py-1.5 text-[10px] font-black text-emerald-100 transition hover:bg-emerald-400/15"
+        onclick={canMergeDeploy ? requestMergeDeploy : markDone}
+        disabled={isMergeDeployBusy(mergeDeployState)}
+        class="rounded-lg border px-2 py-1.5 text-[10px] font-black transition {canMergeDeploy ? 'border-cyan-300/35 bg-cyan-400/10 text-cyan-100 hover:bg-cyan-400/15' : 'border-emerald-300/30 bg-emerald-400/10 text-emerald-100 hover:bg-emerald-400/15'} {isMergeDeployBusy(mergeDeployState) ? 'opacity-70 cursor-wait' : ''}"
       >
-        Mark Done
+        {canMergeDeploy ? mergeDeployButtonLabel(mergeDeployState) : 'Mark Done'}
       </button>
     </div>
   {/if}

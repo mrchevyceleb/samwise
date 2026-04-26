@@ -83,6 +83,13 @@ async fn doppler_scope_for(main_repo: &str, worktree: &str) -> Option<String> {
     None
 }
 
+/// Resolve the Doppler scope Sam should use when running commands for a repo
+/// checkout or Samwise worktree.
+pub async fn doppler_scope_for_checkout(repo_path: &str) -> Option<String> {
+    let main_repo = resolve_main_repo(repo_path).await;
+    doppler_scope_for(&main_repo, repo_path).await
+}
+
 async fn configured_doppler_scopes() -> Vec<String> {
     if which::which("doppler").is_err() { return Vec::new(); }
     let out = async_cmd("doppler")

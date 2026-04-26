@@ -1,7 +1,12 @@
 import type { AeComment, AeTask } from '$lib/types';
 
 export const UI_STAMP_KEY = 'samwise_ui_stamp';
-export const COPILOT_REVIEW_STAMP = 'copilot_review';
+export const MANUAL_IN_PROGRESS_STAMP = 'manual_in_progress';
+const LEGACY_COPILOT_REVIEW_STAMP = 'copilot_review';
+export const MERGE_DEPLOY_REQUESTED_AT_KEY = 'samwise_merge_deploy_requested_at';
+export const MERGE_DEPLOY_STARTED_AT_KEY = 'samwise_merge_deploy_started_at';
+export const MERGE_DEPLOY_STATUS_KEY = 'samwise_merge_deploy_status';
+export const MERGE_DEPLOY_ERROR_KEY = 'samwise_merge_deploy_error';
 
 export type ReviewVerdict = 'merge' | 'fix' | 'inconclusive' | 'errored' | 'blocked';
 
@@ -14,18 +19,63 @@ export interface ReviewActionPanel {
 	source: 'samwise-pr-review' | 'auto-merge' | 'error';
 }
 
-export function getUiStamp(task: Pick<AeTask, 'context'>): typeof COPILOT_REVIEW_STAMP | null {
-	return task.context?.[UI_STAMP_KEY] === COPILOT_REVIEW_STAMP ? COPILOT_REVIEW_STAMP : null;
+export type MergeDeployStatus = 'requested' | 'running' | 'succeeded' | 'failed';
+
+export interface MergeDeployState {
+	status: MergeDeployStatus | null;
+	requestedAt: string | null;
+	startedAt: string | null;
+	error: string | null;
 }
 
-export function nextCopilotStampContext(task: Pick<AeTask, 'context'>): Record<string, unknown> | null {
+export function getUiStamp(task: Pick<AeTask, 'context'>): typeof MANUAL_IN_PROGRESS_STAMP | null {
+	const stamp = task.context?.[UI_STAMP_KEY];
+	return stamp === MANUAL_IN_PROGRESS_STAMP || stamp === LEGACY_COPILOT_REVIEW_STAMP ? MANUAL_IN_PROGRESS_STAMP : null;
+}
+
+export function nextManualInProgressStampContext(task: Pick<AeTask, 'context'>): Record<string, unknown> | null {
 	const context = { ...(task.context ?? {}) };
 	if (getUiStamp(task)) {
 		delete context[UI_STAMP_KEY];
 		return Object.keys(context).length > 0 ? context : null;
 	}
-	context[UI_STAMP_KEY] = COPILOT_REVIEW_STAMP;
+	context[UI_STAMP_KEY] = MANUAL_IN_PROGRESS_STAMP;
 	return context;
+}
+
+export function getMergeDeployState(task: Pick<AeTask, 'context'>): MergeDeployState {
+	const context = task.context ?? {};
+	const rawStatus = context[MERGE_DEPLOY_STATUS_KEY];
+	const status: MergeDeployStatus | null =
+		rawStatus === 'requested' || rawStatus === 'running' || rawStatus === 'succeeded' || rawStatus === 'failed'
+			? rawStatus
+			: null;
+	return {
+		status,
+		requestedAt: stringValue(context[MERGE_DEPLOY_REQUESTED_AT_KEY]),
+		startedAt: stringValue(context[MERGE_DEPLOY_STARTED_AT_KEY]),
+		error: stringValue(context[MERGE_DEPLOY_ERROR_KEY]),
+	};
+}
+
+export function requestMergeDeployContext(task: Pick<AeTask, 'context'>): Record<string, unknown> {
+	return {
+		...(task.context ?? {}),
+		[MERGE_DEPLOY_REQUESTED_AT_KEY]: new Date().toISOString(),
+		[MERGE_DEPLOY_STATUS_KEY]: 'requested',
+		[MERGE_DEPLOY_ERROR_KEY]: null,
+	};
+}
+
+export function mergeDeployButtonLabel(state: MergeDeployState): string {
+	if (state.status === 'running') return 'Deploying...';
+	if (state.status === 'requested') return 'Merge Queued';
+	if (state.status === 'failed') return 'Retry Merge + Deploy';
+	return 'Merge + Deploy';
+}
+
+export function isMergeDeployBusy(state: MergeDeployState): boolean {
+	return state.status === 'requested' || state.status === 'running';
 }
 
 export function isReviewActionStatus(status: AeTask['status']): boolean {
@@ -196,4 +246,8 @@ function clampText(value: string, max: number): string {
 
 function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function stringValue(value: unknown): string | null {
+	return typeof value === 'string' && value.trim().length > 0 ? value : null;
 }

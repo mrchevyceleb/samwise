@@ -9,8 +9,12 @@
 	import {
 		extractReviewActionPanel,
 		getUiStamp,
+		getMergeDeployState,
 		isReviewActionStatus,
+		isMergeDeployBusy,
+		mergeDeployButtonLabel,
 		nextManualInProgressStampContext,
+		requestMergeDeployContext,
 	} from '$lib/utils/review-actions';
 	import { formatTimeAgo } from '$lib/utils/relative-time';
 	import { openExternal } from '$lib/utils/tauri';
@@ -45,7 +49,9 @@
 	let comments = $derived(commentStore.getComments(task.id));
 	let reviewPanel = $derived(extractReviewActionPanel(task, comments));
 	let uiStamp = $derived(getUiStamp(task));
+	let mergeDeployState = $derived(getMergeDeployState(task));
 	let showReviewActions = $derived(isReviewActionStatus(task.status) && !!(reviewPanel || task.pr_url));
+	let canMergeDeploy = $derived(!!task.pr_url && (task.status === 'approved' || mergeDeployState.status === 'failed'));
 	let qaResult = $derived(task.visual_qa_result);
 	let subtasks = $derived(task.subtasks || []);
 	let subtaskTotal = $derived(subtasks.length);
@@ -132,6 +138,13 @@
 		e.preventDefault();
 		e.stopPropagation();
 		await taskStore.updateTask(task.id, { context: nextManualInProgressStampContext(task) });
+	}
+
+	async function requestMergeDeploy(e: MouseEvent) {
+		e.preventDefault();
+		e.stopPropagation();
+		if (!canMergeDeploy || isMergeDeployBusy(mergeDeployState)) return;
+		await taskStore.updateTask(task.id, { context: requestMergeDeployContext(task) });
 	}
 
 	function openPr(e: MouseEvent) {
@@ -362,16 +375,18 @@
 				style="
 					display: flex; align-items: center; justify-content: center; gap: 5px;
 					padding: 7px 8px; border-radius: 8px;
-					background: rgba(63, 185, 80, 0.08);
-					border: 1px solid rgba(63, 185, 80, 0.24);
-					color: var(--accent-green);
+					background: {canMergeDeploy ? 'rgba(34, 211, 238, 0.10)' : 'rgba(63, 185, 80, 0.08)'};
+					border: 1px solid {canMergeDeploy ? 'rgba(103, 232, 249, 0.32)' : 'rgba(63, 185, 80, 0.24)'};
+					color: {canMergeDeploy ? '#67e8f9' : 'var(--accent-green)'};
 					font-size: 10px; font-weight: 900; font-family: var(--font-ui);
-					cursor: pointer; transition: all 0.15s ease;
+					cursor: {isMergeDeployBusy(mergeDeployState) ? 'wait' : 'pointer'}; transition: all 0.15s ease;
+					opacity: {isMergeDeployBusy(mergeDeployState) ? '0.72' : '1'};
 				"
 				onmousedown={(e) => e.stopPropagation()}
-				onclick={markDone}
+				onclick={canMergeDeploy ? requestMergeDeploy : markDone}
+				disabled={isMergeDeployBusy(mergeDeployState)}
 			>
-				Mark Done
+				{canMergeDeploy ? mergeDeployButtonLabel(mergeDeployState) : 'Mark Done'}
 			</button>
 		</div>
 	{/if}
