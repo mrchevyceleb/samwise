@@ -626,6 +626,9 @@ fn min_across_dimensions(scores: &Value) -> Option<i64> {
 /// pass, Ok(false) if any fail or if we time out. Require at least 2 polls before
 /// trusting an "empty / all pass" result, so checks that haven't registered yet
 /// don't short-circuit the gate.
+/// Keep the JSON field list compatible with older GitHub CLI builds; `bucket`
+/// already normalizes pass/fail/pending and `conclusion` is not universally
+/// available.
 pub async fn wait_for_ci(pr_url: &str, repo_path: &str) -> Result<bool, String> {
     let start = std::time::Instant::now();
     let max = Duration::from_secs(CI_POLL_MAX_SECS);
@@ -634,7 +637,7 @@ pub async fn wait_for_ci(pr_url: &str, repo_path: &str) -> Result<bool, String> 
 
     loop {
         let output = async_cmd("gh")
-            .args(["pr", "checks", pr_url, "--json", "name,state,conclusion,bucket"])
+            .args(["pr", "checks", pr_url, "--json", "name,state,bucket"])
             .current_dir(repo_path)
             .output()
             .await

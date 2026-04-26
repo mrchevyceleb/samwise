@@ -118,13 +118,20 @@ export function getTaskStore() {
 
     async updateTask(id: string, updates: Partial<AeTask>) {
       try {
-        await safeInvoke('supabase_update_task', {
+        const result = await safeInvoke('supabase_update_task', {
           id,
           updates,
         });
+        if (result === null) {
+          throw new Error('Supabase update command did not return a result.');
+        }
         tasks = tasks.map(t => t.id === id ? { ...t, ...updates, updated_at: new Date().toISOString() } : t);
+        error = null;
+        return true;
       } catch (e) {
+        error = e instanceof Error ? e.message : String(e);
         console.warn('[tasks] update failed:', e);
+        return false;
       }
     },
 

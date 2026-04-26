@@ -86,7 +86,10 @@ class TasksStore {
 
   async updateTask(taskId: string, updates: Partial<AeTask>) {
     const idx = this.tasks.findIndex((t) => t.id === taskId);
-    if (idx < 0) return;
+    if (idx < 0) {
+      this.error = 'Task no longer exists locally. Refresh and try again.';
+      return false;
+    }
     const prev = this.tasks[idx];
     const now = new Date().toISOString();
     const payload = { ...updates, updated_at: now };
@@ -112,7 +115,10 @@ class TasksStore {
         this.tasks = rev;
       }
       this.error = error.message;
+      return false;
     }
+    this.error = null;
+    return true;
   }
 
   async setStatus(taskId: string, status: TaskStatus) {

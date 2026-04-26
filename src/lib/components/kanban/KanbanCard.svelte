@@ -50,6 +50,7 @@
 	let reviewPanel = $derived(extractReviewActionPanel(task, comments));
 	let uiStamp = $derived(getUiStamp(task));
 	let mergeDeployState = $derived(getMergeDeployState(task));
+	let mergeDeployRequestError = $state<string | null>(null);
 	let showReviewActions = $derived(isReviewActionStatus(task.status) && !!(reviewPanel || task.pr_url));
 	let canMergeDeploy = $derived(!!task.pr_url && (task.status === 'approved' || mergeDeployState.status === 'failed'));
 	let qaResult = $derived(task.visual_qa_result);
@@ -149,7 +150,11 @@
 		e.preventDefault();
 		e.stopPropagation();
 		if (!canMergeDeploy || isMergeDeployBusy(mergeDeployState)) return;
-		await taskStore.updateTask(task.id, { context: requestMergeDeployContext(task) });
+		mergeDeployRequestError = null;
+		const ok = await taskStore.updateTask(task.id, { context: requestMergeDeployContext(task) });
+		if (!ok) {
+			mergeDeployRequestError = taskStore.error || 'Could not queue Merge + Deploy.';
+		}
 	}
 
 	function openPr(e: MouseEvent) {
@@ -429,6 +434,18 @@
 				{canMergeDeploy ? mergeDeployButtonLabel(mergeDeployState) : 'Mark Done'}
 			</button>
 		</div>
+		{#if mergeDeployRequestError || mergeDeployState.error}
+			<div style="
+				margin-top: 7px; padding: 7px 8px; border-radius: 8px;
+				background: rgba(248, 81, 73, 0.12);
+				border: 1px solid rgba(248, 81, 73, 0.34);
+				color: #ffb4ae; font-size: 10px; font-weight: 750; line-height: 1.35;
+				display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+				overflow: hidden;
+			">
+				Merge + Deploy failed: {mergeDeployRequestError || mergeDeployState.error}
+			</div>
+		{/if}
 	{/if}
 
 	<!-- Bottom row: indicators -->

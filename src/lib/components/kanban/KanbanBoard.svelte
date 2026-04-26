@@ -18,6 +18,10 @@
 
 	let showNewTask = $state(false);
 	let selectedTask = $state<AeTask | null>(null);
+	let selectedTaskId = $derived(selectedTask?.id ?? null);
+	let liveSelectedTask = $derived(
+		selectedTaskId ? taskStore.tasks.find(t => t.id === selectedTaskId) ?? selectedTask : null
+	);
 	let addBtnHovered = $state(false);
 	let contextMenu = $state<{ task: AeTask; x: number; y: number } | null>(null);
 
@@ -283,8 +287,8 @@
 	<NewTaskModal onClose={() => showNewTask = false} />
 {/if}
 
-{#if selectedTask}
-	<TaskDetailModal task={selectedTask} onClose={() => selectedTask = null} />
+{#if liveSelectedTask}
+	<TaskDetailModal task={liveSelectedTask} onClose={() => selectedTask = null} />
 {/if}
 
 {#if contextMenu}

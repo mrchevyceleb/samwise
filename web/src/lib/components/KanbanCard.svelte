@@ -18,6 +18,7 @@
   let reviewPanel = $derived(extractReviewActionPanel(task, comments));
   let uiStamp = $derived(getUiStamp(task));
   let mergeDeployState = $derived(getMergeDeployState(task));
+  let mergeDeployRequestError = $state<string | null>(null);
   let showReviewActions = $derived(isReviewActionStatus(task.status) && !!(reviewPanel || task.pr_url));
   let canMergeDeploy = $derived(!!task.pr_url && (task.status === 'approved' || mergeDeployState.status === 'failed'));
   let originKey = $derived(
@@ -55,12 +56,18 @@
   }
 
   async function requestMergeDeploy(e: MouseEvent) {
+    e.preventDefault();
     e.stopPropagation();
     if (!canMergeDeploy || isMergeDeployBusy(mergeDeployState)) return;
-    await tasksStore.updateTask(task.id, { context: requestMergeDeployContext(task) });
+    mergeDeployRequestError = null;
+    const ok = await tasksStore.updateTask(task.id, { context: requestMergeDeployContext(task) });
+    if (!ok) {
+      mergeDeployRequestError = tasksStore.error || 'Could not queue Merge + Deploy.';
+    }
   }
 
   async function markDone(e: MouseEvent) {
+    e.preventDefault();
     e.stopPropagation();
     await tasksStore.setStatus(task.id, 'done');
   }
@@ -185,6 +192,11 @@
         {canMergeDeploy ? mergeDeployButtonLabel(mergeDeployState) : 'Mark Done'}
       </button>
     </div>
+    {#if mergeDeployRequestError || mergeDeployState.error}
+      <div class="mt-2 line-clamp-3 rounded-lg border border-rose-400/35 bg-rose-500/10 px-2 py-1.5 text-[10px] font-bold leading-snug text-rose-100">
+        Merge + Deploy failed: {mergeDeployRequestError || mergeDeployState.error}
+      </div>
+    {/if}
   {/if}
 
   <div class="mt-2 flex flex-wrap items-center gap-1.5 text-[10px] text-slate-400">

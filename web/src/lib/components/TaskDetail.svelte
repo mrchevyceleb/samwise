@@ -27,6 +27,7 @@
   let reviewPanel = $derived(extractReviewActionPanel(task, comments));
   let uiStamp = $derived(getUiStamp(task));
   let mergeDeployState = $derived(getMergeDeployState(task));
+  let mergeDeployRequestError = $state<string | null>(null);
   let canMergeDeploy = $derived(!!task.pr_url && (task.status === 'approved' || mergeDeployState.status === 'failed'));
 
   function verdictColor(verdict: string | undefined) {
@@ -46,7 +47,11 @@
 
   async function requestMergeDeploy() {
     if (!canMergeDeploy || isMergeDeployBusy(mergeDeployState)) return;
-    await tasksStore.updateTask(task.id, { context: requestMergeDeployContext(task) });
+    mergeDeployRequestError = null;
+    const ok = await tasksStore.updateTask(task.id, { context: requestMergeDeployContext(task) });
+    if (!ok) {
+      mergeDeployRequestError = tasksStore.error || 'Could not queue Merge + Deploy.';
+    }
   }
 
   async function markDone() {
@@ -155,6 +160,11 @@
               </button>
             {/if}
           </div>
+          {#if mergeDeployRequestError || mergeDeployState.error}
+            <div class="mt-3 whitespace-pre-wrap rounded-xl border border-rose-400/35 bg-rose-500/10 px-3 py-2 text-xs font-bold leading-snug text-rose-100">
+              Merge + Deploy failed: {mergeDeployRequestError || mergeDeployState.error}
+            </div>
+          {/if}
         </section>
       {/if}
 

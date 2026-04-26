@@ -55,6 +55,7 @@
 	let restarting = $state(false);
 	let markingDone = $state(false);
 	let requestingMergeDeploy = $state(false);
+	let mergeDeployRequestError = $state<string | null>(null);
 	let prBtnHovered = $state(false);
 
 	// Tabs: "details" or "report"
@@ -149,8 +150,12 @@
 	async function handleRequestMergeDeploy() {
 		if (!canMergeDeploy || requestingMergeDeploy || isMergeDeployBusy(mergeDeployState)) return;
 		requestingMergeDeploy = true;
+		mergeDeployRequestError = null;
 		try {
-			await taskStore.updateTask(task.id, { context: requestMergeDeployContext(task) });
+			const ok = await taskStore.updateTask(task.id, { context: requestMergeDeployContext(task) });
+			if (!ok) {
+				mergeDeployRequestError = taskStore.error || 'Could not queue Merge + Deploy.';
+			}
 		} finally {
 			requestingMergeDeploy = false;
 		}
@@ -525,6 +530,17 @@
 								{/if}
 							{/if}
 						</div>
+						{#if mergeDeployRequestError || mergeDeployState.error}
+							<div style="
+								margin-top: 10px; padding: 10px 12px; border-radius: 10px;
+								background: rgba(248, 81, 73, 0.12);
+								border: 1px solid rgba(248, 81, 73, 0.34);
+								color: #ffb4ae; font-size: 12px; font-weight: 750; line-height: 1.4;
+								white-space: pre-wrap;
+							">
+								Merge + Deploy failed: {mergeDeployRequestError || mergeDeployState.error}
+							</div>
+						{/if}
 					</div>
 				{/if}
 
@@ -842,6 +858,17 @@
 						>
 							{canMergeDeploy ? (requestingMergeDeploy ? 'Queueing...' : mergeDeployButtonLabel(mergeDeployState)) : (markingDone ? 'Marking Done...' : 'Mark Done')}
 						</button>
+						{#if mergeDeployRequestError || mergeDeployState.error}
+							<div style="
+								padding: 8px 10px; border-radius: 8px;
+								background: rgba(248, 81, 73, 0.12);
+								border: 1px solid rgba(248, 81, 73, 0.34);
+								color: #ffb4ae; font-size: 11px; font-weight: 750; line-height: 1.35;
+								white-space: pre-wrap;
+							">
+								Merge + Deploy failed: {mergeDeployRequestError || mergeDeployState.error}
+							</div>
+						{/if}
 					{/if}
 
 					{#if isStoppable}
