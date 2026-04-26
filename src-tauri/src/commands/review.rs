@@ -327,7 +327,7 @@ async fn collect_pr_review_context(pr_url: &str, cwd: &str) -> String {
     let short_sha = if head_sha.len() >= 7 { &head_sha[..7] } else { head_sha };
 
     let mut out = format!(
-        "- State: {}\n- Merged at: {}\n- Mergeable: {}\n- Review decision: {}\n- Head: {} ({})",
+        "- State: {}\n- Merged at: {}\n- Mergeable: {}\n- Review decision: {}\n- Head: {} ({})\n- Vercel policy: ignore Vercel deploy/comment checks for merge readiness; they are informational only",
         state, merged_at, mergeable, review_decision, head_ref, short_sha
     );
     out.push('\n');
@@ -347,6 +347,7 @@ fn summarize_status_check_rollup(pr: &Value) -> String {
     let mut pending = 0usize;
     let mut failed = 0usize;
     let mut other = 0usize;
+    let mut ignored = 0usize;
     let mut lines = Vec::new();
 
     for check in checks {
@@ -356,20 +357,26 @@ fn summarize_status_check_rollup(pr: &Value) -> String {
             .filter(|s| !s.is_empty())
             .unwrap_or("unnamed check");
         let status = check_status_label(check);
-        match status.as_str() {
-            "SUCCESS" | "NEUTRAL" | "SKIPPED" => success += 1,
-            "PENDING" | "EXPECTED" | "QUEUED" | "IN_PROGRESS" | "REQUESTED" | "WAITING" => pending += 1,
-            "FAILURE" | "FAILED" | "ERROR" | "CANCELLED" | "TIMED_OUT" | "ACTION_REQUIRED" => failed += 1,
-            _ => other += 1,
+        let ignored_vercel = is_ignored_vercel_check(name);
+        if ignored_vercel {
+            ignored += 1;
+        } else {
+            match status.as_str() {
+                "SUCCESS" | "NEUTRAL" | "SKIPPED" => success += 1,
+                "PENDING" | "EXPECTED" | "QUEUED" | "IN_PROGRESS" | "REQUESTED" | "WAITING" => pending += 1,
+                "FAILURE" | "FAILED" | "ERROR" | "CANCELLED" | "TIMED_OUT" | "ACTION_REQUIRED" => failed += 1,
+                _ => other += 1,
+            }
         }
         if lines.len() < 12 {
-            lines.push(format!("  - {}: {}", name, status));
+            let suffix = if ignored_vercel { " (ignored: Vercel informational)" } else { "" };
+            lines.push(format!("  - {}: {}{}", name, status, suffix));
         }
     }
 
     let mut out = format!(
-        "- Checks: {} total, {} success/skipped, {} pending, {} failed, {} other",
-        checks.len(), success, pending, failed, other
+        "- Checks: {} total, {} ignored Vercel, {} success/skipped, {} pending, {} failed, {} other",
+        checks.len(), ignored, success, pending, failed, other
     );
     for line in lines {
         out.push('\n');
@@ -392,6 +399,10 @@ fn check_status_label(check: &Value) -> String {
         }
     }
     "UNKNOWN".to_string()
+}
+
+fn is_ignored_vercel_check(name: &str) -> bool {
+    name.to_lowercase().contains("vercel")
 }
 
 fn check_blocker_paths(files: &[String]) -> Option<String> {
@@ -769,7 +780,7 @@ pub async fn run_samwise_pr_review(
     let cwd = resolve_codex_cwd(repo_path);
     let host_pr_context = collect_pr_review_context(pr_url, &cwd).await;
     let prompt = format!(
-        "Use $samwise-pr-review on {}. Emit only the skill output per its template, no preamble, no follow-up. The report must include the Deployment Required section with explicit Railway server, Supabase migrations, and Supabase Edge Functions yes/no/unknown lines.\n\nSamwise host preflight, collected outside the Codex sandbox:\n{}\n\nUse the host preflight as trusted PR/check context. If your own GitHub tooling is unavailable but the host preflight confirms checks are green, do not create a blocker solely for that tooling failure. If you cannot inspect the code/diff well enough to make a recommendation, emit VERDICT: inconclusive instead of VERDICT: fix_issues.",
+        "Use $samwise-pr-review on {}. Emit only the skill output per its template, no preamble, no follow-up. The report must include the Deployment Required section with explicit Railway server, Supabase migrations, and Supabase Edge Functions yes/no/unknown lines.\n\nSamwise host preflight, collected outside the Codex sandbox:\n{}\n\nUse the host preflight as trusted PR/check context. Vercel deploy/comment checks are useless for Samwise merge decisions: ignore all Vercel checks completely, including pending, failed, cancelled, or unavailable Vercel checks. Never emit VERDICT: inconclusive or VERDICT: fix_issues solely because of Vercel status. If your own GitHub tooling is unavailable but the host preflight gives PR/check context, do not create a blocker solely for that tooling failure. If you cannot inspect the code/diff well enough to make a recommendation, emit VERDICT: inconclusive instead of VERDICT: fix_issues.",
         pr_url,
         host_pr_context
     );
@@ -968,6 +979,14 @@ fn normalize_pr_review_result(
     parsed: (PrReviewVerdict, bool, String),
 ) -> (PrReviewVerdict, bool, String) {
     let (verdict, requires_human, mut markdown) = parsed;
+    if matches!(verdict, PrReviewVerdict::Inconclusive) && has_substantive_blocker(&markdown) {
+        if !markdown.ends_with('\n') {
+            markdown.push('\n');
+        }
+        markdown.push_str("\nSamwise note: Codex emitted `inconclusive` but included substantive blocker bullets. Treating this as `fix_issues` so the card does not sit in Review with actionable work hidden in the comments.");
+        return (PrReviewVerdict::FixIssues, requires_human, markdown);
+    }
+
     if !matches!(verdict, PrReviewVerdict::FixIssues) {
         return (verdict, requires_human, markdown);
     }

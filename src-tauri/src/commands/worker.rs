@@ -4373,7 +4373,10 @@ pub async fn sweep_pr_review_queue(
         let updated_at = task.get("updated_at").and_then(|v| v.as_str()).unwrap_or("");
         let last_review = task.get("last_pr_review_at").and_then(|v| v.as_str());
 
-        // Fire if never reviewed, OR updated_at > last_pr_review_at (card moved back in).
+        // Fire if never reviewed, OR updated_at > last_pr_review_at (card moved back in),
+        // OR the last review was long enough ago to retry an inconclusive Codex
+        // decision. This keeps cards from sitting in Review forever when host
+        // checks were merely pending during the first pass.
         let should_run = match last_review {
             None => true,
             Some(last) if !last.is_empty() => {
@@ -4381,7 +4384,9 @@ pub async fn sweep_pr_review_queue(
                     chrono::DateTime::parse_from_rfc3339(updated_at),
                     chrono::DateTime::parse_from_rfc3339(last),
                 ) {
-                    (Ok(u), Ok(l)) => u > l,
+                    (Ok(u), Ok(l)) => {
+                        u > l || chrono::Utc::now().signed_duration_since(l.with_timezone(&chrono::Utc)) > chrono::Duration::minutes(30)
+                    }
                     _ => true,
                 }
             }
