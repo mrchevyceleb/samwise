@@ -702,10 +702,13 @@ pub async fn wait_for_ci(pr_url: &str, repo_path: &str) -> Result<bool, String> 
 
 pub async fn gh_merge(pr_url: &str, repo_path: &str, head_sha: &str) -> Result<(), String> {
     // --match-head-commit rejects if anyone pushed after our review.
+    // Do not pass --delete-branch: Sam task branches are attached to local
+    // worktrees, so gh can successfully merge the PR and then exit non-zero
+    // while failing to delete the local branch.
     let output = async_cmd("gh")
         .args([
             "pr", "merge", pr_url,
-            "--squash", "--delete-branch",
+            "--squash",
             "--match-head-commit", head_sha,
         ])
         .current_dir(repo_path)
@@ -713,9 +716,36 @@ pub async fn gh_merge(pr_url: &str, repo_path: &str, head_sha: &str) -> Result<(
         .await
         .map_err(|e| format!("spawn gh merge: {}", e))?;
     if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if gh_pr_is_merged(pr_url, repo_path).await.unwrap_or(false) {
+            log::warn!(
+                "[review] gh pr merge returned non-zero after PR merged; treating as success. stderr={} stdout={}",
+                stderr,
+                stdout
+            );
+            return Ok(());
+        }
+        return Err(if stdout.is_empty() { stderr } else { format!("{} {}", stderr, stdout) });
     }
     Ok(())
+}
+
+async fn gh_pr_is_merged(pr_url: &str, repo_path: &str) -> Result<bool, String> {
+    let output = async_cmd("gh")
+        .args(["pr", "view", pr_url, "--json", "state,mergedAt"])
+        .current_dir(repo_path)
+        .output()
+        .await
+        .map_err(|e| format!("spawn gh pr view: {}", e))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let parsed: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("parse gh pr view: {}", e))?;
+    let state = parsed.get("state").and_then(|v| v.as_str()).unwrap_or("").to_uppercase();
+    let merged_at = parsed.get("mergedAt").and_then(|v| v.as_str()).unwrap_or("");
+    Ok(state == "MERGED" || !merged_at.is_empty())
 }
 
 async fn block(
