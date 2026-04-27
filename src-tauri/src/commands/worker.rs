@@ -4527,6 +4527,9 @@ async fn run_merge_deploy_workflow(
     preflight_supabase_deploy_context(repo_path, &files)
         .await
         .map_err(|e| MergeDeployError::new(e, pr_merged))?;
+    preflight_railway_deploy_context(repo_path, &files)
+        .await
+        .map_err(|e| MergeDeployError::new(e, pr_merged))?;
 
     if !pr_merged {
         if !should_merge_if_open {
@@ -4609,6 +4612,73 @@ async fn prepare_deploy_checkout(repo_path: &str, task_id: &str, default_branch:
     let origin_ref = format!("origin/{}", default_branch);
     run_git(&["checkout", "--detach", &origin_ref], &deploy_path).await?;
     Ok(deploy_path)
+}
+
+async fn preflight_railway_deploy_context(repo_path: &str, files: &[String]) -> Result<(), String> {
+    if !railway_deploy_required(repo_path, files).await {
+        return Ok(());
+    }
+    if which::which("railway").is_err() {
+        return Err("Railway deploy is required, but the Railway CLI is not installed or not on PATH.".to_string());
+    }
+
+    let doppler_scope = dev_server::doppler_scope_for_checkout(repo_path).await;
+    let mut cmd = if let Some(scope) = doppler_scope.as_deref() {
+        let mut c = async_cmd("doppler");
+        c.args(["run", "--scope", scope, "--", "railway", "whoami"]);
+        c
+    } else {
+        let mut c = async_cmd("railway");
+        c.arg("whoami");
+        c
+    };
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        cmd.current_dir(repo_path)
+            .env("CI", "true")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output(),
+    )
+    .await
+    .map_err(|_| "Railway auth check timed out after 30 seconds.".to_string())?
+    .map_err(|e| format!("spawn railway auth check: {}", e))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = redact_secrets(&String::from_utf8_lossy(&output.stderr));
+    let stdout = redact_secrets(&String::from_utf8_lossy(&output.stdout));
+    let details = [stderr.trim(), stdout.trim()]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    Err(format!(
+        "Railway deploy is required, but Railway CLI auth is not available for this checkout. Run `railway login` once, or add a valid RAILWAY_TOKEN to the app's Doppler scope. Details: {}",
+        truncate(&details, 900)
+    ))
+}
+
+async fn railway_deploy_required(repo_path: &str, files: &[String]) -> bool {
+    let package_scripts = read_package_scripts(repo_path).await;
+    let railway_context = read_railway_project_context(repo_path).await;
+    let touches_tools = files.iter().any(|f| f.starts_with("tools-server/"));
+    let touches_server = files.iter().any(|f| is_server_deploy_path(f));
+
+    if touches_tools && (railway_context.is_some() || package_scripts.contains_key("tools:deploy")) {
+        return true;
+    }
+    if touches_server && (railway_context.is_some() || package_scripts.contains_key("server:deploy")) {
+        return true;
+    }
+    discover_railway_roots(repo_path)
+        .into_iter()
+        .any(|root| {
+            let rel = path_relative_to(&root, repo_path);
+            files.iter().any(|file| railway_root_matches_file(&rel, file))
+        })
 }
 
 async fn build_deploy_plan(repo_path: &str, files: &[String]) -> Result<DeployPlan, String> {
