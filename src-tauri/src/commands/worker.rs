@@ -4392,6 +4392,14 @@ struct DeployPlan {
 }
 
 #[derive(Debug, Clone)]
+struct RailwayProjectContext {
+    project: String,
+    environment: Option<String>,
+    environment_name: Option<String>,
+    service: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 struct MergeDeployError {
     message: String,
     pr_merged: bool,
@@ -4641,25 +4649,43 @@ async fn build_deploy_plan(repo_path: &str, files: &[String]) -> Result<DeployPl
     }
 
     let package_scripts = read_package_scripts(repo_path).await;
+    let railway_context = read_railway_project_context(repo_path).await;
     let touches_tools = files.iter().any(|f| f.starts_with("tools-server/"));
     let touches_server = files.iter().any(|f| is_server_deploy_path(f));
 
-    if touches_tools && package_scripts.iter().any(|s| s == "tools:deploy") {
-        plan.railway_reasons.push("tools-server/ changed; using npm run tools:deploy".to_string());
+    let tools_script = package_scripts.get("tools:deploy").map(String::as_str);
+    let server_script = package_scripts.get("server:deploy").map(String::as_str);
+
+    if touches_tools && (railway_context.is_some() || tools_script.is_some()) {
+        let command = match (railway_context.as_ref(), tools_script) {
+            (Some(context), Some(script)) => inject_railway_context_into_command(script, context)
+                .unwrap_or_else(|| railway_up_command(Some(context), Some("tools-server"), Some("tools-server"), false)),
+            (Some(context), None) => railway_up_command(Some(context), Some("tools-server"), Some("tools-server"), false),
+            (None, Some(_)) => "npm run tools:deploy".to_string(),
+            (None, None) => unreachable!("guard requires a Railway context or tools deploy script"),
+        };
+        plan.railway_reasons.push(format!("tools-server/ changed; using {}", command));
         plan.commands.push(DeployCommand {
             category: "railway",
             label: "Railway tools-server".to_string(),
-            command: "npm run tools:deploy".to_string(),
+            command,
             cwd: repo_path.to_string(),
         });
     }
 
-    if touches_server && package_scripts.iter().any(|s| s == "server:deploy") {
-        plan.railway_reasons.push("server/root deploy files changed; using npm run server:deploy".to_string());
+    if touches_server && (railway_context.is_some() || server_script.is_some()) {
+        let command = match (railway_context.as_ref(), server_script) {
+            (Some(context), Some(script)) => inject_railway_context_into_command(script, context)
+                .unwrap_or_else(|| railway_up_command(Some(context), None, None, false)),
+            (Some(context), None) => railway_up_command(Some(context), None, None, false),
+            (None, Some(_)) => "npm run server:deploy".to_string(),
+            (None, None) => unreachable!("guard requires a Railway context or server deploy script"),
+        };
+        plan.railway_reasons.push(format!("server/root deploy files changed; using {}", command));
         plan.commands.push(DeployCommand {
             category: "railway",
             label: "Railway server".to_string(),
-            command: "npm run server:deploy".to_string(),
+            command,
             cwd: repo_path.to_string(),
         });
     }
@@ -4670,11 +4696,12 @@ async fn build_deploy_plan(repo_path: &str, files: &[String]) -> Result<DeployPl
             let matches_root = files.iter().any(|f| railway_root_matches_file(&rel, f));
             if !matches_root { continue; }
             let label = if rel.is_empty() { "Railway server".to_string() } else { format!("Railway server ({})", rel) };
-            let command = if rel.is_empty() {
-                "railway up --detach".to_string()
-            } else {
-                format!("railway up --detach --path-as-root {}", shell_quote_simple(&rel))
-            };
+            let command = railway_up_command(
+                railway_context.as_ref(),
+                None,
+                if rel.is_empty() { None } else { Some(rel.as_str()) },
+                true,
+            );
             plan.railway_reasons.push(format!("{} changed; using {}", if rel.is_empty() { "Railway root".to_string() } else { rel.clone() }, command));
             plan.commands.push(DeployCommand {
                 category: "railway",
@@ -5035,14 +5062,205 @@ fn is_server_deploy_path(file: &str) -> bool {
         )
 }
 
-async fn read_package_scripts(repo_path: &str) -> Vec<String> {
+async fn read_package_scripts(repo_path: &str) -> std::collections::BTreeMap<String, String> {
     let path = Path::new(repo_path).join("package.json");
-    let Ok(raw) = tokio::fs::read_to_string(path).await else { return Vec::new(); };
-    let Ok(parsed) = serde_json::from_str::<Value>(&raw) else { return Vec::new(); };
+    let Ok(raw) = tokio::fs::read_to_string(path).await else { return std::collections::BTreeMap::new(); };
+    let Ok(parsed) = serde_json::from_str::<Value>(&raw) else { return std::collections::BTreeMap::new(); };
     parsed.get("scripts")
         .and_then(|v| v.as_object())
-        .map(|obj| obj.keys().cloned().collect())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(key, value)| value.as_str().map(|script| (key.clone(), script.to_string())))
+                .collect()
+        })
         .unwrap_or_default()
+}
+
+async fn read_railway_project_context(repo_path: &str) -> Option<RailwayProjectContext> {
+    let home = dirs::home_dir()?;
+    let raw = tokio::fs::read_to_string(home.join(".railway").join("config.json")).await.ok()?;
+    let parsed = serde_json::from_str::<Value>(&raw).ok()?;
+    let projects = parsed.get("projects").and_then(|v| v.as_object())?;
+    let candidates = railway_context_candidate_paths(repo_path).await;
+
+    for candidate in &candidates {
+        if let Some(project) = projects.get(candidate) {
+            if let Some(context) = railway_project_context_from_value(candidate, project) {
+                return Some(context);
+            }
+        }
+    }
+
+    let repo_names = railway_repo_names(repo_path, &candidates);
+    for (key, project) in projects {
+        let project_path = project
+            .get("projectPath")
+            .and_then(|v| v.as_str())
+            .unwrap_or(key);
+        let Some(name) = Path::new(project_path).file_name().and_then(|v| v.to_str()) else { continue; };
+        if repo_names.iter().any(|repo_name| repo_name == name) {
+            if let Some(context) = railway_project_context_from_value(key, project) {
+                return Some(context);
+            }
+        }
+    }
+
+    None
+}
+
+async fn railway_context_candidate_paths(repo_path: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    push_unique_string(&mut paths, normalize_path_string(repo_path));
+
+    if let Ok(common_dir) = run_git(&["rev-parse", "--git-common-dir"], repo_path).await {
+        let common_path = Path::new(&common_dir);
+        let absolute_common = if common_path.is_absolute() {
+            common_path.to_path_buf()
+        } else {
+            Path::new(repo_path).join(common_path)
+        };
+        if let Some(main_repo) = absolute_common.parent() {
+            push_unique_string(&mut paths, normalize_path_string(&main_repo.to_string_lossy()));
+        }
+    }
+
+    let repo_names = railway_repo_names(repo_path, &paths);
+    for path in paths.clone() {
+        add_mirrored_railway_documents_paths(&mut paths, &path);
+    }
+    add_documents_repo_paths(&mut paths, &repo_names);
+    paths
+}
+
+fn railway_project_context_from_value(_key: &str, value: &Value) -> Option<RailwayProjectContext> {
+    let project = value.get("project").and_then(|v| v.as_str())?.trim();
+    if project.is_empty() { return None; }
+
+    Some(RailwayProjectContext {
+        project: project.to_string(),
+        environment: non_empty_json_string(value, "environment"),
+        environment_name: non_empty_json_string(value, "environmentName"),
+        service: non_empty_json_string(value, "service"),
+    })
+}
+
+fn non_empty_json_string(value: &Value, key: &str) -> Option<String> {
+    value.get(key)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn railway_up_command(
+    context: Option<&RailwayProjectContext>,
+    service: Option<&str>,
+    path_as_root: Option<&str>,
+    detach: bool,
+) -> String {
+    let mut parts = vec!["railway up".to_string()];
+    if let Some(context) = context {
+        parts.push(format!("--project {}", shell_quote_simple(&context.project)));
+        if let Some(environment) = context.environment_name.as_deref().or(context.environment.as_deref()) {
+            parts.push(format!("--environment {}", shell_quote_simple(environment)));
+        }
+    }
+    if let Some(service) = service
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| context.and_then(|context| context.service.as_deref()))
+    {
+        parts.push(format!("--service {}", shell_quote_simple(service.trim())));
+    }
+    if detach {
+        parts.push("--detach".to_string());
+    }
+    if let Some(path_as_root) = path_as_root.filter(|value| !value.trim().is_empty()) {
+        parts.push(format!("--path-as-root {}", shell_quote_simple(path_as_root.trim())));
+    }
+    parts.join(" ")
+}
+
+fn inject_railway_context_into_command(command: &str, context: &RailwayProjectContext) -> Option<String> {
+    let needle = "railway up";
+    let index = command.find(needle)?;
+    let railway_args = &command[index + needle.len()..];
+    let mut replacement = railway_up_project_environment_prefix(context);
+    if !railway_args.contains("--service") {
+        if let Some(service) = context.service.as_deref().filter(|value| !value.trim().is_empty()) {
+            replacement.push_str(&format!(" --service {}", shell_quote_simple(service.trim())));
+        }
+    }
+    Some(command.replacen(needle, &replacement, 1))
+}
+
+fn railway_up_project_environment_prefix(context: &RailwayProjectContext) -> String {
+    let mut parts = vec![
+        "railway up".to_string(),
+        format!("--project {}", shell_quote_simple(&context.project)),
+    ];
+    if let Some(environment) = context.environment_name.as_deref().or(context.environment.as_deref()) {
+        parts.push(format!("--environment {}", shell_quote_simple(environment)));
+    }
+    parts.join(" ")
+}
+
+fn railway_repo_names(repo_path: &str, candidates: &[String]) -> Vec<String> {
+    let mut names = Vec::new();
+    for path in std::iter::once(repo_path).chain(candidates.iter().map(String::as_str)) {
+        if let Some(name) = samwise_worktree_repo_name_local(path) {
+            push_unique_string(&mut names, name);
+        }
+        if let Some(name) = Path::new(path).file_name().and_then(|v| v.to_str()) {
+            if !name.starts_with(".deploy-") && !name.is_empty() {
+                push_unique_string(&mut names, name.to_string());
+            }
+        }
+    }
+    names
+}
+
+fn samwise_worktree_repo_name_local(path: &str) -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let marker = format!("{}/samwise/worktrees/", home);
+    let rest = path.strip_prefix(&marker)?;
+    let repo_name = rest.split('/').next().unwrap_or("").trim();
+    if repo_name.is_empty() { return None; }
+    Some(repo_name.to_string())
+}
+
+fn add_mirrored_railway_documents_paths(paths: &mut Vec<String>, path: &str) {
+    let Ok(home) = std::env::var("HOME") else { return; };
+    let marker = format!("{}/samwise/", home);
+    let Some(rest) = path.strip_prefix(&marker) else { return; };
+    let mut parts = rest.split('/');
+    let Some(bucket) = parts.next().filter(|s| !s.is_empty() && *s != "worktrees") else { return; };
+    let Some(repo_name) = parts.next().filter(|s| !s.is_empty()) else { return; };
+
+    push_unique_string(paths, format!("{}/Documents/{}/{}", home, bucket, repo_name));
+    if let Some(prefix) = bucket.strip_suffix("-Apps") {
+        push_unique_string(paths, format!("{}/Documents/{}-PROJECTS/{}", home, prefix.to_ascii_uppercase(), repo_name));
+    }
+}
+
+fn add_documents_repo_paths(paths: &mut Vec<String>, repo_names: &[String]) {
+    let Some(home) = dirs::home_dir() else { return; };
+    let documents = home.join("Documents");
+    let Ok(entries) = std::fs::read_dir(documents) else { return; };
+
+    for entry in entries.flatten() {
+        let Ok(metadata) = entry.metadata() else { continue; };
+        if !metadata.is_dir() { continue; }
+        for repo_name in repo_names {
+            let candidate = entry.path().join(repo_name);
+            if candidate.is_dir() {
+                push_unique_string(paths, normalize_path_string(&candidate.to_string_lossy()));
+            }
+        }
+    }
+}
+
+fn normalize_path_string(path: &str) -> String {
+    path.trim_end_matches('/').to_string()
 }
 
 fn discover_railway_roots(repo_path: &str) -> Vec<PathBuf> {
