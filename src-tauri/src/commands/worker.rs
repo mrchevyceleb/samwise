@@ -4730,6 +4730,9 @@ async fn run_merge_deploy_workflow(
     let plan = build_deploy_plan(&deploy_path, &files)
         .await
         .map_err(|e| MergeDeployError::new(e, pr_merged))?;
+    ensure_railway_links_for_deploy_plan(repo_path, &deploy_path, &plan)
+        .await
+        .map_err(|e| MergeDeployError::new(e, pr_merged))?;
 
     persist_deploy_plan(config, task_id, &plan).await;
     agent_comment(config, task_id, &format!("Post-merge deploy plan:\n\n{}", deploy_plan_markdown(&plan))).await;
@@ -5263,6 +5266,69 @@ fn is_railway_deploy_wait_path(file: &str) -> bool {
         )
 }
 
+async fn ensure_railway_links_for_deploy_plan(
+    source_repo_path: &str,
+    deploy_path: &str,
+    plan: &DeployPlan,
+) -> Result<(), String> {
+    let railway_cwds = plan.commands
+        .iter()
+        .filter(|command| command.category == "railway")
+        .map(|command| command.cwd.as_str())
+        .collect::<HashSet<_>>();
+
+    if railway_cwds.is_empty() {
+        return Ok(());
+    }
+
+    ensure_railway_link_for_path(source_repo_path, deploy_path).await?;
+    for cwd in railway_cwds {
+        ensure_railway_link_for_path(source_repo_path, cwd).await?;
+    }
+    Ok(())
+}
+
+async fn ensure_railway_link_for_path(source_repo_path: &str, target_path: &str) -> Result<(), String> {
+    let Some(home) = dirs::home_dir() else {
+        return Err("Railway deploy is required, but the home directory could not be resolved for Railway CLI config.".to_string());
+    };
+    let config_path = home.join(".railway").join("config.json");
+    let raw = tokio::fs::read_to_string(&config_path)
+        .await
+        .map_err(|e| format!("Railway deploy is required, but {} could not be read: {}", config_path.display(), e))?;
+    let mut config: Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("Railway deploy is required, but {} is invalid JSON: {}", config_path.display(), e))?;
+
+    let projects = config
+        .get_mut("projects")
+        .and_then(|v| v.as_object_mut())
+        .ok_or_else(|| format!("Railway deploy is required, but {} has no projects map.", config_path.display()))?;
+
+    if projects.contains_key(target_path) {
+        return Ok(());
+    }
+
+    let Some(source_link) = projects.get(source_repo_path).cloned() else {
+        return Err(format!(
+            "Railway deploy is required, but `{}` is not linked in Railway CLI config. Run `railway link` there once, then retry Merge + Deploy.",
+            source_repo_path
+        ));
+    };
+
+    let mut target_link = source_link;
+    if let Some(obj) = target_link.as_object_mut() {
+        obj.insert("projectPath".to_string(), Value::String(target_path.to_string()));
+    }
+    projects.insert(target_path.to_string(), target_link);
+
+    let serialized = serde_json::to_string_pretty(&config)
+        .map_err(|e| format!("serialize Railway CLI config: {}", e))?;
+    tokio::fs::write(&config_path, serialized)
+        .await
+        .map_err(|e| format!("write Railway CLI config {}: {}", config_path.display(), e))?;
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 enum DeployGreenError {
     TimedOut(String),
@@ -5316,10 +5382,15 @@ async fn wait_for_post_merge_deploy_green(pr_url: &str, repo_path: &str) -> Resu
                 last_detail = format!("pending checks: {}", truncate(&pending.join("; "), 900));
             }
         } else if !output.status.success() && stdout.trim().is_empty() {
-            return Err(DeployGreenError::PollError(format!(
-                "gh pr checks: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if review::gh_checks_no_checks_reported(&stderr) {
+                last_detail = "no checks reported yet".to_string();
+            } else {
+                return Err(DeployGreenError::PollError(format!(
+                    "gh pr checks: {}",
+                    stderr.trim()
+                )));
+            }
         }
 
         if start.elapsed() >= max {
@@ -6675,7 +6746,7 @@ pub fn notify_callback(
 /// and lack origin metadata because the receiver can resolve tickets by task_id.
 /// Failures do not retry inline: a comment is posted on the Sam task so Matt
 /// can re-fire from the queue UI.
-fn close_origin_ticket(
+pub(crate) fn close_origin_ticket(
     config: &SupabaseConfig,
     task_id: &str,
     origin_system: &str,

@@ -686,7 +686,19 @@ pub async fn wait_for_ci(pr_url: &str, repo_path: &str) -> Result<bool, String> 
                 }
             }
         } else if !output.status.success() && stdout.trim().is_empty() {
-            return Err(format!("gh pr checks: {}", String::from_utf8_lossy(&output.stderr).trim()));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if gh_checks_no_checks_reported(&stderr) {
+                // GitHub CLI exits non-zero for a brand-new PR head before
+                // checks have attached. Treat it like an empty checks array
+                // and keep polling instead of failing the merge immediately.
+                if observations >= CI_MIN_OBSERVATIONS && start.elapsed() >= Duration::from_secs(60) {
+                    log::info!("[review] no CI checks reported on PR {} after {} observations; treating as pass",
+                        pr_url, observations);
+                    return Ok(true);
+                }
+            } else {
+                return Err(format!("gh pr checks: {}", stderr.trim()));
+            }
         }
 
         if start.elapsed() >= max {
@@ -694,6 +706,22 @@ pub async fn wait_for_ci(pr_url: &str, repo_path: &str) -> Result<bool, String> 
             return Ok(false);
         }
         tokio::time::sleep(interval).await;
+    }
+}
+
+pub(crate) fn gh_checks_no_checks_reported(stderr: &str) -> bool {
+    stderr.to_ascii_lowercase().contains("no checks reported")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gh_checks_no_checks_reported;
+
+    #[test]
+    fn detects_gh_no_checks_reported_error() {
+        assert!(gh_checks_no_checks_reported("no checks reported on the 'sam/1234abcd' branch"));
+        assert!(gh_checks_no_checks_reported("No checks reported on the 'main' branch"));
+        assert!(!gh_checks_no_checks_reported("HTTP 500 from GitHub"));
     }
 }
 

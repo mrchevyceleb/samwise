@@ -126,7 +126,25 @@ class TasksStore {
     if (!task || task.status === status) return;
     const updates: Partial<AeTask> = { status };
     if (status === 'done') updates.completed_at = new Date().toISOString();
-    await this.updateTask(taskId, updates);
+    const ok = await this.updateTask(taskId, updates);
+    if (ok && status === 'done') void this.closeOriginTicket(task);
+  }
+
+  private async closeOriginTicket(task: AeTask) {
+    if (task.origin_system === 'manual' || task.source === 'manual') return;
+    if (!task.origin_system && !task.callback_url) return;
+    try {
+      const res = await fetch('/api/close-origin-ticket', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ task_id: task.id })
+      });
+      if (!res.ok) {
+        console.warn('[tasks] close-origin failed:', await res.text());
+      }
+    } catch (e) {
+      console.warn('[tasks] close-origin failed:', e);
+    }
   }
 
   async loadCommentsFor(taskId: string) {

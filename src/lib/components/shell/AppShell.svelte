@@ -30,6 +30,7 @@
 	let chatToggleHovered = $state(false);
 	let showMasterPrompt = $state(false);
 	let realtimeChannels: any[] = [];
+	let taskRefreshInterval: ReturnType<typeof setInterval> | null = null;
 
 	let workerUnlisten: (() => void) | null = null;
 
@@ -92,6 +93,7 @@
 		]);
 
 		initRealtime();
+		startTaskRefreshFallback();
 
 		try {
 			const { listen } = await import('@tauri-apps/api/event');
@@ -99,7 +101,7 @@
 				const { event_type, message, task_id } = event.payload;
 				console.log(`[worker] ${event_type}: ${message}`);
 				if (event_type === 'task_completed' || event_type === 'task_failed') {
-					taskStore.fetchTasks();
+					taskStore.fetchTasks({ silent: true });
 				}
 			});
 		} catch {
@@ -110,6 +112,10 @@
 	onDestroy(() => {
 		for (const ch of realtimeChannels) {
 			ch.unsubscribe();
+		}
+		if (taskRefreshInterval) {
+			clearInterval(taskRefreshInterval);
+			taskRefreshInterval = null;
 		}
 		workerUnlisten?.();
 		chatStore.destroySession();
@@ -122,7 +128,7 @@
 		const taskChannel = subscribeToTable(config.url, config.anon_key, 'ae_tasks', (payload) => {
 			const { eventType } = payload;
 			if (eventType === 'INSERT' || eventType === 'UPDATE' || eventType === 'DELETE') {
-				taskStore.fetchTasks();
+				taskStore.fetchTasks({ silent: true });
 			}
 		});
 		realtimeChannels.push(taskChannel);
@@ -140,6 +146,17 @@
 			}
 		});
 		realtimeChannels.push(commentChannel);
+	}
+
+	function startTaskRefreshFallback() {
+		if (taskRefreshInterval) return;
+		taskRefreshInterval = setInterval(() => {
+			taskStore.fetchTasks({ silent: true });
+		}, 10_000);
+	}
+
+	function handleFocus() {
+		taskStore.fetchTasks({ silent: true });
 	}
 
 	// Watch for reconfigure requests from Settings modal
@@ -183,7 +200,7 @@
 	}
 </script>
 
-<svelte:window onkeydown={handleGlobalKeyDown} />
+<svelte:window onkeydown={handleGlobalKeyDown} onfocus={handleFocus} />
 
 <div class="app-shell" style="display: flex; flex-direction: column; height: 100vh; width: 100vw; background: {theme.c.bgCanvas}; color: {theme.c.textPrimary};">
 	<TitleBar />

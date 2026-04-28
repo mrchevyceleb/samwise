@@ -59,8 +59,8 @@ export function getTaskStore() {
       };
     },
 
-    async fetchTasks() {
-      loading = true;
+    async fetchTasks(options: { silent?: boolean } = {}) {
+      if (!options.silent) loading = true;
       error = null;
       try {
         const result = await safeInvoke<AeTask[]>('supabase_fetch_tasks');
@@ -71,7 +71,7 @@ export function getTaskStore() {
         error = String(e);
         console.warn('[tasks] fetch failed:', e);
       } finally {
-        loading = false;
+        if (!options.silent) loading = false;
       }
     },
 
@@ -145,6 +145,8 @@ export function getTaskStore() {
     },
 
     async moveTask(id: string, newStatus: TaskStatus) {
+      const task = tasks.find(t => t.id === id);
+      if (!task || task.status === newStatus) return;
       const updates: Partial<AeTask> = { status: newStatus };
       if (newStatus === 'done') {
         updates.completed_at = new Date().toISOString();

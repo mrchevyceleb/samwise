@@ -491,7 +491,40 @@ pub async fn supabase_create_task(task: Value, state: tauri::State<'_, SupabaseS
 #[tauri::command]
 pub async fn supabase_update_task(id: String, updates: Value, state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
     let config = state.get_config().await;
-    update_task(&config, &id, &updates).await
+    let result = update_task(&config, &id, &updates).await?;
+    if updates.get("status").and_then(|v| v.as_str()) == Some("done") {
+        close_origin_ticket_for_done_update(&config, &id, &result).await;
+    }
+    Ok(result)
+}
+
+async fn close_origin_ticket_for_done_update(config: &SupabaseConfig, id: &str, update_result: &Value) {
+    let mut task = update_result
+        .as_array()
+        .and_then(|rows| rows.first())
+        .cloned();
+    if task.is_none() {
+        task = fetch_task(config, id).await.ok().flatten();
+    }
+    let Some(task) = task else {
+        log::warn!("[close-origin] skipped: could not load task {} after Done update", id);
+        return;
+    };
+
+    let pr_url = task.get("pr_url").and_then(|v| v.as_str()).unwrap_or("");
+    let origin_system = task.get("origin_system").and_then(|v| v.as_str()).unwrap_or("");
+    let origin_id = task.get("origin_id").and_then(|v| v.as_str()).unwrap_or("");
+    let task_source = task.get("source").and_then(|v| v.as_str()).unwrap_or("");
+    let callback_url = task.get("callback_url").and_then(|v| v.as_str()).unwrap_or("");
+    crate::commands::worker::close_origin_ticket(
+        config,
+        id,
+        origin_system,
+        origin_id,
+        pr_url,
+        task_source,
+        callback_url,
+    );
 }
 
 #[tauri::command]
