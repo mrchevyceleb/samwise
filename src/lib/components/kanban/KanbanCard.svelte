@@ -247,6 +247,33 @@
 		</div>
 	{/if}
 
+	{#if task.on_hold}
+		<div style="
+			display: flex; align-items: center; justify-content: space-between; gap: 8px;
+			margin: -2px -2px 10px -2px; padding: 8px 10px; border-radius: 12px;
+			background: linear-gradient(135deg, rgba(148, 163, 184, 0.30), rgba(100, 116, 139, 0.16));
+			border: 1px solid rgba(203, 213, 225, 0.55);
+			box-shadow: 0 0 18px rgba(100, 116, 139, 0.20), inset 0 1px 0 rgba(255,255,255,0.18);
+		">
+			<span style="display: inline-flex; align-items: center; gap: 6px;">
+				<svg width="11" height="11" viewBox="0 0 16 16" fill="#e2e8f0" aria-hidden="true">
+					<path d="M11.5 1.75C11.5 .784 12.284 0 13.25 0a1.75 1.75 0 011.75 1.75v12.5A1.75 1.75 0 0113.25 16a1.75 1.75 0 01-1.75-1.75V1.75zm-7 0C4.5.784 5.284 0 6.25 0A1.75 1.75 0 018 1.75v12.5A1.75 1.75 0 016.25 16 1.75 1.75 0 014.5 14.25V1.75z"/>
+				</svg>
+				<span style="color: #f1f5f9; font-size: 11px; font-weight: 950; text-transform: uppercase; letter-spacing: 0.55px;">
+					On Hold
+				</span>
+			</span>
+			<span style="
+				padding: 2px 6px; border-radius: 999px;
+				background: rgba(2, 6, 23, 0.36); color: #cbd5e1;
+				border: 1px solid rgba(203, 213, 225, 0.45);
+				font-size: 9px; font-weight: 950; letter-spacing: 0.45px;
+			">
+				SAM SKIPS
+			</span>
+		</div>
+	{/if}
+
 	<!-- Title (truncated to 2 lines) -->
 	<div style="
 		font-size: 14px; font-weight: 600; color: var(--text-primary);
@@ -419,6 +446,24 @@
 		">
 			{qaResult.pass ? 'QA Passed' : 'QA Failed'}
 		</div>
+	{/if}
+
+	<!-- Sam's commit message (Root Cause / Fixes Made / CS Message). Shown on
+	     any post-commit status so Matt can scan what's about to merge without
+	     opening the PR. Constrained height + scroll so a long body doesn't
+	     dominate the card. -->
+	{#if task.commit_message && task.commit_message.trim()}
+		<div style="
+			margin-bottom: 8px; padding: 8px 10px; border-radius: 6px;
+			background: rgba(99, 102, 241, 0.05);
+			border-left: 2px solid rgba(99, 102, 241, 0.45);
+			font-family: var(--font-mono); font-size: 10px; line-height: 1.4;
+			color: var(--text-secondary); white-space: pre-wrap; word-wrap: break-word;
+			max-height: 200px; overflow-y: auto;
+		"
+			onmousedown={(e) => e.stopPropagation()}
+			onclick={(e) => e.stopPropagation()}
+		>{task.commit_message}</div>
 	{/if}
 
 	{#if showReviewActions && task.status !== 'done'}

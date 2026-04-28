@@ -10,6 +10,7 @@
   let maxDiff = $derived(settingsStore.value.autoMergeMaxDiffLines);
   let prReviewEnabled = $derived(settingsStore.value.autoPrReviewEnabled);
   let autoFixEnabled = $derived(settingsStore.value.autoFixFromFixesNeededEnabled);
+  let visualQaEnabled = $derived(settingsStore.value.visualQaEnabled);
 
   function toggleEnabled() {
     updateSetting('autoMergeEnabled', !enabled);
@@ -21,6 +22,10 @@
 
   function toggleAutoFix() {
     updateSetting('autoFixFromFixesNeededEnabled', !autoFixEnabled);
+  }
+
+  function toggleVisualQa() {
+    updateSetting('visualQaEnabled', !visualQaEnabled);
   }
 
   function setMinScore(v: number) {
@@ -196,6 +201,50 @@
         position: absolute; top: 2px; left: {autoFixEnabled ? '22px' : '2px'};
         width: 18px; height: 18px; border-radius: 50%;
         background: {autoFixEnabled ? 'white' : 'var(--text-muted)'};
+        transition: all 0.2s ease;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+      "></span>
+    </button>
+  </div>
+
+  <!-- Visual QA -->
+  <div style="font-size: 13px; font-weight: 600; color: var(--text-primary); padding-bottom: 4px; border-top: 1px solid var(--border-default); padding-top: 20px; margin-top: 4px;">
+    Visual QA
+  </div>
+
+  <div style="font-size: 12px; color: var(--text-secondary); line-height: 1.5;">
+    When on, Sam starts a dev server, takes before/after screenshots (desktop and mobile), and runs a Claude vision pass that flags regressions
+    and feeds the explanation back to Claude Code as a fix-it prompt (up to 3 attempts). Off by default. Currently the screenshotter has no
+    authentication support, so for auth-walled apps it only sees the login page and rubber-stamps every PR. Leave off until per-project storage
+    state is wired up.
+  </div>
+
+  <div
+    style="display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; background: var(--bg-primary); border: 1px solid var(--border-default); border-radius: 10px;"
+    onmouseenter={() => hovered = 'visualqa'}
+    onmouseleave={() => hovered = null}
+  >
+    <div>
+      <div style="font-size: 13px; font-weight: 600; color: var(--text-primary);">Run Visual QA on every code task</div>
+      <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">Off by default. Turn on once your project has authenticated screenshots set up.</div>
+    </div>
+    <button
+      onclick={toggleVisualQa}
+      role="switch"
+      aria-checked={visualQaEnabled}
+      aria-label="Toggle Visual QA"
+      style="
+        position: relative; width: 44px; height: 24px; border-radius: 12px; cursor: pointer;
+        background: {visualQaEnabled ? '#6366f1' : 'var(--bg-elevated)'};
+        border: 1px solid {visualQaEnabled ? '#6366f1' : 'var(--border-default)'};
+        transition: all 0.2s ease;
+        transform: {hovered === 'visualqa' ? 'scale(1.05)' : 'scale(1)'};
+      "
+    >
+      <span style="
+        position: absolute; top: 2px; left: {visualQaEnabled ? '22px' : '2px'};
+        width: 18px; height: 18px; border-radius: 50%;
+        background: {visualQaEnabled ? 'white' : 'var(--text-muted)'};
         transition: all 0.2s ease;
         box-shadow: 0 1px 3px rgba(0,0,0,0.3);
       "></span>

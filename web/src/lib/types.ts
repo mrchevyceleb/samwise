@@ -63,6 +63,8 @@ export interface AeTask {
   origin_system?: OriginSystem | null;
   origin_id?: string | null;
   origin_url?: string | null;
+  on_hold?: boolean;
+  commit_message?: string | null;
 }
 
 export const ORIGIN_LABEL: Record<Exclude<OriginSystem, 'manual'>, string> = {

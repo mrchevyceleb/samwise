@@ -537,6 +537,10 @@ async fn worker_loop(
                             _ => 4,
                         };
                         let mut sorted = arr.clone();
+                        // Skip tasks Matt stamped HOLD on the card. They stay in the
+                        // queued column visually but the worker won't claim them
+                        // until he clicks the stamp off.
+                        sorted.retain(|t| !t.get("on_hold").and_then(|v| v.as_bool()).unwrap_or(false));
                         sorted.sort_by(|a, b| {
                             let pa = priority_order(a.get("priority").and_then(|v| v.as_str()).unwrap_or("medium"));
                             let pb = priority_order(b.get("priority").and_then(|v| v.as_str()).unwrap_or("medium"));
@@ -565,55 +569,71 @@ async fn worker_loop(
                                             "Picked up \"{}\" from the queue. I'll post updates as I go.", task_title
                                         )).await;
 
-                                        let result = execute_task(&app, &machine_name, &config, task.clone(), current_process_id.clone()).await;
+                                        // Run the task in a spawned tokio task so the worker
+                                        // poll loop keeps ticking. Heartbeats, the merge-deploy
+                                        // sweep, the PR-review sweep, telegram polls, crons, and
+                                        // triggers all need to run while a long task is in flight.
+                                        // Single-active is still enforced by `current_task_id`,
+                                        // which the loop checks before claiming the next task.
+                                        let app_spawn = app.clone();
+                                        let machine_name_spawn = machine_name.clone();
+                                        let config_spawn = config.clone();
+                                        let task_spawn = task.clone();
+                                        let current_process_id_spawn = current_process_id.clone();
+                                        let current_task_id_spawn = current_task_id.clone();
+                                        let task_title_spawn = task_title.clone();
+                                        let task_id_spawn = task_id.clone();
+                                        tokio::spawn(async move {
+                                            let result = execute_task(&app_spawn, &machine_name_spawn, &config_spawn, task_spawn, current_process_id_spawn).await;
 
-                                        {
-                                            let mut ct = current_task_id.lock().await;
-                                            *ct = None;
-                                        }
+                                            {
+                                                let mut ct = current_task_id_spawn.lock().await;
+                                                *ct = None;
+                                            }
 
-                                        match &result {
-                                            Ok(msg) => {
-                                                emit_worker_event(&app, "task_completed", msg, Some(&task_id));
-                                                // Proactive chat: announce completion.
-                                                // If a Codex review was just kicked off on the freshly-opened PR,
-                                                // don't ask "want me to pick up something else?" — the card is
-                                                // still being reviewed async. Signal that instead.
-                                                let completion_settings: Option<serde_json::Value> = if let Ok(data_dir) = app.path().app_data_dir() {
-                                                    let p = data_dir.join("settings.json");
-                                                    tokio::fs::read_to_string(&p).await.ok().and_then(|s| serde_json::from_str(&s).ok())
-                                                } else { None };
-                                                let auto_merge_on = completion_settings.as_ref()
-                                                    .and_then(|s| s.get("autoMergeEnabled"))
-                                                    .and_then(|v| v.as_bool()).unwrap_or(false);
-                                                let pr_review_on = completion_settings.as_ref()
-                                                    .and_then(|s| s.get("autoPrReviewEnabled"))
-                                                    .and_then(|v| v.as_bool()).unwrap_or(true);
+                                            match &result {
+                                                Ok(msg) => {
+                                                    emit_worker_event(&app_spawn, "task_completed", msg, Some(&task_id_spawn));
+                                                    // Proactive chat: announce completion.
+                                                    // If a Codex review was just kicked off on the freshly-opened PR,
+                                                    // don't ask "want me to pick up something else?" — the card is
+                                                    // still being reviewed async. Signal that instead.
+                                                    let completion_settings: Option<serde_json::Value> = if let Ok(data_dir) = app_spawn.path().app_data_dir() {
+                                                        let p = data_dir.join("settings.json");
+                                                        tokio::fs::read_to_string(&p).await.ok().and_then(|s| serde_json::from_str(&s).ok())
+                                                    } else { None };
+                                                    let auto_merge_on = completion_settings.as_ref()
+                                                        .and_then(|s| s.get("autoMergeEnabled"))
+                                                        .and_then(|v| v.as_bool()).unwrap_or(false);
+                                                    let pr_review_on = completion_settings.as_ref()
+                                                        .and_then(|s| s.get("autoPrReviewEnabled"))
+                                                        .and_then(|v| v.as_bool()).unwrap_or(true);
 
-                                                if msg.contains("PR created") && pr_review_on && !auto_merge_on {
-                                                    agent_chat(&config, &format!(
-                                                        "PR's up for \"{}\": {}. Running Codex review now. I'll post the verdict and route the card in a minute — no need to pick up something new yet.",
-                                                        task_title, msg
-                                                    )).await;
-                                                } else if msg.contains("PR created") {
-                                                    agent_chat(&config, &format!(
-                                                        "Done with \"{}\". {} Want me to pick up something else?", task_title, msg
-                                                    )).await;
-                                                } else {
-                                                    agent_chat(&config, &format!(
-                                                        "Finished \"{}\". {} Anything else?", task_title, msg
+                                                    if msg.contains("PR created") && pr_review_on && !auto_merge_on {
+                                                        agent_chat(&config_spawn, &format!(
+                                                            "PR's up for \"{}\": {}. Running Codex review now. I'll post the verdict and route the card in a minute — no need to pick up something new yet.",
+                                                            task_title_spawn, msg
+                                                        )).await;
+                                                    } else if msg.contains("PR created") {
+                                                        agent_chat(&config_spawn, &format!(
+                                                            "Done with \"{}\". {} Want me to pick up something else?", task_title_spawn, msg
+                                                        )).await;
+                                                    } else {
+                                                        agent_chat(&config_spawn, &format!(
+                                                            "Finished \"{}\". {} Anything else?", task_title_spawn, msg
+                                                        )).await;
+                                                    }
+                                                }
+                                                Err(err) => {
+                                                    emit_worker_event(&app_spawn, "task_failed", err, Some(&task_id_spawn));
+                                                    // Proactive chat: explain failure
+                                                    agent_chat(&config_spawn, &format!(
+                                                        "Ran into trouble on \"{}\": {}. You might want to take a look or re-queue it.",
+                                                        task_title_spawn, truncate(err, 200)
                                                     )).await;
                                                 }
                                             }
-                                            Err(err) => {
-                                                emit_worker_event(&app, "task_failed", err, Some(&task_id));
-                                                // Proactive chat: explain failure
-                                                agent_chat(&config, &format!(
-                                                    "Ran into trouble on \"{}\": {}. You might want to take a look or re-queue it.",
-                                                    task_title, truncate(err, 200)
-                                                )).await;
-                                            }
-                                        }
+                                        });
                                     }
                                     Err(_) => {
                                         // Someone else claimed it, try next tick
@@ -1138,9 +1158,25 @@ async fn execute_task(
         }
     }
 
+    // Read the Visual QA gate from settings.json once per task. When disabled
+    // (default) Sam skips the dev server, before/after screenshots, the QA
+    // loop, and the screenshot upload. The toggle lives in Settings -> Auto-Merge.
+    let visual_qa_enabled = {
+        use tauri::Manager;
+        if let Ok(data_dir) = app.path().app_data_dir() {
+            let p = data_dir.join("settings.json");
+            tokio::fs::read_to_string(&p).await.ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|s| s.get("visualQaEnabled").and_then(|v| v.as_bool()))
+                .unwrap_or(false)
+        } else {
+            false
+        }
+    };
+
     // 3b. Start dev server if no preview_url and repo has a package.json (code tasks only)
     let mut dev_server_handle: Option<dev_server::DevServerHandle> = None;
-    if !is_research && preview_url.is_none() {
+    if !is_research && preview_url.is_none() && visual_qa_enabled {
         let pkg_json = std::path::Path::new(&repo_path).join("package.json");
         if tokio::fs::metadata(&pkg_json).await.is_ok() {
             agent_comment(config, &task_id, "No preview URL set. Starting a dev server...").await;
@@ -1172,14 +1208,15 @@ async fn execute_task(
         }
     }
 
-    // 4. Take BEFORE screenshots if preview_url is set (code tasks only)
+    // 4. Take BEFORE screenshots if preview_url is set (code tasks only).
+    // Skipped when visual QA is disabled.
     let screenshot_dir = dirs::cache_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("agent-one-screenshots")
         .join(&task_id)
         .to_string_lossy()
         .into_owned();
-    if !is_research {
+    if !is_research && visual_qa_enabled {
         if let Some(ref preview) = preview_url {
             let _ = tokio::fs::create_dir_all(&screenshot_dir).await;
             agent_comment(config, &task_id, "Taking before screenshots...").await;
@@ -1310,25 +1347,23 @@ Use a HEREDOC so the body is multi-line:\n\
 git add -A && git commit -m \"$(cat <<'EOF'\n\
 {title}\n\
 \n\
-What was fixed:\n\
-- <plain-English description of the bug or feature, from the user/customer POV>\n\
+Root Cause:\n\
+- <why this bug existed or why this feature was missing: the underlying defect, the wrong assumption, the missing piece in the codebase. Be specific about the file/function/line where the cause lives.>\n\
 \n\
-How it was fixed:\n\
-- <technical summary of the change: files/functions touched, approach, why>\n\
+Fixes Made:\n\
+- <what changes you made: files and functions touched, the approach, and why this approach over alternatives. One bullet per logical change.>\n\
+\n\
+CS Message:\n\
+- <one or two sentences Customer Success can paste to the customer in non-technical language. If this is internal-only, write \"internal only, no customer message needed\".>\n\
 \n\
 Deployment required:\n\
 - Railway server: <yes/no/unknown> - <plain reason, including service name if yes>\n\
 - Supabase migrations: <yes/no/unknown> - <plain reason, including migration filenames if yes>\n\
 - Supabase Edge Functions: <yes/no/unknown> - <plain reason, including function names if yes>\n\
-\n\
-For Customer Success:\n\
-- <one or two sentences CS can paste to the customer explaining that it's fixed and what to expect now, in non-technical language>\n\
 EOF\n\
 )\"\n\
 ```\n\
-Fill in every section concretely. Do not use placeholders. If the task is a \
-non-customer-facing refactor, still write the \"For Customer Success\" line \
-but mark it as \"internal only, no customer message needed\". The deployment \
+Fill in every section concretely. Do not use placeholders. The deployment \
 section must be crystal clear: use \"no\" when the PR does not require that \
 deployment path, \"yes\" when it does, and \"unknown\" only when the codebase \
 does not provide enough evidence.\n\n\
@@ -1421,6 +1456,22 @@ from Matt, stop without making changes and explain specifically what you need cl
             // Post full output but cap at 10KB to avoid Supabase/UI issues with massive comments
             let comment_output = truncate(&output, 10_000);
             agent_comment(config, &task_id, &format!("Code changes done. Here's what I did:\n\n{}", comment_output)).await;
+
+            // Capture the structured commit message Claude Code just wrote, BEFORE
+            // codex-fix or build-repair can stack auto-generated commits on top.
+            // The card renders this so Matt can read Root Cause / Fixes Made / CS
+            // Message at a glance without opening the PR. We grab HEAD's full body;
+            // any later codex-fix / merge-conflict commits live on the branch but
+            // don't overwrite this field.
+            if let Ok(msg) = run_git(&["log", "-1", "--pretty=%B", "HEAD"], &repo_path).await {
+                let trimmed = msg.trim_end().to_string();
+                if !trimmed.is_empty() {
+                    let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                        "commit_message": trimmed,
+                        "updated_at": chrono::Utc::now().to_rfc3339(),
+                    })).await;
+                }
+            }
 
             // 5b. Run /codex-fix in the worktree to get a Codex review of the diff and auto-apply
             // any must-fix/should-fix edits. Runs BEFORE screenshots + QA so QA validates the
@@ -1533,8 +1584,10 @@ from Matt, stop without making changes and explain specifically what you need cl
                 }
             }
 
-            // 6. Take AFTER screenshots (may be re-taken inside the QA retry loop below)
-            if let Some(ref preview) = preview_url {
+            // 6. Take AFTER screenshots (may be re-taken inside the QA retry loop below).
+            // Skipped when visual QA is disabled.
+            if visual_qa_enabled {
+              if let Some(ref preview) = preview_url {
                 agent_comment(config, &task_id, "Taking after screenshots...").await;
 
                 for (label, name, viewport) in [
@@ -1546,6 +1599,7 @@ from Matt, stop without making changes and explain specifically what you need cl
                         log::warn!("[worker] after-{} screenshot failed: {}", label, e);
                     }
                 }
+              }
             }
 
             // Mark first unchecked subtask as done (re-fetch fresh subtasks to avoid stale data)
@@ -1620,16 +1674,19 @@ from Matt, stop without making changes and explain specifically what you need cl
             // If QA flags a problem, feed the explanation back to Claude Code as a fix-it
             // prompt, re-screenshot, re-QA. Up to MAX_QA_ATTEMPTS (3) total attempts so
             // Sam can't spiral. On exhaustion we push anyway with an honest note.
+            // Skipped when visual QA is disabled.
             const MAX_QA_ATTEMPTS: u32 = 3;
-            let _ = supabase::update_task(config, &task_id, &serde_json::json!({
-                "status": "testing",
-                "updated_at": chrono::Utc::now().to_rfc3339(),
-            })).await;
+            if visual_qa_enabled {
+                let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                    "status": "testing",
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                })).await;
+            }
 
             let mut qa_attempts: u32 = 0;
             let mut final_qa: Option<(bool, String)> = None;
 
-            if preview_url.is_some() {
+            if visual_qa_enabled && preview_url.is_some() {
                 loop {
                     qa_attempts += 1;
                     let starting_msg = if qa_attempts == 1 {
@@ -1721,7 +1778,8 @@ When done, run `git add -A && git commit -m \"fix: address QA feedback\"` and st
 
             // 7b. Upload the (possibly revised) screenshots to Supabase Storage now that
             // the QA loop has settled. Task record points at the final images only.
-            if preview_url.is_some() {
+            // Skipped when visual QA is disabled (no screenshots to upload).
+            if visual_qa_enabled && preview_url.is_some() {
                 let (urls, _) = upload_screenshots_to_storage(config, &task_id, &screenshot_dir).await
                     .unwrap_or_default();
                 let before_urls: Vec<&String> = urls.iter().filter(|u| u.contains("before-")).collect();
@@ -1729,6 +1787,14 @@ When done, run `git add -A && git commit -m \"fix: address QA feedback\"` and st
                 let _ = supabase::update_task(config, &task_id, &serde_json::json!({
                     "screenshots_before": before_urls,
                     "screenshots_after": after_urls,
+                })).await;
+            } else if !visual_qa_enabled {
+                // Re-runs of a card whose previous run was QA'd would otherwise show
+                // stale screenshots and pass/fail results in the UI. Clear them.
+                let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                    "screenshots_before": serde_json::Value::Null,
+                    "screenshots_after": serde_json::Value::Null,
+                    "visual_qa_result": serde_json::Value::Null,
                 })).await;
             }
 

@@ -110,7 +110,11 @@ pub async fn update_task_if_status(config: &SupabaseConfig, id: &str, expected_s
 
 pub async fn claim_task(config: &SupabaseConfig, task_id: &str, worker_id: &str) -> Result<Value, String> {
     let client = build_client(config)?;
-    let url = format!("{}?id=eq.{}&status=eq.queued", rest_url(config, "ae_tasks"), task_id);
+    // Filter on `on_hold=false` at PATCH time too. The worker loop already
+    // skips held tasks before calling this, but Matt could stamp HOLD between
+    // the fetch and the PATCH. Including the gate in the SQL filter makes the
+    // claim atomic with the hold check.
+    let url = format!("{}?id=eq.{}&status=eq.queued&on_hold=eq.false", rest_url(config, "ae_tasks"), task_id);
     let now = chrono::Utc::now().to_rfc3339();
     let body = serde_json::json!({
         "status": "in_progress",
@@ -121,7 +125,7 @@ pub async fn claim_task(config: &SupabaseConfig, task_id: &str, worker_id: &str)
     let result = handle_response(client.patch(&url).json(&body).send().await.map_err(|e| e.to_string())?).await?;
     if let Some(arr) = result.as_array() {
         if arr.is_empty() {
-            return Err("Task is no longer queued (already claimed or changed)".to_string());
+            return Err("Task is no longer queued (already claimed, held, or changed)".to_string());
         }
     }
     Ok(result)

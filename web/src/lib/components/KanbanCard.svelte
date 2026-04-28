@@ -95,6 +95,12 @@
     e.stopPropagation();
     await tasksStore.setStatus(task.id, 'done');
   }
+
+  async function toggleHold(e: MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    await tasksStore.updateTask(task.id, { on_hold: !task.on_hold });
+  }
 </script>
 
 <div
@@ -120,6 +126,22 @@
         </span>
         <span class="rounded-full border border-orange-200/40 bg-black/25 px-1.5 py-0.5 text-[9px] font-black uppercase tracking-wide text-orange-100">
           Mine
+        </span>
+      </div>
+    </div>
+  {/if}
+
+  {#if task.on_hold}
+    <div class="mb-2 rounded-xl border border-slate-300/60 bg-gradient-to-r from-slate-400/30 via-slate-300/15 to-slate-500/20 px-2.5 py-2 shadow-lg shadow-slate-950/30">
+      <div class="flex items-center justify-between gap-2">
+        <span class="inline-flex items-center gap-1.5 text-[11px] font-black uppercase tracking-[0.16em] text-slate-50">
+          <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+            <path d="M11.5 1.75C11.5 .784 12.284 0 13.25 0a1.75 1.75 0 011.75 1.75v12.5A1.75 1.75 0 0113.25 16a1.75 1.75 0 01-1.75-1.75V1.75zm-7 0C4.5.784 5.284 0 6.25 0A1.75 1.75 0 018 1.75v12.5A1.75 1.75 0 016.25 16 1.75 1.75 0 014.5 14.25V1.75z"/>
+          </svg>
+          On Hold
+        </span>
+        <span class="rounded-full border border-slate-200/40 bg-black/25 px-1.5 py-0.5 text-[9px] font-black uppercase tracking-wide text-slate-100">
+          Sam Skips
         </span>
       </div>
     </div>
@@ -195,6 +217,26 @@
         <div class="h-full bg-emerald-400/70" style="width:{(done / task.subtasks.length) * 100}%"></div>
       </div>
       <span class="text-[10px] text-slate-400">{done}/{task.subtasks.length}</span>
+    </div>
+  {/if}
+
+  {#if task.commit_message && task.commit_message.trim()}
+    <pre
+      onmousedown={(e) => e.stopPropagation()}
+      onclick={(e) => e.stopPropagation()}
+      class="mt-2 max-h-52 overflow-y-auto whitespace-pre-wrap break-words rounded-md border-l-2 border-indigo-400/45 bg-indigo-500/5 px-2.5 py-2 font-mono text-[10px] leading-snug text-slate-300"
+    >{task.commit_message}</pre>
+  {/if}
+
+  {#if task.status === 'queued'}
+    <div class="mt-2 flex justify-end">
+      <button
+        type="button"
+        onclick={toggleHold}
+        class="rounded-lg border px-2 py-1 text-[10px] font-black uppercase tracking-wide transition {task.on_hold ? 'border-emerald-300/40 bg-emerald-400/10 text-emerald-100 hover:bg-emerald-400/15' : 'border-slate-300/30 bg-slate-400/10 text-slate-100 hover:bg-slate-400/15'}"
+      >
+        {task.on_hold ? 'Release' : 'Hold'}
+      </button>
     </div>
   {/if}
 

@@ -56,6 +56,11 @@
 		onClose();
 	}
 
+	async function toggleHold() {
+		await taskStore.updateTask(task.id, { on_hold: !task.on_hold });
+		onClose();
+	}
+
 	function openDetails() {
 		onOpenDetail(task);
 		onClose();
@@ -302,6 +307,34 @@
 		</div>
 
 		<div style="height: 1px; background: var(--border-subtle); margin: 4px 6px;"></div>
+
+		<!-- Hold / Release (only meaningful while queued) -->
+		{#if task.status === 'queued'}
+			<button
+				class="ctx-item"
+				style="
+					display: flex; align-items: center; gap: 8px; width: 100%;
+					padding: 7px 10px; border: none; background: none; border-radius: 6px;
+					color: {task.on_hold ? 'var(--accent-green)' : 'var(--accent-amber, #d29922)'};
+					font-size: 12px; font-weight: 500;
+					font-family: var(--font-ui); cursor: pointer; text-align: left;
+					transition: background 0.1s;
+				"
+				onmouseenter={(e) => { (e.currentTarget as HTMLElement).style.background = task.on_hold ? 'rgba(63, 185, 80, 0.08)' : 'rgba(210, 153, 34, 0.10)'; submenu = null; }}
+				onmouseleave={(e) => { (e.currentTarget as HTMLElement).style.background = 'none'; }}
+				onclick={toggleHold}
+			>
+				<svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" style="opacity: 0.75;">
+					{#if task.on_hold}
+						<path d="M5 2.75C5 1.784 5.784 1 6.75 1h2.5c.966 0 1.75.784 1.75 1.75v10.5A1.75 1.75 0 019.25 15h-2.5A1.75 1.75 0 015 13.25V2.75z"/>
+					{:else}
+						<path d="M11.5 1.75C11.5 .784 12.284 0 13.25 0a1.75 1.75 0 011.75 1.75v12.5A1.75 1.75 0 0113.25 16a1.75 1.75 0 01-1.75-1.75V1.75zm-7 0C4.5.784 5.284 0 6.25 0A1.75 1.75 0 018 1.75v12.5A1.75 1.75 0 016.25 16 1.75 1.75 0 014.5 14.25V1.75z"/>
+					{/if}
+				</svg>
+				{task.on_hold ? 'Release (Sam can claim)' : 'Hold (Sam will skip)'}
+			</button>
+			<div style="height: 1px; background: var(--border-subtle); margin: 4px 6px;"></div>
+		{/if}
 
 		<!-- Re-queue (only if failed) -->
 		{#if task.status === 'failed'}
