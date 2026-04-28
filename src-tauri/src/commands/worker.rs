@@ -4551,7 +4551,17 @@ async fn start_merge_deploy_task(
                 notify_callback(&config_clone, &task_id, "done", Some(&pr_url), None);
                 let origin_system = latest_task.get("origin_system").and_then(|v| v.as_str()).unwrap_or("");
                 let origin_id = latest_task.get("origin_id").and_then(|v| v.as_str()).unwrap_or("");
-                close_origin_ticket(&config_clone, &task_id, origin_system, origin_id, &pr_url);
+                let task_source = latest_task.get("source").and_then(|v| v.as_str()).unwrap_or("");
+                let callback_url = latest_task.get("callback_url").and_then(|v| v.as_str()).unwrap_or("");
+                close_origin_ticket(
+                    &config_clone,
+                    &task_id,
+                    origin_system,
+                    origin_id,
+                    &pr_url,
+                    task_source,
+                    callback_url,
+                );
                 agent_comment(&config_clone, &task_id, &format!("Merge + Deploy complete. Moving the card to Done.\n\n{}", summary)).await;
             }
             Err(err) => {
@@ -5951,7 +5961,17 @@ pub async fn sweep_pr_merged_cards(config: &SupabaseConfig) {
                 notify_callback(config, task_id, "done", Some(pr_url), None);
                 let origin_system = task.get("origin_system").and_then(|v| v.as_str()).unwrap_or("");
                 let origin_id = task.get("origin_id").and_then(|v| v.as_str()).unwrap_or("");
-                close_origin_ticket(config, task_id, origin_system, origin_id, pr_url);
+                let task_source = task.get("source").and_then(|v| v.as_str()).unwrap_or("");
+                let callback_url = task.get("callback_url").and_then(|v| v.as_str()).unwrap_or("");
+                close_origin_ticket(
+                    config,
+                    task_id,
+                    origin_system,
+                    origin_id,
+                    pr_url,
+                    task_source,
+                    callback_url,
+                );
                 continue;
             }
             start_merge_deploy_task(
@@ -6438,18 +6458,32 @@ pub fn notify_callback(
 /// After merge+deploy is green, close the upstream origin ticket (Operly
 /// triage, Banana triage, Sentry issue). The closeout edge function does the
 /// real work — we just hand it the origin pointer plus the merged PR. Skips
-/// `manual` and tasks without origin metadata. Failures do not retry inline:
-/// a comment is posted on the Sam task so Matt can re-fire from the queue UI.
+/// manual tasks, but still attempts older triage tasks that have callback_url
+/// and lack origin metadata because the receiver can resolve tickets by task_id.
+/// Failures do not retry inline: a comment is posted on the Sam task so Matt
+/// can re-fire from the queue UI.
 fn close_origin_ticket(
     config: &SupabaseConfig,
     task_id: &str,
     origin_system: &str,
     origin_id: &str,
     pr_url: &str,
+    task_source: &str,
+    callback_url: &str,
 ) {
-    if origin_system.is_empty() || origin_system == "manual" {
+    let origin_system = origin_system.trim();
+    let task_source = task_source.trim();
+    let callback_url = callback_url.trim();
+    if origin_system == "manual" || task_source == "manual" {
         log::info!(
-            "[close-origin] skipped: manual task or missing origin for task {}",
+            "[close-origin] skipped: manual task {}",
+            task_id
+        );
+        return;
+    }
+    if origin_system.is_empty() && callback_url.is_empty() {
+        log::info!(
+            "[close-origin] skipped: missing origin and callback metadata for task {}",
             task_id
         );
         return;
@@ -6457,7 +6491,15 @@ fn close_origin_ticket(
 
     let cfg = config.clone();
     let task_id = task_id.to_string();
-    let origin_system = origin_system.to_string();
+    let origin_system = if origin_system.is_empty() {
+        log::warn!(
+            "[close-origin] origin metadata missing for task {}; attempting closeout by task_id",
+            task_id
+        );
+        "unknown".to_string()
+    } else {
+        origin_system.to_string()
+    };
     let origin_id = origin_id.to_string();
     let pr_url = pr_url.to_string();
 
