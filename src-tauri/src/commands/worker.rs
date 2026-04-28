@@ -54,6 +54,8 @@ const MERGE_CONFLICT_FIX_ERROR_KEY: &str = "samwise_merge_conflict_fix_error";
 /// Lives outside the Samwise Supabase project; URL is the source of truth.
 const CLOSE_ORIGIN_TICKET_URL: &str =
     "https://iycloielqcjnjqddeuet.supabase.co/functions/v1/close-origin-ticket";
+const POST_MERGE_DEPLOY_GREEN_TIMEOUT_SECS: u64 = 10 * 60;
+const POST_MERGE_DEPLOY_GREEN_POLL_SECS: u64 = 20;
 
 async fn run_git(args: &[&str], repo_path: &str) -> Result<String, String> {
     let output = async_cmd("git")
@@ -4469,12 +4471,28 @@ struct RailwayProjectContext {
 struct MergeDeployError {
     message: String,
     pr_merged: bool,
+    kind: MergeDeployErrorKind,
 }
 
 impl MergeDeployError {
     fn new(message: impl Into<String>, pr_merged: bool) -> Self {
-        Self { message: message.into(), pr_merged }
+        Self { message: message.into(), pr_merged, kind: MergeDeployErrorKind::Standard }
     }
+
+    fn deploy_failed(message: impl Into<String>, pr_merged: bool) -> Self {
+        Self { message: message.into(), pr_merged, kind: MergeDeployErrorKind::DeployFailed }
+    }
+
+    fn deploy_timed_out(message: impl Into<String>, pr_merged: bool) -> Self {
+        Self { message: message.into(), pr_merged, kind: MergeDeployErrorKind::DeployTimedOut }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergeDeployErrorKind {
+    Standard,
+    DeployFailed,
+    DeployTimedOut,
 }
 
 /// Pick up merge/deploy requests written by the desktop or web UI. The UI only
@@ -4541,24 +4559,48 @@ async fn start_merge_deploy_task(
                 context.insert(MERGE_DEPLOY_STATUS_KEY.to_string(), Value::String("failed".to_string()));
                 context.insert(MERGE_DEPLOY_COMPLETED_AT_KEY.to_string(), Value::String(chrono::Utc::now().to_rfc3339()));
                 context.insert(MERGE_DEPLOY_ERROR_KEY.to_string(), Value::String(truncate(&err.message, 900)));
-                let next_status = if err.pr_merged { "fixes_needed" } else { "approved" };
-                let _ = supabase::update_task(&config_clone, &task_id, &serde_json::json!({
-                    "status": next_status,
+                let next_status = match err.kind {
+                    MergeDeployErrorKind::DeployTimedOut => None,
+                    MergeDeployErrorKind::DeployFailed if err.pr_merged => Some("failed"),
+                    _ => Some(if err.pr_merged { "fixes_needed" } else { "approved" }),
+                };
+                let mut updates = serde_json::json!({
                     "updated_at": chrono::Utc::now().to_rfc3339(),
                     "context": Value::Object(context),
                     "failure_reason": format!("Merge + Deploy failed: {}", truncate(&err.message, 1000)),
-                })).await;
-                notify_callback(&config_clone, &task_id, next_status, Some(&pr_url), Some(&err.message));
-                agent_comment(
-                    &config_clone,
-                    &task_id,
-                    &format!(
-                        "Merge + Deploy failed{}. Leaving this card in {}.\n\nReason: {}",
-                        if err.pr_merged { " after the PR was merged" } else { "" },
-                        if err.pr_merged { "Fixes Needed" } else { "Ready to Merge" },
-                        truncate(&err.message, 1800)
-                    ),
-                ).await;
+                });
+                if let Some(status) = next_status {
+                    updates["status"] = Value::String(status.to_string());
+                }
+                let _ = supabase::update_task(&config_clone, &task_id, &updates).await;
+
+                if let Some(status) = next_status {
+                    notify_callback(&config_clone, &task_id, status, Some(&pr_url), Some(&err.message));
+                }
+
+                let comment = match err.kind {
+                    MergeDeployErrorKind::DeployTimedOut => {
+                        format!(
+                            "Closeout deferred: deploy timed out.\n\nReason: {}",
+                            truncate(&err.message, 1800)
+                        )
+                    }
+                    MergeDeployErrorKind::DeployFailed if err.pr_merged => {
+                        format!(
+                            "Merge + Deploy failed after the PR was merged. Leaving this card Failed.\n\nReason: {}",
+                            truncate(&err.message, 1800)
+                        )
+                    }
+                    _ => {
+                        format!(
+                            "Merge + Deploy failed{}. Leaving this card in {}.\n\nReason: {}",
+                            if err.pr_merged { " after the PR was merged" } else { "" },
+                            if err.pr_merged { "Fixes Needed" } else { "Ready to Merge" },
+                            truncate(&err.message, 1800)
+                        )
+                    }
+                };
+                agent_comment(&config_clone, &task_id, &comment).await;
             }
         }
     });
@@ -4585,6 +4627,7 @@ async fn run_merge_deploy_workflow(
     let files = review::fetch_pr_files(pr_url, repo_path)
         .await
         .map_err(|e| MergeDeployError::new(format!("failed to list PR files: {}", e), false))?;
+    let wait_for_deploy_green = deploy_green_wait_required(repo_path, &files).await;
 
     let mut pr_merged = gh_pr_is_merged(pr_url, repo_path)
         .await
@@ -4631,13 +4674,34 @@ async fn run_merge_deploy_workflow(
     agent_comment(config, task_id, &format!("Post-merge deploy plan:\n\n{}", deploy_plan_markdown(&plan))).await;
 
     if plan.commands.is_empty() {
-        return Ok("No Railway server, Supabase migration, or Supabase Edge Function deploy steps were detected for this PR.".to_string());
+        let summary = "No Railway server, Supabase migration, or Supabase Edge Function deploy steps were detected for this PR.".to_string();
+        if wait_for_deploy_green {
+            wait_for_post_merge_deploy_green(pr_url, repo_path)
+                .await
+                .map_err(|e| match e {
+                    DeployGreenError::TimedOut(message) => MergeDeployError::deploy_timed_out(message, pr_merged),
+                    DeployGreenError::Failed(message) => MergeDeployError::deploy_failed(message, pr_merged),
+                    DeployGreenError::PollError(message) => MergeDeployError::new(message, pr_merged),
+                })?;
+            return Ok(format!("{}\n\nPost-merge deploy checks are green.", summary));
+        }
+        return Ok(summary);
     }
 
     for command in &plan.commands {
         run_deploy_command(command)
             .await
-            .map_err(|e| MergeDeployError::new(e, pr_merged))?;
+            .map_err(|e| MergeDeployError::deploy_failed(e, pr_merged))?;
+    }
+
+    if wait_for_deploy_green {
+        wait_for_post_merge_deploy_green(pr_url, repo_path)
+            .await
+            .map_err(|e| match e {
+                DeployGreenError::TimedOut(message) => MergeDeployError::deploy_timed_out(message, pr_merged),
+                DeployGreenError::Failed(message) => MergeDeployError::deploy_failed(message, pr_merged),
+                DeployGreenError::PollError(message) => MergeDeployError::new(message, pr_merged),
+            })?;
     }
 
     Ok(deploy_plan_markdown(&plan))
@@ -4941,6 +5005,136 @@ fn deploy_plan_markdown(plan: &DeployPlan) -> String {
         "- Railway server: {}\n- Supabase migrations: {}\n- Supabase Edge Functions: {}\n\n{}",
         railway, migrations, functions, commands
     )
+}
+
+async fn deploy_green_wait_required(repo_path: &str, files: &[String]) -> bool {
+    if files.iter().any(|f| {
+        f.starts_with("supabase/migrations/") || f.starts_with("supabase/functions/")
+    }) {
+        return true;
+    }
+
+    if !files.iter().any(|f| is_railway_deploy_wait_path(f)) {
+        return false;
+    }
+
+    repo_has_railway_service(repo_path).await
+}
+
+async fn repo_has_railway_service(repo_path: &str) -> bool {
+    if read_railway_project_context(repo_path).await.is_some() {
+        return true;
+    }
+    if !discover_railway_roots(repo_path).is_empty() {
+        return true;
+    }
+
+    let scripts = read_package_scripts(repo_path).await;
+    scripts.contains_key("server:deploy") || scripts.contains_key("tools:deploy")
+}
+
+fn is_railway_deploy_wait_path(file: &str) -> bool {
+    let file = file.trim_start_matches("./");
+    file.starts_with("server/")
+        || file.starts_with("tools-server/")
+        || matches!(
+            file,
+            "package.json"
+                | "package-lock.json"
+                | "railway.json"
+                | "railway.toml"
+                | "nixpacks.toml"
+        )
+}
+
+#[derive(Debug, Clone)]
+enum DeployGreenError {
+    TimedOut(String),
+    Failed(String),
+    PollError(String),
+}
+
+async fn wait_for_post_merge_deploy_green(pr_url: &str, repo_path: &str) -> Result<(), DeployGreenError> {
+    let start = std::time::Instant::now();
+    let max = std::time::Duration::from_secs(POST_MERGE_DEPLOY_GREEN_TIMEOUT_SECS);
+    let interval = std::time::Duration::from_secs(POST_MERGE_DEPLOY_GREEN_POLL_SECS);
+    let mut last_detail = "no checks observed yet".to_string();
+
+    loop {
+        let output = async_cmd("gh")
+            .args(["pr", "checks", pr_url, "--json", "name,state,bucket"])
+            .current_dir(repo_path)
+            .output()
+            .await
+            .map_err(|e| DeployGreenError::PollError(format!("spawn gh checks: {}", e)))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let parsed: Result<Value, _> = serde_json::from_str(&stdout);
+        if let Ok(Value::Array(checks)) = parsed {
+            if !checks.is_empty() {
+                let failed = checks
+                    .iter()
+                    .filter(|check| check_bucket(check).map(|bucket| matches!(bucket, "fail" | "cancel")).unwrap_or(false))
+                    .map(check_detail)
+                    .collect::<Vec<_>>();
+                if !failed.is_empty() {
+                    return Err(DeployGreenError::Failed(format!(
+                        "post-merge deploy check failed: {}",
+                        truncate(&failed.join("; "), 900)
+                    )));
+                }
+
+                let pending = checks
+                    .iter()
+                    .filter(|check| {
+                        check_bucket(check)
+                            .map(|bucket| !matches!(bucket, "pass" | "skipping"))
+                            .unwrap_or(true)
+                    })
+                    .map(check_detail)
+                    .collect::<Vec<_>>();
+                if pending.is_empty() {
+                    log::info!("[merge-deploy] post-merge deploy checks green for {}", pr_url);
+                    return Ok(());
+                }
+                last_detail = format!("pending checks: {}", truncate(&pending.join("; "), 900));
+            }
+        } else if !output.status.success() && stdout.trim().is_empty() {
+            return Err(DeployGreenError::PollError(format!(
+                "gh pr checks: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+
+        if start.elapsed() >= max {
+            return Err(DeployGreenError::TimedOut(format!(
+                "deploy timed out after {} minutes ({})",
+                POST_MERGE_DEPLOY_GREEN_TIMEOUT_SECS / 60,
+                last_detail
+            )));
+        }
+
+        tokio::time::sleep(interval).await;
+    }
+}
+
+fn check_bucket(check: &Value) -> Option<&str> {
+    check.get("bucket").and_then(|v| v.as_str())
+}
+
+fn check_detail(check: &Value) -> String {
+    let name = check
+        .get("name")
+        .or_else(|| check.get("context"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unnamed check");
+    let bucket = check_bucket(check).unwrap_or("unknown");
+    let state = check.get("state").and_then(|v| v.as_str()).unwrap_or("");
+    if state.is_empty() {
+        format!("{} ({})", name, bucket)
+    } else {
+        format!("{} ({} / {})", name, bucket, state)
+    }
 }
 
 fn merge_deploy_request_is_pending(task: &Value) -> bool {
@@ -5444,26 +5638,7 @@ fn railway_root_matches_file(root_rel: &str, file: &str) -> bool {
 
 fn is_root_railway_deploy_path(file: &str) -> bool {
     let file = file.trim_start_matches("./");
-    if file.is_empty() {
-        return false;
-    }
-    if is_server_deploy_path(file) {
-        return true;
-    }
-    if file.starts_with("supabase/")
-        || file.starts_with(".github/")
-        || file.starts_with(".vscode/")
-        || file.starts_with("docs/")
-        || file.starts_with("screenshots/")
-        || file.starts_with("test-results/")
-    {
-        return false;
-    }
-    let basename = file.rsplit('/').next().unwrap_or(file);
-    !matches!(
-        basename,
-        "README.md" | "CHANGELOG.md" | "LICENSE" | "AGENTS.md" | "CLAUDE.md"
-    )
+    is_railway_deploy_wait_path(file)
 }
 
 fn push_unique_string(items: &mut Vec<String>, value: String) {
@@ -5543,6 +5718,9 @@ pub async fn sweep_pr_merged_cards(config: &SupabaseConfig) {
                     "review_cycle_count": 0,
                 })).await;
                 notify_callback(config, task_id, "done", Some(pr_url), None);
+                let origin_system = task.get("origin_system").and_then(|v| v.as_str()).unwrap_or("");
+                let origin_id = task.get("origin_id").and_then(|v| v.as_str()).unwrap_or("");
+                close_origin_ticket(config, task_id, origin_system, origin_id, pr_url);
                 continue;
             }
             start_merge_deploy_task(
@@ -6038,7 +6216,11 @@ fn close_origin_ticket(
     origin_id: &str,
     pr_url: &str,
 ) {
-    if origin_system.is_empty() || origin_system == "manual" || origin_id.is_empty() {
+    if origin_system.is_empty() || origin_system == "manual" {
+        log::info!(
+            "[close-origin] skipped: manual task or missing origin for task {}",
+            task_id
+        );
         return;
     }
 
@@ -6049,20 +6231,46 @@ fn close_origin_ticket(
     let pr_url = pr_url.to_string();
 
     tokio::spawn(async move {
+        let Some(secret) = sam_callback_secret() else {
+            log::warn!("[close-origin] SAM_CALLBACK_SECRET is not configured for task {}", task_id);
+            agent_comment(&cfg, &task_id, "Closeout failed: missing SAM_CALLBACK_SECRET. Run manually.").await;
+            return;
+        };
+
         let payload = serde_json::json!({
-            "system": origin_system,
-            "origin_id": origin_id,
-            "pr_url": pr_url,
-            "task_id": task_id,
+            "task_id": &task_id,
+            "pr_url": &pr_url,
+            "system": &origin_system,
+            "origin_id": &origin_id,
         });
+        let body = match serde_json::to_string(&payload) {
+            Ok(body) => body,
+            Err(e) => {
+                log::warn!("[close-origin] serialize failed for task {}: {}", task_id, e);
+                return;
+            }
+        };
+
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = match HmacSha256::new_from_slice(secret.as_bytes()) {
+            Ok(mac) => mac,
+            Err(e) => {
+                log::warn!("[close-origin] HMAC init failed for task {}: {}", task_id, e);
+                agent_comment(&cfg, &task_id, "Closeout failed: could not sign callback. Run manually.").await;
+                return;
+            }
+        };
+        mac.update(body.as_bytes());
+        let signature = hex::encode(mac.finalize().into_bytes());
 
         let req = reqwest::Client::new()
             .post(CLOSE_ORIGIN_TICKET_URL)
             .header("content-type", "application/json")
-            .header("authorization", format!("Bearer {}", cfg.anon_key))
-            .header("apikey", cfg.anon_key.clone())
+            .header("x-samwise-signature", format!("sha256={}", signature))
             .header("user-agent", "samwise-worker/1")
-            .json(&payload);
+            .body(body);
 
         let send = tokio::time::timeout(std::time::Duration::from_secs(15), req.send()).await;
         let (status_label, error_detail): (String, Option<String>) = match send {
@@ -6104,6 +6312,18 @@ fn close_origin_ticket(
         );
         agent_comment(&cfg, &task_id, &comment).await;
     });
+}
+
+fn sam_callback_secret() -> Option<String> {
+    std::env::var("SAM_CALLBACK_SECRET")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            option_env!("SAM_CALLBACK_SECRET")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
 }
 
 /// Summarize the branch diff into three short sections for the PR body:

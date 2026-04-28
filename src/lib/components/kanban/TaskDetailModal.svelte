@@ -441,6 +441,17 @@
 					</div>
 				{/if}
 
+				{#if task.commit_message && task.commit_message.trim()}
+					<div style="
+						margin-bottom: 18px; padding: 12px 14px; border-radius: 10px;
+						background: rgba(99, 102, 241, 0.06);
+						border-left: 3px solid rgba(99, 102, 241, 0.55);
+						font-family: var(--font-mono); font-size: 12px; line-height: 1.5;
+						color: var(--text-secondary); white-space: pre-wrap; word-wrap: break-word;
+						max-height: 360px; overflow-y: auto;
+					">{task.commit_message}</div>
+				{/if}
+
 				{#if reviewPanel && isReviewActionStatus(task.status)}
 					<div style="
 						margin-bottom: 18px; padding: 14px; border-radius: 14px;

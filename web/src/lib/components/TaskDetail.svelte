@@ -131,6 +131,10 @@
     </header>
 
     <div class="px-4 py-4 space-y-4">
+      {#if task.commit_message && task.commit_message.trim()}
+        <pre class="max-h-[420px] overflow-y-auto whitespace-pre-wrap break-words rounded-xl border-l-4 border-indigo-400/55 bg-indigo-500/5 px-3 py-3 font-mono text-xs leading-relaxed text-slate-200">{task.commit_message}</pre>
+      {/if}
+
       {#if reviewPanel && isReviewActionStatus(task.status)}
         <section
           class="rounded-2xl border p-3 shadow-inner"
