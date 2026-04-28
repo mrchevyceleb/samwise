@@ -58,7 +58,7 @@ const DIFF_DELIMITER: &str = "===SAMWISE-DIFF-9f3c2a8b1d7e===";
 
 #[derive(Debug)]
 pub enum AutoMergeOutcome {
-    Merged,
+    ReadyForMergeDeploy { head_sha: String },
     Blocked { reason: String, scores: Option<Value> },
     Skipped,
 }
@@ -210,22 +210,19 @@ pub async fn try_auto_merge(
         }
     };
 
-    // 10. Merge, pinned to the SHA we reviewed (rejects if anyone pushed after our review).
-    match gh_merge(pr_url, repo_path, &head_sha).await {
-        Ok(()) => {
-            let _ = supabase::update_task(config, task_id, &serde_json::json!({
-                "auto_merged": true,
-                "status": "done",
-                "updated_at": chrono::Utc::now().to_rfc3339(),
-            })).await;
-            log_decision(config, task_id, pr_url, Some(&scores), Some(&blockers_val), Some(ci_ok), "merged", "all gates passed").await;
-            AutoMergeOutcome::Merged
-        }
-        Err(e) => {
-            block(config, task_id, pr_url, Some(scores), Some(blockers_val), Some(ci_ok),
-                &format!("gh pr merge failed: {}", e)).await
-        }
-    }
+    // 10. Hand off to worker.rs for merge + post-merge deploy. The worker uses
+    // this reviewed head SHA as a TOCTOU guard before it calls `gh pr merge`.
+    log_decision(
+        config,
+        task_id,
+        pr_url,
+        Some(&scores),
+        Some(&blockers_val),
+        Some(ci_ok),
+        "ready_for_merge_deploy",
+        "all gates passed",
+    ).await;
+    AutoMergeOutcome::ReadyForMergeDeploy { head_sha }
 }
 
 // ── helpers ──────────────────────────────────────────────────────────

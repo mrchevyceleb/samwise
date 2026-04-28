@@ -49,6 +49,8 @@ const MERGE_CONFLICT_FIX_STARTED_AT_KEY: &str = "samwise_merge_conflict_fix_star
 const MERGE_CONFLICT_FIX_COMPLETED_AT_KEY: &str = "samwise_merge_conflict_fix_completed_at";
 const MERGE_CONFLICT_FIX_STATUS_KEY: &str = "samwise_merge_conflict_fix_status";
 const MERGE_CONFLICT_FIX_ERROR_KEY: &str = "samwise_merge_conflict_fix_error";
+const SAMWISE_DEPLOY_MANIFEST_PATH: &str = ".samwise/deploy.json";
+const SAMWISE_SUPABASE_AUTO_COMMAND: &str = "samwise:supabase:auto";
 
 /// External edge function that closes the upstream ticket (Operly triage,
 /// Banana triage, Sentry issue) after Sam ships and the deploy is green.
@@ -1865,12 +1867,31 @@ When done, run `git add -A && git commit -m \"fix: address QA feedback\"` and st
                         config, &repo_path, &pr_url, &task_id, &title, &description, &cached_settings,
                     ).await;
                     match outcome {
-                        review::AutoMergeOutcome::Merged => {
-                            notify_callback(config, &task_id, "done", Some(&pr_url), None);
-                            agent_comment(config, &task_id, "Auto-merged. All gates green.").await;
+                        review::AutoMergeOutcome::ReadyForMergeDeploy { head_sha } => {
+                            let latest_task = supabase::fetch_task(config, &task_id)
+                                .await
+                                .ok()
+                                .flatten()
+                                .unwrap_or_else(|| serde_json::json!({
+                                    "id": &task_id,
+                                    "pr_url": &pr_url,
+                                    "repo_path": &repo_path,
+                                }));
+                            let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                                "status": "approved",
+                                "updated_at": chrono::Utc::now().to_rfc3339(),
+                            })).await;
+                            notify_callback(config, &task_id, "approved", Some(&pr_url), None);
+                            start_merge_deploy_task(
+                                config,
+                                latest_task,
+                                true,
+                                "Auto-merge gates passed. Running Merge + Deploy.",
+                                Some(head_sha),
+                            ).await;
                             if notify_task_completed_code {
                                 send_telegram(config, &format!(
-                                    "Auto-merged *{}*",
+                                    "Auto-merge gates passed for *{}* — running Merge \\+ Deploy",
                                     escape_markdown_v2(&title)
                                 )).await;
                             }
@@ -4154,6 +4175,7 @@ async fn start_merge_conflict_fix_task(config: &SupabaseConfig, task: Value) {
                     latest_task,
                     true,
                     "Merge conflicts were resolved and pushed. Retrying Merge + Deploy.",
+                    None,
                 ).await;
             }
             Err(err) => {
@@ -4460,13 +4482,28 @@ struct DeployPlan {
     supabase_functions: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
-struct RailwayProjectContext {
-    project: String,
-    environment: Option<String>,
-    environment_name: Option<String>,
-    service: Option<String>,
+#[derive(Debug, Clone, Deserialize)]
+struct SamwiseDeployManifest {
+    #[serde(default)]
+    rules: Vec<SamwiseDeployRule>,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+struct SamwiseDeployRule {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    paths: Vec<String>,
+    #[serde(default)]
+    commands: Vec<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    category: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RailwayProjectContext;
 
 #[derive(Debug, Clone)]
 struct MergeDeployError {
@@ -4506,7 +4543,7 @@ pub async fn sweep_merge_deploy_requests(config: &SupabaseConfig) {
         let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("");
         if !matches!(status, "approved" | "fixes_needed" | "review") { continue; }
         if !merge_deploy_request_is_pending(task) { continue; }
-        start_merge_deploy_task(config, task.clone(), status == "approved", "Merge + Deploy requested from the UI.").await;
+        start_merge_deploy_task(config, task.clone(), status == "approved", "Merge + Deploy requested from the UI.", None).await;
     }
 }
 
@@ -4515,6 +4552,7 @@ async fn start_merge_deploy_task(
     task: Value,
     should_merge_if_open: bool,
     start_comment: &str,
+    expected_head_sha: Option<String>,
 ) {
     let task_id = task.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let pr_url = task.get("pr_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -4533,7 +4571,7 @@ async fn start_merge_deploy_task(
 
     let config_clone = config.clone();
     tokio::spawn(async move {
-        match run_merge_deploy_workflow(&config_clone, &task, should_merge_if_open).await {
+        match run_merge_deploy_workflow(&config_clone, &task, should_merge_if_open, expected_head_sha).await {
             Ok(summary) => {
                 let latest_task = supabase::fetch_task(&config_clone, &task_id).await.ok().flatten().unwrap_or_else(|| task.clone());
                 let mut context = task_context_object(&latest_task);
@@ -4621,6 +4659,7 @@ async fn run_merge_deploy_workflow(
     config: &SupabaseConfig,
     task: &Value,
     should_merge_if_open: bool,
+    expected_head_sha: Option<String>,
 ) -> Result<String, MergeDeployError> {
     let task_id = task.get("id").and_then(|v| v.as_str()).unwrap_or("");
     let pr_url = task.get("pr_url").and_then(|v| v.as_str()).unwrap_or("");
@@ -4644,6 +4683,9 @@ async fn run_merge_deploy_workflow(
         .await
         .map_err(|e| MergeDeployError::new(format!("failed to read PR state: {}", e), false))?;
 
+    preflight_deploy_manifest_context(repo_path, &files)
+        .await
+        .map_err(|e| MergeDeployError::new(e, pr_merged))?;
     preflight_supabase_deploy_context(repo_path, &files)
         .await
         .map_err(|e| MergeDeployError::new(e, pr_merged))?;
@@ -4658,6 +4700,14 @@ async fn run_merge_deploy_workflow(
         let head_sha = review::fetch_pr_head_sha(pr_url, repo_path)
             .await
             .map_err(|e| MergeDeployError::new(format!("failed to read PR head SHA: {}", e), false))?;
+        if let Some(expected) = expected_head_sha.as_deref() {
+            if head_sha != expected {
+                return Err(MergeDeployError::new(
+                    "PR head changed after the auto-merge review passed; leaving it unmerged so the new commit can be reviewed.",
+                    false,
+                ));
+            }
+        }
         match review::wait_for_ci(pr_url, repo_path).await {
             Ok(true) => {}
             Ok(false) => return Err(MergeDeployError::new("non-Vercel CI checks are not green; merge blocked", false)),
@@ -4759,6 +4809,19 @@ async fn preflight_railway_deploy_context(repo_path: &str, files: &[String]) -> 
     if !railway_deploy_required(repo_path, files).await {
         return Ok(());
     }
+    let manifest = read_samwise_deploy_manifest(repo_path).await?;
+    let Some(manifest) = manifest else {
+        return Err(format!(
+            "Railway deploy appears required, but {} is missing. Add explicit deploy rules before Samwise can merge this safely.",
+            SAMWISE_DEPLOY_MANIFEST_PATH
+        ));
+    };
+    if !manifest_has_matching_deploy_rule(&manifest, files) {
+        return Err(format!(
+            "Railway deploy appears required, but no rule in {} matches the changed files. Add a matching rule before Samwise can merge this safely.",
+            SAMWISE_DEPLOY_MANIFEST_PATH
+        ));
+    }
     if which::which("railway").is_err() {
         return Err("Railway deploy is required, but the Railway CLI is not installed or not on PATH.".to_string());
     }
@@ -4800,6 +4863,20 @@ async fn preflight_railway_deploy_context(repo_path: &str, files: &[String]) -> 
         "Railway deploy is required, but Railway CLI auth is not available for this checkout. Run `railway login` once, or add a valid RAILWAY_TOKEN to the app's Doppler scope. Details: {}",
         truncate(&details, 900)
     ))
+}
+
+async fn preflight_deploy_manifest_context(repo_path: &str, files: &[String]) -> Result<(), String> {
+    let Some(manifest) = read_samwise_deploy_manifest(repo_path).await? else {
+        return Ok(());
+    };
+    if manifest.rules.is_empty() {
+        return Err(format!("{} exists but has no deploy rules.", SAMWISE_DEPLOY_MANIFEST_PATH));
+    }
+    let _ = matching_manifest_rules(&manifest, files)
+        .into_iter()
+        .map(|rule| manifest_rule_cwd(repo_path, rule))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(())
 }
 
 async fn railway_deploy_required(repo_path: &str, files: &[String]) -> bool {
@@ -4864,71 +4941,194 @@ async fn build_deploy_plan(repo_path: &str, files: &[String]) -> Result<DeployPl
         });
     }
 
-    let package_scripts = read_package_scripts(repo_path).await;
-    let railway_context = read_railway_project_context(repo_path).await;
-    let touches_tools = files.iter().any(|f| f.starts_with("tools-server/"));
-    let touches_server = files.iter().any(|f| is_server_deploy_path(f));
-
-    let tools_script = package_scripts.get("tools:deploy").map(String::as_str);
-    let server_script = package_scripts.get("server:deploy").map(String::as_str);
-
-    if touches_tools && (railway_context.is_some() || tools_script.is_some()) {
-        let command = match (railway_context.as_ref(), tools_script) {
-            (Some(context), Some(script)) => inject_railway_context_into_command(script, context)
-                .unwrap_or_else(|| railway_up_command(Some(context), Some("tools-server"), Some("tools-server"), false)),
-            (Some(context), None) => railway_up_command(Some(context), Some("tools-server"), Some("tools-server"), false),
-            (None, Some(_)) => "npm run tools:deploy".to_string(),
-            (None, None) => unreachable!("guard requires a Railway context or tools deploy script"),
-        };
-        plan.railway_reasons.push(format!("tools-server/ changed; using {}", command));
-        plan.commands.push(DeployCommand {
-            category: "railway",
-            label: "Railway tools-server".to_string(),
-            command,
-            cwd: repo_path.to_string(),
-        });
-    }
-
-    if touches_server && (railway_context.is_some() || server_script.is_some()) {
-        let command = match (railway_context.as_ref(), server_script) {
-            (Some(context), Some(script)) => inject_railway_context_into_command(script, context)
-                .unwrap_or_else(|| railway_up_command(Some(context), None, None, false)),
-            (Some(context), None) => railway_up_command(Some(context), None, None, false),
-            (None, Some(_)) => "npm run server:deploy".to_string(),
-            (None, None) => unreachable!("guard requires a Railway context or server deploy script"),
-        };
-        plan.railway_reasons.push(format!("server/root deploy files changed; using {}", command));
-        plan.commands.push(DeployCommand {
-            category: "railway",
-            label: "Railway server".to_string(),
-            command,
-            cwd: repo_path.to_string(),
-        });
-    }
-
-    if !plan.commands.iter().any(|c| c.category == "railway") {
-        for root in discover_railway_roots(repo_path) {
-            let rel = path_relative_to(&root, repo_path);
-            let matches_root = files.iter().any(|f| railway_root_matches_file(&rel, f));
-            if !matches_root { continue; }
-            let label = if rel.is_empty() { "Railway server".to_string() } else { format!("Railway server ({})", rel) };
-            let command = railway_up_command(
-                railway_context.as_ref(),
-                None,
-                if rel.is_empty() { None } else { Some(rel.as_str()) },
-                true,
-            );
-            plan.railway_reasons.push(format!("{} changed; using {}", if rel.is_empty() { "Railway root".to_string() } else { rel.clone() }, command));
-            plan.commands.push(DeployCommand {
-                category: "railway",
-                label,
-                command,
-                cwd: repo_path.to_string(),
-            });
-        }
+    if let Some(manifest) = read_samwise_deploy_manifest(repo_path).await? {
+        add_manifest_deploy_commands(&mut plan, repo_path, files, &manifest)?;
     }
 
     Ok(plan)
+}
+
+async fn read_samwise_deploy_manifest(repo_path: &str) -> Result<Option<SamwiseDeployManifest>, String> {
+    let path = Path::new(repo_path).join(SAMWISE_DEPLOY_MANIFEST_PATH);
+    let raw = match tokio::fs::read_to_string(&path).await {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("read {}: {}", path.display(), e)),
+    };
+    let manifest: SamwiseDeployManifest = serde_json::from_str(&raw)
+        .map_err(|e| format!("parse {}: {}", path.display(), e))?;
+    validate_samwise_deploy_manifest(&manifest)?;
+    for rule in &manifest.rules {
+        let _ = manifest_rule_cwd(repo_path, rule)?;
+    }
+    Ok(Some(manifest))
+}
+
+fn validate_samwise_deploy_manifest(manifest: &SamwiseDeployManifest) -> Result<(), String> {
+    for (idx, rule) in manifest.rules.iter().enumerate() {
+        let label = manifest_rule_label(rule, idx);
+        if rule.paths.iter().all(|p| p.trim().is_empty()) {
+            return Err(format!("{} rule '{}' has no paths.", SAMWISE_DEPLOY_MANIFEST_PATH, label));
+        }
+        if rule.commands.iter().all(|c| c.trim().is_empty()) {
+            return Err(format!("{} rule '{}' has no commands.", SAMWISE_DEPLOY_MANIFEST_PATH, label));
+        }
+    }
+    Ok(())
+}
+
+fn add_manifest_deploy_commands(
+    plan: &mut DeployPlan,
+    repo_path: &str,
+    files: &[String],
+    manifest: &SamwiseDeployManifest,
+) -> Result<(), String> {
+    for (idx, rule) in manifest.rules.iter().enumerate() {
+        if !deploy_rule_matches_files(rule, files) {
+            continue;
+        }
+
+        let cwd = manifest_rule_cwd(repo_path, rule)?;
+        let label = manifest_rule_label(rule, idx);
+        let is_railway = manifest_rule_is_railway(rule);
+
+        for command in rule.commands.iter().map(|c| c.trim()).filter(|c| !c.is_empty()) {
+            if command == SAMWISE_SUPABASE_AUTO_COMMAND {
+                continue;
+            }
+            if is_railway {
+                plan.railway_reasons.push(format!("{} matched; using {}", label, command));
+            }
+            plan.commands.push(DeployCommand {
+                category: if is_railway { "railway" } else { "custom" },
+                label: label.clone(),
+                command: command.to_string(),
+                cwd: cwd.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn manifest_has_matching_deploy_rule(manifest: &SamwiseDeployManifest, files: &[String]) -> bool {
+    matching_manifest_rules(manifest, files)
+        .into_iter()
+        .any(|rule| rule.commands.iter().any(|command| {
+            let command = command.trim();
+            !command.is_empty() && command != SAMWISE_SUPABASE_AUTO_COMMAND
+        }))
+}
+
+fn matching_manifest_rules<'a>(manifest: &'a SamwiseDeployManifest, files: &[String]) -> Vec<&'a SamwiseDeployRule> {
+    manifest.rules
+        .iter()
+        .filter(|rule| deploy_rule_matches_files(rule, files))
+        .collect()
+}
+
+fn deploy_rule_matches_files(rule: &SamwiseDeployRule, files: &[String]) -> bool {
+    rule.paths.iter().any(|pattern| {
+        let pattern = pattern.trim();
+        !pattern.is_empty() && files.iter().any(|file| deploy_path_pattern_matches(pattern, file))
+    })
+}
+
+fn deploy_path_pattern_matches(pattern: &str, file: &str) -> bool {
+    let pattern = normalize_repo_relative_path(pattern.trim_start_matches("./"));
+    let file = normalize_repo_relative_path(file.trim_start_matches("./"));
+
+    if pattern.is_empty() {
+        return false;
+    }
+    if let Some(prefix) = pattern.strip_suffix("/**") {
+        return file == prefix || file.starts_with(&format!("{}/", prefix));
+    }
+    if !pattern.contains('*') && !pattern.contains('?') {
+        return file == pattern || pattern.strip_suffix('/').map(|p| file.starts_with(&format!("{}/", p))).unwrap_or(false);
+    }
+
+    let mut regex_body = String::new();
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        match chars[i] {
+            '*' if chars.get(i + 1) == Some(&'*') => {
+                regex_body.push_str(".*");
+                i += 2;
+            }
+            '*' => {
+                regex_body.push_str("[^/]*");
+                i += 1;
+            }
+            '?' => {
+                regex_body.push_str("[^/]");
+                i += 1;
+            }
+            ch => {
+                regex_body.push_str(&regex::escape(&ch.to_string()));
+                i += 1;
+            }
+        }
+    }
+    regex::Regex::new(&format!("^{}$", regex_body))
+        .map(|re| re.is_match(&file))
+        .unwrap_or(false)
+}
+
+fn manifest_rule_cwd(repo_path: &str, rule: &SamwiseDeployRule) -> Result<String, String> {
+    let Some(cwd) = rule.cwd.as_deref().map(str::trim).filter(|cwd| !cwd.is_empty()) else {
+        return Ok(repo_path.to_string());
+    };
+    let cwd_path = Path::new(cwd);
+    if cwd_path.is_absolute() {
+        return Err(format!(
+            "{} rule '{}' uses an absolute cwd. Keep deploy cwd paths relative to the repo.",
+            SAMWISE_DEPLOY_MANIFEST_PATH,
+            if rule.name.trim().is_empty() { "(unnamed)" } else { rule.name.trim() }
+        ));
+    }
+    if cwd_path.components().any(|component| matches!(component, std::path::Component::ParentDir)) {
+        return Err(format!(
+            "{} rule '{}' has an unsafe cwd '{}'.",
+            SAMWISE_DEPLOY_MANIFEST_PATH,
+            if rule.name.trim().is_empty() { "(unnamed)" } else { rule.name.trim() },
+            cwd
+        ));
+    }
+
+    let normalized = normalize_repo_relative_path(cwd);
+    if normalized.is_empty() {
+        return Ok(repo_path.to_string());
+    }
+    if normalized.starts_with("../") || normalized == ".." {
+        return Err(format!(
+            "{} rule '{}' has an unsafe cwd '{}'.",
+            SAMWISE_DEPLOY_MANIFEST_PATH,
+            if rule.name.trim().is_empty() { "(unnamed)" } else { rule.name.trim() },
+            cwd
+        ));
+    }
+    Ok(Path::new(repo_path).join(normalized).to_string_lossy().into_owned())
+}
+
+fn manifest_rule_label(rule: &SamwiseDeployRule, idx: usize) -> String {
+    let name = rule.name.trim();
+    if name.is_empty() {
+        format!("Configured deploy rule {}", idx + 1)
+    } else {
+        name.to_string()
+    }
+}
+
+fn manifest_rule_is_railway(rule: &SamwiseDeployRule) -> bool {
+    if rule.category.as_deref().map(|c| c.eq_ignore_ascii_case("railway")).unwrap_or(false) {
+        return true;
+    }
+    if rule.name.to_ascii_lowercase().contains("railway") {
+        return true;
+    }
+    rule.commands.iter().any(|command| command.to_ascii_lowercase().contains("railway"))
+        || rule.paths.iter().any(|path| path.to_ascii_lowercase().contains("railway"))
 }
 
 async fn run_deploy_command(command: &DeployCommand) -> Result<(), String> {
@@ -5603,6 +5803,83 @@ mod merge_deploy_tests {
         assert_eq!(impacted, vec!["email".to_string(), "execute-automation-rules".to_string()]);
         let _ = std::fs::remove_dir_all(repo);
     }
+
+    #[test]
+    fn deploy_manifest_path_patterns_match_expected_files() {
+        assert!(deploy_path_pattern_matches("tools-server/**", "tools-server/index.ts"));
+        assert!(deploy_path_pattern_matches("server/**", "server/index.ts"));
+        assert!(deploy_path_pattern_matches("*.json", "package.json"));
+        assert!(!deploy_path_pattern_matches("tools-server/**", "server/index.ts"));
+        assert!(!deploy_path_pattern_matches("*.json", "server/package.json"));
+    }
+
+    #[tokio::test]
+    async fn deploy_manifest_commands_are_used_for_railway_paths() {
+        let repo = std::env::temp_dir().join(format!(
+            "samwise-deploy-manifest-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(repo.join(".samwise")).unwrap();
+        std::fs::write(
+            repo.join(".samwise/deploy.json"),
+            r#"{
+              "rules": [
+                {
+                  "name": "Railway tools server",
+                  "category": "railway",
+                  "paths": ["tools-server/**"],
+                  "commands": ["npm run tools:deploy"]
+                },
+                {
+                  "name": "Supabase",
+                  "paths": ["supabase/migrations/**", "supabase/functions/**"],
+                  "commands": ["samwise:supabase:auto"]
+                }
+              ]
+            }"#,
+        ).unwrap();
+
+        let files = vec!["tools-server/index.ts".to_string()];
+        let plan = build_deploy_plan(&repo.to_string_lossy(), &files).await.unwrap();
+
+        assert_eq!(plan.commands.len(), 1);
+        assert_eq!(plan.commands[0].category, "railway");
+        assert_eq!(plan.commands[0].label, "Railway tools server");
+        assert_eq!(plan.commands[0].command, "npm run tools:deploy");
+        assert!(plan.railway_reasons.iter().any(|reason| reason.contains("npm run tools:deploy")));
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[tokio::test]
+    async fn deploy_manifest_supabase_auto_alias_does_not_duplicate_commands() {
+        let repo = std::env::temp_dir().join(format!(
+            "samwise-deploy-manifest-supabase-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(repo.join(".samwise")).unwrap();
+        std::fs::write(
+            repo.join(".samwise/deploy.json"),
+            r#"{
+              "rules": [
+                {
+                  "name": "Supabase",
+                  "paths": ["supabase/migrations/**"],
+                  "commands": ["samwise:supabase:auto"]
+                }
+              ]
+            }"#,
+        ).unwrap();
+
+        let files = vec!["supabase/migrations/20260428120000_test.sql".to_string()];
+        let plan = build_deploy_plan(&repo.to_string_lossy(), &files).await.unwrap();
+
+        assert_eq!(plan.commands.len(), 1);
+        assert_eq!(plan.commands[0].category, "supabase_migrations");
+        assert!(plan.commands[0].command.contains("supabase db push"));
+        let _ = std::fs::remove_dir_all(repo);
+    }
 }
 
 fn supabase_db_push_command() -> String {
@@ -5707,72 +5984,7 @@ fn railway_project_context_from_value(_key: &str, value: &Value) -> Option<Railw
     let project = value.get("project").and_then(|v| v.as_str())?.trim();
     if project.is_empty() { return None; }
 
-    Some(RailwayProjectContext {
-        project: project.to_string(),
-        environment: non_empty_json_string(value, "environment"),
-        environment_name: non_empty_json_string(value, "environmentName"),
-        service: non_empty_json_string(value, "service"),
-    })
-}
-
-fn non_empty_json_string(value: &Value, key: &str) -> Option<String> {
-    value.get(key)
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-fn railway_up_command(
-    context: Option<&RailwayProjectContext>,
-    service: Option<&str>,
-    path_as_root: Option<&str>,
-    detach: bool,
-) -> String {
-    let mut parts = vec!["railway up".to_string()];
-    if let Some(context) = context {
-        parts.push(format!("--project {}", shell_quote_simple(&context.project)));
-        if let Some(environment) = context.environment_name.as_deref().or(context.environment.as_deref()) {
-            parts.push(format!("--environment {}", shell_quote_simple(environment)));
-        }
-    }
-    if let Some(service) = service
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| context.and_then(|context| context.service.as_deref()))
-    {
-        parts.push(format!("--service {}", shell_quote_simple(service.trim())));
-    }
-    if detach {
-        parts.push("--detach".to_string());
-    }
-    if let Some(path_as_root) = path_as_root.filter(|value| !value.trim().is_empty()) {
-        parts.push(format!("--path-as-root {}", shell_quote_simple(path_as_root.trim())));
-    }
-    parts.join(" ")
-}
-
-fn inject_railway_context_into_command(command: &str, context: &RailwayProjectContext) -> Option<String> {
-    let needle = "railway up";
-    let index = command.find(needle)?;
-    let railway_args = &command[index + needle.len()..];
-    let mut replacement = railway_up_project_environment_prefix(context);
-    if !railway_args.contains("--service") {
-        if let Some(service) = context.service.as_deref().filter(|value| !value.trim().is_empty()) {
-            replacement.push_str(&format!(" --service {}", shell_quote_simple(service.trim())));
-        }
-    }
-    Some(command.replacen(needle, &replacement, 1))
-}
-
-fn railway_up_project_environment_prefix(context: &RailwayProjectContext) -> String {
-    let mut parts = vec![
-        "railway up".to_string(),
-        format!("--project {}", shell_quote_simple(&context.project)),
-    ];
-    if let Some(environment) = context.environment_name.as_deref().or(context.environment.as_deref()) {
-        parts.push(format!("--environment {}", shell_quote_simple(environment)));
-    }
-    parts.join(" ")
+    Some(RailwayProjectContext)
 }
 
 fn railway_repo_names(repo_path: &str, candidates: &[String]) -> Vec<String> {
@@ -5979,6 +6191,7 @@ pub async fn sweep_pr_merged_cards(config: &SupabaseConfig) {
                 task.clone(),
                 false,
                 "PR merged on GitHub. Running post-merge deploy plan before moving the card to Done.",
+                None,
             ).await;
             continue;
         }
