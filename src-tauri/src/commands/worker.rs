@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -4822,8 +4823,13 @@ async fn build_deploy_plan(repo_path: &str, files: &[String]) -> Result<DeployPl
             push_unique_string(&mut plan.supabase_functions, name);
         }
     }
-    if files.iter().any(|f| f.starts_with("supabase/functions/_shared/")) {
-        for name in discover_edge_function_names(repo_path).await {
+    let shared_function_files = files
+        .iter()
+        .filter(|f| f.starts_with("supabase/functions/_shared/"))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !shared_function_files.is_empty() {
+        for name in discover_impacted_edge_function_names(repo_path, &shared_function_files).await {
             push_unique_string(&mut plan.supabase_functions, name);
         }
     }
@@ -5362,6 +5368,231 @@ async fn discover_edge_function_names(repo_path: &str) -> Vec<String> {
 
 fn is_deployable_edge_function_name(name: &str) -> bool {
     !name.is_empty() && name != "_shared" && !name.starts_with('.')
+}
+
+async fn discover_impacted_edge_function_names(repo_path: &str, changed_shared_files: &[String]) -> Vec<String> {
+    let all_modules = collect_edge_source_modules(repo_path);
+    if all_modules.is_empty() {
+        log::warn!(
+            "[merge-deploy] could not inspect Supabase function dependency graph in {}; shared changes will not expand function deploys",
+            repo_path
+        );
+        return Vec::new();
+    }
+
+    let changed = changed_shared_files
+        .iter()
+        .map(|file| normalize_repo_relative_path(file))
+        .collect::<HashSet<_>>();
+    let all_module_set = all_modules.iter().cloned().collect::<HashSet<_>>();
+    let mut deps_by_module = HashMap::new();
+
+    for module in &all_modules {
+        let path = Path::new(repo_path).join(module);
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            deps_by_module.insert(module.clone(), Vec::new());
+            continue;
+        };
+        let deps = extract_module_specifiers(&source)
+            .into_iter()
+            .filter_map(|specifier| resolve_relative_module(module, &specifier, &all_module_set))
+            .collect::<Vec<_>>();
+        deps_by_module.insert(module.clone(), deps);
+    }
+
+    let mut impacted = Vec::new();
+    for function_name in discover_edge_function_names(repo_path).await {
+        let function_prefix = format!("supabase/functions/{}/", function_name);
+        let mut memo = HashMap::new();
+        let function_impacted = all_modules
+            .iter()
+            .filter(|module| module.starts_with(&function_prefix))
+            .any(|module| {
+                let mut visiting = HashSet::new();
+                module_depends_on_changed_shared(module, &changed, &deps_by_module, &mut memo, &mut visiting)
+            });
+        if function_impacted {
+            push_unique_string(&mut impacted, function_name);
+        }
+    }
+
+    impacted.sort();
+    impacted
+}
+
+fn collect_edge_source_modules(repo_path: &str) -> Vec<String> {
+    let functions_root = Path::new(repo_path).join("supabase").join("functions");
+    let repo_root = Path::new(repo_path);
+    if !functions_root.is_dir() {
+        return Vec::new();
+    }
+
+    let mut modules = Vec::new();
+    for entry in walkdir::WalkDir::new(functions_root).into_iter().filter_map(Result::ok) {
+        if !entry.file_type().is_file() || !is_edge_source_file(entry.path()) {
+            continue;
+        }
+        if entry.path().components().any(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .map(|name| matches!(name, "node_modules" | ".git" | ".supabase"))
+                .unwrap_or(false)
+        }) {
+            continue;
+        }
+        if let Ok(relative) = entry.path().strip_prefix(repo_root) {
+            modules.push(path_to_slash_string(relative));
+        }
+    }
+    modules.sort();
+    modules
+}
+
+fn is_edge_source_file(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs")
+    )
+}
+
+fn extract_module_specifiers(source: &str) -> Vec<String> {
+    let Ok(re) = regex::Regex::new(
+        r#"(?:import|export)\s+(?:type\s+)?(?:[^'"]*?\s+from\s*)?['"]([^'"]+)['"]|import\s*\(\s*['"]([^'"]+)['"]\s*\)"#,
+    ) else {
+        return Vec::new();
+    };
+    re.captures_iter(source)
+        .filter_map(|captures| captures.get(1).or_else(|| captures.get(2)).map(|m| m.as_str().to_string()))
+        .collect()
+}
+
+fn resolve_relative_module(module: &str, specifier: &str, all_modules: &HashSet<String>) -> Option<String> {
+    if !specifier.starts_with('.') {
+        return None;
+    }
+
+    let base_dir = Path::new(module).parent().unwrap_or_else(|| Path::new(""));
+    let candidate = normalize_repo_relative_path(&path_to_slash_string(&base_dir.join(specifier)));
+    if all_modules.contains(&candidate) {
+        return Some(candidate);
+    }
+
+    if Path::new(&candidate).extension().is_none() {
+        for ext in ["ts", "tsx", "js", "jsx", "mjs", "cjs"] {
+            let with_ext = format!("{}.{}", candidate, ext);
+            if all_modules.contains(&with_ext) {
+                return Some(with_ext);
+            }
+        }
+        for index_file in ["index.ts", "index.tsx", "index.js", "index.jsx", "index.mjs", "index.cjs"] {
+            let index_path = format!("{}/{}", candidate, index_file);
+            if all_modules.contains(&index_path) {
+                return Some(index_path);
+            }
+        }
+    }
+
+    None
+}
+
+fn module_depends_on_changed_shared(
+    module: &str,
+    changed: &HashSet<String>,
+    deps_by_module: &HashMap<String, Vec<String>>,
+    memo: &mut HashMap<String, bool>,
+    visiting: &mut HashSet<String>,
+) -> bool {
+    if changed.contains(module) {
+        return true;
+    }
+    if let Some(result) = memo.get(module) {
+        return *result;
+    }
+    if !visiting.insert(module.to_string()) {
+        return false;
+    }
+
+    let result = deps_by_module
+        .get(module)
+        .map(|deps| {
+            deps.iter().any(|dep| {
+                module_depends_on_changed_shared(dep, changed, deps_by_module, memo, visiting)
+            })
+        })
+        .unwrap_or(false);
+    visiting.remove(module);
+    memo.insert(module.to_string(), result);
+    result
+}
+
+fn normalize_repo_relative_path(path: &str) -> String {
+    let path = path.replace('\\', "/");
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    parts.join("/")
+}
+
+fn path_to_slash_string(path: impl AsRef<Path>) -> String {
+    path.as_ref().to_string_lossy().replace('\\', "/")
+}
+
+#[cfg(test)]
+mod merge_deploy_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shared_edge_function_change_only_deploys_importing_functions() {
+        let repo = std::env::temp_dir().join(format!(
+            "samwise-edge-deps-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let functions = repo.join("supabase/functions");
+        std::fs::create_dir_all(functions.join("_shared/email-providers")).unwrap();
+        std::fs::create_dir_all(functions.join("_shared")).unwrap();
+        std::fs::create_dir_all(functions.join("email")).unwrap();
+        std::fs::create_dir_all(functions.join("execute-automation-rules")).unwrap();
+        std::fs::create_dir_all(functions.join("whatsapp")).unwrap();
+
+        std::fs::write(
+            functions.join("_shared/email-providers/gmail.ts"),
+            "export class GmailProvider {}",
+        ).unwrap();
+        std::fs::write(
+            functions.join("_shared/email-providers/factory.ts"),
+            "import { GmailProvider } from './gmail.ts'; export { GmailProvider };",
+        ).unwrap();
+        std::fs::write(functions.join("_shared/cors.ts"), "export const cors = {};").unwrap();
+        std::fs::write(
+            functions.join("email/index.ts"),
+            "import { GmailProvider } from '../_shared/email-providers/factory.ts'; console.log(GmailProvider);",
+        ).unwrap();
+        std::fs::write(
+            functions.join("execute-automation-rules/index.ts"),
+            "import { GmailProvider } from '../_shared/email-providers/factory.ts'; console.log(GmailProvider);",
+        ).unwrap();
+        std::fs::write(
+            functions.join("whatsapp/index.ts"),
+            "import { cors } from '../_shared/cors.ts'; console.log(cors);",
+        ).unwrap();
+
+        let impacted = discover_impacted_edge_function_names(
+            &repo.to_string_lossy(),
+            &["supabase/functions/_shared/email-providers/gmail.ts".to_string()],
+        ).await;
+
+        assert_eq!(impacted, vec!["email".to_string(), "execute-automation-rules".to_string()]);
+        let _ = std::fs::remove_dir_all(repo);
+    }
 }
 
 fn supabase_db_push_command() -> String {
