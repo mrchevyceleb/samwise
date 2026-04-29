@@ -702,6 +702,26 @@ pub fn extract_project_mentions(message: &str, projects: &Value) -> Vec<String> 
     matched
 }
 
+/// Build the numbered project prompt used when a task is waiting for Matt to
+/// pick a repo. The order matches `fetch_projects`, so number replies can use
+/// the same array directly.
+pub fn build_project_selection_prompt(projects: &Value) -> Option<String> {
+    let arr = projects.as_array()?;
+    if arr.is_empty() {
+        return None;
+    }
+
+    let mut list = String::from("Which project?\n");
+    for (i, proj) in arr.iter().enumerate() {
+        let name = proj.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        if !name.is_empty() {
+            list.push_str(&format!("{}. {}\n", i + 1, name));
+        }
+    }
+    list.push_str("\nReply with the number.");
+    Some(list)
+}
+
 // ── Confirmation detection ──────────────────────────────────────────
 
 const AFFIRMATIVE: &[&str] = &[
@@ -775,6 +795,21 @@ pub async fn handle_pending_confirmation(
     let Some(most_recent) = sorted.first() else { return None; };
     let task_id = most_recent.get("id").and_then(|v| v.as_str()).unwrap_or("");
     let task_title = most_recent.get("title").and_then(|v| v.as_str()).unwrap_or("untitled");
+    let needs_project = most_recent
+        .get("project")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().is_empty())
+        .unwrap_or(true)
+        && most_recent
+            .get("repo_path")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true)
+        && most_recent
+            .get("repo_url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true);
 
     if task_id.is_empty() { return None; }
 
@@ -802,6 +837,13 @@ pub async fn handle_pending_confirmation(
             } else {
                 let _ = supabase::update_task_if_status(config, task_id, "pending_confirmation", &serde_json::json!({"status": "queued"})).await;
                 format!("Got it, queued up \"{}\".", task_title)
+            }
+        } else if needs_project {
+            let projects = supabase::fetch_projects(config).await.ok();
+            if let Some(prompt) = projects.as_ref().and_then(build_project_selection_prompt) {
+                format!("I still need a project for \"{}\" before I can start.\n\n{}", task_title, prompt)
+            } else {
+                format!("I still need to know which repo to use for \"{}\". Reply with @project-name or set repo_path on the card.", task_title)
             }
         } else {
             // Simple "yes" confirmation
@@ -1026,7 +1068,10 @@ Rules for task_type:
         .trim();
 
     let parsed: serde_json::Value = serde_json::from_str(cleaned)
-        .map_err(|e| format!("Failed to parse AI response: {}. Raw: {}", e, &result[..result.len().min(200)]))?;
+        .map_err(|e| {
+            let raw: String = result.chars().take(200).collect();
+            format!("Failed to parse AI response: {}. Raw: {}", e, raw)
+        })?;
 
     Ok(ExpandedTask {
         title: parsed.get("title").and_then(|v| v.as_str()).unwrap_or(&raw_input).to_string(),

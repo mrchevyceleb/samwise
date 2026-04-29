@@ -44,14 +44,56 @@ check_inflight() {
         --data-urlencode "or=(status.eq.in_progress,and(status.eq.review,last_pr_review_at.gt.$(date -u -v-25M +%Y-%m-%dT%H:%M:%SZ)))" \
         "$SB_URL/rest/v1/ae_tasks" || echo "[]")
 
-    if [ "$RESP" = "[]" ] || [ -z "$RESP" ]; then
+    # Merge/deploy and conflict-fix work runs from approved/review cards, so it
+    # is tracked in task context instead of the top-level status.
+    local CONTEXT_RESP RUNNING_CONTEXT
+    CONTEXT_RESP=$(curl -sS -G \
+        -H "apikey: $SB_KEY" \
+        -H "Authorization: Bearer $SB_KEY" \
+        --data-urlencode "select=id,title,status,context" \
+        --data-urlencode "status=in.(approved,fixes_needed,review)" \
+        "$SB_URL/rest/v1/ae_tasks" || echo "[]")
+    RUNNING_CONTEXT=$(printf '%s' "$CONTEXT_RESP" | python3 -c '
+import json
+import sys
+
+try:
+    rows = json.load(sys.stdin)
+except Exception:
+    rows = []
+
+if not isinstance(rows, list):
+    rows = []
+
+labels = {
+    "samwise_merge_deploy_status": "Merge + Deploy",
+    "samwise_merge_conflict_fix_status": "Merge conflict fix",
+}
+blocked = []
+for row in rows:
+    context = row.get("context") or {}
+    running = [label for key, label in labels.items() if context.get(key) == "running"]
+    if running:
+        item = dict(row)
+        item["running_context"] = ", ".join(running)
+        blocked.append(item)
+
+print(json.dumps(blocked))
+' 2>/dev/null || echo "[]")
+
+    if { [ "$RESP" = "[]" ] || [ -z "$RESP" ]; } && { [ "$RUNNING_CONTEXT" = "[]" ] || [ -z "$RUNNING_CONTEXT" ]; }; then
         return 0
     fi
 
     echo "!! Sam has work in flight:"
-    echo "$RESP" | python3 -c "import sys,json; [print(f'   [{t[\"status\"]}] {t[\"title\"]}') for t in json.load(sys.stdin)]" 2>/dev/null || echo "$RESP"
+    if [ "$RESP" != "[]" ] && [ -n "$RESP" ]; then
+        echo "$RESP" | python3 -c "import sys,json; [print(f'   [{t[\"status\"]}] {t[\"title\"]}') for t in json.load(sys.stdin)]" 2>/dev/null || echo "$RESP"
+    fi
+    if [ "$RUNNING_CONTEXT" != "[]" ] && [ -n "$RUNNING_CONTEXT" ]; then
+        echo "$RUNNING_CONTEXT" | python3 -c "import sys,json; [print(f'   [{t[\"status\"]}] {t[\"title\"]} ({t[\"running_context\"]})') for t in json.load(sys.stdin)]" 2>/dev/null || echo "$RUNNING_CONTEXT"
+    fi
     echo
-    echo "Restarting now would kill the Claude Code / Codex child processes."
+    echo "Restarting now would kill Claude Code, Codex, or deploy child processes."
     echo "Either wait, or pass --force to override."
     exit 1
 }

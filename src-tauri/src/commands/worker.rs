@@ -703,6 +703,11 @@ async fn worker_loop(
                                                             "PR's up for \"{}\": {}. Running Codex review now. I'll post the verdict and route the card in a minute — no need to pick up something new yet.",
                                                             task_title_spawn, msg
                                                         )).await;
+                                                    } else if msg.contains("Waiting for project/repo confirmation") {
+                                                        agent_chat(&config_spawn, &format!(
+                                                            "Paused \"{}\": I need the project/repo before I can start. Reply with the project number or tag the card with @project-name.",
+                                                            task_title_spawn
+                                                        )).await;
                                                     } else if msg.contains("PR created") {
                                                         agent_chat(&config_spawn, &format!(
                                                             "Done with \"{}\". {} Want me to pick up something else?", task_title_spawn, msg
@@ -1157,7 +1162,7 @@ async fn execute_task(
                 "status": "pending_confirmation",
                 "updated_at": chrono::Utc::now().to_rfc3339(),
             })).await;
-            return Err(format!("No repo_path for task {}", task_id));
+            return Ok("Waiting for project/repo confirmation before I can start.".to_string());
         }
     };
 
@@ -2141,11 +2146,7 @@ async fn run_build_check(repo_path: &str) -> Result<Option<String>, (String, Str
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let combined = if stderr.trim().is_empty() { stdout } else { stderr };
-    let tail = if combined.len() > 2000 {
-        combined[combined.len() - 2000..].to_string()
-    } else {
-        combined
-    };
+    let tail = tail_chars(&combined, 2000);
     Err((cmd_label, tail.trim().to_string()))
 }
 
@@ -2352,6 +2353,16 @@ fn truncate(s: &str, max_chars: usize) -> String {
     } else {
         let truncated: String = s.chars().take(max_chars).collect();
         format!("{}...", truncated)
+    }
+}
+
+fn tail_chars(s: &str, max_chars: usize) -> String {
+    let char_count = s.chars().count();
+    if char_count <= max_chars {
+        s.to_string()
+    } else {
+        let tail: String = s.chars().skip(char_count - max_chars).collect();
+        format!("...{}", tail)
     }
 }
 
@@ -2698,10 +2709,11 @@ async fn check_telegram_messages(
         *guard = Some(highest_update_id);
     }
 
-    // Media branch: any photos/docs in this batch → create a task directly
+    // Media branch: any photos/docs in this batch -> create a task directly
     // with attachments. The combined text (including caption) becomes the
     // task body. This bypasses the chat flow because a screenshot almost
-    // always means "here's a bug, fix it".
+    // always means "here's a bug, fix it"; if no project can be resolved, we
+    // pause for project selection before the worker can claim the card.
     if !pending_file_ids.is_empty() {
         let mut stored: Vec<serde_json::Value> = Vec::new();
         for (fid, _caption) in &pending_file_ids {
@@ -2717,6 +2729,13 @@ async fn check_telegram_messages(
                 Err(e) => log::warn!("[worker] Telegram getFile/download failed for {}: {}", fid, e),
             }
         }
+        if stored.is_empty() {
+            send_telegram_plain(
+                config,
+                "I got the Telegram attachment, but couldn't upload it into Samwise storage. Try sending it again.",
+            ).await;
+            return;
+        }
 
         let body_text = combined_parts.join("\n\n");
         let (title, description) = if body_text.is_empty() {
@@ -2726,7 +2745,7 @@ async fn check_telegram_messages(
             )
         } else {
             let first_line = body_text.lines().next().unwrap_or("Image from Telegram").chars().take(120).collect::<String>();
-            (first_line, body_text)
+            (first_line, body_text.clone())
         };
 
         let mut task_row = serde_json::json!({
@@ -2738,32 +2757,63 @@ async fn check_telegram_messages(
             "source": "telegram",
             "attachments": stored,
         });
-        // Best-effort project inference via substring match on ae_projects.
-        if let Ok(projects) = supabase::fetch_projects(config).await {
+        let projects = supabase::fetch_projects(config).await.ok();
+        // Best-effort project inference via @mention first, then substring
+        // match on ae_projects.
+        if let Some(projects) = projects.as_ref() {
             if let Some(arr) = projects.as_array() {
                 let hay = format!("{}\n{}", task_row["title"].as_str().unwrap_or(""), task_row["description"].as_str().unwrap_or("")).to_lowercase();
-                let mut names: Vec<&str> = arr.iter()
-                    .filter_map(|p| p.get("name").and_then(|v| v.as_str()))
-                    .collect();
-                names.sort_by_key(|n| std::cmp::Reverse(n.len()));
-                if let Some(n) = names.into_iter().find(|n| hay.contains(&n.to_lowercase())) {
-                    task_row["project"] = serde_json::Value::String(n.to_string());
-                    if let Some(row) = arr.iter().find(|p| p.get("name").and_then(|v| v.as_str()) == Some(n)) {
-                        if let Some(v) = row.get("repo_url") { task_row["repo_url"] = v.clone(); }
-                        if let Some(v) = row.get("repo_path") { task_row["repo_path"] = v.clone(); }
-                        if let Some(v) = row.get("preview_url") { task_row["preview_url"] = v.clone(); }
+                let mentioned = super::chat::extract_project_mentions(&body_text, projects).into_iter().next();
+                let matched = if let Some(name) = mentioned {
+                    Some(name)
+                } else {
+                    let mut names: Vec<&str> = arr.iter()
+                        .filter_map(|p| p.get("name").and_then(|v| v.as_str()))
+                        .collect();
+                    names.sort_by_key(|n| std::cmp::Reverse(n.len()));
+                    names.into_iter().find(|n| hay.contains(&n.to_lowercase())).map(str::to_string)
+                };
+                if let Some(name) = matched {
+                    task_row["project"] = serde_json::Value::String(name.clone());
+                    if let Some(row) = arr.iter().find(|p| p.get("name").and_then(|v| v.as_str()) == Some(&name)) {
+                        for field in &["repo_url", "repo_path", "preview_url"] {
+                            if let Some(v) = row.get(*field).filter(|v| v.as_str().map(|s| !s.is_empty()).unwrap_or(false)) {
+                                task_row[*field] = v.clone();
+                            }
+                        }
                     }
                 }
             }
         }
 
+        let has_project = task_row
+            .get("project")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        task_row["status"] = serde_json::Value::String(if has_project { "queued" } else { "pending_confirmation" }.to_string());
+
         match supabase::create_task(config, &task_row).await {
             Ok(_) => {
                 log::info!("[worker] Telegram: created task with {} attachment(s)", stored.len());
-                send_telegram(config, &format!(
-                    "Got it. Queued a task with {} attachment{}.",
-                    stored.len(), if stored.len() == 1 { "" } else { "s" }
-                )).await;
+                if has_project {
+                    send_telegram(config, &format!(
+                        "Got it. Queued a task with {} attachment{}.",
+                        stored.len(), if stored.len() == 1 { "" } else { "s" }
+                    )).await;
+                } else {
+                    let mut msg = format!(
+                        "Got the image and attached {} file{}. I need the project before I can start.",
+                        stored.len(), if stored.len() == 1 { "" } else { "s" }
+                    );
+                    if let Some(prompt) = projects.as_ref().and_then(super::chat::build_project_selection_prompt) {
+                        msg.push_str("\n\n");
+                        msg.push_str(&prompt);
+                    } else {
+                        msg.push_str(" Reply with @project-name.");
+                    }
+                    send_telegram_plain(config, &msg).await;
+                }
             }
             Err(e) => log::warn!("[worker] Telegram attachment task insert failed: {}", e),
         }
@@ -3113,13 +3163,9 @@ async fn process_telegram_message(config: &SupabaseConfig, user_message: &str, m
     if any_task_unresolved && mentioned_projects.is_empty() {
         if let Some(arr) = projects_all.as_array() {
             if !arr.is_empty() {
-                let mut list = String::from("Which project?\n");
-                for (i, proj) in arr.iter().enumerate() {
-                    let name = proj.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    list.push_str(&format!("{}. {}\n", i + 1, name));
+                if let Some(list) = chat::build_project_selection_prompt(&projects_all) {
+                    send_telegram_plain(config, &list).await;
                 }
-                list.push_str("\nReply with the number.");
-                send_telegram_plain(config, &list).await;
             }
         }
     }
@@ -3338,11 +3384,7 @@ pub async fn run_claude_code_opts(cwd: &str, prompt: &str, max_turns: u32, timeo
             stderr.to_string()
         } else {
             let tail = stdout_text.trim();
-            let snippet: String = if tail.len() > 1200 {
-                format!("…{}", &tail[tail.len() - 1200..])
-            } else {
-                tail.to_string()
-            };
+            let snippet = tail_chars(tail, 1200);
             if snippet.is_empty() {
                 "no stderr, no stdout captured".to_string()
             } else {
@@ -3780,11 +3822,7 @@ pub async fn run_claude_code_streaming(
             stderr.to_string()
         } else {
             let tail = raw_tail.trim();
-            let snippet: String = if tail.len() > 1200 {
-                format!("…{}", &tail[tail.len() - 1200..])
-            } else {
-                tail.to_string()
-            };
+            let snippet = tail_chars(tail, 1200);
             if snippet.is_empty() {
                 "no stderr, no stdout captured".to_string()
             } else {
@@ -3894,7 +3932,7 @@ async fn take_screenshot(url: &str, output_path: &str, viewport: &str) -> Result
             return Err(format!("playwright screenshot: {}", {
                 let s = if stderr.trim().is_empty() { stdout.to_string() } else { stderr.to_string() };
                 let s = s.trim();
-                if s.len() > 400 { s[s.len() - 400..].to_string() } else { s.to_string() }
+                tail_chars(s, 400)
             }));
         }
         tokio::time::sleep(std::time::Duration::from_millis(750)).await;
@@ -5228,26 +5266,10 @@ fn manifest_rule_is_railway(rule: &SamwiseDeployRule) -> bool {
 }
 
 async fn run_deploy_command(command: &DeployCommand) -> Result<(), String> {
-    log::info!("[merge-deploy] running {} in {}: {}", command.label, command.cwd, command.command);
-    let doppler_scope = dev_server::doppler_scope_for_checkout(&command.cwd).await;
-    let mut cmd = if let Some(scope) = doppler_scope.as_deref() {
-        let mut c = async_cmd("doppler");
-        c.args(["run", "--scope", scope, "--", "sh", "-lc", &command.command]);
-        c
-    } else {
-        let mut c = async_cmd("sh");
-        c.args(["-lc", &command.command]);
-        c
-    };
-    cmd.current_dir(&command.cwd)
-        .env("CI", "true")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+    ensure_node_dependencies_for_deploy(command).await?;
 
-    let output = tokio::time::timeout(std::time::Duration::from_secs(20 * 60), cmd.output())
-        .await
-        .map_err(|_| format!("{} timed out after 20 minutes", command.label))?
-        .map_err(|e| format!("spawn {}: {}", command.label, e))?;
+    log::info!("[merge-deploy] running {} in {}: {}", command.label, command.cwd, command.command);
+    let output = run_deploy_shell(&command.cwd, &command.command, &command.label, 20 * 60).await?;
 
     if output.status.success() {
         return Ok(());
@@ -5262,6 +5284,73 @@ async fn run_deploy_command(command: &DeployCommand) -> Result<(), String> {
         truncate(stderr.trim(), 900),
         truncate(stdout.trim(), 500)
     ))
+}
+
+async fn ensure_node_dependencies_for_deploy(command: &DeployCommand) -> Result<(), String> {
+    let command_text = command.command.to_ascii_lowercase();
+    let likely_needs_node_modules =
+        command_text.contains("npm run")
+        || command_text.contains("npx ")
+        || command_text.contains("node ")
+        || command_text.contains("tsc ")
+        || command_text.contains("tsx ");
+    if !likely_needs_node_modules {
+        return Ok(());
+    }
+
+    let cwd = Path::new(&command.cwd);
+    if !cwd.join("package.json").is_file() || cwd.join("node_modules").is_dir() {
+        return Ok(());
+    }
+
+    let install_command = if cwd.join("package-lock.json").is_file() {
+        "npm ci"
+    } else {
+        "npm install"
+    };
+    let label = format!("install dependencies for {}", command.label);
+    log::info!("[merge-deploy] {} in {}: {}", label, command.cwd, install_command);
+    let output = run_deploy_shell(&command.cwd, install_command, &label, 20 * 60).await?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = redact_secrets(&String::from_utf8_lossy(&output.stderr));
+    let stdout = redact_secrets(&String::from_utf8_lossy(&output.stdout));
+    Err(format!(
+        "{} failed with {}. stderr: {} stdout: {}",
+        label,
+        output.status,
+        truncate(stderr.trim(), 900),
+        truncate(stdout.trim(), 500)
+    ))
+}
+
+async fn run_deploy_shell(
+    cwd: &str,
+    command: &str,
+    label: &str,
+    timeout_secs: u64,
+) -> Result<std::process::Output, String> {
+    let doppler_scope = dev_server::doppler_scope_for_checkout(cwd).await;
+    let mut cmd = if let Some(scope) = doppler_scope.as_deref() {
+        let mut c = async_cmd("doppler");
+        c.args(["run", "--scope", scope, "--", "sh", "-lc", command]);
+        c
+    } else {
+        let mut c = async_cmd("sh");
+        c.args(["-lc", command]);
+        c
+    };
+    cmd.current_dir(cwd)
+        .env("CI", "true")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output())
+        .await
+        .map_err(|_| format!("{} timed out after {} minutes", label, timeout_secs / 60))?
+        .map_err(|e| format!("spawn {}: {}", label, e))
 }
 
 async fn persist_deploy_plan(config: &SupabaseConfig, task_id: &str, plan: &DeployPlan) {
