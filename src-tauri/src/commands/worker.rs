@@ -271,9 +271,9 @@ pub async fn autostart_worker(app: tauri::AppHandle) {
     let sb_config_arc = Arc::clone(&sb_state.config);
     let app_handle = app.clone();
 
-    log::info!("[worker] autostart: launching worker_loop as {}", machine_name);
+    log::info!("[worker] autostart: launching worker_loop (supervised) as {}", machine_name);
     tokio::spawn(async move {
-        worker_loop(running, current_task, last_tg_update, current_pid, machine_name, sb_config_arc, app_handle).await;
+        supervise_worker_loop(running, current_task, last_tg_update, current_pid, machine_name, sb_config_arc, app_handle).await;
     });
 }
 
@@ -353,7 +353,7 @@ pub async fn worker_start(
     let app_handle = app.clone();
 
     tokio::spawn(async move {
-        worker_loop(running, current_task, last_tg_update, current_pid, machine_name, sb_config_arc, app_handle).await;
+        supervise_worker_loop(running, current_task, last_tg_update, current_pid, machine_name, sb_config_arc, app_handle).await;
     });
 
     Ok(())
@@ -444,6 +444,90 @@ pub async fn restart_task(
     })).await;
     agent_comment(&config, &task_id, "Task restarted. Back in the queue.").await;
     Ok(())
+}
+
+// ── Worker Supervisor ───────────────────────────────────────────────
+//
+// Wraps `worker_loop` in a panic-catching restart loop. Tokio surfaces
+// task panics through `JoinHandle::await -> Err(JoinError { is_panic })`,
+// so we spawn the loop as a child task and respawn it on panic. Without
+// this, a single bad slice or unwrap inside `worker_loop` silently kills
+// the worker thread while the Tauri main thread keeps the UI alive --
+// what bit Sam on 2026-04-29 (12 hours dead, no tickets picked up,
+// triggered by a Telegram caption hitting a non-char-boundary slice).
+async fn supervise_worker_loop(
+    running: Arc<AtomicBool>,
+    current_task_id: Arc<tokio::sync::Mutex<Option<String>>>,
+    last_telegram_update_id: Arc<tokio::sync::Mutex<Option<i64>>>,
+    current_process_id: Arc<tokio::sync::Mutex<Option<u32>>>,
+    machine_name: String,
+    sb_config_arc: Arc<tokio::sync::RwLock<SupabaseConfig>>,
+    app: tauri::AppHandle,
+) {
+    let mut restarts: u32 = 0;
+
+    while running.load(Ordering::Relaxed) {
+        let running_c = running.clone();
+        let current_task_c = current_task_id.clone();
+        let last_tg_c = last_telegram_update_id.clone();
+        let current_pid_c = current_process_id.clone();
+        let machine_c = machine_name.clone();
+        let sb_c = sb_config_arc.clone();
+        let app_c = app.clone();
+
+        let handle = tokio::spawn(async move {
+            worker_loop(running_c, current_task_c, last_tg_c, current_pid_c, machine_c, sb_c, app_c).await;
+        });
+
+        match handle.await {
+            Ok(()) => {
+                log::info!("[worker-supervisor] worker_loop exited cleanly; supervisor done");
+                break;
+            }
+            Err(join_err) if join_err.is_panic() => {
+                restarts += 1;
+                log::error!(
+                    "[worker-supervisor] worker_loop PANICKED (restart #{}). Backoff 5s. Detail: {:?}",
+                    restarts, join_err
+                );
+
+                // Clear in-flight task pointer so we don't think we're still
+                // running whatever crashed; the orphaned ae_tasks row will be
+                // recovered by `recover_stuck_tasks` when worker_loop respawns.
+                {
+                    let mut ct = current_task_id.lock().await;
+                    *ct = None;
+                }
+                {
+                    let mut pid = current_process_id.lock().await;
+                    *pid = None;
+                }
+
+                // Tell Matt the worker crashed and is auto-recovering.
+                let config = sb_config_arc.read().await.clone();
+                let msg = format!(
+                    "Worker thread panicked (auto-restart #{}). Recovering in 5s. Check ~/Library/Logs/Samwise/samwise.err.log for the panic.",
+                    restarts
+                );
+                agent_chat(&config, &msg).await;
+
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+            Err(join_err) => {
+                log::error!(
+                    "[worker-supervisor] worker_loop join error (cancelled or other): {:?}",
+                    join_err
+                );
+                break;
+            }
+        }
+    }
+
+    log::info!(
+        "[worker-supervisor] supervisor exiting (running={}, total_restarts={})",
+        running.load(Ordering::Relaxed),
+        restarts
+    );
 }
 
 // ── Worker Loop ─────────────────────────────────────────────────────
@@ -2696,7 +2780,7 @@ async fn check_telegram_messages(
             part_count, combined_text.len()
         );
     } else {
-        log::info!("[worker] Telegram message received: {}", &combined_text[..combined_text.len().min(50)]);
+        log::info!("[worker] Telegram message received: {}", truncate(&combined_text, 50));
     }
 
     process_telegram_message(config, &combined_text, machine_name).await;
@@ -3347,7 +3431,7 @@ fn detect_rate_limit(text: &str) -> Option<String> {
         "http 429",
     ];
     if needles.iter().any(|n| lower.contains(n)) {
-        let short = if text.len() > 400 { &text[..400] } else { text };
+        let short = truncate(text, 400);
         return Some(format!("Hit a Claude rate / usage limit. Wait a few minutes and retry. Raw: {}", short.trim()));
     }
     None
@@ -3494,8 +3578,17 @@ pub async fn run_claude_code_streaming(
                 // never empty when stderr is silent (common for stream-json).
                 if raw_tail.len() + line.len() + 1 > RAW_TAIL_CAP {
                     let drop = (raw_tail.len() + line.len() + 1).saturating_sub(RAW_TAIL_CAP);
-                    if drop >= raw_tail.len() { raw_tail.clear(); }
-                    else { raw_tail.drain(..drop); }
+                    if drop >= raw_tail.len() {
+                        raw_tail.clear();
+                    } else {
+                        // Walk forward to the next UTF-8 char boundary so drain
+                        // never panics on multi-byte chars in Claude's stdout.
+                        let mut safe_drop = drop;
+                        while safe_drop < raw_tail.len() && !raw_tail.is_char_boundary(safe_drop) {
+                            safe_drop += 1;
+                        }
+                        raw_tail.drain(..safe_drop);
+                    }
                 }
                 raw_tail.push_str(&line);
                 raw_tail.push('\n');
