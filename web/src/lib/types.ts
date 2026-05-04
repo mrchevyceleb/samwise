@@ -40,6 +40,7 @@ export interface AeTask {
   preview_url: string | null;
   pr_url: string | null;
   pr_number: number | null;
+  report_url: string | null;
   screenshots_before: string[] | null;
   screenshots_after: string[] | null;
   visual_qa_result: { pass: boolean; explanation: string } | null;

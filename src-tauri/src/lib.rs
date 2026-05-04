@@ -2,6 +2,7 @@ mod state;
 mod commands;
 mod models;
 pub mod process;
+pub mod report_server;
 
 use commands::claude_code::ClaudeCodeState;
 use commands::supabase::SupabaseState;
@@ -142,6 +143,17 @@ pub fn run() {
             let app_handle_for_worker = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 commands::worker::autostart_worker(app_handle_for_worker).await;
+            });
+
+            // Spawn the Tailscale-only report server. Best-effort: if Tailscale
+            // isn't installed or the IP can't be detected, the server simply
+            // does not start and research reports remain readable through the
+            // desktop modal (no public URL).
+            let app_handle_for_reports = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Ok(data_dir) = app_handle_for_reports.path().app_data_dir() {
+                    report_server::spawn(data_dir.join("reports")).await;
+                }
             });
 
             Ok(())

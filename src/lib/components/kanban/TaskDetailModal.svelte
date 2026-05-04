@@ -401,6 +401,29 @@
 					<svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M4.5 0A2.5 2.5 0 002 2.5v11A2.5 2.5 0 004.5 16h7a2.5 2.5 0 002.5-2.5v-8a.5.5 0 00-.146-.354l-4.5-4.5A.5.5 0 009 .5H4.5zM10 4V1l4 4h-3a1 1 0 01-1-1zM5 7.5a.5.5 0 01.5-.5h5a.5.5 0 010 1h-5a.5.5 0 01-.5-.5zm.5 2.5a.5.5 0 000 1h5a.5.5 0 000-1h-5z"/></svg>
 					Report
 				</button>
+				{#if task.report_url}
+					<button
+						type="button"
+						title="Open the rendered report in your browser (tailnet only)"
+						style="
+							margin-left: auto; align-self: center;
+							padding: 5px 12px; font-size: 11px; font-weight: 600;
+							font-family: var(--font-ui); cursor: pointer;
+							background: rgba(99, 102, 241, 0.1); color: var(--accent-indigo);
+							border: 1px solid rgba(99, 102, 241, 0.3); border-radius: 6px;
+							display: inline-flex; align-items: center; gap: 6px;
+							transition: all 0.15s ease;
+						"
+						onclick={() => openExternal(task.report_url!)}
+					>
+						<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+							<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
+							<polyline points="15 3 21 3 21 9"/>
+							<line x1="10" y1="14" x2="21" y2="3"/>
+						</svg>
+						View in browser
+					</button>
+				{/if}
 			</div>
 		{/if}
 

@@ -1595,9 +1595,10 @@ from Matt, stop without making changes and explain specifically what you need cl
         Ok(output) => {
             let summary = truncate(&output, 500);
 
-            // Research tasks: save full output as artifact, post short comment, mark done
+            // Research tasks: save full output as artifact, render HTML for
+            // the Tailscale-only report server, post short comment, route to
+            // review.
             if is_research {
-                // Save the full report as an artifact
                 let artifact_result = supabase::create_artifact(config, &serde_json::json!({
                     "task_id": task_id,
                     "title": title,
@@ -1605,25 +1606,59 @@ from Matt, stop without making changes and explain specifically what you need cl
                     "artifact_type": "report",
                 })).await;
 
-                match artifact_result {
-                    Ok(_) => {
-                        agent_comment(config, &task_id, "Analysis complete. Full report saved. Click the Report tab above to read it.").await;
-                    }
-                    Err(e) => {
-                        log::warn!("[worker] Failed to save artifact: {}", e);
-                        // Fallback: post truncated summary in comment
-                        agent_comment(config, &task_id, &format!("Analysis complete. (Failed to save full report, showing summary)\n\n{}", summary)).await;
+                // Best-effort: render HTML and write to the reports directory
+                // the local server static-serves, then attach the URL to the
+                // task. Independent of artifact save success — even if
+                // Supabase wrote nothing, the local file + URL still works.
+                let mut report_url: Option<String> = None;
+                if let Ok(data_dir) = app.path().app_data_dir() {
+                    let reports_dir = data_dir.join("reports");
+                    if let Err(e) = tokio::fs::create_dir_all(&reports_dir).await {
+                        log::warn!("[worker] could not create reports dir: {}", e);
+                    } else {
+                        let generated_at = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC").to_string();
+                        let html = crate::report_server::render_report_html(&title, &generated_at, &output);
+                        let html_path = reports_dir.join(format!("{}.html", task_id));
+                        if let Err(e) = tokio::fs::write(&html_path, &html).await {
+                            log::warn!("[worker] could not write report html {:?}: {}", html_path, e);
+                        } else if let Some(base) = crate::report_server::url_base() {
+                            report_url = Some(format!("{}/r/{}", base, task_id));
+                        } else {
+                            log::info!("[worker] report html written but server has no URL base; skipping report_url");
+                        }
                     }
                 }
+
+                let view_link = report_url
+                    .as_deref()
+                    .map(|u| format!(" View it: {}", u))
+                    .unwrap_or_default();
+                let comment_body = match (&artifact_result, report_url.is_some()) {
+                    (Ok(_), true) => format!("Analysis complete. Full report saved.{}", view_link),
+                    (Ok(_), false) => "Analysis complete. Full report saved. Click the Report tab above to read it.".to_string(),
+                    (Err(e), true) => {
+                        log::warn!("[worker] Failed to save artifact: {}", e);
+                        format!("Analysis complete. Saved the rendered report locally.{}", view_link)
+                    }
+                    (Err(e), false) => {
+                        log::warn!("[worker] Failed to save artifact: {}", e);
+                        format!("Analysis complete. (Failed to save full report, showing summary)\n\n{}", summary)
+                    }
+                };
+                agent_comment(config, &task_id, &comment_body).await;
 
                 // Land in `review` so the report card stays visible until
                 // Matt acknowledges it (drag to Done). Going straight to Done
                 // means the card vanishes behind the collapsible Done column
                 // and the report can be missed entirely.
-                let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                let mut updates = serde_json::json!({
                     "status": "review",
                     "updated_at": chrono::Utc::now().to_rfc3339(),
-                })).await;
+                });
+                if let Some(url) = report_url.as_ref() {
+                    updates["report_url"] = serde_json::Value::String(url.clone());
+                }
+                let _ = supabase::update_task(config, &task_id, &updates).await;
                 notify_callback(config, &task_id, "review", None, None);
                 if notify_task_completed_research {
                     send_telegram(config, &format!(

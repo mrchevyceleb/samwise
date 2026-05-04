@@ -61,3 +61,7 @@ dirs = "5"
 which = "6"
 libc = "0.2.185"
 
+# Local report server (Tailscale-bound HTTP for research-task HTML reports)
+axum = "0.7"
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+
