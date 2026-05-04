@@ -1226,6 +1226,14 @@ async fn execute_task(
 
     let mut repo_path = match repo_path {
         Some(p) => p,
+        None if is_research => {
+            // Research tasks don't need a repo: they read, analyze, and write
+            // a report. Run Claude from the home directory so it can navigate
+            // to any absolute path the description references.
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            log::info!("[worker] research task {} has no repo_path; using home dir {}", task_id, home);
+            home
+        }
         None => {
             // Pause the task and ask Matt to wire up repo_path rather than failing.
             // Matt can answer in chat to move it back to `queued`.
@@ -1608,12 +1616,15 @@ from Matt, stop without making changes and explain specifically what you need cl
                     }
                 }
 
+                // Land in `review` so the report card stays visible until
+                // Matt acknowledges it (drag to Done). Going straight to Done
+                // means the card vanishes behind the collapsible Done column
+                // and the report can be missed entirely.
                 let _ = supabase::update_task(config, &task_id, &serde_json::json!({
-                    "status": "done",
-                    "completed_at": chrono::Utc::now().to_rfc3339(),
+                    "status": "review",
                     "updated_at": chrono::Utc::now().to_rfc3339(),
                 })).await;
-                notify_callback(config, &task_id, "done", None, None);
+                notify_callback(config, &task_id, "review", None, None);
                 if notify_task_completed_research {
                     send_telegram(config, &format!(
                         "Finished analysis on *{}*\\. Full report saved as an artifact\\.",
@@ -4798,12 +4809,171 @@ pub async fn sweep_merge_deploy_requests(config: &SupabaseConfig) {
     let Ok(tasks) = supabase::fetch_tasks(config, None).await else { return };
     let Some(arr) = tasks.as_array() else { return };
 
+    // Pre-flight: if Matt requested Merge + Deploy on 2+ PRs in the same repo
+    // (e.g. clearing a morning queue), have Sam scan the diffs once for
+    // dependency / file-collision concerns before any merge starts. Result is
+    // informational; nothing auto-reorders. One pass per repo per hour.
+    let pending: Vec<&Value> = arr.iter()
+        .filter(|t| {
+            let status = t.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            status == "approved" && merge_deploy_request_is_pending(t)
+        })
+        .collect();
+    if pending.len() >= 2 {
+        let mut by_repo: HashMap<String, Vec<Value>> = HashMap::new();
+        for t in &pending {
+            let repo_path = t.get("repo_path").and_then(|v| v.as_str()).unwrap_or("");
+            if repo_path.is_empty() { continue; }
+            by_repo.entry(repo_path.to_string()).or_default().push((*t).clone());
+        }
+        for (repo_path, repo_tasks) in by_repo {
+            if repo_tasks.len() < 2 { continue; }
+            if !claim_pre_flight_slot(&repo_path) { continue; }
+            // Pre-flight runs Claude for up to ~600s. Awaiting it here would
+            // starve the worker heartbeat (60s freshness), making the worker
+            // look offline and risking a secondary host taking over. Detach.
+            let config_spawn = config.clone();
+            tokio::spawn(async move {
+                run_pre_flight_queue_analysis(&config_spawn, &repo_path, &repo_tasks).await;
+            });
+        }
+    }
+
     for task in arr {
         let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("");
         if !matches!(status, "approved" | "fixes_needed" | "review") { continue; }
         if !merge_deploy_request_is_pending(task) { continue; }
         start_merge_deploy_task(config, task.clone(), status == "approved", "Merge + Deploy requested from the UI.", None).await;
     }
+}
+
+const PRE_FLIGHT_COOLDOWN_SECS: i64 = 60 * 60;
+static PRE_FLIGHT_LAST_RUN: OnceLock<StdMutex<HashMap<String, chrono::DateTime<chrono::Utc>>>> = OnceLock::new();
+
+/// Atomically reserve a pre-flight slot for `repo_path`. Returns true if the
+/// caller should run the analysis now (cooldown has elapsed). Stored
+/// in-memory only — a worker restart drops the history, which is fine for an
+/// hourly hint; the worst case is one extra Claude call after a restart.
+fn claim_pre_flight_slot(repo_path: &str) -> bool {
+    let registry = PRE_FLIGHT_LAST_RUN.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut guard = registry.lock().unwrap_or_else(|p| p.into_inner());
+    let now = chrono::Utc::now();
+    if let Some(last) = guard.get(repo_path) {
+        if (now - *last).num_seconds() < PRE_FLIGHT_COOLDOWN_SECS {
+            return false;
+        }
+    }
+    guard.insert(repo_path.to_string(), now);
+    true
+}
+
+async fn run_pre_flight_queue_analysis(
+    config: &SupabaseConfig,
+    repo_path: &str,
+    tasks: &[Value],
+) {
+    let mut summaries: Vec<String> = Vec::new();
+    let mut anchor_task_id: Option<String> = None;
+    for t in tasks {
+        let task_id = t.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let pr_url = t.get("pr_url").and_then(|v| v.as_str()).unwrap_or("");
+        let title = t.get("title").and_then(|v| v.as_str()).unwrap_or("(no title)");
+        if anchor_task_id.is_none() && !task_id.is_empty() {
+            anchor_task_id = Some(task_id.clone());
+        }
+        if pr_url.is_empty() { continue; }
+        let files = match review::fetch_pr_files(pr_url, repo_path).await {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("[pre-flight] fetch_pr_files failed for {}: {}", pr_url, e);
+                Vec::new()
+            }
+        };
+        let preview: Vec<String> = files.iter().take(10).cloned().collect();
+        let extra = files.len().saturating_sub(preview.len());
+        let files_block = if preview.is_empty() {
+            "(no files reported)".to_string()
+        } else {
+            let mut s = preview.join("\n  - ");
+            s.insert_str(0, "  - ");
+            if extra > 0 {
+                s.push_str(&format!("\n  - …and {} more", extra));
+            }
+            s
+        };
+        summaries.push(format!(
+            "- {pr_url}\n  title: {title}\n  changed files ({total}):\n{files_block}",
+            pr_url = pr_url,
+            title = title,
+            total = files.len(),
+            files_block = files_block
+        ));
+    }
+
+    if summaries.is_empty() {
+        log::info!("[pre-flight] no usable PR data for {}", repo_path);
+        return;
+    }
+
+    let prompt = pre_flight_queue_prompt(repo_path, &summaries);
+    let process_id_slot: Arc<tokio::sync::Mutex<Option<u32>>> = Arc::new(tokio::sync::Mutex::new(None));
+    // We need a task_id for streaming heartbeats but don't want analysis
+    // comments to pollute one of the queued cards' threads. Use the first
+    // pending task as the anchor for the live stream and post the final
+    // analysis as a comment on it.
+    let Some(anchor_id) = anchor_task_id else { return };
+    let analysis = match run_claude_code_streaming(
+        repo_path,
+        &prompt,
+        0,
+        600,
+        config,
+        &anchor_id,
+        process_id_slot,
+    ).await {
+        Ok(out) => out.trim().to_string(),
+        Err(e) => {
+            log::warn!("[pre-flight] Claude pass failed for {}: {}", repo_path, e);
+            return;
+        }
+    };
+    if analysis.is_empty() { return; }
+
+    let header = format!(
+        "Pre-flight check on `{}` queue ({} PRs ready to merge):\n\n",
+        repo_path, summaries.len()
+    );
+    let combined = format!("{}{}", header, truncate(&analysis, 4000));
+
+    agent_comment(config, &anchor_id, &combined).await;
+    let _ = supabase::send_message(config, &serde_json::json!({
+        "role": "agent",
+        "content": &combined,
+        "conversation_id": supabase::DEFAULT_CONVERSATION_ID,
+    })).await;
+}
+
+fn pre_flight_queue_prompt(repo_path: &str, summaries: &[String]) -> String {
+    format!(
+        "You are Sam doing a pre-flight scan on a queue of approved PRs that are about to be merged and deployed in this repo.\n\n\
+Repo: `{repo}`\n\n\
+PRs in queue (oldest approval first):\n{prs}\n\n\
+Instructions:\n\
+- For each PR, you may run `gh pr diff <url>` or read the listed files in this checkout to understand intent.\n\
+- Identify any pair of PRs that touch the same files and could conflict on merge.\n\
+- Identify any semantic dependency (PR-B uses a function/symbol PR-A introduces, schema changes that need to land before code that reads them, etc.).\n\
+- Suggest a merge order. Default to the existing approval order unless you spot a real reason to change it.\n\
+- Keep the response under ~600 words. Use plain markdown bullets, no preamble.\n\n\
+Format:\n\
+**Recommended order:**\n\
+1. <pr-url> — <one-line reason>\n\
+2. ...\n\n\
+**Concerns:**\n\
+- <only list concerns you actually found; if none, write \"none — these look independent\">\n\n\
+Do NOT modify any files. Do NOT run `gh pr merge` or push. This is read-only analysis.",
+        repo = repo_path,
+        prs = summaries.join("\n")
+    )
 }
 
 async fn start_merge_deploy_task(
@@ -5095,7 +5265,7 @@ async fn run_merge_deploy_workflow(
     }
 
     for command in &plan.commands {
-        run_deploy_command(command)
+        run_deploy_command_with_escalation(command, config, task_id)
             .await
             .map_err(|e| MergeDeployError::deploy_failed(e, pr_merged))?;
     }
@@ -5495,6 +5665,124 @@ async fn run_deploy_command(command: &DeployCommand) -> Result<(), String> {
         truncate(stderr.trim(), 900),
         truncate(stdout.trim(), 500)
     ))
+}
+
+/// Run a deploy command. On non-zero exit, hand the failure to Claude Code in
+/// the deploy checkout with a focused prompt and retry the command once.
+/// Bounded to a single escalation per command — no retry loops. On final
+/// failure, returns the original error followed by Sam's summary.
+async fn run_deploy_command_with_escalation(
+    command: &DeployCommand,
+    config: &SupabaseConfig,
+    task_id: &str,
+) -> Result<(), String> {
+    let first_err = match run_deploy_command(command).await {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+
+    agent_comment(
+        config,
+        task_id,
+        &format!(
+            "Deploy step `{}` failed. Asking Sam to investigate before I give up.\n\n```\n{}\n```",
+            command.label,
+            truncate(&first_err, 1600)
+        ),
+    ).await;
+
+    // Snapshot HEAD before Claude runs. The deploy worktree is not a real
+    // branch — any commit here would be lost on the next deploy. If Claude
+    // ignores the HARD RULES and commits anyway, we abort the retry and
+    // surface the violation rather than reporting Done on phantom code.
+    let head_before = run_git(&["rev-parse", "HEAD"], &command.cwd).await.ok();
+
+    let prompt = deploy_failure_fix_prompt(command, &first_err);
+    let process_id_slot: Arc<tokio::sync::Mutex<Option<u32>>> = Arc::new(tokio::sync::Mutex::new(None));
+    let claude_summary = match run_claude_code_streaming(
+        &command.cwd,
+        &prompt,
+        0,
+        1200,
+        config,
+        task_id,
+        process_id_slot,
+    ).await {
+        Ok(output) => truncate(output.trim(), 1800).to_string(),
+        Err(e) => return Err(format!(
+            "{}\n\nSam could not run a fix attempt: {}",
+            first_err, e
+        )),
+    };
+
+    // Verify the deploy worktree is unchanged. If Sam committed code here
+    // despite the rules, the fix will never reach the default branch — fail
+    // fast so Matt sees that the deploy can't be considered successful.
+    if let Some(before) = head_before.as_deref().map(str::trim) {
+        let after = run_git(&["rev-parse", "HEAD"], &command.cwd).await.ok();
+        let after_trim = after.as_deref().map(str::trim).unwrap_or("");
+        if !before.is_empty() && before != after_trim {
+            return Err(format!(
+                "{}\n\nSam committed in the deploy worktree (HEAD {} -> {}) which would not reach the default branch. Aborting deploy. Sam's notes:\n{}",
+                first_err, before, after_trim, claude_summary
+            ));
+        }
+    }
+    let dirty = run_git(&["status", "--porcelain"], &command.cwd).await.unwrap_or_default();
+    if !dirty.trim().is_empty() {
+        return Err(format!(
+            "{}\n\nSam left uncommitted changes in the deploy worktree:\n{}\n\nThis would not reach the default branch. Aborting deploy. Sam's notes:\n{}",
+            first_err, truncate(dirty.trim(), 600), claude_summary
+        ));
+    }
+
+    // Retry the original command once after Sam's pass.
+    match run_deploy_command(command).await {
+        Ok(()) => {
+            agent_comment(
+                config,
+                task_id,
+                &format!(
+                    "Sam fixed `{}` and the deploy step is now green.\n\nSam's notes:\n```\n{}\n```",
+                    command.label,
+                    claude_summary
+                ),
+            ).await;
+            Ok(())
+        }
+        Err(retry_err) => Err(format!(
+            "{}\n\nSam attempted a fix but `{}` still fails.\n\nRetry error:\n{}\n\nSam's notes:\n{}",
+            first_err, command.label, retry_err, claude_summary
+        )),
+    }
+}
+
+fn deploy_failure_fix_prompt(command: &DeployCommand, error: &str) -> String {
+    format!(
+        "You are Sam investigating a deploy step that failed for an already-merged PR. \
+Samwise needs you to either fix the EXTERNAL state so the deploy can succeed on retry, or clearly explain why it cannot be fixed automatically.\n\n\
+Failed step: `{label}` ({category})\n\
+Working directory: `{cwd}`\n\
+Command: `{command}`\n\n\
+Failure output (stderr/stdout truncated, secrets redacted):\n```\n{error}\n```\n\n\
+HARD RULES — read carefully:\n\
+- DO NOT modify any files in this checkout. DO NOT `git add`, `git commit`, or `git push`.\n\
+- This checkout is the deploy worktree, not a PR branch. Anything you commit here will not reach the GitHub default branch and will be lost the next time Samwise prepares a deploy.\n\
+- If the failure is a CODE defect (build error, syntax error in a migration, schema mismatch, wrong import), STOP and report it. Do not try to patch the code yourself — that needs a real PR through normal review.\n\n\
+What you ARE allowed to do:\n\
+- Re-run the failed command in `{cwd}` once for fresh diagnostic output.\n\
+- Run read-only inspection commands (`gh`, `railway status`, `supabase status`, `cat`, `ls`).\n\
+- Fix EXTERNAL/environmental state when the cause is clearly there: relink a Supabase project, refresh a Railway login if obviously expired, restart a stuck CLI auth handshake. These mutate machine state, not the repo.\n\n\
+End your response with a one-line verdict:\n\
+- `VERDICT: env fixed` (you fixed external state; deploy command should now succeed on retry)\n\
+- `VERDICT: needs Matt` (env problem you can't fix safely, OR a code defect — describe what Matt needs to do, including any code change needed)\n\
+- `VERDICT: gave up` (you couldn't determine a safe path)",
+        label = command.label,
+        category = command.category,
+        cwd = command.cwd,
+        command = command.command,
+        error = truncate(error, 2400)
+    )
 }
 
 async fn ensure_node_dependencies_for_deploy(command: &DeployCommand) -> Result<(), String> {

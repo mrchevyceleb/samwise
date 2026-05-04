@@ -90,6 +90,7 @@ export interface AeComment {
 
 export const STATUSES: TaskStatus[] = [
   'queued',
+  'pending_confirmation',
   'in_progress',
   'testing',
   'review',
