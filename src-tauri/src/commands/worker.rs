@@ -878,9 +878,17 @@ async fn evaluate_crons(config: &SupabaseConfig, app: &tauri::AppHandle) -> Resu
             }
         };
 
-        // Create task from template
-        let mut task = template.clone();
-        if let Some(obj) = task.as_object_mut() {
+        // `repo_parent` on the template is a cron-evaluator hint, not an
+        // ae_tasks column. When set, fan out to one task per git subdir of
+        // that path. Otherwise create a single task from the template as-is.
+        let repo_parent = template.get("repo_parent")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty());
+
+        let mut base_task = template.clone();
+        if let Some(obj) = base_task.as_object_mut() {
+            obj.remove("repo_parent");
             obj.insert("source".to_string(), serde_json::json!("cron"));
             obj.insert("cron_id".to_string(), serde_json::json!(cron_id));
             if !obj.contains_key("status") {
@@ -891,13 +899,63 @@ async fn evaluate_crons(config: &SupabaseConfig, app: &tauri::AppHandle) -> Resu
             }
         }
 
-        match supabase::create_task(config, &task).await {
-            Ok(_) => {
-                log::info!("[worker] Cron '{}' created task", cron_name);
-                emit_worker_event(app, "cron_fired", &format!("Cron '{}' created a new task", cron_name), None);
+        if let Some(parent_path) = repo_parent {
+            let parent = std::path::PathBuf::from(&parent_path);
+            let mut subdirs: Vec<std::path::PathBuf> = Vec::new();
+            match tokio::fs::read_dir(&parent).await {
+                Ok(mut rd) => {
+                    while let Ok(Some(entry)) = rd.next_entry().await {
+                        let p = entry.path();
+                        if p.is_dir() && p.join(".git").exists() {
+                            subdirs.push(p);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("[worker] Cron '{}' repo_parent {} unreadable: {}", cron_name, parent_path, e);
+                }
             }
-            Err(e) => {
-                log::error!("[worker] Cron '{}' failed to create task: {}", cron_name, e);
+            subdirs.sort();
+
+            if subdirs.is_empty() {
+                log::warn!("[worker] Cron '{}' fan-out found no git repos under {}", cron_name, parent_path);
+            }
+
+            let original_title = base_task.get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or(cron_name)
+                .to_string();
+
+            let mut created = 0usize;
+            for repo_path_buf in &subdirs {
+                let repo_name = repo_path_buf.file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("repo")
+                    .to_string();
+                let mut task = base_task.clone();
+                if let Some(obj) = task.as_object_mut() {
+                    obj.insert("title".to_string(), serde_json::json!(format!("[{}] {}", repo_name, original_title)));
+                    obj.insert("repo_path".to_string(), serde_json::json!(repo_path_buf.to_string_lossy().to_string()));
+                    obj.insert("project".to_string(), serde_json::json!(repo_name));
+                }
+                match supabase::create_task(config, &task).await {
+                    Ok(_) => { created += 1; }
+                    Err(e) => log::error!("[worker] Cron '{}' fan-out task for {} failed: {}", cron_name, repo_name, e),
+                }
+            }
+            if created > 0 {
+                log::info!("[worker] Cron '{}' fanned out across {} repos", cron_name, created);
+                emit_worker_event(app, "cron_fired", &format!("Cron '{}' fanned out across {} repo{}", cron_name, created, if created == 1 { "" } else { "s" }), None);
+            }
+        } else {
+            match supabase::create_task(config, &base_task).await {
+                Ok(_) => {
+                    log::info!("[worker] Cron '{}' created task", cron_name);
+                    emit_worker_event(app, "cron_fired", &format!("Cron '{}' created a new task", cron_name), None);
+                }
+                Err(e) => {
+                    log::error!("[worker] Cron '{}' failed to create task: {}", cron_name, e);
+                }
             }
         }
 

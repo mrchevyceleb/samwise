@@ -448,24 +448,6 @@
 		</div>
 	{/if}
 
-	<!-- Sam's commit message (Root Cause / Fixes Made / CS Message). Shown on
-	     any post-commit status so Matt can scan what's about to merge without
-	     opening the PR. Constrained height + scroll so a long body doesn't
-	     dominate the card. -->
-	{#if task.commit_message && task.commit_message.trim()}
-		<div style="
-			margin-bottom: 8px; padding: 8px 10px; border-radius: 6px;
-			background: rgba(99, 102, 241, 0.05);
-			border-left: 2px solid rgba(99, 102, 241, 0.45);
-			font-family: var(--font-mono); font-size: 10px; line-height: 1.4;
-			color: var(--text-secondary); white-space: pre-wrap; word-wrap: break-word;
-			max-height: 200px; overflow-y: auto;
-		"
-			onmousedown={(e) => e.stopPropagation()}
-			onclick={(e) => e.stopPropagation()}
-		>{task.commit_message}</div>
-	{/if}
-
 	{#if showReviewActions && task.status !== 'done'}
 		<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 8px;">
 			<button

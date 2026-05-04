@@ -127,6 +127,24 @@ async function handleCrons(method: string, id: string | null, action: string | n
     if (cronErr || !cron) return err("Cron not found", 404);
 
     const template = cron.task_template as Record<string, unknown>;
+
+    // Fan-out crons (`repo_parent`) need filesystem access on the worker to
+    // enumerate git subdirs. The Edge Function can't do that, so backdate
+    // next_run instead — the worker will pick it up on its next tick (~60s)
+    // and run the proper fan-out path.
+    if (typeof template.repo_parent === "string" && template.repo_parent.trim().length > 0) {
+      const due = new Date(Date.now() - 1000).toISOString();
+      const { error: updErr } = await supabase
+        .from("ae_crons")
+        .update({ next_run: due })
+        .eq("id", id);
+      if (updErr) return err(`Failed to queue cron: ${updErr.message}`, 500);
+      return json(
+        { ok: true, queued: true, message: "Fan-out cron queued; worker will fire on its next tick (~60s)." },
+        202,
+      );
+    }
+
     const { data: task, error: taskErr } = await supabase
       .from("ae_tasks")
       .insert({

@@ -20,18 +20,20 @@
 	let editingCron = $state<AeCron | null>(null);
 	let showWebhookForm = $state(false);
 
-	// Cron form fields
-	let cronName = $state('');
+	// Cron form fields — minimal: prompt + repo target + schedule + enabled.
+	// Name and title are derived from the prompt's first line.
+	let cronPrompt = $state('');
 	let cronSchedule = $state('0 9 * * *');
 	let cronScheduleMode = $state<'preset' | 'custom'>('preset');
 	let cronCustom = $state('');
-	let cronTaskTitle = $state('');
-	let cronTaskType = $state<TaskType>('research');
-	let cronPriority = $state<TaskPriority>('medium');
+	let cronRepoMode = $state<'project' | 'parent'>('project');
 	let cronProject = $state('');
-	let cronDescription = $state('');
+	let cronRepoParent = $state('');
 	let cronEnabled = $state(true);
 	let cronSaving = $state(false);
+
+	let cronRepoOk = $derived(cronRepoMode === 'project' ? !!cronProject : !!cronRepoParent.trim());
+	let cronCanSave = $derived(!!cronPrompt.trim() && cronRepoOk && !cronSaving);
 
 	// Webhook form fields
 	let webhookName = $state('');
@@ -71,21 +73,25 @@
 
 	// ── Cron helpers ───────────────────────────────────────────
 	function resetCronForm() {
-		cronName = ''; cronTaskTitle = ''; cronSchedule = '0 9 * * *';
-		cronScheduleMode = 'preset'; cronCustom = ''; cronTaskType = 'research';
-		cronPriority = 'medium'; cronProject = ''; cronDescription = '';
+		cronPrompt = ''; cronSchedule = '0 9 * * *';
+		cronScheduleMode = 'preset'; cronCustom = '';
+		cronRepoMode = 'project'; cronProject = ''; cronRepoParent = '';
 		cronEnabled = true; editingCron = null;
+	}
+
+	function deriveName(promptText: string): string {
+		const firstLine = promptText.split('\n').map(s => s.trim()).find(s => s.length > 0) || 'Scheduled job';
+		return firstLine.length > 80 ? firstLine.slice(0, 77) + '...' : firstLine;
 	}
 
 	function editCron(cron: AeCron) {
 		editingCron = cron;
-		cronName = cron.name;
-		const tpl = cron.task_template as Record<string, any>;
-		cronTaskTitle = tpl?.title || cron.name;
-		cronTaskType = tpl?.task_type || 'research';
-		cronPriority = tpl?.priority || 'medium';
-		cronProject = tpl?.project || '';
-		cronDescription = tpl?.description || '';
+		const tpl = (cron.task_template ?? {}) as Record<string, any>;
+		// Migrate legacy templates: prefer description, fall back to title, fall back to name
+		cronPrompt = (tpl?.description as string) || (tpl?.title as string) || cron.name || '';
+		cronProject = (tpl?.project as string) || '';
+		cronRepoParent = (tpl?.repo_parent as string) || '';
+		cronRepoMode = cronRepoParent ? 'parent' : 'project';
 		cronEnabled = cron.enabled;
 		const matchesPreset = presets.find(p => p.value === cron.schedule);
 		if (matchesPreset) {
@@ -100,19 +106,26 @@
 
 	async function saveCron() {
 		const schedule = cronScheduleMode === 'preset' ? cronSchedule : cronCustom;
-		if (!cronName.trim() || !schedule || cronSaving) return;
+		const promptText = cronPrompt.trim();
+		const repoOk = cronRepoMode === 'project' ? !!cronProject : !!cronRepoParent.trim();
+		if (!promptText || !schedule || !repoOk || cronSaving) return;
 		cronSaving = true;
 		try {
+			const derivedName = deriveName(promptText);
+			const template: Record<string, unknown> = {
+				title: derivedName,
+				description: promptText,
+				priority: 'medium',
+			};
+			if (cronRepoMode === 'project') {
+				template.project = cronProject;
+			} else {
+				template.repo_parent = cronRepoParent.trim();
+			}
 			const data = {
-				name: cronName.trim(),
+				name: derivedName,
 				schedule,
-				task_template: {
-					title: cronTaskTitle || cronName,
-					task_type: cronTaskType,
-					priority: cronPriority,
-					...(cronProject ? { project: cronProject } : {}),
-					...(cronDescription ? { description: cronDescription } : {}),
-				},
+				task_template: template,
 				enabled: cronEnabled,
 			};
 			if (editingCron) {
@@ -245,67 +258,46 @@
 						{editingCron ? 'Edit' : 'New'} Recurring Task
 					</div>
 
-					<!-- Row: Name + Priority -->
-					<div style="display: grid; grid-template-columns: 1fr 140px; gap: 10px;">
-						<div style="display: flex; flex-direction: column; gap: 4px;">
-							<span style="{labelStyle}">Job Name</span>
-							<input bind:value={cronName} placeholder="e.g. Daily deploy check" style="{inputStyle}" />
-						</div>
-						<div style="display: flex; flex-direction: column; gap: 4px;">
-							<span style="{labelStyle}">Priority</span>
-							<select bind:value={cronPriority}
-								style="padding: 8px 10px; background: var(--bg-primary); border: 1px solid var(--border-default); border-radius: 6px; color: var(--text-primary); font-size: 13px; font-family: var(--font-ui); outline: none; cursor: pointer;">
-								{#each priorities as p}
-									<option value={p.value}>{p.label}</option>
-								{/each}
-							</select>
-						</div>
-					</div>
-
-					<!-- Task title -->
+					<!-- Prompt -->
 					<div style="display: flex; flex-direction: column; gap: 4px;">
-						<span style="{labelStyle}">Task Title (what Sam sees on the board)</span>
-						<input bind:value={cronTaskTitle} placeholder="Leave blank to use job name" style="{inputStyle}" />
+						<span style="{labelStyle}">Prompt</span>
+						<textarea bind:value={cronPrompt} placeholder="What should Sam do? e.g. /match, or 'audit dependencies and report stale ones', or 'grab Railway logs and create triage tickets for critical issues'"
+							style="padding: 8px 10px; background: var(--bg-primary); border: 1px solid var(--border-default); border-radius: 6px; color: var(--text-primary); font-size: 13px; font-family: var(--font-ui); outline: none; resize: vertical; min-height: 80px; width: 100%; box-sizing: border-box; line-height: 1.5;"></textarea>
 					</div>
 
-					<!-- Description -->
+					<!-- Repo target -->
 					<div style="display: flex; flex-direction: column; gap: 4px;">
-						<span style="{labelStyle}">Instructions for Sam (optional)</span>
-						<textarea bind:value={cronDescription} placeholder="What should Sam do when this task fires?"
-							style="padding: 8px 10px; background: var(--bg-primary); border: 1px solid var(--border-default); border-radius: 6px; color: var(--text-primary); font-size: 13px; font-family: var(--font-ui); outline: none; resize: vertical; min-height: 60px; width: 100%; box-sizing: border-box;"></textarea>
-					</div>
-
-					<!-- Row: Task Type + Project -->
-					<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
-						<div style="display: flex; flex-direction: column; gap: 4px;">
-							<span style="{labelStyle}">Task Type</span>
-							<div style="display: flex; gap: 4px;">
-								<button onclick={() => cronTaskType = 'code'}
-									style="flex: 1; padding: 6px; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; font-family: var(--font-ui); transition: all 0.15s;
-										border: 1px solid {cronTaskType === 'code' ? 'rgba(99,102,241,0.4)' : 'var(--border-default)'};
-										background: {cronTaskType === 'code' ? 'rgba(99,102,241,0.1)' : 'var(--bg-surface)'};
-										color: {cronTaskType === 'code' ? 'var(--accent-indigo)' : 'var(--text-muted)'};">
-									Code
-								</button>
-								<button onclick={() => cronTaskType = 'research'}
-									style="flex: 1; padding: 6px; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; font-family: var(--font-ui); transition: all 0.15s;
-										border: 1px solid {cronTaskType === 'research' ? 'rgba(99,102,241,0.4)' : 'var(--border-default)'};
-										background: {cronTaskType === 'research' ? 'rgba(99,102,241,0.1)' : 'var(--bg-surface)'};
-										color: {cronTaskType === 'research' ? 'var(--accent-indigo)' : 'var(--text-muted)'};">
-									Research
-								</button>
-							</div>
+						<span style="{labelStyle}">Repo</span>
+						<div style="display: flex; gap: 4px; margin-bottom: 4px;">
+							<button onclick={() => cronRepoMode = 'project'}
+								style="padding: 4px 10px; border-radius: 5px; font-size: 11px; font-weight: 600; cursor: pointer; font-family: var(--font-ui); transition: all 0.15s;
+									border: 1px solid {cronRepoMode === 'project' ? 'rgba(99,102,241,0.4)' : 'var(--border-default)'};
+									background: {cronRepoMode === 'project' ? 'rgba(99,102,241,0.1)' : 'transparent'};
+									color: {cronRepoMode === 'project' ? 'var(--accent-indigo)' : 'var(--text-muted)'};">
+								Single project
+							</button>
+							<button onclick={() => cronRepoMode = 'parent'}
+								style="padding: 4px 10px; border-radius: 5px; font-size: 11px; font-weight: 600; cursor: pointer; font-family: var(--font-ui); transition: all 0.15s;
+									border: 1px solid {cronRepoMode === 'parent' ? 'rgba(99,102,241,0.4)' : 'var(--border-default)'};
+									background: {cronRepoMode === 'parent' ? 'rgba(99,102,241,0.1)' : 'transparent'};
+									color: {cronRepoMode === 'parent' ? 'var(--accent-indigo)' : 'var(--text-muted)'};">
+								All repos in folder
+							</button>
 						</div>
-						<div style="display: flex; flex-direction: column; gap: 4px;">
-							<span style="{labelStyle}">Project (optional)</span>
+						{#if cronRepoMode === 'project'}
 							<select bind:value={cronProject}
 								style="padding: 8px 10px; background: var(--bg-primary); border: 1px solid var(--border-default); border-radius: 6px; color: var(--text-primary); font-size: 13px; font-family: var(--font-ui); outline: none; cursor: pointer;">
-								<option value="">None</option>
+								<option value="">Select a project…</option>
 								{#each projectStore.projects as proj}
 									<option value={proj.name}>{proj.name}</option>
 								{/each}
 							</select>
-						</div>
+						{:else}
+							<input bind:value={cronRepoParent} placeholder="/Users/mjohnst/samwise/Personal-Apps" style="{monoInputStyle}" />
+							<div style="font-size: 10px; color: var(--text-muted); margin-top: 2px; line-height: 1.5;">
+								Fans out at trigger time: one task per direct subfolder containing a .git directory.
+							</div>
+						{/if}
 					</div>
 
 					<!-- Schedule -->
@@ -359,9 +351,9 @@
 							style="padding: 6px 12px; border: 1px solid var(--border-default); background: none; border-radius: 6px; color: var(--text-muted); font-size: 12px; cursor: pointer; font-family: var(--font-ui);">
 							Cancel
 						</button>
-						<button onclick={saveCron} disabled={!cronName.trim() || cronSaving}
+						<button onclick={saveCron} disabled={!cronCanSave}
 							style="padding: 6px 16px; border: none; border-radius: 6px; font-size: 12px; font-weight: 700; cursor: pointer; font-family: var(--font-ui); transition: all 0.15s;
-								background: {!cronName.trim() ? 'var(--text-muted)' : 'var(--accent-indigo)'}; color: white;">
+								background: {!cronCanSave ? 'var(--text-muted)' : 'var(--accent-indigo)'}; color: white;">
 							{cronSaving ? 'Saving...' : editingCron ? 'Update' : 'Create'}
 						</button>
 					</div>
@@ -377,6 +369,10 @@
 				</div>
 			{:else}
 				{#each automation.crons as cron (cron.id)}
+					{@const tpl = (cron.task_template ?? {}) as Record<string, any>}
+					{@const repoParentTail = typeof tpl.repo_parent === 'string'
+						? (String(tpl.repo_parent).split(/[\\/]/).filter(Boolean).pop() || String(tpl.repo_parent))
+						: ''}
 					<div style="padding: 12px 14px; background: var(--bg-primary); border: 1px solid var(--border-default); border-radius: 8px; display: flex; flex-direction: column; gap: 6px; transition: all 0.15s;">
 						<div style="display: flex; align-items: center; gap: 8px;">
 							<span style="
@@ -389,14 +385,17 @@
 								{humanSchedule(cron.schedule)}
 							</span>
 						</div>
-						<div style="display: flex; align-items: center; gap: 12px; font-size: 11px; color: var(--text-muted);">
-							{#if (cron.task_template as any)?.task_type}
-								<span>{(cron.task_template as any).task_type}</span>
-							{/if}
-							{#if (cron.task_template as any)?.priority}
-								<span style="color: {priorities.find(p => p.value === (cron.task_template as any).priority)?.color || 'var(--text-muted)'};">
-									{(cron.task_template as any).priority}
+						<div style="display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--text-muted); flex-wrap: wrap;">
+							{#if tpl.repo_parent}
+								<span style="padding: 1px 6px; border-radius: 4px; background: rgba(168, 85, 247, 0.1); color: #c084fc; font-family: var(--font-mono);" title={String(tpl.repo_parent)}>
+									📂 {repoParentTail}/*
 								</span>
+							{:else if tpl.project}
+								<span style="padding: 1px 6px; border-radius: 4px; background: rgba(99, 102, 241, 0.1); color: var(--accent-indigo); font-family: var(--font-mono);">
+									@{tpl.project}
+								</span>
+							{:else}
+								<span style="padding: 1px 6px; border-radius: 4px; background: rgba(248, 81, 73, 0.1); color: var(--accent-red);">no repo</span>
 							{/if}
 							<span>Last: {formatDate(cron.last_run)}</span>
 							<span>Next: {formatDate(cron.next_run)}</span>
