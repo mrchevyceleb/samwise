@@ -3877,13 +3877,13 @@ async fn task_is_live(config: &SupabaseConfig, task_id: &str) -> bool {
 /// Take a screenshot using Playwright (headless chromium).
 /// Retries once if the first capture fails, since the app may still be hydrating.
 async fn take_screenshot(url: &str, output_path: &str, viewport: &str) -> Result<(), String> {
-    // Playwright is installed as a dev dep of the Samwise repo (not globally),
+    // Playwright is installed as a dev dep of the AutoSam repo (not globally),
     // so `npx playwright` has to run with cwd inside that repo or npx tries to
     // download a fresh copy that doesn't have the chromium browser installed.
     // Under launchd SamWise's cwd is `/` so the bare call silently fails.
     let playwright_cwd = std::env::var("HOME")
-        .map(|h| format!("{}/samwise/Personal-Apps/Samwise", h))
-        .unwrap_or_else(|_| "/Users/mjohnst/samwise/Personal-Apps/Samwise".to_string());
+        .map(|h| format!("{}/samwise/Personal-Apps/AutoSam", h))
+        .unwrap_or_else(|_| "/Users/mjohnst/samwise/Personal-Apps/AutoSam".to_string());
 
     // Give Chromium an isolated user-data-dir inside Samwise's own container
     // area so it never touches ~/Library/Application Support/Google/Chrome or
