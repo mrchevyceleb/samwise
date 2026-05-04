@@ -164,10 +164,11 @@ pub const DEFAULT_CONVERSATION_ID: &str = "00000000-0000-0000-0000-000000000001"
 
 pub async fn fetch_messages(config: &SupabaseConfig) -> Result<Value, String> {
     let client = build_client(config)?;
-    // Filter by the fixed conversation UUID so old messages with random UUIDs
-    // (written before the conversation_id bug was fixed) don't pollute the feed.
+    // Newest 200, not oldest 200. Realtime only catches inserts after the app
+    // opens, so an asc+limit window strands every message between #200 and now.
+    // The chat store re-sorts to ascending for rendering.
     let url = format!(
-        "{}?conversation_id=eq.{}&order=created_at.asc&limit=200",
+        "{}?conversation_id=eq.{}&order=created_at.desc&limit=200",
         rest_url(config, "ae_messages"),
         DEFAULT_CONVERSATION_ID
     );
