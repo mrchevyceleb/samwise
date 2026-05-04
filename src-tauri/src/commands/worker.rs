@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tauri::{Emitter, Manager};
 
 use super::dev_server;
@@ -59,6 +59,25 @@ const CLOSE_ORIGIN_TICKET_URL: &str =
     "https://iycloielqcjnjqddeuet.supabase.co/functions/v1/close-origin-ticket";
 const POST_MERGE_DEPLOY_GREEN_TIMEOUT_SECS: u64 = 10 * 60;
 const POST_MERGE_DEPLOY_GREEN_POLL_SECS: u64 = 20;
+
+/// Per-repo serialization for Merge + Deploy. Multiple cards on the same
+/// repo would otherwise race over the shared deploy worktree, `gh pr merge`,
+/// `supabase db push`, `railway up`, etc. The registry holds one
+/// `tokio::sync::Mutex` per `repo_path`; a Merge + Deploy task acquires it
+/// before doing any work and releases when finished.
+static MERGE_DEPLOY_LOCKS: OnceLock<StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    OnceLock::new();
+
+fn merge_deploy_lock_for(repo_path: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let registry = MERGE_DEPLOY_LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut guard = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .entry(repo_path.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
 
 async fn run_git(args: &[&str], repo_path: &str) -> Result<String, String> {
     let output = async_cmd("git")
@@ -4701,7 +4720,29 @@ async fn start_merge_deploy_task(
     agent_comment(config, &task_id, start_comment).await;
 
     let config_clone = config.clone();
+    let repo_path_for_lock = task
+        .get("repo_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     tokio::spawn(async move {
+        let _repo_lock = if !repo_path_for_lock.is_empty() {
+            let lock = merge_deploy_lock_for(&repo_path_for_lock);
+            match Arc::clone(&lock).try_lock_owned() {
+                Ok(guard) => Some(guard),
+                Err(_) => {
+                    agent_comment(
+                        &config_clone,
+                        &task_id,
+                        "Another Merge + Deploy is in flight on this repo. Waiting for it to finish before continuing.",
+                    ).await;
+                    Some(lock.lock_owned().await)
+                }
+            }
+        } else {
+            None
+        };
+
         match run_merge_deploy_workflow(&config_clone, &task, should_merge_if_open, expected_head_sha).await {
             Ok(summary) => {
                 let latest_task = supabase::fetch_task(&config_clone, &task_id).await.ok().flatten().unwrap_or_else(|| task.clone());
