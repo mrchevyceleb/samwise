@@ -1597,9 +1597,37 @@ from Matt, stop without making changes and explain specifically what you need cl
                 return Ok("Task was cancelled".to_string());
             }
 
+            // Pin codex-fix's review scope to *this task's* diff. Without explicit
+            // flags the slash command's auto-detection misfires inside a headless
+            // Claude Code session (no chat context to anchor "session start") and
+            // can review commits well outside the ticket. We compute the merge-base
+            // with origin/<base> ourselves and hand it to codex-fix, which honors
+            // --base/--scope verbatim and skips its own scope inference.
+            let codex_base_arg = match resolved_base_branch.as_deref() {
+                Some(base) => {
+                    match run_git(
+                        &["merge-base", "HEAD", &format!("origin/{}", base)],
+                        &repo_path,
+                    ).await {
+                        Ok(sha) => {
+                            let sha = sha.trim().to_string();
+                            if sha.is_empty() { None } else { Some(sha) }
+                        }
+                        Err(e) => {
+                            log::warn!("[worker] codex-fix merge-base lookup failed: {}", e);
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+            let codex_prompt = match &codex_base_arg {
+                Some(sha) => format!("/codex-fix --base {} --scope branch", sha),
+                None => "/codex-fix".to_string(),
+            };
             agent_comment(config, &task_id, "Running /codex-fix for a review pass before QA...").await;
             let codex_result = run_claude_code_streaming(
-                &repo_path, "/codex-fix", 0, 1200, config, &task_id, process_id_slot.clone()
+                &repo_path, &codex_prompt, 0, 1200, config, &task_id, process_id_slot.clone()
             ).await;
             { let mut pid = process_id_slot.lock().await; *pid = None; }
             // If codex-fix itself was cancelled mid-run, bail out.
