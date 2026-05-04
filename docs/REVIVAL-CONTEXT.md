@@ -1,4 +1,4 @@
-# Samwise Revival Context
+# AutoSam Revival Context
 
 Planning conversation that produced the revival direction. Preserved so the vision and design rationale aren't lost to chat history.
 
@@ -6,7 +6,7 @@ Planning conversation that produced the revival direction. Preserved so the visi
 
 A personal tool, not a product. Matt owns the machine, the repos, and the risk. No multi-tenancy, sandboxing, or security boilerplate required.
 
-**Samwise is someone.** He has a name (LOTR reference, the gardener who carries the load), a personality ("senior dev on Slack" tone), and a role (Matt's AI junior developer). He lives on the Mac mini with persistent identity and memory.
+**AutoSam is someone.** He has a name (LOTR reference, the gardener who carries the load), a personality ("senior dev on Slack" tone), and a role (Matt's AI junior developer). He lives on the Mac mini with persistent identity and memory.
 
 ### Core properties
 
@@ -22,7 +22,7 @@ Every cloud agent starts fresh. Sam doesn't.
 
 When Matt messages Sam three days from now and Sam says "we talked about that Tuesday, you decided to use the Supabase approach, want me to pick it back up?" that's the continuity no cloud tool provides. Memory plus persistent workspace plus always-on presence equals coworker, not tool.
 
-The Copilot cloud agent clones fresh, pokes around, answers, and is gone. Samwise has been in the Operly repo for weeks. His workspace is warm. His node_modules are cached. His git branches are still checked out. He remembers the Tuesday merge and has an opinion about the current design because he was there when Matt decided it.
+The Copilot cloud agent clones fresh, pokes around, answers, and is gone. AutoSam has been in the Operly repo for weeks. His workspace is warm. His node_modules are cached. His git branches are still checked out. He remembers the Tuesday merge and has an opinion about the current design because he was there when Matt decided it.
 
 ## Why finish agent-one instead of rebuilding
 

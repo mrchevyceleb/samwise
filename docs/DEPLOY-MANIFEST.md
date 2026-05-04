@@ -1,6 +1,6 @@
-# Samwise Deploy Manifest
+# AutoSam Deploy Manifest
 
-Samwise looks for `.samwise/deploy.json` in a target repo during Merge + Deploy.
+AutoSam looks for `.samwise/deploy.json` in a target repo during Merge + Deploy.
 The manifest is the repo-owned source of truth for deployment commands that are
 too project-specific to infer safely.
 
@@ -33,10 +33,10 @@ repo root unless `cwd` is set to a relative path. Absolute or parent-directory
 `cwd` values are rejected.
 
 `samwise:supabase:auto` is a built-in alias. It keeps Supabase migrations and
-Edge Functions on Samwise's normal automatic deploy path:
+Edge Functions on AutoSam's normal automatic deploy path:
 
 - `supabase/migrations/*.sql` runs `supabase db push`
 - `supabase/functions/<name>/**` runs `supabase functions deploy <name>`
 
 Railway deploys fail closed: if changed files imply a Railway deploy but no
-manifest rule matches them, Samwise refuses to merge.
+manifest rule matches them, AutoSam refuses to merge.

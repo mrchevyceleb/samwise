@@ -1,4 +1,4 @@
-# Samwise - AI Coding Coworker
+# AutoSam - AI Coding Coworker
 
 Matt's AI junior developer. Autonomous coding agent that lives on the Mac mini, reachable from anywhere. Tauri v2 + SvelteKit 5 + Rust.
 
