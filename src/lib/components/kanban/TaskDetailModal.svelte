@@ -21,6 +21,7 @@
 		requestMergeDeployContext,
 	} from '$lib/utils/review-actions';
 	import { formatTimeAgo } from '$lib/utils/relative-time';
+	import { renderMarkdown } from '$lib/utils/markdown';
 	import { safeInvoke, openExternal } from '$lib/utils/tauri';
 	import CommentThread from './CommentThread.svelte';
 	import SubtaskChecklist from './SubtaskChecklist.svelte';
@@ -88,6 +89,14 @@
 
 	let hasReport = $derived(artifacts.some(a => a.artifact_type === 'report'));
 	let reportArtifact = $derived(artifacts.find(a => a.artifact_type === 'report'));
+	let reportHtml = $state('');
+	$effect(() => {
+		const content = reportArtifact?.content;
+		if (!content) { reportHtml = ''; return; }
+		let cancelled = false;
+		renderMarkdown(content).then(html => { if (!cancelled) reportHtml = html; });
+		return () => { cancelled = true; };
+	});
 
 	// Derived
 	let elapsed = $derived(formatTimeAgo(new Date(task.created_at).getTime()));
@@ -398,11 +407,15 @@
 		{#if activeTab === 'report' && hasReport && reportArtifact}
 			<!-- Report view -->
 			<div style="padding: 24px; max-height: 60vh; overflow-y: auto;">
-				<div style="
-					font-size: 13px; line-height: 1.8; color: var(--text-secondary);
-					white-space: pre-wrap; font-family: var(--font-ui);
+				<div class="report-body" style="
+					font-size: 13px; line-height: 1.65; color: var(--text-primary);
+					font-family: var(--font-ui);
 				">
-					{reportArtifact.content}
+					{#if reportHtml}
+						{@html reportHtml}
+					{:else}
+						<div style="color: var(--text-muted); font-size: 12px;">Rendering report…</div>
+					{/if}
 				</div>
 			</div>
 		{:else}
@@ -1056,3 +1069,23 @@
 		{/if}
 	</div>
 </div>
+
+<style>
+	:global(.report-body h1) { font-size: 22px; font-weight: 700; margin: 24px 0 12px; color: var(--text-primary); border-bottom: 1px solid var(--border-default); padding-bottom: 6px; }
+	:global(.report-body h2) { font-size: 18px; font-weight: 700; margin: 22px 0 10px; color: var(--text-primary); }
+	:global(.report-body h3) { font-size: 15px; font-weight: 700; margin: 18px 0 8px; color: var(--text-primary); }
+	:global(.report-body h4) { font-size: 14px; font-weight: 700; margin: 14px 0 6px; color: var(--text-primary); }
+	:global(.report-body p) { margin: 8px 0; }
+	:global(.report-body ul), :global(.report-body ol) { margin: 8px 0; padding-left: 22px; }
+	:global(.report-body li) { margin: 3px 0; }
+	:global(.report-body code) { background: rgba(99, 102, 241, 0.12); color: var(--accent-indigo); padding: 1px 6px; border-radius: 4px; font-family: var(--font-mono); font-size: 12px; }
+	:global(.report-body pre) { background: rgba(0,0,0,0.32); padding: 12px 14px; border-radius: 8px; overflow-x: auto; margin: 10px 0; border: 1px solid var(--border-subtle); }
+	:global(.report-body pre code) { background: transparent; color: var(--text-primary); padding: 0; font-size: 12px; line-height: 1.55; }
+	:global(.report-body a) { color: var(--accent-blue); text-decoration: underline; }
+	:global(.report-body strong) { color: var(--text-primary); font-weight: 700; }
+	:global(.report-body blockquote) { border-left: 3px solid var(--accent-indigo); padding-left: 12px; margin: 10px 0; color: var(--text-secondary); }
+	:global(.report-body table) { border-collapse: collapse; margin: 12px 0; font-size: 12px; }
+	:global(.report-body th), :global(.report-body td) { border: 1px solid var(--border-default); padding: 6px 10px; text-align: left; }
+	:global(.report-body th) { background: rgba(99, 102, 241, 0.08); font-weight: 700; color: var(--text-primary); }
+	:global(.report-body hr) { border: none; border-top: 1px solid var(--border-default); margin: 18px 0; }
+</style>
