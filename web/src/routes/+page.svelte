@@ -94,6 +94,13 @@
         <div class="hidden sm:block text-[10px] uppercase tracking-wide text-slate-500">build {buildLabel}</div>
       {/if}
       <div class="ml-auto flex items-center gap-2">
+        <a
+          href="/reports"
+          class="rounded-lg border border-indigo-500/40 bg-indigo-500/10 px-3 py-1.5 text-xs font-semibold text-indigo-100 hover:bg-indigo-500/20 transition-colors"
+          title="Browse research reports"
+        >
+          📄 Reports
+        </a>
         <input
           type="search"
           bind:value={query}

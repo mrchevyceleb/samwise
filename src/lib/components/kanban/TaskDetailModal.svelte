@@ -477,6 +477,45 @@
 					</div>
 				{/if}
 
+				{#if task.report_url}
+					<button
+						type="button"
+						style="
+							display: flex; align-items: center; gap: 10px;
+							width: 100%; margin-bottom: 16px;
+							padding: 12px 14px; border-radius: 10px;
+							background: linear-gradient(135deg, rgba(99, 102, 241, 0.18), rgba(99, 102, 241, 0.06));
+							border: 1px solid rgba(99, 102, 241, 0.4);
+							color: var(--accent-indigo);
+							font-size: 13px; font-weight: 700; font-family: var(--font-ui);
+							cursor: pointer; transition: all 0.15s ease;
+							text-align: left;
+						"
+						onmouseenter={(e) => { (e.currentTarget as HTMLElement).style.background = 'linear-gradient(135deg, rgba(99, 102, 241, 0.28), rgba(99, 102, 241, 0.1))'; }}
+						onmouseleave={(e) => { (e.currentTarget as HTMLElement).style.background = 'linear-gradient(135deg, rgba(99, 102, 241, 0.18), rgba(99, 102, 241, 0.06))'; }}
+						onclick={() => openExternal(task.report_url!)}
+						title={task.report_url}
+					>
+						<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink: 0;">
+							<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+							<polyline points="14 2 14 8 20 8"/>
+							<line x1="9" y1="13" x2="15" y2="13"/>
+							<line x1="9" y1="17" x2="15" y2="17"/>
+						</svg>
+						<div style="flex: 1; min-width: 0;">
+							<div>Open report in browser</div>
+							<div style="font-size: 10px; font-weight: 500; color: var(--text-muted); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+								{task.report_url} · tailnet only
+							</div>
+						</div>
+						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink: 0; opacity: 0.7;">
+							<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
+							<polyline points="15 3 21 3 21 9"/>
+							<line x1="10" y1="14" x2="21" y2="3"/>
+						</svg>
+					</button>
+				{/if}
+
 				{#if task.commit_message && task.commit_message.trim()}
 					<div style="
 						margin-bottom: 18px; padding: 12px 14px; border-radius: 10px;

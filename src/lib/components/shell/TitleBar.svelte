@@ -2,6 +2,7 @@
 	import { getWorkerStore } from '$lib/stores/worker.svelte';
 	import { getTaskStore } from '$lib/stores/tasks.svelte';
 	import { getTheme } from '$lib/stores/theme.svelte';
+	import { openExternal } from '$lib/utils/tauri';
 
 	const worker = getWorkerStore();
 	const taskStore = getTaskStore();
@@ -19,6 +20,13 @@
 	let minimizeHovered = $state(false);
 	let maximizeHovered = $state(false);
 	let closeHovered = $state(false);
+	let reportsHovered = $state(false);
+
+	const REPORTS_URL = 'https://samwise-board.vercel.app/reports';
+
+	function openReports() {
+		openExternal(REPORTS_URL);
+	}
 
 	async function minimize() {
 		try {
@@ -107,6 +115,30 @@
 
 	<!-- Right: Window controls -->
 	<div style="display: flex; align-items: center; gap: 2px; min-width: 100px; justify-content: flex-end;">
+		<button
+			style="
+				display: flex; align-items: center; gap: 5px;
+				height: 26px; padding: 0 10px; margin-right: 6px;
+				border: 1px solid {reportsHovered ? 'rgba(99, 102, 241, 0.5)' : 'rgba(99, 102, 241, 0.25)'};
+				background: {reportsHovered ? 'rgba(99, 102, 241, 0.18)' : 'rgba(99, 102, 241, 0.08)'};
+				color: var(--accent-indigo, #6366f1);
+				border-radius: 6px; cursor: pointer;
+				font-size: 11px; font-weight: 600; font-family: var(--font-ui);
+				transition: all 0.15s ease;
+			"
+			onmouseenter={() => reportsHovered = true}
+			onmouseleave={() => reportsHovered = false}
+			onclick={openReports}
+			title="Browse research reports (opens in browser)"
+		>
+			<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+				<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+				<polyline points="14 2 14 8 20 8"/>
+				<line x1="9" y1="13" x2="15" y2="13"/>
+				<line x1="9" y1="17" x2="15" y2="17"/>
+			</svg>
+			Reports
+		</button>
 		<button
 			style="width: 32px; height: 26px; display: flex; align-items: center; justify-content: center; border: none; background: {minimizeHovered ? theme.c.bgElevated : 'transparent'}; color: {theme.c.textSecondary}; border-radius: 6px; cursor: pointer; font-size: 16px; transition: all 0.15s ease;"
 			onmouseenter={() => minimizeHovered = true}

@@ -28,6 +28,20 @@
   let comments = $derived(tasksStore.comments[task.id] ?? []);
   let before = $derived(task.screenshots_before ?? []);
   let after = $derived(task.screenshots_after ?? []);
+
+  /** Escape HTML then auto-link http(s) URLs so they're clickable in comments. */
+  function renderCommentHtml(content: string): string {
+    const escaped = content
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+    return escaped.replace(
+      /(https?:\/\/[^\s<]+)/g,
+      '<a href="$1" target="_blank" rel="noopener noreferrer" class="text-indigo-300 underline hover:text-indigo-200">$1</a>'
+    );
+  }
   let attachments = $derived(task.attachments ?? []);
   let reviewPanel = $derived(extractReviewActionPanel(task, comments));
   let uiStamp = $derived(getUiStamp(task));
@@ -238,6 +252,15 @@
       {/if}
 
       <section class="flex flex-col gap-2 text-xs">
+        {#if task.report_url}
+          <LinkRow
+            label="Report"
+            url={task.report_url}
+            icon="📄"
+            colorClass="border-indigo-500/40 bg-indigo-500/15 text-indigo-100"
+            hoverClass="hover:bg-indigo-500/25"
+          />
+        {/if}
         {#if task.pr_url}
           <LinkRow
             label={`PR${task.pr_number ? ` #${task.pr_number}` : ''}`}
@@ -318,7 +341,7 @@
             {#each comments as c}
               <li class="rounded-lg border border-white/10 bg-white/5 p-2">
                 <div class="text-[10px] uppercase tracking-wide text-slate-400">{c.author} · {new Date(c.created_at).toLocaleString()}</div>
-                <p class="text-sm text-slate-200 whitespace-pre-wrap">{c.content}</p>
+                <p class="text-sm text-slate-200 whitespace-pre-wrap">{@html renderCommentHtml(c.content)}</p>
               </li>
             {/each}
           </ul>
