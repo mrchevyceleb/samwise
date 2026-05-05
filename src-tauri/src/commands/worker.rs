@@ -1251,6 +1251,9 @@ async fn execute_task(
         }
     };
 
+    let include_customer_success = task_allows_customer_success_messages(&task)
+        || is_operly_project_name(&project_name);
+
     // Matt's main clone of the repo. We never modify this — we create worktrees off it.
     let main_repo_path = repo_path.clone();
     // Branch is set after the worktree is created for code tasks; research leaves it None.
@@ -1513,6 +1516,19 @@ async fn execute_task(
             title, description
         ));
     } else {
+        let customer_success_commit_section = if include_customer_success {
+            "CS Message:\n\
+- <one or two sentences Customer Success can paste to the customer in non-technical language. If this is internal-only, write \"internal only, no customer message needed\".>\n\
+\n\
+"
+        } else {
+            ""
+        };
+        let customer_success_scope_instruction = if include_customer_success {
+            ""
+        } else {
+            "Do not add a CS Message, For Customer Success, or paste-ready customer-service message anywhere. Customer Success copy is currently Operly-only.\n\n"
+        };
         prompt_parts.push(format!(
             "## Task\n**{title}**\n\n{description}\n\n\
 ## Instructions\n\
@@ -1532,9 +1548,7 @@ Root Cause:\n\
 Fixes Made:\n\
 - <what changes you made: files and functions touched, the approach, and why this approach over alternatives. One bullet per logical change.>\n\
 \n\
-CS Message:\n\
-- <one or two sentences Customer Success can paste to the customer in non-technical language. If this is internal-only, write \"internal only, no customer message needed\".>\n\
-\n\
+{customer_success_commit_section}\
 Deployment required:\n\
 - Railway server: <yes/no/unknown> - <plain reason, including service name if yes>\n\
 - Supabase migrations: <yes/no/unknown> - <plain reason, including migration filenames if yes>\n\
@@ -1546,6 +1560,7 @@ Fill in every section concretely. Do not use placeholders. The deployment \
 section must be crystal clear: use \"no\" when the PR does not require that \
 deployment path, \"yes\" when it does, and \"unknown\" only when the codebase \
 does not provide enough evidence.\n\n\
+{customer_success_scope_instruction}\
 Then stop. Do not open the PR yourself \u{2014} that is handled after this step.\n\n\
 If the task is genuinely ambiguous and you cannot proceed without a decision \
 from Matt, stop without making changes and explain specifically what you need clarified."
@@ -2067,6 +2082,7 @@ When done, run `git add -A && git commit -m \"fix: address QA feedback\"` and st
                 &branch, resolved_base_branch.as_deref(),
                 &screenshot_dir, preview_url.is_some(),
                 qa_note_for_pr.as_deref(),
+                include_customer_success,
             ).await;
 
             match pr_result {
@@ -7117,6 +7133,25 @@ pub fn spawn_auto_fix_task(
         // Build fix prompt. Focus Claude Code on the blockers only — not risks,
         // not "not verified" items. The review markdown is already structured
         // with ## Blockers so we can hand it over wholesale.
+        let include_customer_success = supabase::fetch_task(&config, &task_id)
+            .await
+            .ok()
+            .flatten()
+            .as_ref()
+            .map(task_allows_customer_success_messages)
+            .unwrap_or(false);
+        let customer_success_review_section = if include_customer_success {
+            "For Customer Success:\n\
+- <one plain sentence, or \"internal only, no customer message needed\">\n\
+"
+        } else {
+            ""
+        };
+        let customer_success_scope_instruction = if include_customer_success {
+            ""
+        } else {
+            "Do not add a For Customer Success section, CS Message section, or paste-ready customer-service message. Customer Success copy is currently Operly-only.\n\n"
+        };
         let prompt = format!(
             "You are Sam fixing the blockers a Codex review flagged on this PR. \
 The repo is already checked out at this worktree, and you are on the PR's head branch.\n\n\
@@ -7137,18 +7172,21 @@ Deployment required:\n\
 - Railway server: <yes/no/unknown> - <plain reason, including service name if yes>\n\
 - Supabase migrations: <yes/no/unknown> - <plain reason, including migration filenames if yes>\n\
 - Supabase Edge Functions: <yes/no/unknown> - <plain reason, including function names if yes>\n\n\
-For Customer Success:\n\
-- <one plain sentence, or \"internal only, no customer message needed\">\n\
+{customer_success_review_section}\
 EOF\n\
 )\"\n\
 ```\n\
 Do not leave placeholders in the deployment section; say \"no\" explicitly when \
 Railway, Supabase migrations, or Edge Functions do not need deployment.\n\n\
+{customer_success_scope_instruction}\
 Do not push — that is handled after this step. Do not open a second PR.\n\
 If a blocker is genuinely unfixable without Matt's input (e.g. needs a product \
 decision or schema change), stop and explain which blocker and why, without \
 making any other changes.",
-            review_markdown, new_cycle
+            review_markdown,
+            new_cycle,
+            customer_success_review_section = customer_success_review_section,
+            customer_success_scope_instruction = customer_success_scope_instruction
         );
 
         let process_id_slot: Arc<tokio::sync::Mutex<Option<u32>>> = Arc::new(tokio::sync::Mutex::new(None));
@@ -7599,15 +7637,31 @@ fn sam_callback_secret() -> Option<String> {
         })
 }
 
+fn is_operly_project_name(project: &str) -> bool {
+    project.trim().eq_ignore_ascii_case("operly")
+}
+
+fn allows_customer_success_messages(project: &str, origin_system: &str) -> bool {
+    is_operly_project_name(project)
+        || origin_system.trim().eq_ignore_ascii_case("operly_triage")
+}
+
+fn task_allows_customer_success_messages(task: &Value) -> bool {
+    let project = task.get("project").and_then(|v| v.as_str()).unwrap_or("");
+    let origin_system = task.get("origin_system").and_then(|v| v.as_str()).unwrap_or("");
+    allows_customer_success_messages(project, origin_system)
+}
+
 /// Summarize the branch diff into three short sections for the PR body:
 /// what was fixed (user-visible), how it was fixed (technical), and a
-/// paste-ready Customer Success blurb. Best-effort — returns None on any
-/// failure so PR creation still proceeds.
+/// paste-ready Customer Success blurb for Operly tasks. Best-effort: returns
+/// None on any failure so PR creation still proceeds.
 async fn summarize_pr_changes(
     repo_path: &str,
     base_branch: &str,
     title: &str,
     description: &str,
+    include_customer_success: bool,
 ) -> Option<String> {
     // Grab the branch diff vs base. Cap the size so we don't blow past the
     // CLI prompt limit on large refactors — the summary just gets a
@@ -7632,15 +7686,28 @@ async fn summarize_pr_changes(
         return None;
     }
 
+    let json_schema = if include_customer_success {
+        "{\n  \"what\": \"...\",\n  \"how\": \"...\",\n  \"customer_message\": \"...\"\n}"
+    } else {
+        "{\n  \"what\": \"...\",\n  \"how\": \"...\"\n}"
+    };
+    let customer_success_field_rule = if include_customer_success {
+        "- customer_message: one or two plain-text sentences Customer Success can paste to the customer. No code terms, no markdown, no filenames, no apologies longer than needed. If the change is internal-only, set this to exactly \"internal only, no customer message needed\".\n"
+    } else {
+        "- Do not include customer_message or any Customer Success copy. Customer Success messages are currently Operly-only, and this task is not Operly.\n"
+    };
+
     let prompt = format!(
         "You are summarizing a code change for a pull request Matt will review.\n\
 Return ONLY a single JSON object with exactly these keys, no prose, no markdown fence:\n\
-{{\n  \"what\": \"...\",\n  \"how\": \"...\",\n  \"customer_message\": \"...\"\n}}\n\n\
+{json_schema}\n\n\
 Field rules:\n\
 - what: 1-3 short bullets (plain English, user/customer POV) describing the bug or feature. Lead with the observable symptom.\n\
 - how: 1-4 short bullets describing the technical change. Mention files or functions touched and the approach.\n\
-- customer_message: one or two plain-text sentences Customer Success can paste to the customer. No code terms, no markdown, no filenames, no apologies longer than needed. If the change is internal-only, set this to exactly \"internal only, no customer message needed\".\n\n\
+{customer_success_field_rule}\n\
 ## Task title\n{title}\n\n## Task description\n{description}\n\n## Diff (base: {base_branch})\n```diff\n{diff}\n```\n",
+        json_schema = json_schema,
+        customer_success_field_rule = customer_success_field_rule,
         title = title, description = description, base_branch = base_branch, diff = diff
     );
 
@@ -7653,7 +7720,11 @@ Field rules:\n\
     let parsed: serde_json::Value = serde_json::from_str(json_slice).ok()?;
     let what = parsed.get("what").and_then(|v| v.as_str()).unwrap_or("").trim();
     let how = parsed.get("how").and_then(|v| v.as_str()).unwrap_or("").trim();
-    let cs = parsed.get("customer_message").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let cs = if include_customer_success {
+        parsed.get("customer_message").and_then(|v| v.as_str()).unwrap_or("").trim()
+    } else {
+        ""
+    };
     if what.is_empty() && how.is_empty() && cs.is_empty() { return None; }
 
     let mut md = String::new();
@@ -7661,8 +7732,10 @@ Field rules:\n\
     md.push_str(if what.is_empty() { "_not provided_" } else { what });
     md.push_str("\n\n### How it was fixed\n");
     md.push_str(if how.is_empty() { "_not provided_" } else { how });
-    md.push_str("\n\n### For Customer Success\n");
-    md.push_str(if cs.is_empty() { "_not provided_" } else { cs });
+    if include_customer_success {
+        md.push_str("\n\n### For Customer Success\n");
+        md.push_str(if cs.is_empty() { "_not provided_" } else { cs });
+    }
     md.push('\n');
     Some(md)
 }
@@ -7679,6 +7752,7 @@ async fn create_pr(
     screenshot_dir: &str,
     has_screenshots: bool,
     qa_note: Option<&str>,
+    include_customer_success: bool,
 ) -> Result<String, String> {
     // Branch should already be resolved by execute_task, but fallback just in case
     let branch_name = branch.clone().unwrap_or_else(|| "agent-one/patch".to_string());
@@ -7747,11 +7821,16 @@ async fn create_pr(
     // Build PR body with Supabase Storage URLs instead of repo-relative paths
     let mut pr_body = format!("## {}\n\n{}\n\n", title, description);
 
-    // Ask Claude to summarize the diff into three sections Matt actually reads:
-    // what was fixed (customer-visible), how it was fixed (technical),
-    // and a paste-ready blurb for Customer Success. Best-effort: if the
-    // summarizer fails or returns junk, we still ship the PR without it.
-    if let Some(summary_md) = summarize_pr_changes(repo_path, &base_branch, title, description).await {
+    // Ask Claude to summarize the diff into the sections Matt actually reads.
+    // Customer Success copy is only included for Operly tasks right now.
+    // Best-effort: if the summarizer fails or returns junk, we still ship the PR.
+    if let Some(summary_md) = summarize_pr_changes(
+        repo_path,
+        &base_branch,
+        title,
+        description,
+        include_customer_success,
+    ).await {
         pr_body.push_str(&summary_md);
         pr_body.push('\n');
     }
