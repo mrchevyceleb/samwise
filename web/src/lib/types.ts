@@ -9,6 +9,7 @@ export type TaskStatus =
   | 'failed'
   | 'pending_confirmation';
 export type TaskPriority = 'critical' | 'high' | 'medium' | 'low';
+export type TaskType = 'code' | 'research';
 export type OriginSystem = 'operly_triage' | 'banana_triage' | 'sentry' | 'manual';
 
 export interface Attachment {
@@ -86,6 +87,29 @@ export interface AeComment {
   task_id: string;
   author: 'matt' | 'agent' | 'system';
   content: string;
+  created_at: string;
+}
+
+export interface AeCron {
+  id: string;
+  name: string;
+  schedule: string;
+  task_template: Record<string, unknown>;
+  enabled: boolean;
+  last_run: string | null;
+  next_run: string | null;
+  created_at: string;
+}
+
+export interface AeProject {
+  id: string;
+  name: string;
+  repo_url: string | null;
+  repo_path: string | null;
+  preview_url: string | null;
+  client: string | null;
+  deploy_method: string | null;
+  dev_command: string | null;
   created_at: string;
 }
 

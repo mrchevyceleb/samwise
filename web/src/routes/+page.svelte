@@ -5,9 +5,11 @@
   import KanbanColumn from '$lib/components/KanbanColumn.svelte';
   import TaskDetail from '$lib/components/TaskDetail.svelte';
   import NewTaskModal from '$lib/components/NewTaskModal.svelte';
+  import ScheduleModal from '$lib/components/ScheduleModal.svelte';
 
   let selected = $state<AeTask | null>(null);
   let showNew = $state(false);
+  let showSchedules = $state(false);
   let query = $state('');
   let projectFilter = $state('');
   let buildVersion = $state('');
@@ -101,6 +103,14 @@
         >
           📄 Reports
         </a>
+        <button
+          type="button"
+          onclick={() => (showSchedules = true)}
+          class="rounded-lg border border-sky-500/40 bg-sky-500/10 px-3 py-1.5 text-xs font-semibold text-sky-100 transition hover:-translate-y-0.5 hover:bg-sky-500/20"
+          title="Manage cron jobs"
+        >
+          ⏱ Schedules
+        </button>
         <input
           type="search"
           bind:value={query}
@@ -152,6 +162,10 @@
 
 {#if showNew}
   <NewTaskModal {projects} onClose={() => (showNew = false)} />
+{/if}
+
+{#if showSchedules}
+  <ScheduleModal onClose={() => (showSchedules = false)} />
 {/if}
 
 <button
