@@ -162,6 +162,12 @@ fn task_context_string(task: &Value, key: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+#[derive(Clone, Debug)]
+struct WorktreeTaskInfo {
+    status: String,
+    head_ref: Option<String>,
+}
+
 /// Compute the task branch name from a short id. Single source of truth so sweep
 /// and task-create agree.
 fn task_branch_name(short_id: &str) -> String {
@@ -180,6 +186,45 @@ fn is_automation_pr_head(head: &str) -> bool {
         trimmed.split('/').next(),
         Some("fix" | "banana" | "codex")
     )
+}
+
+fn pr_number_from_url(pr_url: &str) -> Option<i64> {
+    let trimmed = pr_url.trim().trim_end_matches('/');
+    if !trimmed.contains("/pull/") {
+        return None;
+    }
+    let number = trimmed.rsplit('/').next()?;
+    if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    number.parse::<i64>().ok()
+}
+
+fn push_branch_candidate(candidates: &mut Vec<String>, branch: impl Into<String>) {
+    let branch = branch.into();
+    let branch = branch.trim();
+    if branch.is_empty() || branch == "HEAD" {
+        return;
+    }
+    if !candidates.iter().any(|candidate| candidate == branch) {
+        candidates.push(branch.to_string());
+    }
+}
+
+fn worktree_pr_head_candidates(
+    short_id: &str,
+    current_branch: Option<&str>,
+    task_info: Option<&WorktreeTaskInfo>,
+) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(branch) = current_branch {
+        push_branch_candidate(&mut candidates, branch);
+    }
+    if let Some(head_ref) = task_info.and_then(|info| info.head_ref.as_deref()) {
+        push_branch_candidate(&mut candidates, head_ref);
+    }
+    push_branch_candidate(&mut candidates, task_branch_name(short_id));
+    candidates
 }
 
 /// Fetch latest origin state into Matt's main repo, then create a worktree for Sam
@@ -2138,11 +2183,15 @@ When done, run `git add -A && git commit -m \"fix: address QA feedback\"` and st
 
             match pr_result {
                 Ok(pr_url) => {
-                    let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                    let mut pr_updates = serde_json::json!({
                         "status": "review",
                         "pr_url": pr_url,
                         "updated_at": chrono::Utc::now().to_rfc3339(),
-                    })).await;
+                    });
+                    if let Some(pr_number) = pr_number_from_url(&pr_url) {
+                        pr_updates["pr_number"] = serde_json::json!(pr_number);
+                    }
+                    let _ = supabase::update_task(config, &task_id, &pr_updates).await;
                     notify_callback(config, &task_id, "review", Some(&pr_url), None);
                     agent_comment(config, &task_id, &format!("PR's up: {}. Let me know if you want any changes.", pr_url)).await;
 
@@ -2303,9 +2352,20 @@ async fn main_repo_for_worktree(wt_str: &str) -> Option<String> {
     abs.parent().map(|p| p.to_string_lossy().into_owned())
 }
 
-/// Walk ~/samwise/worktrees/<repo>/<short_id>, query the matching PR via `gh pr list
-/// --head sam/<short_id>`, and remove worktrees whose PRs are merged or closed. Worktrees
-/// without a PR that are >48h old are treated as orphans (crashed task) and removed too.
+async fn current_worktree_branch(wt_str: &str) -> Option<String> {
+    let branch = run_git(&["branch", "--show-current"], wt_str).await.ok()?;
+    let branch = branch.trim();
+    if branch.is_empty() {
+        None
+    } else {
+        Some(branch.to_string())
+    }
+}
+
+/// Walk ~/samwise/worktrees/<repo>/<short_id>, query matching PR heads from the
+/// checked-out branch, stored task context, and legacy `sam/<short_id>` branch,
+/// then remove worktrees whose PRs are merged or closed. Worktrees without a PR
+/// that are >48h old are treated as orphans (crashed task) and removed too.
 /// Returns (removed, kept).
 /// Detect the project type and run its build. Returns:
 /// - Ok(Some(cmd)) if a build ran and passed
@@ -2401,14 +2461,27 @@ async fn recover_stuck_tasks(config: &SupabaseConfig) -> usize {
 /// full UUID, which silently made every lookup miss and sent every worktree
 /// down the "task row gone" branch — the sweep then deleted remote branches
 /// and GitHub auto-closed the still-open PRs attached to them.
-async fn failed_task_ids(config: &SupabaseConfig) -> std::collections::HashMap<String, String> {
+async fn worktree_task_info(config: &SupabaseConfig) -> std::collections::HashMap<String, WorktreeTaskInfo> {
     let mut out = std::collections::HashMap::new();
     let Ok(all) = supabase::fetch_tasks(config, None).await else { return out; };
     if let Some(arr) = all.as_array() {
         for t in arr {
             let id = t.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let status = t.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            if !id.is_empty() { out.insert(short_task_id(&id), status); }
+            let head_ref = task_context_string(t, "head_ref");
+            let info = WorktreeTaskInfo { status, head_ref };
+            if !id.is_empty() {
+                out.insert(short_task_id(&id), info.clone());
+            }
+            if let Some(short) = t
+                .get("context")
+                .and_then(|v| v.as_object())
+                .and_then(|c| c.get("orphan_short_id"))
+                .and_then(|v| v.as_str())
+                .and_then(valid_short_id)
+            {
+                out.insert(short, info);
+            }
         }
     }
     out
@@ -2432,7 +2505,7 @@ async fn sweep_worktrees_inner(config: Option<&SupabaseConfig>) -> (usize, usize
     // whose worktrees should be cleaned up immediately, and delete them
     // without waiting for the 48h orphan rule to fire.
     let task_statuses = match config {
-        Some(c) => failed_task_ids(c).await,
+        Some(c) => worktree_task_info(c).await,
         None => std::collections::HashMap::new(),
     };
 
@@ -2452,22 +2525,26 @@ async fn sweep_worktrees_inner(config: Option<&SupabaseConfig>) -> (usize, usize
             let short_id = wt_path.file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let branch = task_branch_name(&short_id);
-
             let Some(main_repo) = main_repo_for_worktree(&wt_str).await else {
                 kept += 1;
                 continue;
             };
             touched_main_repos.insert(main_repo.clone());
+            let current_branch = current_worktree_branch(&wt_str).await;
+            let task_match = task_statuses.get(&short_id);
+            let branch_candidates = worktree_pr_head_candidates(
+                &short_id,
+                current_branch.as_deref(),
+                task_match,
+            );
 
             // Task-status-driven removal. If the task row is failed OR the task
             // is gone entirely (but we have a task map to check against), nuke
             // the worktree immediately — no reason to keep a worktree for a
             // task Matt will never revisit.
-            let task_match = task_statuses.get(&short_id);
             let task_based_removal = match (config.is_some(), task_match) {
-                (true, Some(status)) if status == "failed" || status == "cancelled" => {
-                    Some(format!("task {}", status))
+                (true, Some(info)) if info.status == "failed" || info.status == "cancelled" => {
+                    Some(format!("task {}", info.status))
                 }
                 (true, None) if !task_statuses.is_empty() => {
                     Some("task row gone".to_string())
@@ -2478,37 +2555,57 @@ async fn sweep_worktrees_inner(config: Option<&SupabaseConfig>) -> (usize, usize
             // Always check PR state first. Even a task flagged failed or
             // missing can have a PR Matt is reviewing — never kill the remote
             // branch under an OPEN PR, because GitHub auto-closes it.
-            let pr_state_raw = async_cmd("gh")
-                .args(["pr", "list", "--head", &branch, "--state", "all", "--json", "state", "--limit", "1"])
-                .current_dir(&main_repo)
-                .output().await;
+            let mut pr_state: Option<(String, String)> = None;
+            for branch in &branch_candidates {
+                let pr_state_raw = async_cmd("gh")
+                    .args(["pr", "list", "--head", branch, "--state", "all", "--json", "state", "--limit", "1"])
+                    .current_dir(&main_repo)
+                    .output().await;
 
-            let pr_state: Option<String> = match pr_state_raw {
-                Ok(out) if out.status.success() => {
-                    let body = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    if body.contains("\"state\":\"MERGED\"") { Some("MERGED".into()) }
-                    else if body.contains("\"state\":\"CLOSED\"") { Some("CLOSED".into()) }
-                    else if body.contains("\"state\":\"OPEN\"") { Some("OPEN".into()) }
-                    else if body == "[]" { Some("NONE".into()) }
-                    else { None }
+                let branch_state: Option<String> = match pr_state_raw {
+                    Ok(out) if out.status.success() => {
+                        let body = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                        if body.contains("\"state\":\"OPEN\"") { Some("OPEN".into()) }
+                        else if body.contains("\"state\":\"MERGED\"") { Some("MERGED".into()) }
+                        else if body.contains("\"state\":\"CLOSED\"") { Some("CLOSED".into()) }
+                        else if body == "[]" { Some("NONE".into()) }
+                        else { None }
+                    }
+                    Ok(out) => {
+                        log::warn!("[sweep] gh pr list failed for {}: {}", branch, String::from_utf8_lossy(&out.stderr).trim());
+                        None
+                    }
+                    Err(e) => {
+                        log::warn!("[sweep] gh invocation failed for {}: {}", branch, e);
+                        None
+                    }
+                };
+
+                match branch_state.as_deref() {
+                    Some("OPEN") => {
+                        pr_state = Some((branch.clone(), "OPEN".to_string()));
+                        break;
+                    }
+                    Some("MERGED" | "CLOSED") if pr_state.as_ref().map(|(_, state)| state.as_str()) != Some("MERGED") => {
+                        pr_state = branch_state.map(|state| (branch.clone(), state));
+                    }
+                    Some("NONE") if pr_state.is_none() => {
+                        pr_state = Some((branch.clone(), "NONE".to_string()));
+                    }
+                    Some(_) => {}
+                    None if pr_state.is_none() => {}
+                    None => {}
                 }
-                Ok(out) => {
-                    log::warn!("[sweep] gh pr list failed for {}: {}", branch, String::from_utf8_lossy(&out.stderr).trim());
-                    None
-                }
-                Err(e) => {
-                    log::warn!("[sweep] gh invocation failed: {}", e);
-                    None
-                }
-            };
+            }
+            let pr_state_label = pr_state.as_ref().map(|(_, state)| state.as_str());
 
             // Hard gate: an open PR always keeps the worktree + branch alive.
-            if pr_state.as_deref() == Some("OPEN") {
+            if pr_state_label == Some("OPEN") {
                 kept += 1;
                 continue;
             }
 
-            let (should_remove, reason) = match (task_based_removal, pr_state.as_deref()) {
+            let (should_remove, reason) = match (task_based_removal, pr_state_label) {
                 (_, Some("MERGED")) => (true, "PR merged".to_string()),
                 (_, Some("CLOSED")) => (true, "PR closed".to_string()),
                 (Some(r), _) => (true, r),
@@ -2530,12 +2627,16 @@ async fn sweep_worktrees_inner(config: Option<&SupabaseConfig>) -> (usize, usize
             if should_remove {
                 log::info!("[sweep] removing worktree {} ({})", wt_str, reason);
                 let _ = run_git(&["worktree", "remove", "--force", &wt_str], &main_repo).await;
-                let _ = run_git(&["branch", "-D", &branch], &main_repo).await;
+                for branch in &branch_candidates {
+                    let _ = run_git(&["branch", "-D", branch], &main_repo).await;
+                }
                 // Only delete the remote branch when we're sure no open PR is
                 // attached. The open-PR guard above already returned early,
                 // and PR-merged / PR-closed states mean the branch is already
                 // detached from a live review.
-                let _ = run_git(&["push", "origin", "--delete", &branch], &main_repo).await;
+                for branch in &branch_candidates {
+                    let _ = run_git(&["push", "origin", "--delete", branch], &main_repo).await;
+                }
                 let _ = tokio::fs::remove_dir_all(&wt_path).await;
                 removed += 1;
             } else {
@@ -4683,7 +4784,7 @@ async fn prepare_conflict_fix_worktree(
     } else {
         run_git(&["checkout", "-b", &head_branch, &origin_head], &path_str).await?;
     }
-    run_git(&["merge", "--ff-only", &origin_head], &path_str).await?;
+    run_git(&["reset", "--hard", &origin_head], &path_str).await?;
 
     Ok((path_str, head_branch, base_branch))
 }
@@ -4775,7 +4876,7 @@ async fn ensure_pr_review_worktree(
             } else {
                 run_git(&["checkout", "-b", &expected_branch, &origin_head], &worktree_str).await?;
             }
-            run_git(&["merge", "--ff-only", &origin_head], &worktree_str).await?;
+            run_git(&["reset", "--hard", &origin_head], &worktree_str).await?;
             ensure_clean_review_worktree(&worktree_str).await?;
             return Ok(worktree_str);
         }
@@ -4805,7 +4906,7 @@ async fn ensure_pr_review_worktree(
             main_repo_path,
         ).await?;
     }
-    run_git(&["merge", "--ff-only", &origin_head], &worktree_str).await?;
+    run_git(&["reset", "--hard", &origin_head], &worktree_str).await?;
     ensure_clean_review_worktree(&worktree_str).await?;
 
     Ok(worktree_str)
@@ -6844,6 +6945,41 @@ mod merge_deploy_tests {
     }
 
     #[test]
+    fn pr_number_from_url_parses_github_pull_urls() {
+        assert_eq!(
+            pr_number_from_url("https://github.com/R-Link-LLC/operly/pull/123"),
+            Some(123)
+        );
+        assert_eq!(
+            pr_number_from_url("https://github.com/R-Link-LLC/operly/pull/123/"),
+            Some(123)
+        );
+        assert_eq!(pr_number_from_url("https://github.com/R-Link-LLC/operly/issues/123"), None);
+        assert_eq!(pr_number_from_url(""), None);
+        assert_eq!(pr_number_from_url("https://github.com/R-Link-LLC/operly/pull/not-a-number"), None);
+    }
+
+    #[test]
+    fn worktree_pr_head_candidates_include_helper_and_legacy_heads() {
+        let info = WorktreeTaskInfo {
+            status: "review".to_string(),
+            head_ref: Some("banana/f68cb3c5-1abf-4823-9d32-41274c1550b0".to_string()),
+        };
+        assert_eq!(
+            worktree_pr_head_candidates("757ea819", Some("fix/context-trimming-empty-messages"), Some(&info)),
+            vec![
+                "fix/context-trimming-empty-messages".to_string(),
+                "banana/f68cb3c5-1abf-4823-9d32-41274c1550b0".to_string(),
+                "sam/757ea819".to_string(),
+            ]
+        );
+        assert_eq!(
+            worktree_pr_head_candidates("757ea819", Some("sam/757ea819"), None),
+            vec!["sam/757ea819".to_string()]
+        );
+    }
+
+    #[test]
     fn pr_head_validation_rejects_mismatched_recovered_branch() {
         assert!(ensure_pr_head_matches_task("sam/adca7909", "sam/adca7909").is_ok());
         assert!(ensure_pr_head_matches_task("sam/97571af7", "sam/adca7909").is_err());
@@ -7356,25 +7492,38 @@ pub async fn sweep_adopt_orphan_prs(config: &SupabaseConfig) {
             if pr_url.is_empty() {
                 continue;
             }
+            let pr_number = pr.get("number").and_then(|v| v.as_i64()).unwrap_or(0);
             if let Some(existing_task) = known_pr_tasks.get(&pr_url) {
+                let task_id = existing_task.get("id").and_then(|v| v.as_str()).unwrap_or("");
                 let existing_status = existing_task
                     .get("status")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
+                let missing_pr_number = existing_task
+                    .get("pr_number")
+                    .and_then(|v| v.as_i64())
+                    .map(|n| n <= 0)
+                    .unwrap_or(true);
                 if matches!(existing_status, "done" | "failed") {
-                    let task_id = existing_task.get("id").and_then(|v| v.as_str()).unwrap_or("");
                     if !task_id.is_empty() {
                         let now = chrono::Utc::now().to_rfc3339();
                         let mut context = task_context_object(existing_task);
                         context.insert("head_ref".to_string(), Value::String(head.to_string()));
+                        if pr_number > 0 {
+                            context.insert("pr_number".to_string(), serde_json::json!(pr_number));
+                        }
                         context.insert("revived_open_pr_at".to_string(), Value::String(now.clone()));
-                        let _ = supabase::update_task(config, task_id, &serde_json::json!({
+                        let mut updates = serde_json::json!({
                             "status": "review",
                             "completed_at": Value::Null,
                             "failure_reason": Value::Null,
                             "context": Value::Object(context),
                             "updated_at": now,
-                        })).await;
+                        });
+                        if pr_number > 0 {
+                            updates["pr_number"] = serde_json::json!(pr_number);
+                        }
+                        let _ = supabase::update_task(config, task_id, &updates).await;
                         agent_comment(
                             config,
                             task_id,
@@ -7386,11 +7535,20 @@ pub async fn sweep_adopt_orphan_prs(config: &SupabaseConfig) {
                             existing_status
                         );
                     }
+                } else if !task_id.is_empty() && missing_pr_number && pr_number > 0 {
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let mut context = task_context_object(existing_task);
+                    context.insert("head_ref".to_string(), Value::String(head.to_string()));
+                    context.insert("pr_number".to_string(), serde_json::json!(pr_number));
+                    let _ = supabase::update_task(config, task_id, &serde_json::json!({
+                        "pr_number": pr_number,
+                        "context": Value::Object(context),
+                        "updated_at": now,
+                    })).await;
                 }
                 continue;
             }
 
-            let pr_number = pr.get("number").and_then(|v| v.as_i64()).unwrap_or(0);
             let short_key = valid_short_id(head);
             if let Some(ref short) = short_key {
                 if known_short_ids.contains(short) {
