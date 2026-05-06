@@ -814,6 +814,15 @@ async fn worker_loop(
             sweep_pr_merged_cards(&config).await;
         }
 
+        // Adopt orphan open `sam/*` PRs whose ae_tasks row is missing back
+        // into the dashboard. Failsafe for cases where the row gets deleted
+        // mid-flight or out-of-band, leaving an open PR with no card to
+        // surface it. Every ~5min (60 ticks) — gh round-trip per repo so we
+        // don't want this on the hot path.
+        if tick % 60 == 1 {
+            sweep_adopt_orphan_prs(&config).await;
+        }
+
         tick += 1;
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
@@ -7011,6 +7020,225 @@ pub async fn sweep_pr_merged_cards(config: &SupabaseConfig) {
             continue;
         }
         // OPEN / anything else: leave alone.
+    }
+}
+
+/// Walk every registered project's repo, list open `sam/*` PRs on GitHub, and
+/// adopt any whose ae_tasks row is missing back into the dashboard. This is the
+/// failsafe for the case Matt hit on 2026-05-05: 6 PRs sitting open with no
+/// task card, because the corresponding rows had been deleted (manually, or by
+/// some upstream sweep we haven't located). Without this, those PRs are
+/// invisible in the kanban board and effectively orphaned.
+///
+/// Created cards land in `review` so they show up where Matt expects, with
+/// `source = "orphan-recovery"` and the original short id stashed in
+/// `context.orphan_short_id` so subsequent runs are idempotent.
+pub async fn sweep_adopt_orphan_prs(config: &SupabaseConfig) {
+    let projects = match supabase::fetch_projects(config).await {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("[orphan-sweep] fetch_projects failed: {}", e);
+            return;
+        }
+    };
+    let Some(proj_arr) = projects.as_array() else { return; };
+
+    // Pull all known ae_tasks pr_urls + short_ids once so we can match without
+    // an N+1 query loop. Only consider not-archived rows so a deleted card
+    // gets re-adopted (the deleter is the bug we're working around).
+    let known_tasks = match supabase::fetch_tasks(config, None).await {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("[orphan-sweep] fetch_tasks failed: {}", e);
+            return;
+        }
+    };
+    let mut known_pr_urls: std::collections::HashSet<String> = Default::default();
+    let mut known_short_ids: std::collections::HashSet<String> = Default::default();
+    if let Some(arr) = known_tasks.as_array() {
+        for t in arr {
+            if let Some(u) = t.get("pr_url").and_then(|v| v.as_str()) {
+                if !u.is_empty() {
+                    known_pr_urls.insert(u.to_string());
+                }
+            }
+            if let Some(id) = t.get("id").and_then(|v| v.as_str()) {
+                known_short_ids.insert(short_task_id(id));
+            }
+            // Older recovery rows stash the original short id in context so we
+            // don't double-adopt across restarts.
+            if let Some(short) = t
+                .get("context")
+                .and_then(|v| v.as_object())
+                .and_then(|c| c.get("orphan_short_id"))
+                .and_then(|v| v.as_str())
+            {
+                known_short_ids.insert(short.to_string());
+            }
+        }
+    }
+
+    for proj in proj_arr {
+        let repo_path = proj.get("repo_path").and_then(|v| v.as_str()).unwrap_or("");
+        let project_name = proj.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let repo_url = proj.get("repo_url").and_then(|v| v.as_str()).unwrap_or("");
+        let preview_url = proj.get("preview_url").and_then(|v| v.as_str()).unwrap_or("");
+        if repo_path.is_empty() || tokio::fs::metadata(repo_path).await.is_err() {
+            continue;
+        }
+
+        // List open PRs whose head ref starts with `sam/` (Sam's branch
+        // convention). gh's `--head` filter is exact-match, so we list all
+        // open PRs and filter client-side.
+        let out = async_cmd("gh")
+            .args([
+                "pr", "list",
+                "--state", "open",
+                "--limit", "100",
+                "--json", "number,title,body,headRefName,url,createdAt,baseRefName,headRefOid",
+            ])
+            .current_dir(repo_path)
+            .output()
+            .await;
+        let Ok(o) = out else { continue };
+        if !o.status.success() {
+            log::warn!(
+                "[orphan-sweep] gh pr list failed for {}: {}",
+                repo_path,
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            continue;
+        }
+        let body = String::from_utf8_lossy(&o.stdout);
+        let parsed: Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("[orphan-sweep] parse gh pr list: {}", e);
+                continue;
+            }
+        };
+        let Some(prs) = parsed.as_array() else { continue };
+
+        for pr in prs {
+            let head = pr.get("headRefName").and_then(|v| v.as_str()).unwrap_or("");
+            if !head.starts_with("sam/") {
+                continue;
+            }
+            let short = head.strip_prefix("sam/").unwrap_or("");
+            // Only treat the 8-hex-char form as Sam's; anything else is a
+            // hand-named branch that happens to share the prefix.
+            if short.len() < 8 || !short.chars().take(8).all(|c| c.is_ascii_hexdigit()) {
+                continue;
+            }
+            let short_key: String = short.chars().take(8).collect();
+
+            let pr_url = pr.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if pr_url.is_empty() {
+                continue;
+            }
+            if known_pr_urls.contains(&pr_url) || known_short_ids.contains(&short_key) {
+                continue;
+            }
+
+            let pr_number = pr.get("number").and_then(|v| v.as_i64()).unwrap_or(0);
+            let pr_title = pr
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let pr_body = pr
+                .get("body")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let base_ref = pr
+                .get("baseRefName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let head_oid = pr
+                .get("headRefOid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let now = chrono::Utc::now().to_rfc3339();
+            let title = if pr_title.is_empty() {
+                format!("Orphan PR #{}", pr_number)
+            } else {
+                pr_title
+            };
+            let description = if pr_body.is_empty() {
+                format!(
+                    "Recovered orphan PR — task row was missing when this sweep ran.\n\n{}",
+                    pr_url
+                )
+            } else {
+                format!(
+                    "Recovered orphan PR — task row was missing when this sweep ran.\n\n{}\n\n---\n{}",
+                    pr_url, pr_body
+                )
+            };
+
+            let mut new_task = serde_json::json!({
+                "title": title,
+                "description": description,
+                "status": "review",
+                "priority": "medium",
+                "task_type": "code",
+                "source": "orphan-recovery",
+                "assignee": "sam",
+                "pr_url": pr_url,
+                "context": {
+                    "orphan_short_id": short_key,
+                    "pr_number": pr_number,
+                    "head_ref": head,
+                    "head_oid": head_oid,
+                    "base_ref": base_ref,
+                    "adopted_at": now,
+                },
+                "claimed_at": now,
+                "updated_at": now,
+            });
+            if !project_name.is_empty() {
+                new_task["project"] = serde_json::json!(project_name);
+            }
+            if !repo_path.is_empty() {
+                new_task["repo_path"] = serde_json::json!(repo_path);
+            }
+            if !repo_url.is_empty() {
+                new_task["repo_url"] = serde_json::json!(repo_url);
+            }
+            if !preview_url.is_empty() {
+                new_task["preview_url"] = serde_json::json!(preview_url);
+            }
+            if !base_ref.is_empty() {
+                new_task["base_branch"] = serde_json::json!(base_ref);
+            }
+
+            match supabase::create_task(config, &new_task).await {
+                Ok(v) => {
+                    let new_id = v
+                        .as_array()
+                        .and_then(|a| a.first())
+                        .and_then(|t| t.get("id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?")
+                        .to_string();
+                    log::info!(
+                        "[orphan-sweep] adopted PR {} (head={}) into ae_tasks {}",
+                        pr_url, head, new_id
+                    );
+                    // Cache so we don't double-adopt within the same tick if
+                    // the same head shows up under multiple project entries.
+                    known_pr_urls.insert(pr_url);
+                    known_short_ids.insert(short_key);
+                }
+                Err(e) => {
+                    log::warn!("[orphan-sweep] create_task failed for {}: {}", pr_url, e);
+                }
+            }
+        }
     }
 }
 
