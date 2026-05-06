@@ -13,4 +13,7 @@ create table if not exists public.ae_artifacts (
 );
 create index if not exists idx_ae_artifacts_task on public.ae_artifacts(task_id, created_at);
 
-alter publication supabase_realtime add table public.ae_artifacts;
+do $$
+begin
+  begin alter publication supabase_realtime add table public.ae_artifacts; exception when duplicate_object then null; end;
+end $$;

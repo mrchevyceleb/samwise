@@ -176,6 +176,13 @@ struct GitHubPullRef {
     number: i64,
 }
 
+#[derive(Default)]
+struct TaskTombstones {
+    pr_urls: HashSet<String>,
+    scoped_head_refs: HashSet<String>,
+    scoped_short_ids: HashSet<String>,
+}
+
 /// Compute the task branch name from a short id. Single source of truth so sweep
 /// and task-create agree.
 fn task_branch_name(short_id: &str) -> String {
@@ -198,6 +205,93 @@ fn is_automation_pr_head(head: &str) -> bool {
 
 fn pr_number_from_url(pr_url: &str) -> Option<i64> {
     github_pull_ref_from_url(pr_url).map(|pr| pr.number)
+}
+
+fn normalize_pr_url(pr_url: &str) -> String {
+    pr_url.trim().trim_end_matches('/').to_string()
+}
+
+fn scoped_tombstone_keys(repo_path: &str, repo_url: &str, value: &str) -> Vec<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Vec::new();
+    }
+    let mut keys = Vec::new();
+    let repo_path = repo_path.trim();
+    if !repo_path.is_empty() {
+        keys.push(format!("path:{}::{}", repo_path, value));
+    }
+    let repo_url = normalize_repo_url(repo_url);
+    if !repo_url.is_empty() {
+        keys.push(format!("url:{}::{}", repo_url, value));
+    }
+    keys
+}
+
+fn tombstone_matches_pr(
+    tombstones: &TaskTombstones,
+    pr_url: &str,
+    repo_path: &str,
+    repo_url: &str,
+    head_ref: &str,
+    short_id: Option<&str>,
+) -> bool {
+    if !pr_url.is_empty() && tombstones.pr_urls.contains(&normalize_pr_url(pr_url)) {
+        return true;
+    }
+    for key in scoped_tombstone_keys(repo_path, repo_url, head_ref) {
+        if tombstones.scoped_head_refs.contains(&key) {
+            return true;
+        }
+    }
+    if let Some(short) = short_id {
+        for key in scoped_tombstone_keys(repo_path, repo_url, short) {
+            if tombstones.scoped_short_ids.contains(&key) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+async fn load_task_tombstones(config: &SupabaseConfig) -> TaskTombstones {
+    let mut tombstones = TaskTombstones::default();
+    let rows = match supabase::fetch_task_tombstones(config).await {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("[orphan-sweep] task tombstones unavailable: {}", e);
+            return tombstones;
+        }
+    };
+    let Some(arr) = rows.as_array() else { return tombstones };
+    for row in arr {
+        if let Some(pr_url) = row.get("pr_url").and_then(|v| v.as_str()) {
+            let normalized = normalize_pr_url(pr_url);
+            if !normalized.is_empty() {
+                tombstones.pr_urls.insert(normalized);
+            }
+        }
+        let repo_path = row.get("repo_path").and_then(|v| v.as_str()).unwrap_or("");
+        let repo_url = row.get("repo_url").and_then(|v| v.as_str()).unwrap_or("");
+        if let Some(head_ref) = row.get("head_ref").and_then(|v| v.as_str()) {
+            let trimmed = head_ref.trim();
+            if !trimmed.is_empty() {
+                for key in scoped_tombstone_keys(repo_path, repo_url, trimmed) {
+                    tombstones.scoped_head_refs.insert(key);
+                }
+            }
+        }
+        if let Some(short) = row
+            .get("orphan_short_id")
+            .and_then(|v| v.as_str())
+            .and_then(valid_short_id)
+        {
+            for key in scoped_tombstone_keys(repo_path, repo_url, &short) {
+                tombstones.scoped_short_ids.insert(key);
+            }
+        }
+    }
+    tombstones
 }
 
 fn github_pull_ref_from_url(pr_url: &str) -> Option<GitHubPullRef> {
@@ -930,13 +1024,25 @@ async fn worker_loop(
             sweep_pr_merged_cards(&config).await;
         }
 
-        // Adopt orphan open `sam/*` PRs whose ae_tasks row is missing back
-        // into the dashboard. Failsafe for cases where the row gets deleted
-        // mid-flight or out-of-band, leaving an open PR with no card to
-        // surface it. Every ~5min (60 ticks) — gh round-trip per repo so we
-        // don't want this on the hot path.
+        // Adopt orphan open `sam/*` PRs only when explicitly enabled. This used
+        // to run by default, but that made intentional card deletion non-sticky:
+        // the next sweep interpreted "Matt deleted this" as "missing row, revive
+        // it." Deletion now wins unless a settings.json flag opts recovery back in.
         if tick % 60 == 1 {
-            sweep_adopt_orphan_prs(&config).await;
+            let settings: Option<serde_json::Value> = if let Ok(data_dir) = app.path().app_data_dir() {
+                let settings_path = data_dir.join("settings.json");
+                tokio::fs::read_to_string(&settings_path).await
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+            } else { None };
+            let orphan_recovery_on = settings
+                .as_ref()
+                .and_then(|s| s.get("autoAdoptOrphanPrsEnabled"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if orphan_recovery_on {
+                sweep_adopt_orphan_prs(&config).await;
+            }
         }
 
         tick += 1;
@@ -7663,7 +7769,7 @@ pub async fn sweep_adopt_orphan_prs(config: &SupabaseConfig) {
         for t in arr {
             if let Some(u) = t.get("pr_url").and_then(|v| v.as_str()) {
                 if !u.is_empty() {
-                    known_pr_tasks.insert(u.to_string(), t.clone());
+                    known_pr_tasks.insert(normalize_pr_url(u), t.clone());
                 }
             }
             if let Some(id) = t.get("id").and_then(|v| v.as_str()) {
@@ -7683,6 +7789,7 @@ pub async fn sweep_adopt_orphan_prs(config: &SupabaseConfig) {
             }
         }
     }
+    let tombstones = load_task_tombstones(config).await;
 
     for proj in proj_arr {
         let repo_path = proj.get("repo_path").and_then(|v| v.as_str()).unwrap_or("");
@@ -7736,7 +7843,20 @@ pub async fn sweep_adopt_orphan_prs(config: &SupabaseConfig) {
                 continue;
             }
             let pr_number = pr.get("number").and_then(|v| v.as_i64()).unwrap_or(0);
-            if let Some(existing_task) = known_pr_tasks.get(&pr_url) {
+            let short_key = valid_short_id(head);
+            if tombstone_matches_pr(
+                &tombstones,
+                &pr_url,
+                repo_path,
+                repo_url,
+                head,
+                short_key.as_deref(),
+            ) {
+                log::info!("[orphan-sweep] skipping intentionally deleted PR {} (head={})", pr_url, head);
+                continue;
+            }
+            let normalized_pr_url = normalize_pr_url(&pr_url);
+            if let Some(existing_task) = known_pr_tasks.get(&normalized_pr_url) {
                 let task_id = existing_task.get("id").and_then(|v| v.as_str()).unwrap_or("");
                 let existing_status = existing_task
                     .get("status")
@@ -7792,7 +7912,6 @@ pub async fn sweep_adopt_orphan_prs(config: &SupabaseConfig) {
                 continue;
             }
 
-            let short_key = valid_short_id(head);
             if let Some(ref short) = short_key {
                 if known_short_ids.contains(short) {
                     continue;
@@ -7891,7 +8010,7 @@ pub async fn sweep_adopt_orphan_prs(config: &SupabaseConfig) {
                     );
                     // Cache so we don't double-adopt within the same tick if
                     // the same head shows up under multiple project entries.
-                    known_pr_tasks.insert(pr_url, new_task);
+                    known_pr_tasks.insert(normalized_pr_url, new_task);
                     if let Some(short) = short_key {
                         known_short_ids.insert(short);
                     }

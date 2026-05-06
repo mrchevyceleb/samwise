@@ -94,6 +94,62 @@ pub async fn create_task(config: &SupabaseConfig, task: &Value) -> Result<Value,
     handle_response(client.post(&rest_url(config, "ae_tasks")).json(task).send().await.map_err(|e| e.to_string())?).await
 }
 
+pub async fn record_task_tombstone(config: &SupabaseConfig, task: &Value) -> Result<Value, String> {
+    let client = build_client(config)?;
+    let context = task.get("context").and_then(|v| v.as_object());
+    let head_ref = context
+        .and_then(|c| c.get("head_ref"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty());
+    let orphan_short_id = context
+        .and_then(|c| c.get("orphan_short_id"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty());
+    let body = serde_json::json!({
+        "task_id": task.get("id").cloned().unwrap_or(Value::Null),
+        "title": task.get("title").cloned().unwrap_or(Value::Null),
+        "source": task.get("source").cloned().unwrap_or(Value::Null),
+        "status": task.get("status").cloned().unwrap_or(Value::Null),
+        "project": task.get("project").cloned().unwrap_or(Value::Null),
+        "repo_url": task.get("repo_url").cloned().unwrap_or(Value::Null),
+        "repo_path": task.get("repo_path").cloned().unwrap_or(Value::Null),
+        "pr_url": task.get("pr_url").cloned().unwrap_or(Value::Null),
+        "pr_number": task.get("pr_number").cloned().unwrap_or(Value::Null),
+        "head_ref": head_ref.map(Value::from).unwrap_or(Value::Null),
+        "orphan_short_id": orphan_short_id.map(Value::from).unwrap_or(Value::Null),
+    });
+    handle_response(client.post(&rest_url(config, "ae_task_tombstones")).json(&body).send().await.map_err(|e| e.to_string())?).await
+}
+
+pub async fn fetch_task_tombstones(config: &SupabaseConfig) -> Result<Value, String> {
+    let client = build_client(config)?;
+    let url = format!(
+        "{}?select=pr_url,repo_path,repo_url,head_ref,orphan_short_id,task_id&order=deleted_at.desc&limit=10000",
+        rest_url(config, "ae_task_tombstones")
+    );
+    handle_response(client.get(&url).send().await.map_err(|e| e.to_string())?).await
+}
+
+fn task_requires_delete_tombstone(task: &Value) -> bool {
+    let has_pr_url = task
+        .get("pr_url")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let context = task.get("context").and_then(|v| v.as_object());
+    let has_head_ref = context
+        .and_then(|c| c.get("head_ref"))
+        .and_then(|v| v.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let has_orphan_short_id = context
+        .and_then(|c| c.get("orphan_short_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    has_pr_url || has_head_ref || has_orphan_short_id
+}
+
 pub async fn update_task(config: &SupabaseConfig, id: &str, updates: &Value) -> Result<Value, String> {
     let client = build_client(config)?;
     let url = format!("{}?id=eq.{}", rest_url(config, "ae_tasks"), id);
@@ -531,6 +587,17 @@ async fn close_origin_ticket_for_done_update(config: &SupabaseConfig, id: &str, 
 #[tauri::command]
 pub async fn supabase_delete_task(id: String, state: tauri::State<'_, SupabaseState>) -> Result<(), String> {
     let config = state.get_config().await;
+    if let Some(task) = fetch_task(&config, &id).await? {
+        if let Err(e) = record_task_tombstone(&config, &task).await {
+            if task_requires_delete_tombstone(&task) {
+                return Err(format!(
+                    "Delete blocked: could not record the PR tombstone needed to keep this card from being recovered later. {}",
+                    e
+                ));
+            }
+            log::warn!("[tasks] failed to record deletion tombstone for {}: {}", id, e);
+        }
+    }
     let client = build_client(&config)?;
     let url = format!("{}?id=eq.{}", rest_url(&config, "ae_tasks"), id);
     let resp = client.delete(&url).send().await.map_err(|e| e.to_string())?;
