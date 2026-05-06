@@ -184,7 +184,7 @@ fn is_automation_pr_head(head: &str) -> bool {
     }
     matches!(
         trimmed.split('/').next(),
-        Some("fix" | "banana" | "codex")
+        Some("fix" | "banana" | "codex" | "agent-one")
     )
 }
 
@@ -6938,6 +6938,7 @@ mod merge_deploy_tests {
         assert!(is_automation_pr_head("fix/mobile-paste-chat-bc27ace2"));
         assert!(is_automation_pr_head("banana/f68cb3c5-1abf-4823-9d32-41274c1550b0"));
         assert!(is_automation_pr_head("codex/review-fix"));
+        assert!(is_automation_pr_head("agent-one/fe7901f2-6bf0-422b-8549-f51f42afa224"));
 
         assert!(!is_automation_pr_head("sam/not-valid"));
         assert!(!is_automation_pr_head("main"));
