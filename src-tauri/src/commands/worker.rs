@@ -4490,6 +4490,16 @@ pub fn spawn_pr_review_task(
             }
         };
 
+        let still_in_review = supabase::fetch_task(&config, &task_id).await
+            .ok()
+            .flatten()
+            .and_then(|task| task.get("status").and_then(|v| v.as_str()).map(str::to_string))
+            .as_deref() == Some("review");
+        if !still_in_review {
+            log::info!("[pr-review] task {} moved out of review before verdict; dropping stale verdict", task_id);
+            return;
+        }
+
         // One-line headline so Matt can see the verdict at a glance without
         // scrolling or reading the whole markdown body. Post BEFORE the body
         // so it appears at the top of the review section in the activity log.
@@ -7939,6 +7949,19 @@ async fn maybe_spawn_auto_fix(
     // recovered cards keep the original PR branch key in context.orphan_short_id,
     // while task_id is the recovered card id.
     let latest_task = supabase::fetch_task(&config, &task_id).await.ok().flatten();
+    let current_status = latest_task
+        .as_ref()
+        .and_then(|t| t.get("status"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if current_status != "fixes_needed" {
+        log::info!(
+            "[auto-fix] task {} moved to {} before auto-fix start; respecting manual state",
+            task_id,
+            current_status
+        );
+        return;
+    }
     let cycle_count = latest_task
         .as_ref()
         .and_then(|t| t.get("review_cycle_count"))
@@ -7979,11 +8002,17 @@ pub fn spawn_auto_fix_task(
     tokio::spawn(async move {
         let new_cycle = prev_cycle_count + 1;
 
-        let _ = supabase::update_task(&config, &task_id, &serde_json::json!({
+        let claimed = supabase::update_task_if_status(&config, &task_id, "fixes_needed", &serde_json::json!({
             "status": "in_progress",
             "review_cycle_count": new_cycle,
             "updated_at": chrono::Utc::now().to_rfc3339(),
-        })).await;
+        })).await.ok()
+            .and_then(|v| v.as_array().map(|arr| !arr.is_empty()))
+            .unwrap_or(false);
+        if !claimed {
+            log::info!("[auto-fix] task {} moved out of fixes_needed before claim; respecting manual state", task_id);
+            return;
+        }
         notify_callback(&config, &task_id, "in_progress", Some(&pr_url), None);
 
         agent_comment(&config, &task_id, &format!(
@@ -8149,10 +8178,16 @@ making any other changes.",
                     // telegram like every other terminal branch — without it
                     // the card sits silently in Fixes Needed and Matt has no
                     // way to know auto-fix gave up.
-                    let _ = supabase::update_task(&config, &task_id, &serde_json::json!({
+                    let updated = supabase::update_task_if_status(&config, &task_id, "in_progress", &serde_json::json!({
                         "status": "fixes_needed",
                         "updated_at": chrono::Utc::now().to_rfc3339(),
-                    })).await;
+                    })).await.ok()
+                        .and_then(|v| v.as_array().map(|arr| !arr.is_empty()))
+                        .unwrap_or(false);
+                    if !updated {
+                        log::info!("[auto-fix] task {} moved out of in_progress during no-op run; respecting manual state", task_id);
+                        return;
+                    }
                     notify_callback(&config, &task_id, "fixes_needed", Some(&pr_url), Some("no commit produced"));
                     agent_comment(&config, &task_id, "Auto-fix run finished without producing a new commit — either Claude decided the blockers needed your call, or nothing was actionable from the review. Leaving in Fixes Needed.").await;
                     send_terminal_telegram(
@@ -8171,11 +8206,17 @@ making any other changes.",
                 match push {
                     Ok(o) if o.status.success() => {
                         // Clear last_pr_review_at so the watcher re-runs $samwise-pr-review on the updated PR.
-                        let _ = supabase::update_task(&config, &task_id, &serde_json::json!({
+                        let updated = supabase::update_task_if_status(&config, &task_id, "in_progress", &serde_json::json!({
                             "status": "review",
                             "last_pr_review_at": serde_json::Value::Null,
                             "updated_at": chrono::Utc::now().to_rfc3339(),
-                        })).await;
+                        })).await.ok()
+                            .and_then(|v| v.as_array().map(|arr| !arr.is_empty()))
+                            .unwrap_or(false);
+                        if !updated {
+                            log::info!("[auto-fix] task {} moved out of in_progress after push; respecting manual state", task_id);
+                            return;
+                        }
                         notify_callback(&config, &task_id, "review", Some(&pr_url), None);
                         agent_comment(&config, &task_id, "Pushed fixes. Codex will re-review on the next poll.").await;
                     }
@@ -8196,10 +8237,16 @@ making any other changes.",
 }
 
 async fn fail_auto_fix(config: &SupabaseConfig, task_id: &str, pr_url: &str, reason: &str) {
-    let _ = supabase::update_task(config, task_id, &serde_json::json!({
+    let updated = supabase::update_task_if_status(config, task_id, "in_progress", &serde_json::json!({
         "status": "fixes_needed",
         "updated_at": chrono::Utc::now().to_rfc3339(),
-    })).await;
+    })).await.ok()
+        .and_then(|v| v.as_array().map(|arr| !arr.is_empty()))
+        .unwrap_or(false);
+    if !updated {
+        log::info!("[auto-fix] task {} moved out of in_progress before failure update; respecting manual state", task_id);
+        return;
+    }
     notify_callback(config, task_id, "fixes_needed", Some(pr_url), Some(reason));
     agent_comment(config, task_id, &format!("Auto-fix attempt failed: {}. Leaving in Fixes Needed.", reason)).await;
     send_terminal_telegram(
