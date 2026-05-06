@@ -59,6 +59,7 @@ const CLOSE_ORIGIN_TICKET_URL: &str =
     "https://iycloielqcjnjqddeuet.supabase.co/functions/v1/close-origin-ticket";
 const POST_MERGE_DEPLOY_GREEN_TIMEOUT_SECS: u64 = 10 * 60;
 const POST_MERGE_DEPLOY_GREEN_POLL_SECS: u64 = 20;
+const MERGE_DEPLOY_RUNNING_STALE_SECS: i64 = 90 * 60;
 
 /// Per-repo serialization for Merge + Deploy. Multiple cards on the same
 /// repo would otherwise race over the shared deploy worktree, `gh pr merge`,
@@ -168,6 +169,13 @@ struct WorktreeTaskInfo {
     head_ref: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GitHubPullRef {
+    owner: String,
+    repo: String,
+    number: i64,
+}
+
 /// Compute the task branch name from a short id. Single source of truth so sweep
 /// and task-create agree.
 fn task_branch_name(short_id: &str) -> String {
@@ -189,15 +197,36 @@ fn is_automation_pr_head(head: &str) -> bool {
 }
 
 fn pr_number_from_url(pr_url: &str) -> Option<i64> {
+    github_pull_ref_from_url(pr_url).map(|pr| pr.number)
+}
+
+fn github_pull_ref_from_url(pr_url: &str) -> Option<GitHubPullRef> {
     let trimmed = pr_url.trim().trim_end_matches('/');
-    if !trimmed.contains("/pull/") {
+    let (_, after_host) = trimmed.split_once("github.com/")?;
+    let mut parts = after_host.split('/');
+    let owner = parts.next()?.trim();
+    let repo = parts.next()?.trim();
+    let kind = parts.next()?.trim();
+    let raw_number = parts.next()?.trim();
+    let number = raw_number
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(raw_number)
+        .trim();
+
+    if owner.is_empty()
+        || repo.is_empty()
+        || kind != "pull"
+        || number.is_empty()
+        || !number.chars().all(|c| c.is_ascii_digit())
+    {
         return None;
     }
-    let number = trimmed.rsplit('/').next()?;
-    if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    number.parse::<i64>().ok()
+    Some(GitHubPullRef {
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+        number: number.parse::<i64>().ok()?,
+    })
 }
 
 fn push_branch_candidate(candidates: &mut Vec<String>, branch: impl Into<String>) {
@@ -4790,6 +4819,66 @@ async fn prepare_conflict_fix_worktree(
 }
 
 async fn fetch_pr_branch_info(pr_url: &str, repo_path: &str) -> Result<(String, String), String> {
+    let mut errors = Vec::new();
+    if let Some(pr_ref) = github_pull_ref_from_url(pr_url) {
+        match fetch_pr_branch_info_rest(&pr_ref, repo_path).await {
+            Ok(info) => return Ok(info),
+            Err(err) => errors.push(format!("GitHub REST PR lookup failed: {}", err)),
+        }
+    } else {
+        errors.push(format!("could not parse GitHub pull request URL: {}", pr_url));
+    }
+
+    match fetch_pr_branch_info_graphql(pr_url, repo_path).await {
+        Ok(info) => Ok(info),
+        Err(err) => {
+            errors.push(format!("GitHub GraphQL PR lookup failed: {}", err));
+            Err(errors.join("; "))
+        }
+    }
+}
+
+async fn fetch_pr_branch_info_rest(
+    pr_ref: &GitHubPullRef,
+    repo_path: &str,
+) -> Result<(String, String), String> {
+    let endpoint = format!(
+        "repos/{}/{}/pulls/{}",
+        pr_ref.owner, pr_ref.repo, pr_ref.number
+    );
+    let output = async_cmd("gh")
+        .args(["api", endpoint.as_str()])
+        .current_dir(repo_path)
+        .output()
+        .await
+        .map_err(|e| format!("spawn gh: {}", e))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let parsed: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("parse gh api pull request: {}", e))?;
+    let head = parsed
+        .get("head")
+        .and_then(|v| v.get("ref"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let base = parsed
+        .get("base")
+        .and_then(|v| v.get("ref"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if head.is_empty() || base.is_empty() {
+        return Err("GitHub REST PR branch info was missing head/base refs".to_string());
+    }
+    Ok((head.to_string(), base.to_string()))
+}
+
+async fn fetch_pr_branch_info_graphql(
+    pr_url: &str,
+    repo_path: &str,
+) -> Result<(String, String), String> {
     let output = async_cmd("gh")
         .args(["pr", "view", pr_url, "--json", "headRefName,baseRefName"])
         .current_dir(repo_path)
@@ -5159,11 +5248,57 @@ pub async fn sweep_merge_deploy_requests(config: &SupabaseConfig) {
         }
     }
 
+    let mut running_repos: HashSet<String> = HashSet::new();
+    let mut stale_running: Vec<&Value> = Vec::new();
+    for task in arr {
+        if merge_deploy_context_status(task) != Some("running") { continue; }
+        if merge_deploy_running_is_stale(task) {
+            stale_running.push(task);
+        } else if let Some(repo_key) = merge_deploy_repo_key(task) {
+            running_repos.insert(repo_key);
+        }
+    }
+    for task in stale_running {
+        let task_id = task.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if task_id.is_empty() { continue; }
+        let mut context = task_context_object(task);
+        context.insert(MERGE_DEPLOY_STATUS_KEY.to_string(), Value::String("failed".to_string()));
+        context.insert(MERGE_DEPLOY_COMPLETED_AT_KEY.to_string(), Value::String(chrono::Utc::now().to_rfc3339()));
+        context.insert(
+            MERGE_DEPLOY_ERROR_KEY.to_string(),
+            Value::String("Worker restarted before this Merge + Deploy could finish; resetting so the queue can advance.".to_string()),
+        );
+        let config_clone = config.clone();
+        tokio::spawn(async move {
+            let _ = supabase::update_task(&config_clone, &task_id, &serde_json::json!({
+                "context": Value::Object(context),
+                "updated_at": chrono::Utc::now().to_rfc3339(),
+            })).await;
+            agent_comment(
+                &config_clone,
+                &task_id,
+                "Detected a stale Merge + Deploy run from a previous worker session. Marked it failed so the queue can keep moving. Re-request Merge + Deploy if this PR still needs to ship.",
+            ).await;
+        });
+    }
+
+    let mut queued_by_repo: HashMap<String, Vec<&Value>> = HashMap::new();
     for task in arr {
         let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("");
         if !matches!(status, "approved" | "fixes_needed" | "review") { continue; }
         if !merge_deploy_request_is_pending(task) { continue; }
-        start_merge_deploy_task(config, task.clone(), status == "approved", "Merge + Deploy requested from the UI.", None).await;
+        let Some(repo_key) = merge_deploy_repo_key(task) else { continue; };
+        queued_by_repo.entry(repo_key).or_default().push(task);
+    }
+
+    for (repo_key, mut repo_tasks) in queued_by_repo {
+        if running_repos.contains(&repo_key) {
+            continue;
+        }
+        repo_tasks.sort_by(|a, b| merge_deploy_requested_at(a).cmp(&merge_deploy_requested_at(b)));
+        let Some(task) = repo_tasks.first() else { continue; };
+        let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        start_merge_deploy_task(config, (*task).clone(), status == "approved", "Merge + Deploy is at the front of the queue. Starting now.", None).await;
     }
 }
 
@@ -5307,40 +5442,52 @@ async fn start_merge_deploy_task(
     let pr_url = task.get("pr_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
     if task_id.is_empty() || pr_url.is_empty() { return; }
 
-    let mut context = task_context_object(&task);
-    context.insert(MERGE_DEPLOY_STATUS_KEY.to_string(), Value::String("running".to_string()));
-    context.insert(MERGE_DEPLOY_STARTED_AT_KEY.to_string(), Value::String(chrono::Utc::now().to_rfc3339()));
-    context.insert(MERGE_DEPLOY_ERROR_KEY.to_string(), Value::Null);
-    let _ = supabase::update_task(config, &task_id, &serde_json::json!({
-        "context": Value::Object(context),
-        "updated_at": chrono::Utc::now().to_rfc3339(),
-    })).await;
-
-    agent_comment(config, &task_id, start_comment).await;
-
     let config_clone = config.clone();
     let repo_path_for_lock = task
         .get("repo_path")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    tokio::spawn(async move {
-        let _repo_lock = if !repo_path_for_lock.is_empty() {
-            let lock = merge_deploy_lock_for(&repo_path_for_lock);
-            match Arc::clone(&lock).try_lock_owned() {
-                Ok(guard) => Some(guard),
-                Err(_) => {
+    let repo_lock_guard = if !repo_path_for_lock.is_empty() {
+        let lock = merge_deploy_lock_for(&repo_path_for_lock);
+        match lock.try_lock_owned() {
+            Ok(guard) => Some(guard),
+            Err(_) => {
+                if merge_deploy_context_status(&task) != Some("requested") {
+                    let mut context = task_context_object(&task);
+                    context.insert(MERGE_DEPLOY_STATUS_KEY.to_string(), Value::String("requested".to_string()));
+                    context.insert(MERGE_DEPLOY_REQUESTED_AT_KEY.to_string(), Value::String(chrono::Utc::now().to_rfc3339()));
+                    context.insert(MERGE_DEPLOY_ERROR_KEY.to_string(), Value::Null);
+                    let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                        "context": Value::Object(context),
+                        "updated_at": chrono::Utc::now().to_rfc3339(),
+                    })).await;
                     agent_comment(
-                        &config_clone,
+                        config,
                         &task_id,
-                        "Another Merge + Deploy is in flight on this repo. Waiting for it to finish before continuing.",
+                        "Queued for Merge + Deploy behind another card in this repo. Sam will run it automatically when the current one finishes.",
                     ).await;
-                    Some(lock.lock_owned().await)
                 }
+                return;
             }
-        } else {
-            None
-        };
+        }
+    } else {
+        None
+    };
+    let start_comment = start_comment.to_string();
+    tokio::spawn(async move {
+        let _repo_lock = repo_lock_guard;
+
+        let mut context = task_context_object(&task);
+        context.insert(MERGE_DEPLOY_STATUS_KEY.to_string(), Value::String("running".to_string()));
+        context.insert(MERGE_DEPLOY_STARTED_AT_KEY.to_string(), Value::String(chrono::Utc::now().to_rfc3339()));
+        context.insert(MERGE_DEPLOY_ERROR_KEY.to_string(), Value::Null);
+        let _ = supabase::update_task(&config_clone, &task_id, &serde_json::json!({
+            "context": Value::Object(context),
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+        })).await;
+
+        agent_comment(&config_clone, &task_id, &start_comment).await;
 
         match run_merge_deploy_workflow(&config_clone, &task, should_merge_if_open, expected_head_sha).await {
             Ok(summary) => {
@@ -6435,6 +6582,52 @@ fn merge_deploy_request_is_pending(task: &Value) -> bool {
     status == "requested" && context.get(MERGE_DEPLOY_REQUESTED_AT_KEY).and_then(|v| v.as_str()).is_some()
 }
 
+fn merge_deploy_context_status(task: &Value) -> Option<&str> {
+    task.get("context")
+        .and_then(|v| v.as_object())
+        .and_then(|context| context.get(MERGE_DEPLOY_STATUS_KEY))
+        .and_then(|v| v.as_str())
+}
+
+fn merge_deploy_requested_at(task: &Value) -> Option<&str> {
+    task.get("context")
+        .and_then(|v| v.as_object())
+        .and_then(|context| context.get(MERGE_DEPLOY_REQUESTED_AT_KEY))
+        .and_then(|v| v.as_str())
+}
+
+fn merge_deploy_started_at(task: &Value) -> Option<&str> {
+    task.get("context")
+        .and_then(|v| v.as_object())
+        .and_then(|context| context.get(MERGE_DEPLOY_STARTED_AT_KEY))
+        .and_then(|v| v.as_str())
+}
+
+fn merge_deploy_running_is_stale(task: &Value) -> bool {
+    let Some(started) = merge_deploy_started_at(task)
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+    else {
+        return true;
+    };
+    let age = chrono::Utc::now().signed_duration_since(started.with_timezone(&chrono::Utc));
+    age.num_seconds() > MERGE_DEPLOY_RUNNING_STALE_SECS
+}
+
+fn merge_deploy_repo_key(task: &Value) -> Option<String> {
+    task.get("repo_path")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            task.get("repo_url")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+}
+
 fn task_context_object(task: &Value) -> serde_json::Map<String, Value> {
     task.get("context")
         .and_then(|v| v.as_object())
@@ -6958,6 +7151,45 @@ mod merge_deploy_tests {
         assert_eq!(pr_number_from_url("https://github.com/R-Link-LLC/operly/issues/123"), None);
         assert_eq!(pr_number_from_url(""), None);
         assert_eq!(pr_number_from_url("https://github.com/R-Link-LLC/operly/pull/not-a-number"), None);
+    }
+
+    #[test]
+    fn github_pull_ref_from_url_parses_rest_parts() {
+        assert_eq!(
+            github_pull_ref_from_url("https://github.com/R-Link-LLC/operly/pull/123"),
+            Some(GitHubPullRef {
+                owner: "R-Link-LLC".to_string(),
+                repo: "operly".to_string(),
+                number: 123,
+            })
+        );
+        assert_eq!(
+            github_pull_ref_from_url("https://github.com/R-Link-LLC/operly/pull/123?foo=bar")
+                .map(|pr| pr.number),
+            Some(123)
+        );
+        assert_eq!(github_pull_ref_from_url("https://github.com/R-Link-LLC/operly/issues/123"), None);
+        assert_eq!(github_pull_ref_from_url("https://example.com/R-Link-LLC/operly/pull/123"), None);
+    }
+
+    #[test]
+    fn merge_deploy_running_stale_detects_old_or_missing_started_at() {
+        let task_with_started_at = |started_at: String| {
+            let mut context = serde_json::Map::new();
+            context.insert(MERGE_DEPLOY_STARTED_AT_KEY.to_string(), Value::String(started_at));
+            serde_json::json!({ "context": Value::Object(context) })
+        };
+
+        let fresh = task_with_started_at(chrono::Utc::now().to_rfc3339());
+        assert!(!merge_deploy_running_is_stale(&fresh));
+
+        let stale = task_with_started_at(
+            (chrono::Utc::now() - chrono::Duration::minutes(91)).to_rfc3339()
+        );
+        assert!(merge_deploy_running_is_stale(&stale));
+
+        let missing = serde_json::json!({"context": {}});
+        assert!(merge_deploy_running_is_stale(&missing));
     }
 
     #[test]

@@ -74,6 +74,7 @@ export function requestMergeDeployContext(task: Pick<AeTask, 'context'>): Record
 	return {
 		...(task.context ?? {}),
 		[MERGE_DEPLOY_REQUESTED_AT_KEY]: new Date().toISOString(),
+		[MERGE_DEPLOY_STARTED_AT_KEY]: null,
 		[MERGE_DEPLOY_STATUS_KEY]: 'requested',
 		[MERGE_DEPLOY_ERROR_KEY]: null,
 	};
