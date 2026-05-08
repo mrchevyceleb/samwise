@@ -1216,6 +1216,70 @@ fn normalize_repo_url(url: &str) -> String {
         .to_string()
 }
 
+fn legacy_task_project_candidates(title: &str, description: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    for text in [title, description] {
+        let Some(candidate) = legacy_task_project_candidate(text) else {
+            continue;
+        };
+        if !candidates
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(&candidate))
+        {
+            candidates.push(candidate);
+        }
+    }
+    candidates
+}
+
+fn legacy_task_project_candidate(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let first_line = trimmed.lines().next().unwrap_or(trimmed).trim();
+    let lower = first_line.to_lowercase();
+    let without_lead = ["in ", "on ", "for "]
+        .iter()
+        .find_map(|prefix| lower.strip_prefix(prefix).map(|_| &first_line[prefix.len()..]))
+        .unwrap_or(first_line);
+
+    let mut end = without_lead.len();
+    for sep in [" - ", " – ", " — ", " -- ", ":", "\n"] {
+        if let Some(idx) = without_lead.find(sep) {
+            end = end.min(idx);
+        }
+    }
+
+    let candidate = without_lead[..end]
+        .trim()
+        .trim_matches(|c: char| c == '"' || c == '\'' || c == '`')
+        .trim();
+    if candidate.len() < 3 || candidate.len() > 80 {
+        return None;
+    }
+    if !candidate.chars().any(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+
+    Some(candidate.to_string())
+}
+
+fn infer_legacy_task_project(
+    title: &str,
+    description: &str,
+    projects: &serde_json::Value,
+) -> Option<super::chat::ProjectPrefixMatch> {
+    for candidate in legacy_task_project_candidates(title, description) {
+        let synthetic = format!("{}: {}", candidate, title);
+        if let Some(matched) = super::chat::match_project_prefix(&synthetic, projects) {
+            return Some(matched);
+        }
+    }
+    None
+}
+
 // ── Trigger Evaluation ──────────────────────────────────────────────
 
 async fn evaluate_triggers(config: &super::supabase::SupabaseConfig, app: &tauri::AppHandle) -> Result<(), String> {
@@ -1408,7 +1472,15 @@ async fn execute_task(
     if repo_path.is_none() || preview_url.is_none() || project_name.is_empty() {
         if let Ok(projects) = supabase::fetch_projects(config).await {
             if let Some(arr) = projects.as_array() {
-                // Try matching by project name first, then fall back to repo_url
+                let legacy_match = if project_name.is_empty() && task_repo_url.is_empty() {
+                    infer_legacy_task_project(&title, &description, &projects)
+                } else {
+                    None
+                };
+
+                // Try matching by project name first, then fall back to repo_url,
+                // then rescue old cards whose title/description started with
+                // natural-language routing like `in r-link studio rebuild - ...`.
                 let matched_proj = if !project_name.is_empty() {
                     let name_lower = project_name.to_lowercase();
                     arr.iter().find(|p| {
@@ -1422,6 +1494,11 @@ async fn execute_task(
                         let purl = p.get("repo_url").and_then(|v| v.as_str()).unwrap_or("");
                         normalize_repo_url(purl) == normalized
                     })
+                } else if let Some(matched) = legacy_match.as_ref() {
+                    arr.iter().find(|p| {
+                        p.get("name").and_then(|v| v.as_str())
+                            == Some(matched.project.as_str())
+                    })
                 } else {
                     None
                 };
@@ -1431,9 +1508,30 @@ async fn execute_task(
                     if project_name.is_empty() {
                         if let Some(name) = proj.get("name").and_then(|v| v.as_str()) {
                             project_name = name.to_string();
-                            let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                            let mut updates = serde_json::json!({
                                 "project": &project_name,
-                            })).await;
+                            });
+                            if let Some(matched) = legacy_match.as_ref() {
+                                let mut context = task
+                                    .get("context")
+                                    .cloned()
+                                    .filter(|v| v.is_object())
+                                    .unwrap_or_else(|| serde_json::json!({}));
+                                context["legacy_project_prefix"] =
+                                    serde_json::Value::String(matched.prefix.clone());
+                                context["legacy_project_match_score"] =
+                                    serde_json::Value::Number(serde_json::Number::from(matched.score));
+                                context["legacy_project_inferred_from"] =
+                                    serde_json::Value::String("title_or_description".to_string());
+                                updates["context"] = context;
+                                log::info!(
+                                    "[worker] inferred project '{}' for legacy task {} from '{}'",
+                                    project_name,
+                                    task_id,
+                                    matched.prefix
+                                );
+                            }
+                            let _ = supabase::update_task(config, &task_id, &updates).await;
                         }
                     }
                     if repo_path.is_none() {
