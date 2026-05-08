@@ -1350,6 +1350,13 @@ async fn execute_task(
     let description = task.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let task_type = task.get("task_type").and_then(|v| v.as_str()).unwrap_or("code").to_string();
     let is_research = task_type == "research";
+    let repo_mode = task
+        .get("context")
+        .and_then(|v| v.get("repo_mode"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("project");
+    let flexible_repo_mode = matches!(repo_mode, "none" | "multiple");
+    let uses_single_repo_pipeline = !is_research && !flexible_repo_mode;
 
     // Read settings.json once and cache for both notification prefs and worker rules
     let cached_settings: Option<serde_json::Value> = if let Ok(data_dir) = app.path().app_data_dir() {
@@ -1457,12 +1464,12 @@ async fn execute_task(
 
     let mut repo_path = match repo_path {
         Some(p) => p,
-        None if is_research => {
-            // Research tasks don't need a repo: they read, analyze, and write
-            // a report. Run Claude from the home directory so it can navigate
-            // to any absolute path the description references.
+        None if is_research || flexible_repo_mode => {
+            // Research and explicit no-repo/multiple-repo tasks don't need a
+            // single checkout. Run Claude from home so it can navigate to any
+            // absolute path the prompt references.
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            log::info!("[worker] research task {} has no repo_path; using home dir {}", task_id, home);
+            log::info!("[worker] task {} has repo_mode={} and no repo_path; using home dir {}", task_id, repo_mode, home);
             home
         }
         None => {
@@ -1539,7 +1546,7 @@ async fn execute_task(
     // The worktree lives at ~/samwise/worktrees/<repo>/<short_id> and persists through
     // the PR lifecycle so follow-up tasks can reuse it. A daily sweep removes it once
     // the PR is merged or closed.
-    if !is_research {
+    if uses_single_repo_pipeline {
         // Optional base_branch from the task row — supports stacking on feature branches
         // instead of always basing off the default branch.
         let base_override = task.get("base_branch")
@@ -1589,7 +1596,7 @@ async fn execute_task(
 
     // 3b. Start dev server if no preview_url and repo has a package.json (code tasks only)
     let mut dev_server_handle: Option<dev_server::DevServerHandle> = None;
-    if !is_research && preview_url.is_none() && visual_qa_enabled {
+    if uses_single_repo_pipeline && preview_url.is_none() && visual_qa_enabled {
         let pkg_json = std::path::Path::new(&repo_path).join("package.json");
         if tokio::fs::metadata(&pkg_json).await.is_ok() {
             agent_comment(config, &task_id, "No preview URL set. Starting a dev server...").await;
@@ -1629,7 +1636,7 @@ async fn execute_task(
         .join(&task_id)
         .to_string_lossy()
         .into_owned();
-    if !is_research && visual_qa_enabled {
+    if uses_single_repo_pipeline && visual_qa_enabled {
         if let Some(ref preview) = preview_url {
             let _ = tokio::fs::create_dir_all(&screenshot_dir).await;
             agent_comment(config, &task_id, "Taking before screenshots...").await;
@@ -1647,7 +1654,13 @@ async fn execute_task(
     }
 
     // 5. Run Claude Code CLI
-    let action_label = if is_research { "Running analysis with Claude Code..." } else { "Starting code changes with Claude Code..." };
+    let action_label = if is_research {
+        "Running analysis with Claude Code..."
+    } else if flexible_repo_mode {
+        "Starting flexible repo task with Claude Code..."
+    } else {
+        "Starting code changes with Claude Code..."
+    };
     agent_comment(config, &task_id, action_label).await;
 
     // Build a context-aware prompt with repo info
@@ -1746,6 +1759,16 @@ async fn execute_task(
             "## Task\n**{}**\n\n{}\n\n## Instructions\nThis is a RESEARCH/ANALYSIS task. Do NOT make any code changes, do NOT commit, do NOT create files. Read, analyze, and provide a thorough written report. Be detailed and specific.",
             title, description
         ));
+    } else if flexible_repo_mode {
+        let repo_scope = if repo_mode == "multiple" {
+            "Matt selected Multiple repos. Use the task prompt to identify the repositories or paths involved. If the prompt is not specific enough to identify them, stop and say exactly what repo names or paths you need."
+        } else {
+            "Matt selected No repo. Do not assume a single project checkout. Use the task prompt as the full scope."
+        };
+        prompt_parts.push(format!(
+            "## Task\n**{}**\n\n{}\n\n## Instructions\nThis is a CODE/IMPLEMENTATION task without a single registered repo.\n{}\n\nWork from the home directory. If the prompt names absolute paths or repo names you can locate, you may inspect and edit those files. Do not create a git worktree, do not commit, do not push, and do not open a PR. When finished, report exactly what you changed, what you could not safely change, and what follow-up is needed.",
+            title, description, repo_scope
+        ));
     } else {
         let customer_success_commit_section = if include_customer_success {
             "CS Message:\n\
@@ -1817,7 +1840,7 @@ from Matt, stop without making changes and explain specifically what you need cl
     }
 
     let task_result = match claude_result {
-        Ok(output) if !is_research && !worker_made_changes(&repo_path).await => {
+        Ok(output) if uses_single_repo_pipeline && !worker_made_changes(&repo_path).await => {
             // Code task finished with zero changes (nothing committed, nothing staged,
             // nothing untracked). Distinct from a task failure: Claude read the code and
             // concluded there was nothing to do, or the task was unclear. Route to
@@ -1914,6 +1937,27 @@ from Matt, stop without making changes and explain specifically what you need cl
                 }
                 if let Some(h) = dev_server_handle.take() { let _ = dev_server::kill_dev_server(h).await; }
                 return Ok("Analysis complete".to_string());
+            }
+
+            if flexible_repo_mode {
+                let comment_output = truncate(&output, 10_000);
+                agent_comment(config, &task_id, &format!(
+                    "Flexible repo task complete. I did not run the single-repo PR pipeline for this one.\n\n{}",
+                    comment_output
+                )).await;
+                let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                    "status": "review",
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                })).await;
+                notify_callback(config, &task_id, "review", None, None);
+                if notify_task_completed_code {
+                    send_telegram(config, &format!(
+                        "Finished flexible task on *{}*\\. Ready for review\\.",
+                        escape_markdown_v2(&title)
+                    )).await;
+                }
+                if let Some(h) = dev_server_handle.take() { let _ = dev_server::kill_dev_server(h).await; }
+                return Ok("Flexible repo task complete".to_string());
             }
 
             // Post full output but cap at 10KB to avoid Supabase/UI issues with massive comments
@@ -3050,6 +3094,103 @@ async fn download_telegram_file(
 
 // ── Telegram Inbound ────────────────────────────────────────────────
 
+fn title_from_prompt(prompt: &str, fallback: &str) -> String {
+    let first = prompt
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or(fallback);
+    first.chars().take(120).collect()
+}
+
+fn infer_telegram_task_type(prompt: &str) -> &'static str {
+    let lower = prompt.to_lowercase();
+    if [
+        "research",
+        "investigate",
+        "analyze",
+        "analyse",
+        "audit",
+        "report",
+        "look into",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw))
+    {
+        "research"
+    } else {
+        "code"
+    }
+}
+
+fn backfill_task_project_fields(
+    task: &mut serde_json::Value,
+    projects: &serde_json::Value,
+    project_name: &str,
+) {
+    let Some(arr) = projects.as_array() else {
+        return;
+    };
+    let Some(proj) = arr
+        .iter()
+        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some(project_name))
+    else {
+        return;
+    };
+    for field in &["repo_path", "repo_url", "preview_url"] {
+        if task.get(*field).and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+            if let Some(v) = proj
+                .get(*field)
+                .filter(|v| v.as_str().map(|s| !s.is_empty()).unwrap_or(false))
+            {
+                task[*field] = v.clone();
+            }
+        }
+    }
+}
+
+fn telegram_project_prefix_help(projects: &serde_json::Value) -> String {
+    let examples: Vec<String> = projects
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| p.get("name").and_then(|v| v.as_str()).map(str::to_string))
+                .take(4)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if examples.is_empty() {
+        "Start Telegram tasks with `project: prompt`, but I couldn't load any registered projects to match against.".to_string()
+    } else {
+        format!(
+            "Start Telegram tasks with `project: prompt`.\n\nKnown examples:\n{}",
+            examples
+                .into_iter()
+                .map(|name| format!("- {}: ...", name))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    }
+}
+
+fn telegram_project_no_match_message(prefix: &str, projects: &serde_json::Value) -> String {
+    let suggestions = super::chat::fuzzy_project_suggestions(prefix, projects, 5);
+    if suggestions.is_empty() {
+        format!("I couldn't match `{}` to a registered project. Use `project: prompt` with the project name from Settings.", prefix)
+    } else {
+        format!(
+            "I couldn't confidently match `{}`. Closest projects:\n{}",
+            prefix,
+            suggestions
+                .into_iter()
+                .map(|name| format!("- {}", name))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    }
+}
+
 /// Check for new Telegram messages and process them through Sam's chat logic.
 async fn check_telegram_messages(
     config: &SupabaseConfig,
@@ -3164,11 +3305,23 @@ async fn check_telegram_messages(
     }
 
     // Media branch: any photos/docs in this batch -> create a task directly
-    // with attachments. The combined text (including caption) becomes the
-    // task body. This bypasses the chat flow because a screenshot almost
-    // always means "here's a bug, fix it"; if no project can be resolved, we
-    // pause for project selection before the worker can claim the card.
+    // with attachments. Telegram tasks must start with `project: prompt`; this
+    // keeps screenshots from becoming ambiguous pending-confirmation cards.
     if !pending_file_ids.is_empty() {
+        let body_text = combined_parts.join("\n\n");
+        let projects = supabase::fetch_projects(config).await.ok().unwrap_or(serde_json::json!([]));
+        let Some(prefix) = super::chat::split_project_prefix(&body_text) else {
+            send_telegram_plain(config, &telegram_project_prefix_help(&projects)).await;
+            return;
+        };
+        let Some(project_match) = super::chat::match_project_prefix(&body_text, &projects) else {
+            send_telegram_plain(
+                config,
+                &telegram_project_no_match_message(&prefix.prefix, &projects),
+            ).await;
+            return;
+        };
+
         let mut stored: Vec<serde_json::Value> = Vec::new();
         for (fid, _caption) in &pending_file_ids {
             match download_telegram_file(&token, fid).await {
@@ -3191,16 +3344,11 @@ async fn check_telegram_messages(
             return;
         }
 
-        let body_text = combined_parts.join("\n\n");
-        let (title, description) = if body_text.is_empty() {
-            (
-                format!("Image from Telegram ({} attached)", stored.len()),
-                "Matt sent images from Telegram with no caption. Open the attachments to see the bug/screenshot, then ask for clarification or proceed if the intent is obvious.".to_string(),
-            )
-        } else {
-            let first_line = body_text.lines().next().unwrap_or("Image from Telegram").chars().take(120).collect::<String>();
-            (first_line, body_text.clone())
-        };
+        let title = title_from_prompt(
+            &project_match.prompt,
+            &format!("Image from Telegram ({} attached)", stored.len()),
+        );
+        let description = project_match.prompt.clone();
 
         let mut task_row = serde_json::json!({
             "title": title,
@@ -3210,64 +3358,28 @@ async fn check_telegram_messages(
             "task_type": "code",
             "source": "telegram",
             "attachments": stored,
+            "project": project_match.project.clone(),
+            "context": {
+                "telegram_project_prefix": project_match.prefix.clone(),
+                "telegram_project_match_score": project_match.score,
+                "original_telegram_message": body_text,
+            },
         });
-        let projects = supabase::fetch_projects(config).await.ok();
-        // Best-effort project inference via @mention first, then substring
-        // match on ae_projects.
-        if let Some(projects) = projects.as_ref() {
-            if let Some(arr) = projects.as_array() {
-                let hay = format!("{}\n{}", task_row["title"].as_str().unwrap_or(""), task_row["description"].as_str().unwrap_or("")).to_lowercase();
-                let mentioned = super::chat::extract_project_mentions(&body_text, projects).into_iter().next();
-                let matched = if let Some(name) = mentioned {
-                    Some(name)
-                } else {
-                    let mut names: Vec<&str> = arr.iter()
-                        .filter_map(|p| p.get("name").and_then(|v| v.as_str()))
-                        .collect();
-                    names.sort_by_key(|n| std::cmp::Reverse(n.len()));
-                    names.into_iter().find(|n| hay.contains(&n.to_lowercase())).map(str::to_string)
-                };
-                if let Some(name) = matched {
-                    task_row["project"] = serde_json::Value::String(name.clone());
-                    if let Some(row) = arr.iter().find(|p| p.get("name").and_then(|v| v.as_str()) == Some(&name)) {
-                        for field in &["repo_url", "repo_path", "preview_url"] {
-                            if let Some(v) = row.get(*field).filter(|v| v.as_str().map(|s| !s.is_empty()).unwrap_or(false)) {
-                                task_row[*field] = v.clone();
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let has_project = task_row
-            .get("project")
-            .and_then(|v| v.as_str())
-            .map(|s| !s.trim().is_empty())
-            .unwrap_or(false);
-        task_row["status"] = serde_json::Value::String(if has_project { "queued" } else { "pending_confirmation" }.to_string());
+        backfill_task_project_fields(&mut task_row, &projects, &project_match.project);
 
         match supabase::create_task(config, &task_row).await {
             Ok(_) => {
                 log::info!("[worker] Telegram: created task with {} attachment(s)", stored.len());
-                if has_project {
-                    send_telegram(config, &format!(
-                        "Got it. Queued a task with {} attachment{}.",
-                        stored.len(), if stored.len() == 1 { "" } else { "s" }
-                    )).await;
-                } else {
-                    let mut msg = format!(
-                        "Got the image and attached {} file{}. I need the project before I can start.",
-                        stored.len(), if stored.len() == 1 { "" } else { "s" }
-                    );
-                    if let Some(prompt) = projects.as_ref().and_then(super::chat::build_project_selection_prompt) {
-                        msg.push_str("\n\n");
-                        msg.push_str(&prompt);
-                    } else {
-                        msg.push_str(" Reply with @project-name.");
-                    }
-                    send_telegram_plain(config, &msg).await;
-                }
+                send_telegram_plain(
+                    config,
+                    &format!(
+                        "Got it. Matched `{}` to {} and queued a task with {} attachment{}.",
+                        prefix.prefix,
+                        project_match.project,
+                        stored.len(),
+                        if stored.len() == 1 { "" } else { "s" }
+                    ),
+                ).await;
             }
             Err(e) => log::warn!("[worker] Telegram attachment task insert failed: {}", e),
         }
@@ -3401,10 +3513,38 @@ async fn process_remote_chat_message(config: &SupabaseConfig, message_id: &str, 
         let mut enriched = req.clone();
         if let Some(mentioned) = mentioned_projects.first() {
             enriched["project"] = serde_json::Value::String(mentioned.clone());
-            enriched["status"] = serde_json::Value::String("queued".to_string());
-        } else {
-            enriched["status"] = serde_json::Value::String("pending_confirmation".to_string());
         }
+
+        let has_project_now = enriched.get("project").and_then(|v| v.as_str()).map(|s| !s.is_empty()).unwrap_or(false);
+        if !has_project_now {
+            if let Some(arr) = projects_all.as_array() {
+                let mut names: Vec<String> = arr.iter()
+                    .filter_map(|p| p.get("name").and_then(|v| v.as_str()).map(str::to_string))
+                    .collect();
+                names.sort_by_key(|n| std::cmp::Reverse(n.len()));
+                let haystack = format!(
+                    "{}\n{}\n{}",
+                    user_message.to_lowercase(),
+                    clean_text.to_lowercase(),
+                    raw_response.to_lowercase()
+                );
+                for name in &names {
+                    if haystack.contains(&name.to_lowercase()) {
+                        enriched["project"] = serde_json::Value::String(name.clone());
+                        log::info!("[worker] inferred project '{}' from remote chat response", name);
+                        break;
+                    }
+                }
+            }
+        }
+
+        let has_project = enriched.get("project").and_then(|v| v.as_str()).map(|s| !s.is_empty()).unwrap_or(false);
+        if !has_project {
+            log::warn!("[worker] Skipping remote chat task create: no project resolvable. Sam should ask via reply.");
+            continue;
+        }
+        enriched["status"] = serde_json::Value::String("queued".to_string());
+
         // Backfill repo fields
         let project_name = enriched.get("project").and_then(|v| v.as_str()).unwrap_or("").to_string();
         if !project_name.is_empty() {
@@ -3476,25 +3616,48 @@ async fn process_telegram_message(config: &SupabaseConfig, user_message: &str, m
         return;
     }
 
+    let projects_all = supabase::fetch_projects(config).await.ok().unwrap_or(serde_json::json!([]));
+    let prefix = match chat::split_project_prefix(user_message) {
+        Some(prefix) => prefix,
+        None => {
+            let response_text = telegram_project_prefix_help(&projects_all);
+            let _ = supabase::send_message(config, &serde_json::json!({
+                "role": "agent",
+                "content": &response_text,
+                "conversation_id": supabase::DEFAULT_CONVERSATION_ID,
+            })).await;
+            send_telegram_plain(config, &response_text).await;
+            return;
+        }
+    };
+    let routed_project = match chat::match_project_prefix(user_message, &projects_all) {
+        Some(matched) => matched,
+        None => {
+            let response_text = telegram_project_no_match_message(&prefix.prefix, &projects_all);
+            let _ = supabase::send_message(config, &serde_json::json!({
+                "role": "agent",
+                "content": &response_text,
+                "conversation_id": supabase::DEFAULT_CONVERSATION_ID,
+            })).await;
+            send_telegram_plain(config, &response_text).await;
+            return;
+        }
+    };
+
     // 2. Build context (reuse chat.rs functions)
     let recent_chat = chat::fetch_recent_chat(config).await;
     let project_registry = chat::build_project_registry(config).await;
     let board_ctx = build_simple_board_context(config, machine_name).await;
 
-    // 2b. Extract @ mentions
-    let projects_all = supabase::fetch_projects(config).await.ok().unwrap_or(serde_json::json!([]));
-    let mentioned_projects = chat::extract_project_mentions(user_message, &projects_all);
-
-    // 3. Build prompt (inject @ mention if present)
-    let effective_message = if !mentioned_projects.is_empty() {
-        format!(
-            "{}\n\n[System: Matt explicitly tagged @{}. Use this project for any tasks you create.]",
-            user_message,
-            mentioned_projects.join(", @")
-        )
-    } else {
-        user_message.to_string()
-    };
+    // 3. Build prompt from the text after `project:`, with the fuzzy-routed
+    // project pinned so Claude cannot drift to another repo.
+    let effective_message = format!(
+        "{}\n\n[System: Telegram project prefix \"{}\" fuzzy matched registered project \"{}\" with score {}. Use this exact project for every task you create. The user's task prompt is the text above, after the colon.]",
+        routed_project.prompt,
+        routed_project.prefix,
+        routed_project.project,
+        routed_project.score
+    );
     let prompt = chat::build_system_prompt(&board_ctx, &project_registry, &recent_chat, &effective_message);
 
     // 4. Call Claude Code CLI one-shot
@@ -3516,84 +3679,63 @@ async fn process_telegram_message(config: &SupabaseConfig, user_message: &str, m
     };
 
     // 5. Parse for task creation
-    let (clean_text, task_requests) = chat::parse_chat_response(&raw_response);
+    let (clean_text, mut task_requests) = chat::parse_chat_response(&raw_response);
+    let mut fallback_response: Option<String> = None;
+    if task_requests.is_empty() {
+        task_requests.push(serde_json::json!({
+            "title": title_from_prompt(&routed_project.prompt, "Telegram task"),
+            "description": routed_project.prompt,
+            "priority": "medium",
+            "task_type": infer_telegram_task_type(&routed_project.prompt),
+            "source": "telegram",
+        }));
+        fallback_response = Some(format!(
+            "Queued that for {}. I matched `{}` to the project registry.",
+            routed_project.project, routed_project.prefix
+        ));
+    }
 
-    // 6. Create tasks - enrich with project registry data + handle @ mentions
-    // Mirrors chat.rs: if Sam picked a project (via @mention OR his own
-    // inference), task goes straight to queued. Only gate when we truly
-    // can't resolve a project.
+    // 6. Create tasks - force the routed Telegram project and backfill repo fields.
+    let mut created_any = false;
     for req in &task_requests {
         let mut enriched = req.clone();
 
-        // Override project with @ mention if present
-        if let Some(mentioned) = mentioned_projects.first() {
-            enriched["project"] = serde_json::Value::String(mentioned.clone());
-        }
-
-        // Rescue: Claude sometimes says "queuing up for operly" in the text
-        // but omits the "project" field from the task JSON. Infer from the
-        // user message + Sam's reply text.
-        let has_project_now = enriched.get("project").and_then(|v| v.as_str()).map(|s| !s.is_empty()).unwrap_or(false);
-        if !has_project_now {
-            if let Some(arr) = projects_all.as_array() {
-                let mut names: Vec<String> = arr.iter()
-                    .filter_map(|p| p.get("name").and_then(|v| v.as_str()).map(str::to_string))
-                    .collect();
-                names.sort_by_key(|n| std::cmp::Reverse(n.len()));
-                let haystack = format!(
-                    "{}\n{}\n{}",
-                    user_message.to_lowercase(),
-                    clean_text.to_lowercase(),
-                    raw_response.to_lowercase()
-                );
-                for name in &names {
-                    if haystack.contains(&name.to_lowercase()) {
-                        enriched["project"] = serde_json::Value::String(name.clone());
-                        log::info!("[telegram] inferred project '{}' from conversation text", name);
-                        break;
-                    }
-                }
-            }
-        }
-
-        let has_project = enriched.get("project").and_then(|v| v.as_str()).map(|s| !s.is_empty()).unwrap_or(false);
-        if !has_project {
-            log::warn!("[telegram] Skipping task create: no project resolvable. Sam should ask via reply.");
-            continue;
-        }
+        enriched["project"] = serde_json::Value::String(routed_project.project.clone());
         enriched["status"] = serde_json::Value::String("queued".to_string());
+        let mut context = enriched
+            .get("context")
+            .cloned()
+            .filter(|v| v.is_object())
+            .unwrap_or_else(|| serde_json::json!({}));
+        context["telegram_project_prefix"] =
+            serde_json::Value::String(routed_project.prefix.clone());
+        context["telegram_project_match_score"] =
+            serde_json::Value::Number(serde_json::Number::from(routed_project.score));
+        context["original_telegram_message"] = serde_json::Value::String(user_message.to_string());
+        enriched["context"] = context;
 
-        // Backfill repo fields
-        let project_name = enriched.get("project").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        if !project_name.is_empty() {
-            if let Some(arr) = projects_all.as_array() {
-                if let Some(proj) = arr.iter().find(|p| p.get("name").and_then(|v| v.as_str()) == Some(&project_name)) {
-                    if enriched.get("repo_path").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
-                        if let Some(v) = proj.get("repo_path").filter(|v| v.as_str().map(|s| !s.is_empty()).unwrap_or(false)) {
-                            enriched["repo_path"] = v.clone();
-                        }
-                    }
-                    if enriched.get("repo_url").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
-                        if let Some(v) = proj.get("repo_url").filter(|v| v.as_str().map(|s| !s.is_empty()).unwrap_or(false)) {
-                            enriched["repo_url"] = v.clone();
-                        }
-                    }
-                    if enriched.get("preview_url").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
-                        if let Some(v) = proj.get("preview_url").filter(|v| v.as_str().map(|s| !s.is_empty()).unwrap_or(false)) {
-                            enriched["preview_url"] = v.clone();
-                        }
-                    }
-                }
-            }
-        }
+        backfill_task_project_fields(&mut enriched, &projects_all, &routed_project.project);
 
         if let Err(e) = supabase::create_task(config, &enriched).await {
             log::warn!("[worker] Failed to create task from Telegram: {}", e);
+        } else {
+            created_any = true;
         }
     }
 
     // 7. Save Sam's response to ae_messages
-    let response_text = if clean_text.trim().is_empty() {
+    let response_text = if created_any {
+        fallback_response.unwrap_or_else(|| {
+            if clean_text.trim().is_empty() {
+                format!(
+                    "Queued that for {}. I matched `{}` to the project registry.",
+                    routed_project.project, routed_project.prefix
+                )
+            } else {
+                clean_text.trim().to_string()
+            }
+        })
+    } else if clean_text.trim().is_empty() {
         raw_response.trim().to_string()
     } else {
         clean_text.trim().to_string()
@@ -3607,22 +3749,6 @@ async fn process_telegram_message(config: &SupabaseConfig, user_message: &str, m
 
     // 7b. Send response back via Telegram first
     send_telegram_plain(config, &response_text).await;
-
-    // 7c. Only prompt for project when Sam truly couldn't pick one. If any
-    // task_request already has a project (from @mention or Sam's own
-    // inference), trust it — Sam mentions the choice in his reply already.
-    let any_task_unresolved = task_requests.iter().any(|r| {
-        r.get("project").and_then(|v| v.as_str()).map(|s| s.is_empty()).unwrap_or(true)
-    });
-    if any_task_unresolved && mentioned_projects.is_empty() {
-        if let Some(arr) = projects_all.as_array() {
-            if !arr.is_empty() {
-                if let Some(list) = chat::build_project_selection_prompt(&projects_all) {
-                    send_telegram_plain(config, &list).await;
-                }
-            }
-        }
-    }
 }
 
 /// Build board context without WorkerState (for Telegram handler in worker loop)

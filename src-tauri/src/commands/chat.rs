@@ -702,6 +702,193 @@ pub fn extract_project_mentions(message: &str, projects: &Value) -> Vec<String> 
     matched
 }
 
+#[derive(Clone, Debug)]
+pub struct ProjectPrefix {
+    pub prefix: String,
+    pub prompt: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProjectPrefixMatch {
+    pub prefix: String,
+    pub prompt: String,
+    pub project: String,
+    pub score: u32,
+}
+
+/// Parse Telegram's preferred `project: prompt` convention. The prefix must be
+/// on the first line so URLs and later prompt text don't accidentally route a
+/// task.
+pub fn split_project_prefix(message: &str) -> Option<ProjectPrefix> {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let first_line_end = trimmed.find('\n').unwrap_or(trimmed.len());
+    let first_line = &trimmed[..first_line_end];
+    let colon = first_line.find(':')?;
+    let prefix = first_line[..colon].trim();
+    let prompt = trimmed[colon + 1..].trim();
+
+    if prefix.is_empty()
+        || prompt.is_empty()
+        || prefix.len() > 80
+        || prefix.eq_ignore_ascii_case("http")
+        || prefix.eq_ignore_ascii_case("https")
+    {
+        return None;
+    }
+
+    Some(ProjectPrefix {
+        prefix: prefix.to_string(),
+        prompt: prompt.to_string(),
+    })
+}
+
+pub fn match_project_prefix(message: &str, projects: &Value) -> Option<ProjectPrefixMatch> {
+    let parsed = split_project_prefix(message)?;
+    let (project, score) = fuzzy_match_project_name(&parsed.prefix, projects)?;
+    Some(ProjectPrefixMatch {
+        prefix: parsed.prefix,
+        prompt: parsed.prompt,
+        project,
+        score,
+    })
+}
+
+pub fn fuzzy_project_suggestions(input: &str, projects: &Value, limit: usize) -> Vec<String> {
+    let Some(arr) = projects.as_array() else {
+        return Vec::new();
+    };
+    let mut scored: Vec<(String, u32)> = arr.iter()
+        .filter_map(|p| {
+            p.get("name")
+                .and_then(|v| v.as_str())
+                .map(|name| (name.to_string(), project_match_score(input, name)))
+        })
+        .filter(|(_, score)| *score >= 35)
+        .collect();
+    scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    scored.into_iter().take(limit).map(|(name, _)| name).collect()
+}
+
+fn fuzzy_match_project_name(input: &str, projects: &Value) -> Option<(String, u32)> {
+    let arr = projects.as_array()?;
+    let mut scored: Vec<(String, u32)> = arr.iter()
+        .filter_map(|p| {
+            p.get("name")
+                .and_then(|v| v.as_str())
+                .map(|name| (name.to_string(), project_match_score(input, name)))
+        })
+        .filter(|(_, score)| *score >= 65)
+        .collect();
+    scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let best = scored.first()?.clone();
+    let second_score = scored.get(1).map(|(_, score)| *score).unwrap_or(0);
+    if best.1 >= 94 || best.1.saturating_sub(second_score) >= 4 {
+        Some(best)
+    } else {
+        None
+    }
+}
+
+fn project_match_score(input: &str, name: &str) -> u32 {
+    let query_compact = compact_key(input);
+    let name_compact = compact_key(name);
+    if query_compact.is_empty() || name_compact.is_empty() {
+        return 0;
+    }
+    if query_compact == name_compact {
+        return 100;
+    }
+    if name_compact.starts_with(&query_compact) && query_compact.len() >= 4 {
+        return 92;
+    }
+    if query_compact.starts_with(&name_compact) && name_compact.len() >= 4 {
+        return 90;
+    }
+    if name_compact.contains(&query_compact) && query_compact.len() >= 4 {
+        return 86;
+    }
+
+    let query_tokens = normalized_tokens(input);
+    let name_tokens = normalized_tokens(name);
+    if query_tokens.is_empty() || name_tokens.is_empty() {
+        return 0;
+    }
+
+    let matched_query = query_tokens
+        .iter()
+        .filter(|q| name_tokens.iter().any(|n| token_matches(q, n)))
+        .count();
+    let matched_name = name_tokens
+        .iter()
+        .filter(|n| query_tokens.iter().any(|q| token_matches(q, n)))
+        .count();
+
+    let query_coverage = matched_query as f32 / query_tokens.len() as f32;
+    let name_coverage = matched_name as f32 / name_tokens.len() as f32;
+    let mut score = (query_coverage * 72.0 + name_coverage * 20.0).round() as u32;
+
+    if matched_query == query_tokens.len() && query_tokens.len() > 1 {
+        score += 6;
+    }
+    score.min(99)
+}
+
+fn compact_key(input: &str) -> String {
+    input.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+fn normalized_tokens(input: &str) -> Vec<String> {
+    input.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter_map(|part| {
+            let token = part.trim().to_lowercase();
+            if token.is_empty() { None } else { Some(token) }
+        })
+        .collect()
+}
+
+fn token_matches(query: &str, candidate: &str) -> bool {
+    query == candidate
+        || (query.len() >= 3 && candidate.starts_with(query))
+        || (candidate.len() >= 3 && query.starts_with(candidate))
+        || levenshtein_bounded(query, candidate, typo_threshold(query, candidate))
+}
+
+fn typo_threshold(a: &str, b: &str) -> usize {
+    let min_len = a.len().min(b.len());
+    if min_len <= 4 { 1 } else { 2 }
+}
+
+fn levenshtein_bounded(a: &str, b: &str, max_distance: usize) -> bool {
+    if a.len().abs_diff(b.len()) > max_distance {
+        return false;
+    }
+
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0; b.len() + 1];
+    for (i, ca) in a.bytes().enumerate() {
+        cur[0] = i + 1;
+        let mut row_min = cur[0];
+        for (j, cb) in b.bytes().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+            row_min = row_min.min(cur[j + 1]);
+        }
+        if row_min > max_distance {
+            return false;
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()] <= max_distance
+}
+
 /// Build the numbered project prompt used when a task is waiting for Matt to
 /// pick a repo. The order matches `fetch_projects`, so number replies can use
 /// the same array directly.
@@ -718,7 +905,7 @@ pub fn build_project_selection_prompt(projects: &Value) -> Option<String> {
             list.push_str(&format!("{}. {}\n", i + 1, name));
         }
     }
-    list.push_str("\nReply with the number.");
+    list.push_str("\nReply with the number, `no repo`, or `multiple repos`.");
     Some(list)
 }
 
@@ -772,8 +959,21 @@ pub async fn handle_pending_confirmation(
     config: &supabase::SupabaseConfig,
     user_message: &str,
 ) -> Option<String> {
+    let lower_message = user_message.trim().to_lowercase();
+    let explicit_repo_mode = match lower_message.as_str() {
+        "no repo" | "no repository" | "none" => Some(("none", "No repo")),
+        "multiple repos" | "multiple repo" | "multi repo" | "multi-repo" | "many repos" => {
+            Some(("multiple", "Multiple repos"))
+        }
+        _ => None,
+    };
+
     // Only check if the message looks like a confirmation
-    let confirmation = is_confirmation(user_message)?;
+    let confirmation = if explicit_repo_mode.is_some() {
+        true
+    } else {
+        is_confirmation(user_message)?
+    };
 
     // Fetch pending tasks
     let pending_tasks = match supabase::fetch_tasks(config, Some("pending_confirmation")).await {
@@ -814,7 +1014,7 @@ pub async fn handle_pending_confirmation(
     if task_id.is_empty() { return None; }
 
     let response = if confirmation {
-        let lower = user_message.trim().to_lowercase();
+        let lower = lower_message;
         if let Ok(num) = lower.parse::<usize>() {
             // Number selection: fetch projects and match
             let projects = supabase::fetch_projects(config).await.ok();
@@ -838,6 +1038,43 @@ pub async fn handle_pending_confirmation(
                 let _ = supabase::update_task_if_status(config, task_id, "pending_confirmation", &serde_json::json!({"status": "queued"})).await;
                 format!("Got it, queued up \"{}\".", task_title)
             }
+        } else if let Some((mode, label)) = explicit_repo_mode {
+            let mut context = most_recent
+                .get("context")
+                .cloned()
+                .filter(|v| v.is_object())
+                .unwrap_or_else(|| serde_json::json!({}));
+            context["repo_mode"] = serde_json::Value::String(mode.to_string());
+            context["repo_label"] = serde_json::Value::String(label.to_string());
+            if context
+                .get("original_prompt")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .is_empty()
+            {
+                if let Some(desc) = most_recent
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    context["original_prompt"] = serde_json::Value::String(desc.to_string());
+                }
+            }
+            let _ = supabase::update_task_if_status(
+                config,
+                task_id,
+                "pending_confirmation",
+                &serde_json::json!({
+                    "status": "queued",
+                    "project": serde_json::Value::Null,
+                    "repo_path": serde_json::Value::Null,
+                    "repo_url": serde_json::Value::Null,
+                    "preview_url": serde_json::Value::Null,
+                    "context": context,
+                }),
+            )
+            .await;
+            format!("Got it. Queued \"{}\" with {} selected.", task_title, label)
         } else if needs_project {
             let projects = supabase::fetch_projects(config).await.ok();
             if let Some(prompt) = projects.as_ref().and_then(build_project_selection_prompt) {

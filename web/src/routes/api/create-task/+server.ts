@@ -1,12 +1,31 @@
 import { json, error } from '@sveltejs/kit';
-import { env } from '$env/dynamic/private';
+import { getSupabaseAdmin } from '$lib/server/supabase-admin';
 import type { RequestHandler } from './$types';
 
-export const POST: RequestHandler = async ({ request }) => {
-  const url = env.TASK_WEBHOOK_URL;
-  const secret = env.TASK_WEBHOOK_SECRET;
-  if (!url || !secret) throw error(500, 'webhook not configured');
+type RepoMode = 'project' | 'none' | 'multiple';
+type TaskType = 'code' | 'research';
 
+function cleanString(value: unknown) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function titleFromPrompt(prompt: string) {
+  const first = prompt
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .find(Boolean) || 'New Samwise task';
+  return first.length > 90 ? `${first.slice(0, 87).trimEnd()}...` : first;
+}
+
+function repoModeFrom(value: unknown): RepoMode {
+  return value === 'none' || value === 'multiple' ? value : 'project';
+}
+
+function taskTypeFrom(value: unknown): TaskType {
+  return value === 'research' ? 'research' : 'code';
+}
+
+export const POST: RequestHandler = async ({ request }) => {
   let body: unknown;
   try {
     body = await request.json();
@@ -15,33 +34,81 @@ export const POST: RequestHandler = async ({ request }) => {
   }
 
   const payload = body as Record<string, unknown>;
-  const title = typeof payload.title === 'string' ? payload.title.trim() : '';
-  if (!title) throw error(400, 'title required');
+  const prompt = cleanString(payload.prompt) || cleanString(payload.description) || cleanString(payload.title);
+  if (!prompt) throw error(400, 'prompt required');
 
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-webhook-secret': secret
-    },
-    body: JSON.stringify({
-      title,
-      description: typeof payload.description === 'string' ? payload.description : '',
-      project: typeof payload.project === 'string' && payload.project ? payload.project : undefined,
-      priority: payload.priority ?? 'medium',
-      task_type: payload.task_type ?? 'code',
-      source: 'web-board',
-      base_branch: typeof payload.base_branch === 'string' && payload.base_branch ? payload.base_branch : undefined,
-      attachments: Array.isArray(payload.attachments) ? payload.attachments : undefined
-    })
-  });
+  const repoMode = repoModeFrom(payload.repo_mode);
+  const taskType = taskTypeFrom(payload.task_type);
+  const supabase = getSupabaseAdmin();
 
-  const text = await res.text();
-  let data: unknown = text;
-  try { data = JSON.parse(text); } catch { /* leave as text */ }
+  let projectName: string | null = null;
+  let repoUrl: string | null = null;
+  let repoPath: string | null = null;
+  let previewUrl: string | null = null;
 
-  if (!res.ok) {
-    return json({ ok: false, status: res.status, error: data }, { status: res.status });
+  if (repoMode === 'project') {
+    const projectId = cleanString(payload.project_id);
+    const projectNameInput = cleanString(payload.project);
+
+    let query = supabase
+      .from('ae_projects')
+      .select('id,name,repo_url,repo_path,preview_url')
+      .limit(1);
+
+    if (projectId) {
+      query = query.eq('id', projectId);
+    } else if (projectNameInput) {
+      query = query.eq('name', projectNameInput);
+    } else {
+      throw error(400, 'repo required');
+    }
+
+    const { data, error: projectError } = await query.maybeSingle();
+    if (projectError) throw error(500, projectError.message);
+    if (!data) throw error(400, 'selected repo not found');
+
+    projectName = data.name ?? null;
+    repoUrl = data.repo_url ?? null;
+    repoPath = data.repo_path ?? null;
+    previewUrl = data.preview_url ?? null;
   }
+
+  const context: Record<string, unknown> = {
+    repo_mode: repoMode,
+    original_prompt: prompt,
+  };
+  if (repoMode === 'none') context.repo_label = 'No repo';
+  if (repoMode === 'multiple') context.repo_label = 'Multiple repos';
+  if (repoMode === 'project') context.project_id = cleanString(payload.project_id) || undefined;
+
+  const attachments = Array.isArray(payload.attachments) ? payload.attachments : undefined;
+
+  const row: Record<string, unknown> = {
+    title: cleanString(payload.title) || titleFromPrompt(prompt),
+    description: prompt,
+    status: 'queued',
+    priority: 'medium',
+    task_type: taskType,
+    source: 'web-board',
+    project: projectName,
+    repo_url: repoUrl,
+    repo_path: repoPath,
+    preview_url: previewUrl,
+    base_branch: cleanString(payload.base_branch) || null,
+    context,
+  };
+
+  if (attachments && attachments.length > 0) row.attachments = attachments;
+
+  const { data, error: insertError } = await supabase
+    .from('ae_tasks')
+    .insert(row)
+    .select()
+    .single();
+
+  if (insertError) {
+    return json({ ok: false, error: insertError.message }, { status: 500 });
+  }
+
   return json({ ok: true, result: data });
 };

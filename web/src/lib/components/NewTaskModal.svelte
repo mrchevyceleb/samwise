@@ -1,16 +1,42 @@
 <script lang="ts">
-  type Uploaded = { url: string; name: string; mime: string };
-  let { projects, onClose }: { projects: string[]; onClose: () => void } = $props();
+  import type { AeProject } from '$lib/types';
 
-  let title = $state('');
-  let description = $state('');
-  let project = $state('');
-  let priority = $state<'critical' | 'high' | 'medium' | 'low'>('medium');
+  type Uploaded = { url: string; name: string; mime: string };
+  type RepoMode = 'project' | 'none' | 'multiple';
+
+  let { projects, onClose }: { projects: AeProject[]; onClose: () => void } = $props();
+
+  let prompt = $state('');
+  let repoMode = $state<RepoMode>('project');
+  let selectedProjectId = $state('');
   let task_type = $state<'code' | 'research'>('code');
   let submitting = $state(false);
   let errorMsg = $state<string | null>(null);
   let uploading = $state(0);
   let attachments = $state<Uploaded[]>([]);
+
+  let canSubmit = $derived(
+    prompt.trim().length > 0 &&
+      uploading === 0 &&
+      !submitting &&
+      (repoMode !== 'project' || selectedProjectId.length > 0)
+  );
+
+  let groupedProjects = $derived.by(() => {
+    const groups = new Map<string, AeProject[]>();
+    for (const project of projects) {
+      const key = project.client || 'Uncategorized';
+      const list = groups.get(key) ?? [];
+      list.push(project);
+      groups.set(key, list);
+    }
+    return Array.from(groups.entries());
+  });
+
+  function setRepoMode(mode: RepoMode) {
+    repoMode = mode;
+    if (mode !== 'project') selectedProjectId = '';
+  }
 
   async function uploadFiles(files: FileList | null) {
     if (!files || files.length === 0) return;
@@ -44,7 +70,7 @@
 
   async function submit(e: SubmitEvent) {
     e.preventDefault();
-    if (!title.trim() || submitting || uploading > 0) return;
+    if (!canSubmit) return;
     submitting = true;
     errorMsg = null;
     try {
@@ -52,10 +78,9 @@
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
-          title: title.trim(),
-          description: description.trim(),
-          project: project || undefined,
-          priority,
+          prompt: prompt.trim(),
+          repo_mode: repoMode,
+          project_id: repoMode === 'project' ? selectedProjectId : undefined,
           task_type,
           attachments: attachments.map((a) => ({ url: a.url, name: a.name, mime: a.mime }))
         })
@@ -72,6 +97,17 @@
       submitting = false;
     }
   }
+
+  const repoModes: { v: RepoMode; l: string }[] = [
+    { v: 'project', l: 'Single repo' },
+    { v: 'none', l: 'No repo' },
+    { v: 'multiple', l: 'Multiple repos' }
+  ];
+
+  const taskModes: { v: 'code' | 'research'; l: string }[] = [
+    { v: 'code', l: 'Coding' },
+    { v: 'research', l: 'Research' }
+  ];
 </script>
 
 <div
@@ -83,73 +119,84 @@
   aria-modal="true"
   tabindex="-1"
 >
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <form
     onsubmit={submit}
     onclick={(e) => e.stopPropagation()}
-    class="w-full sm:max-w-lg rounded-t-3xl sm:rounded-3xl bg-slate-900 border border-white/10 shadow-2xl p-4 space-y-3"
+    class="w-full sm:max-w-xl rounded-t-2xl sm:rounded-2xl bg-slate-900 border border-white/10 shadow-2xl p-4 space-y-4"
   >
     <div class="flex items-center justify-between">
-      <h2 class="text-lg font-semibold text-slate-100 flex items-center gap-2">
-        <span class="bob">🌱</span> New task for Sam
-      </h2>
-      <button type="button" onclick={onClose} class="rounded-full h-8 w-8 grid place-items-center bg-white/10 hover:bg-white/20 text-slate-200" aria-label="close">✕</button>
+      <div>
+        <h2 class="text-lg font-semibold text-slate-100">New task for Sam</h2>
+      </div>
+      <button type="button" onclick={onClose} class="rounded-full h-8 w-8 grid place-items-center bg-white/10 hover:bg-white/20 text-slate-200" aria-label="close">x</button>
     </div>
 
-    <label class="block text-xs text-slate-400">
-      Title
-      <input
-        type="text"
-        bind:value={title}
-        required
-        maxlength="200"
-        placeholder="Fix login redirect on Safari"
-        class="mt-1 w-full rounded-lg bg-white/5 border border-white/10 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-white/30"
-      />
-    </label>
+    <fieldset class="space-y-2">
+      <legend class="text-xs font-semibold text-slate-400">Repo</legend>
+      <div class="grid grid-cols-3 gap-2">
+        {#each repoModes as opt}
+          <button
+            type="button"
+            onclick={() => setRepoMode(opt.v)}
+            class="rounded-lg border px-3 py-2 text-center text-sm font-semibold transition {repoMode === opt.v ? 'border-emerald-400/60 bg-emerald-400/10 text-emerald-100' : 'border-white/10 bg-white/5 text-slate-300 hover:bg-white/10'}"
+          >
+            {opt.l}
+          </button>
+        {/each}
+      </div>
+    </fieldset>
 
-    <label class="block text-xs text-slate-400">
-      Description
+    {#if repoMode === 'project'}
+      <label class="block text-xs font-semibold text-slate-400">
+        Select repo
+        <select bind:value={selectedProjectId} class="mt-1 w-full rounded-lg bg-white/5 border border-white/10 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-white/30">
+          <option value="">{projects.length === 0 ? 'No projects configured' : 'Choose a project...'}</option>
+          {#each groupedProjects as [client, clientProjects]}
+            <optgroup label={client}>
+              {#each clientProjects as p}
+                <option value={p.id}>{p.name}</option>
+              {/each}
+            </optgroup>
+          {/each}
+        </select>
+      </label>
+    {/if}
+
+    <label class="block text-xs font-semibold text-slate-400">
+      Prompt
       <textarea
-        bind:value={description}
-        rows="5"
-        placeholder="What should Sam do? Include context, acceptance criteria, links…"
-        class="mt-1 w-full rounded-lg bg-white/5 border border-white/10 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-white/30 resize-y"
+        bind:value={prompt}
+        rows="7"
+        required
+        placeholder={repoMode === 'multiple' ? 'Name the repos and describe the work Sam should coordinate across them.' : 'Describe what Sam should build, fix, investigate, or change.'}
+        class="mt-1 w-full rounded-lg bg-white/5 border border-white/10 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-white/30 resize-y leading-relaxed"
       ></textarea>
     </label>
 
-    <div class="grid grid-cols-2 gap-2">
-      <label class="block text-xs text-slate-400">
-        Project
-        <input
-          list="project-list"
-          bind:value={project}
-          placeholder="optional"
-          class="mt-1 w-full rounded-lg bg-white/5 border border-white/10 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-white/30"
-        />
-        <datalist id="project-list">
-          {#each projects as p}<option value={p}></option>{/each}
-        </datalist>
-      </label>
-
-      <label class="block text-xs text-slate-400">
-        Priority
-        <select bind:value={priority} class="mt-1 w-full rounded-lg bg-white/5 border border-white/10 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-white/30">
-          <option value="critical">Critical</option>
-          <option value="high">High</option>
-          <option value="medium">Medium</option>
-          <option value="low">Low</option>
-        </select>
-      </label>
-    </div>
+    <fieldset class="space-y-2">
+      <legend class="text-xs font-semibold text-slate-400">Mode</legend>
+      <div class="grid grid-cols-2 gap-2">
+        {#each taskModes as opt}
+          <button
+            type="button"
+            onclick={() => (task_type = opt.v)}
+            class="rounded-lg border px-3 py-2 text-center text-sm font-semibold transition {task_type === opt.v ? 'border-sky-400/60 bg-sky-400/10 text-sky-100' : 'border-white/10 bg-white/5 text-slate-300 hover:bg-white/10'}"
+          >
+            {opt.l}
+          </button>
+        {/each}
+      </div>
+    </fieldset>
 
     <div>
-      <label class="block text-xs text-slate-400 mb-1">
-        Attachments (images, PDFs — helps Sam see the bug)
-      </label>
+      <div class="block text-xs font-semibold text-slate-400 mb-1">
+        Attachments
+      </div>
       <label class="flex items-center gap-2 rounded-lg border border-dashed border-white/15 bg-white/5 px-3 py-3 text-sm text-slate-300 hover:bg-white/10 cursor-pointer transition">
-        <span class="text-lg">📎</span>
         <span class="flex-1">
-          {uploading > 0 ? `Uploading ${uploading}…` : 'Tap to attach files'}
+          {uploading > 0 ? `Uploading ${uploading}...` : 'Tap to attach images or PDFs'}
         </span>
         <input
           type="file"
@@ -175,22 +222,12 @@
                 onclick={() => removeAttachment(a.url)}
                 aria-label="remove"
                 class="absolute top-1 right-1 h-6 w-6 grid place-items-center rounded-full bg-black/70 text-slate-100 text-xs hover:bg-rose-500/80"
-              >✕</button>
+              >x</button>
             </li>
           {/each}
         </ul>
       {/if}
     </div>
-
-    <fieldset class="flex gap-2 text-xs text-slate-400">
-      <legend class="sr-only">Task type</legend>
-      {#each [{ v: 'code', l: '💻 Code' }, { v: 'research', l: '🔍 Research' }] as opt}
-        <label class="flex-1 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-center cursor-pointer hover:bg-white/10 {task_type === opt.v ? 'ring-2 ring-emerald-400/60 text-emerald-200' : 'text-slate-300'}">
-          <input type="radio" name="task_type" value={opt.v} bind:group={task_type} class="sr-only" />
-          {opt.l}
-        </label>
-      {/each}
-    </fieldset>
 
     {#if errorMsg}
       <div class="rounded-lg border border-rose-500/40 bg-rose-500/10 p-2 text-xs text-rose-100">{errorMsg}</div>
@@ -204,9 +241,9 @@
       >Cancel</button>
       <button
         type="submit"
-        disabled={submitting || uploading > 0 || !title.trim()}
+        disabled={!canSubmit}
         class="flex-1 rounded-lg bg-emerald-500/90 hover:bg-emerald-400 disabled:opacity-50 disabled:cursor-not-allowed px-3 py-2 text-sm font-medium text-slate-900 transition"
-      >{submitting ? 'Sending…' : uploading > 0 ? 'Uploading…' : '🚀 Queue it'}</button>
+      >{submitting ? 'Queuing...' : uploading > 0 ? 'Uploading...' : 'Queue it'}</button>
     </div>
   </form>
 </div>

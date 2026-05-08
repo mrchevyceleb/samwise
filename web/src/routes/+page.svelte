@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import { tasksStore } from '$lib/stores/tasks.svelte';
-  import { STATUSES, type AeTask } from '$lib/types';
+  import { STATUSES, type AeTask, type AeProject } from '$lib/types';
   import KanbanColumn from '$lib/components/KanbanColumn.svelte';
   import TaskDetail from '$lib/components/TaskDetail.svelte';
   import NewTaskModal from '$lib/components/NewTaskModal.svelte';
@@ -12,6 +12,7 @@
   let showSchedules = $state(false);
   let query = $state('');
   let projectFilter = $state('');
+  let projectRegistry = $state<AeProject[]>([]);
   let buildVersion = $state('');
   let versionTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -35,6 +36,7 @@
 
   onMount(() => {
     tasksStore.init();
+    fetchProjectRegistry();
     checkBuildVersion(false);
     versionTimer = setInterval(() => checkBuildVersion(true), 60_000);
   });
@@ -45,7 +47,7 @@
   });
 
   let tasks = $derived(tasksStore.tasks);
-  let projects = $derived(
+  let boardProjects = $derived(
     Array.from(new Set(tasks.map((t) => t.project).filter(Boolean))).sort() as string[]
   );
   let buildLabel = $derived(buildVersion ? buildVersion.slice(-6) : '');
@@ -77,6 +79,17 @@
     const fresh = tasksStore.tasks.find((t) => t.id === selectedId);
     if (fresh && fresh !== selected) selected = fresh;
   });
+
+  async function fetchProjectRegistry() {
+    try {
+      const res = await fetch('/api/task-projects');
+      if (!res.ok) throw new Error(await res.text());
+      projectRegistry = (await res.json()) as AeProject[];
+    } catch (e) {
+      console.warn('[projects] fetch registry failed', e);
+      projectRegistry = [];
+    }
+  }
 </script>
 
 <svelte:head><title>Samwise Board</title></svelte:head>
@@ -122,7 +135,7 @@
           class="rounded-lg bg-white/5 border border-white/10 px-2 py-1.5 text-sm text-slate-100 focus:outline-none focus:border-white/30"
         >
           <option value="">All</option>
-          {#each projects as p}
+          {#each boardProjects as p}
             <option value={p}>{p}</option>
           {/each}
         </select>
@@ -161,7 +174,7 @@
 {/if}
 
 {#if showNew}
-  <NewTaskModal {projects} onClose={() => (showNew = false)} />
+  <NewTaskModal projects={projectRegistry} onClose={() => (showNew = false)} />
 {/if}
 
 {#if showSchedules}
