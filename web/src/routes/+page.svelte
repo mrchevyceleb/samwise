@@ -96,7 +96,7 @@
 
 <main class="min-h-[100dvh] flex flex-col">
   <header class="sticky top-0 z-30 px-3 sm:px-6 py-3 border-b border-white/10 bg-slate-950/70 backdrop-blur">
-    <div class="flex items-center gap-3">
+    <div class="flex flex-wrap items-center gap-2 sm:gap-3">
       <div class="flex items-center gap-2">
         <span class="text-2xl bob">🌱</span>
         <h1 class="text-lg sm:text-xl font-semibold text-slate-100">Samwise</h1>
@@ -124,22 +124,23 @@
         >
           ⏱ Schedules
         </button>
-        <input
-          type="search"
-          bind:value={query}
-          placeholder="Search…"
-          class="w-32 sm:w-56 rounded-lg bg-white/5 border border-white/10 px-3 py-1.5 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-white/30"
-        />
-        <select
-          bind:value={projectFilter}
-          class="rounded-lg bg-white/5 border border-white/10 px-2 py-1.5 text-sm text-slate-100 focus:outline-none focus:border-white/30"
-        >
-          <option value="">All</option>
-          {#each boardProjects as p}
-            <option value={p}>{p}</option>
-          {/each}
-        </select>
       </div>
+      <div class="basis-full sm:hidden" aria-hidden="true"></div>
+      <input
+        type="search"
+        bind:value={query}
+        placeholder="Search…"
+        class="flex-1 min-w-0 sm:flex-none sm:w-56 rounded-lg bg-white/5 border border-white/10 px-3 py-1.5 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-white/30"
+      />
+      <select
+        bind:value={projectFilter}
+        class="shrink-0 rounded-lg bg-white/5 border border-white/10 px-2 py-1.5 text-sm text-slate-100 focus:outline-none focus:border-white/30"
+      >
+        <option value="">All</option>
+        {#each boardProjects as p}
+          <option value={p}>{p}</option>
+        {/each}
+      </select>
     </div>
   </header>
 
