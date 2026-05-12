@@ -2670,6 +2670,13 @@ async fn run_build_check(repo_path: &str) -> Result<Option<String>, (String, Str
         if !has_build {
             return Ok(None);
         }
+        // Worktrees don't inherit node_modules from the main checkout. Without this,
+        // `npm run build` exits with "sh: tsc: command not found" the first time we
+        // build a fresh worktree, codex-fix can't recover (the fault is environment,
+        // not source), and the task lands in Failed for the wrong reason.
+        if let Err(e) = dev_server::ensure_deps_installed(repo_path).await {
+            return Err(("npm install".to_string(), format!("npm install failed before build: {}", e)));
+        }
         ("npm run build".to_string(), "npm", vec!["run", "build"])
     } else if tokio::fs::metadata(&cargo).await.is_ok() {
         ("cargo build".to_string(), "cargo", vec!["build"])
