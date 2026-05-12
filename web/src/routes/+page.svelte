@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import { tasksStore } from '$lib/stores/tasks.svelte';
+  import { supabase } from '$lib/supabase';
   import { STATUSES, type AeTask, type AeProject } from '$lib/types';
   import KanbanColumn from '$lib/components/KanbanColumn.svelte';
   import TaskDetail from '$lib/components/TaskDetail.svelte';
@@ -15,6 +16,23 @@
   let projectRegistry = $state<AeProject[]>([]);
   let buildVersion = $state('');
   let versionTimer: ReturnType<typeof setInterval> | null = null;
+  let refreshing = $state(false);
+
+  async function refreshAll() {
+    refreshing = true;
+    try {
+      await Promise.all([tasksStore.refresh(), fetchProjectRegistry()]);
+      await checkBuildVersion(true);
+    } finally {
+      refreshing = false;
+    }
+  }
+
+  function onVisibility() {
+    if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+      void refreshAll();
+    }
+  }
 
   async function checkBuildVersion(reloadOnChange: boolean) {
     try {
@@ -39,11 +57,17 @@
     fetchProjectRegistry();
     checkBuildVersion(false);
     versionTimer = setInterval(() => checkBuildVersion(true), 60_000);
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', onVisibility);
+    }
   });
 
   onDestroy(() => {
     tasksStore.destroy();
     if (versionTimer) clearInterval(versionTimer);
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', onVisibility);
+    }
   });
 
   let tasks = $derived(tasksStore.tasks);
@@ -82,9 +106,13 @@
 
   async function fetchProjectRegistry() {
     try {
-      const res = await fetch('/api/task-projects');
-      if (!res.ok) throw new Error(await res.text());
-      projectRegistry = (await res.json()) as AeProject[];
+      const { data, error } = await supabase
+        .from('ae_projects')
+        .select('id,name,repo_url,repo_path,preview_url,client,deploy_method,dev_command,created_at')
+        .order('client', { ascending: true })
+        .order('name', { ascending: true });
+      if (error) throw error;
+      projectRegistry = (data ?? []) as AeProject[];
     } catch (e) {
       console.warn('[projects] fetch registry failed', e);
       projectRegistry = [];
@@ -109,6 +137,17 @@
         <div class="hidden sm:block text-[10px] uppercase tracking-wide text-slate-500">build {buildLabel}</div>
       {/if}
       <div class="ml-auto flex items-center gap-2">
+        <button
+          type="button"
+          onclick={refreshAll}
+          disabled={refreshing}
+          class="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-xs font-semibold text-emerald-100 transition hover:-translate-y-0.5 hover:bg-emerald-500/20 disabled:opacity-60 disabled:cursor-not-allowed"
+          title="Refresh tasks and projects"
+          aria-label="Refresh"
+        >
+          <span class="inline-block {refreshing ? 'animate-spin' : ''}">🔄</span>
+          <span class="ml-1 hidden sm:inline">{refreshing ? 'Refreshing…' : 'Refresh'}</span>
+        </button>
         <a
           href="/reports"
           class="rounded-lg border border-indigo-500/40 bg-indigo-500/10 px-3 py-1.5 text-xs font-semibold text-indigo-100 hover:bg-indigo-500/20 transition-colors"

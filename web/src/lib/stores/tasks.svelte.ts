@@ -10,7 +10,7 @@ class TasksStore {
 
   private channel: ReturnType<typeof supabase.channel> | null = null;
 
-  async init() {
+  async refresh() {
     try {
       const { data, error } = await supabase
         .from('ae_tasks')
@@ -19,14 +19,24 @@ class TasksStore {
         .limit(500);
       if (error) throw error;
       this.tasks = (data ?? []) as AeTask[];
-      this.loading = false;
+      this.error = null;
       this.prefetchReviewComments();
+      if (!this.channel) this.subscribeRealtime();
+      return true;
     } catch (e: unknown) {
       this.error = e instanceof Error ? e.message : String(e);
-      this.loading = false;
-      return;
+      return false;
     }
+  }
 
+  async init() {
+    const ok = await this.refresh();
+    this.loading = false;
+    if (!ok) return;
+    if (!this.channel) this.subscribeRealtime();
+  }
+
+  private subscribeRealtime() {
     this.channel = supabase
       .channel('samwise-board')
       .on(
