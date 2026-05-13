@@ -141,7 +141,7 @@
           type="button"
           onclick={refreshAll}
           disabled={refreshing}
-          class="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-xs font-semibold text-emerald-100 transition hover:-translate-y-0.5 hover:bg-emerald-500/20 disabled:opacity-60 disabled:cursor-not-allowed"
+          class="hidden sm:inline-flex items-center rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-xs font-semibold text-emerald-100 transition hover:-translate-y-0.5 hover:bg-emerald-500/20 disabled:opacity-60 disabled:cursor-not-allowed"
           title="Refresh tasks and projects"
           aria-label="Refresh"
         >
@@ -227,3 +227,14 @@
   aria-label="New task"
   class="fixed bottom-5 right-5 z-30 h-14 w-14 rounded-full bg-emerald-500 hover:bg-emerald-400 shadow-xl shadow-emerald-500/30 text-slate-900 text-3xl font-bold grid place-items-center hover:scale-105 active:scale-95 transition bob"
 >+</button>
+
+<button
+  type="button"
+  onclick={refreshAll}
+  disabled={refreshing}
+  aria-label="Refresh tasks"
+  class="sm:hidden fixed bottom-5 left-5 z-30 h-12 rounded-full border border-emerald-300/50 bg-slate-950/90 px-4 text-sm font-semibold text-emerald-100 shadow-xl shadow-black/30 backdrop-blur flex items-center gap-2 active:scale-95 transition disabled:opacity-60 disabled:cursor-not-allowed"
+>
+  <span class="inline-block text-base {refreshing ? 'animate-spin' : ''}">🔄</span>
+  <span>{refreshing ? 'Refreshing...' : 'Refresh'}</span>
+</button>
