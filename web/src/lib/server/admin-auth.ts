@@ -6,7 +6,11 @@ import { env } from '$env/dynamic/private';
 const ADMIN_COOKIE = 'samwise_web_admin';
 
 function adminKey() {
-  return env.SAMWISE_WEB_ADMIN_KEY || env.AGENT_API_KEY || env.TASK_WEBHOOK_SECRET || '';
+  return env.SAMWISE_WEB_ADMIN_KEY || '';
+}
+
+function adminRequired() {
+  return !!adminKey();
 }
 
 function digest(value: string) {
@@ -20,6 +24,8 @@ function timingSafeStringEqual(a: string, b: string) {
 }
 
 export function hasAdminSession(cookies: Cookies) {
+  if (!adminRequired()) return true;
+
   const key = adminKey();
   const token = cookies.get(ADMIN_COOKIE);
   return !!key && !!token && timingSafeStringEqual(token, digest(key));
@@ -32,7 +38,7 @@ export function isValidAdminKey(candidate: unknown) {
 
 export function setAdminSession(cookies: Cookies) {
   const key = adminKey();
-  if (!key) throw error(500, 'Admin key is not configured');
+  if (!key) return;
 
   cookies.set(ADMIN_COOKIE, digest(key), {
     httpOnly: true,
