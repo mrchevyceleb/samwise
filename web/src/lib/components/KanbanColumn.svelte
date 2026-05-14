@@ -15,6 +15,7 @@
     review: 'bg-violet-400',
     fixes_needed: 'bg-orange-400',
     approved: 'bg-emerald-400',
+    qa: 'bg-teal-400',
     done: 'bg-emerald-500',
     failed: 'bg-rose-500',
     pending_confirmation: 'bg-yellow-400'

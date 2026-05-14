@@ -26,6 +26,11 @@
   let mergeConflictFixState = $derived(getMergeConflictFixState(task));
   let mergeDeployRequestError = $state<string | null>(null);
   let mergeConflictFixRequestError = $state<string | null>(null);
+  let showTesterPicker = $state(false);
+  let testers = $state<{ name: string; role: string }[]>([]);
+  let selectedTester = $state('');
+  let sendingToQa = $state(false);
+  let sendToQaError = $state<string | null>(null);
   let showReviewActions = $derived(isReviewActionStatus(task.status) && !!(reviewPanel || task.pr_url));
   let canMergeDeploy = $derived(!!task.pr_url && (task.status === 'approved' || mergeDeployState.status === 'failed'));
   let canRequestMergeConflictFix = $derived(
@@ -100,6 +105,58 @@
     e.preventDefault();
     e.stopPropagation();
     await tasksStore.updateTask(task.id, { on_hold: !task.on_hold });
+  }
+
+  async function openSendToQa(e: MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    sendToQaError = null;
+    showTesterPicker = true;
+    if (testers.length === 0) {
+      try {
+        const res = await fetch('/api/qa-testers');
+        if (res.ok) {
+          const data = await res.json();
+          testers = data.testers || [];
+          if (testers.length > 0 && !selectedTester) selectedTester = testers[0].name;
+        } else {
+          sendToQaError = `Could not load testers (${res.status})`;
+        }
+      } catch (err) {
+        sendToQaError = err instanceof Error ? err.message : String(err);
+      }
+    }
+  }
+
+  function cancelSendToQa(e: MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    showTesterPicker = false;
+    sendToQaError = null;
+  }
+
+  async function confirmSendToQa(e: MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!selectedTester) { sendToQaError = 'Pick a tester first'; return; }
+    sendingToQa = true;
+    sendToQaError = null;
+    try {
+      const res = await fetch('/api/send-to-qa', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ task_id: task.id, tester: selectedTester })
+      });
+      if (!res.ok) {
+        const body = await res.text();
+        throw new Error(body.slice(0, 200) || `HTTP ${res.status}`);
+      }
+      showTesterPicker = false;
+    } catch (err) {
+      sendToQaError = err instanceof Error ? err.message : String(err);
+    } finally {
+      sendingToQa = false;
+    }
   }
 </script>
 
@@ -276,6 +333,77 @@
     {#if mergeConflictFixRequestError || mergeConflictFixState.error}
       <div class="mt-2 line-clamp-3 rounded-lg border border-amber-400/35 bg-orange-500/10 px-2 py-1.5 text-[10px] font-bold leading-snug text-orange-100">
         Sam conflict recovery failed: {mergeConflictFixRequestError || mergeConflictFixState.error}
+      </div>
+    {/if}
+  {/if}
+
+  {#if task.status === 'approved'}
+    {#if !showTesterPicker}
+      <button
+        type="button"
+        onclick={openSendToQa}
+        class="mt-2 w-full rounded-lg border border-teal-300/45 bg-gradient-to-r from-teal-500/20 to-cyan-500/15 px-2 py-1.5 text-[10px] font-black uppercase tracking-wide text-teal-50 transition hover:from-teal-500/30 hover:to-cyan-500/25"
+      >
+        Send to QA
+      </button>
+    {:else}
+      <div
+        onclick={(e) => e.stopPropagation()}
+        onkeydown={(e) => e.stopPropagation()}
+        role="presentation"
+        class="mt-2 rounded-xl border border-teal-300/40 bg-teal-500/5 p-2.5 shadow-inner"
+      >
+        <div class="text-[10px] font-black uppercase tracking-wide text-teal-100 mb-1.5">Pick a tester</div>
+        {#if testers.length === 0 && !sendToQaError}
+          <div class="text-[10px] text-slate-300">Loading testers...</div>
+        {:else}
+          <select
+            bind:value={selectedTester}
+            class="w-full rounded-md border border-white/15 bg-slate-900/70 px-2 py-1 text-[11px] text-slate-100 focus:outline-none focus:border-teal-300/60"
+          >
+            {#each testers as t (t.name)}
+              <option value={t.name}>{t.name} {t.role === 'admin' ? '(admin)' : ''}</option>
+            {/each}
+          </select>
+        {/if}
+        {#if sendToQaError}
+          <div class="mt-1.5 line-clamp-3 rounded-md border border-rose-400/40 bg-rose-500/10 px-2 py-1 text-[10px] font-bold text-rose-100">{sendToQaError}</div>
+        {/if}
+        <div class="mt-2 grid grid-cols-2 gap-1.5">
+          <button
+            type="button"
+            onclick={cancelSendToQa}
+            disabled={sendingToQa}
+            class="rounded-md border border-white/15 bg-white/5 px-2 py-1 text-[10px] font-black uppercase tracking-wide text-slate-200 hover:bg-white/10 disabled:opacity-50"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onclick={confirmSendToQa}
+            disabled={sendingToQa || !selectedTester}
+            class="rounded-md border border-teal-300/45 bg-teal-500/25 px-2 py-1 text-[10px] font-black uppercase tracking-wide text-teal-50 hover:bg-teal-500/35 disabled:opacity-60 disabled:cursor-wait"
+          >
+            {sendingToQa ? 'Sending...' : 'Send'}
+          </button>
+        </div>
+      </div>
+    {/if}
+  {/if}
+
+  {#if task.status === 'qa'}
+    {@const qaCtx = (task.context && (task.context as Record<string, unknown>).qa) as { tester?: string; ticket_id?: string } | undefined}
+    {#if qaCtx?.tester}
+      <div class="mt-2 rounded-lg border border-teal-300/35 bg-teal-500/10 px-2 py-1.5 text-[10px] font-bold text-teal-100">
+        In QA with {qaCtx.tester}{#if qaCtx.ticket_id}
+          <a
+            href={`https://qa.stonelabs.app/dashboard.html?ticket=${qaCtx.ticket_id}`}
+            target="_blank"
+            rel="noopener"
+            onclick={(e) => e.stopPropagation()}
+            class="ml-1 underline decoration-dotted hover:text-teal-50"
+          >view ticket</a>
+        {/if}
       </div>
     {/if}
   {/if}

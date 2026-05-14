@@ -5,6 +5,7 @@ export type TaskStatus =
   | 'review'
   | 'fixes_needed'
   | 'approved'
+  | 'qa'
   | 'done'
   | 'failed'
   | 'pending_confirmation';
@@ -121,6 +122,7 @@ export const STATUSES: TaskStatus[] = [
   'review',
   'fixes_needed',
   'approved',
+  'qa',
   'done',
   'failed'
 ];
@@ -132,6 +134,7 @@ export const STATUS_LABEL: Record<TaskStatus, string> = {
   review: 'Review',
   fixes_needed: 'Fixes Needed',
   approved: 'Ready to Merge',
+  qa: 'In QA',
   done: 'Done',
   failed: 'Failed',
   pending_confirmation: 'Awaiting Confirmation'
