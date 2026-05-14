@@ -105,7 +105,9 @@ export const POST: RequestHandler = async ({ request }) => {
       autosam_task_id: taskId,
       autosam_pr_url: taskRow.pr_url,
       autosam_preview_url: taskRow.preview_url,
-      autosam_branch: taskRow.branch
+      autosam_branch: taskRow.branch,
+      feedback_ticket_id:
+        (taskRow.context as Record<string, unknown> | null)?.ticket_id ?? null
     }
   };
 

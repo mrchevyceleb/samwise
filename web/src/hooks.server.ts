@@ -1,6 +1,6 @@
 import type { Handle } from '@sveltejs/kit';
 
-const CROSS_ORIGIN_API_PREFIXES = ['/api/qa-testers', '/api/send-to-qa'];
+const CROSS_ORIGIN_API_PREFIXES = ['/api/qa-testers', '/api/send-to-qa', '/api/qa-callback'];
 
 export const handle: Handle = async ({ event, resolve }) => {
   const isCrossOriginApi = CROSS_ORIGIN_API_PREFIXES.some((p) => event.url.pathname.startsWith(p));
@@ -10,7 +10,7 @@ export const handle: Handle = async ({ event, resolve }) => {
       headers: {
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'content-type'
+        'Access-Control-Allow-Headers': 'content-type, x-qa-callback-secret'
       }
     });
   }
