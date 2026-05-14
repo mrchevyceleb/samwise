@@ -1854,7 +1854,7 @@ async fn execute_task(
     // The actual task
     if is_research {
         prompt_parts.push(format!(
-            "## Task\n**{}**\n\n{}\n\n## Instructions\nThis is a RESEARCH/ANALYSIS task. Do NOT make any code changes, do NOT commit, do NOT create files. Read, analyze, and provide a thorough written report. Be detailed and specific.",
+            "## Task\n**{}**\n\n{}\n\n## Instructions\nThis is a RESEARCH/ANALYSIS task. The only restriction is on the repo: do NOT modify source files, do NOT commit, do NOT push, do NOT open a PR.\n\nEverything else is fair game and expected:\n- Run commands (read-only inspections, CLI calls, log fetches, MCP tools)\n- Call MCP tools (Railway, Supabase, GitHub, Slack, etc.)\n- Create new tasks/tickets via the tasks tool or Supabase MCP if the prompt asks you to file findings\n- Post plans, analysis, and reports as comments on this task\n\nIf the prompt asks you to file tickets for findings, that IS the deliverable. Do it. Do not refuse on grounds of \"read-only mode\" — read-only refers to the repo's source code, nothing else.\n\nProduce a thorough written report. Be detailed and specific.",
             title, description
         ));
     } else if flexible_repo_mode {
@@ -5348,29 +5348,6 @@ async fn ensure_pr_review_worktree(
     Ok(worktree_str)
 }
 
-/// Read GitHub's computed merge state for a PR. Returns the uppercased status
-/// string (e.g. "CLEAN", "BEHIND", "BLOCKED", "DIRTY", "UNSTABLE", "UNKNOWN").
-/// Used by the Merge + Deploy workflow to decide whether to merge `main` into
-/// the PR branch before calling `gh_merge`.
-async fn pr_merge_state_status(pr_url: &str, repo_path: &str) -> Result<String, String> {
-    let output = async_cmd("gh")
-        .args(["pr", "view", pr_url, "--json", "mergeStateStatus"])
-        .current_dir(repo_path)
-        .output()
-        .await
-        .map_err(|e| format!("spawn gh: {}", e))?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
-    }
-    let parsed: Value = serde_json::from_slice(&output.stdout)
-        .map_err(|e| format!("parse gh pr view: {}", e))?;
-    Ok(parsed
-        .get("mergeStateStatus")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_uppercase())
-}
-
 async fn run_git_capture(args: &[&str], repo_path: &str) -> Result<(bool, String, String), String> {
     let output = async_cmd("git")
         .args(args)
@@ -5979,64 +5956,59 @@ async fn run_merge_deploy_workflow(
             Err(e) => return Err(MergeDeployError::new(format!("CI check failed before merge: {}", e), false)),
         }
 
-        // If the PR is behind its base, GitHub will refuse the squash-merge.
-        // Reuse the merge-conflict-fix workflow as the merge-main-in primitive:
-        // it spins up a worktree, runs `git merge --no-edit origin/<base>`, and
-        // dispatches Claude only when there's an actual conflict to resolve.
-        // Then push (no force, no rebase).
-        let merge_state = pr_merge_state_status(pr_url, repo_path).await.unwrap_or_default();
-        if merge_state == "BEHIND" {
-            agent_comment(
-                config,
-                task_id,
-                "PR branch is behind its base. Merging the base in (no rebase, no force-push), then re-checking CI before the merge.",
-            ).await;
-            // Snapshot the reviewed head before handing the branch to the merge-in
-            // primitive. The primitive fetches origin and fast-forwards the worktree
-            // first, so a concurrent push to the PR branch during this window would
-            // get folded into our merge commit and silently inherit "approved"
-            // status. We catch that by verifying the post-merge head's first parent
-            // still equals the reviewed head; if it doesn't, someone pushed mid-flow
-            // and we bail out so the new commits get re-reviewed.
-            let pre_merge_head = head_sha.clone();
-            run_merge_conflict_fix_workflow(config, task)
+        // Always pull the latest base branch into the PR before merging. This
+        // avoids relying on GitHub's merge-state cache and makes "green" mean
+        // green against the current main, not yesterday's main.
+        agent_comment(
+            config,
+            task_id,
+            "Pulling the latest base branch into this PR before merge (no rebase, no force-push), then re-checking CI.",
+        ).await;
+        // Snapshot the reviewed head before handing the branch to the merge-in
+        // primitive. The primitive fetches origin and fast-forwards the worktree
+        // first, so a concurrent push to the PR branch during this window would
+        // get folded into our merge commit and silently inherit "approved"
+        // status. We catch that by verifying the post-merge head's first parent
+        // still equals the reviewed head; if it doesn't, someone pushed mid-flow
+        // and we bail out so the new commits get re-reviewed.
+        let pre_merge_head = head_sha.clone();
+        run_merge_conflict_fix_workflow(config, task)
+            .await
+            .map_err(|e| MergeDeployError::new(format!("merge base into PR branch failed: {}", e), false))?;
+        let new_head = review::fetch_pr_head_sha(pr_url, repo_path)
+            .await
+            .map_err(|e| MergeDeployError::new(format!("re-read PR head SHA after merge-in: {}", e), false))?;
+        if new_head != pre_merge_head {
+            let parents = run_git(&["rev-list", "--parents", "-n1", &new_head], repo_path)
                 .await
-                .map_err(|e| MergeDeployError::new(format!("merge base into PR branch failed: {}", e), false))?;
-            let new_head = review::fetch_pr_head_sha(pr_url, repo_path)
-                .await
-                .map_err(|e| MergeDeployError::new(format!("re-read PR head SHA after merge-in: {}", e), false))?;
-            if new_head != pre_merge_head {
-                let parents = run_git(&["rev-list", "--parents", "-n1", &new_head], repo_path)
-                    .await
-                    .map_err(|e| MergeDeployError::new(format!("read merge parents after merge-in: {}", e), false))?;
-                let mut tokens = parents.split_whitespace();
-                let _commit = tokens.next();
-                let first_parent = tokens.next().unwrap_or("").to_string();
-                if first_parent != pre_merge_head {
-                    return Err(MergeDeployError::new(
-                        format!(
-                            "PR branch changed during merge-in (new head's first parent {} does not match reviewed head {}); leaving it unmerged so the new commits can be reviewed.",
-                            if first_parent.is_empty() { "<unknown>" } else { first_parent.as_str() },
-                            pre_merge_head
-                        ),
-                        false,
-                    ));
-                }
+                .map_err(|e| MergeDeployError::new(format!("read merge parents after merge-in: {}", e), false))?;
+            let mut tokens = parents.split_whitespace();
+            let _commit = tokens.next();
+            let first_parent = tokens.next().unwrap_or("").to_string();
+            if first_parent != pre_merge_head {
+                return Err(MergeDeployError::new(
+                    format!(
+                        "PR branch changed during merge-in (new head's first parent {} does not match reviewed head {}); leaving it unmerged so the new commits can be reviewed.",
+                        if first_parent.is_empty() { "<unknown>" } else { first_parent.as_str() },
+                        pre_merge_head
+                    ),
+                    false,
+                ));
             }
-            head_sha = new_head;
-            // Recompute deploy inputs from the post-merge file list. A clean
-            // base-branch rename or new file landing through the merge could
-            // otherwise leave build_deploy_plan / link checks operating on a
-            // stale snapshot and deploying the wrong thing.
-            files = review::fetch_pr_files(pr_url, repo_path)
-                .await
-                .map_err(|e| MergeDeployError::new(format!("re-fetch PR files after merge-in: {}", e), false))?;
-            wait_for_deploy_green = deploy_green_wait_required(repo_path, &files).await;
-            match review::wait_for_ci(pr_url, repo_path).await {
-                Ok(true) => {}
-                Ok(false) => return Err(MergeDeployError::new("CI not green after merging base into PR branch", false)),
-                Err(e) => return Err(MergeDeployError::new(format!("post-merge-in CI check failed: {}", e), false)),
-            }
+        }
+        head_sha = new_head;
+        // Recompute deploy inputs from the post-merge file list. A clean
+        // base-branch rename or new file landing through the merge could
+        // otherwise leave build_deploy_plan / link checks operating on a
+        // stale snapshot and deploying the wrong thing.
+        files = review::fetch_pr_files(pr_url, repo_path)
+            .await
+            .map_err(|e| MergeDeployError::new(format!("re-fetch PR files after merge-in: {}", e), false))?;
+        wait_for_deploy_green = deploy_green_wait_required(repo_path, &files).await;
+        match review::wait_for_ci(pr_url, repo_path).await {
+            Ok(true) => {}
+            Ok(false) => return Err(MergeDeployError::new("CI not green after merging base into PR branch", false)),
+            Err(e) => return Err(MergeDeployError::new(format!("post-merge-in CI check failed: {}", e), false)),
         }
 
         review::gh_merge(pr_url, repo_path, &head_sha)
