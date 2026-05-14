@@ -7,6 +7,14 @@ const DEFAULT_QAHUB_URL = 'https://iycloielqcjnjqddeuet.supabase.co';
 const DEFAULT_QAHUB_ANON_KEY =
   'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml5Y2xvaWVscWNqbmpxZGRldWV0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njg5NDIzNjgsImV4cCI6MjA4NDUxODM2OH0.OEuHnHLx6aaT_jCdiGD2SKBtNu96AOl7CiiuYxW3G0o';
 
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'content-type'
+};
+
+export const OPTIONS: RequestHandler = () => new Response(null, { headers: CORS_HEADERS });
+
 // Map AutoSam project name to QA Hub client key. Unknown projects default to rlink-rebuild.
 function clientFromProject(project: string | null | undefined): string {
   const p = (project || '').toLowerCase();
@@ -139,10 +147,13 @@ export const POST: RequestHandler = async ({ request }) => {
     throw error(502, `Failed to update AutoSam task: ${updateErr.message}`);
   }
 
-  return json({
-    ok: true,
-    qa_ticket_id: qaTicketId,
-    qa_ticket_url: `https://qa.stonelabs.app/dashboard.html?ticket=${qaTicketId}`,
-    tester
-  });
+  return json(
+    {
+      ok: true,
+      qa_ticket_id: qaTicketId,
+      qa_ticket_url: `https://qa.stonelabs.app/dashboard.html?ticket=${qaTicketId}`,
+      tester
+    },
+    { headers: CORS_HEADERS }
+  );
 };
