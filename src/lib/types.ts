@@ -1,6 +1,6 @@
 /** Agent One - Supabase table types */
 
-export type TaskStatus = 'queued' | 'in_progress' | 'testing' | 'review' | 'fixes_needed' | 'approved' | 'done' | 'failed' | 'pending_confirmation';
+export type TaskStatus = 'queued' | 'in_progress' | 'testing' | 'review' | 'fixes_needed' | 'approved' | 'qa' | 'done' | 'failed' | 'pending_confirmation';
 export type TaskPriority = 'critical' | 'high' | 'medium' | 'low';
 export type TaskSource = 'manual' | 'trigger' | 'cron' | 'chat';
 export type TaskType = 'code' | 'research';
@@ -177,6 +177,7 @@ export const KANBAN_COLUMNS: KanbanColumn[] = [
   { status: 'review', label: 'Review', color: '#3fb950', glowColor: 'rgba(63, 185, 80, 0.15)', icon: 'PR' },
   { status: 'fixes_needed', label: 'Fixes Needed', color: '#f97316', glowColor: 'rgba(249, 115, 22, 0.18)', icon: '!!' },
   { status: 'approved', label: 'Ready to Merge', color: '#58a6ff', glowColor: 'rgba(88, 166, 255, 0.15)', icon: '++' },
+  { status: 'qa', label: 'In QA', color: '#14b8a6', glowColor: 'rgba(20, 184, 166, 0.18)', icon: 'QA' },
   { status: 'done', label: 'Done', color: '#8b949e', glowColor: 'rgba(139, 148, 158, 0.1)', icon: 'ok' },
   { status: 'failed', label: 'Failed', color: '#f85149', glowColor: 'rgba(248, 81, 73, 0.2)', icon: 'X' },
 ];

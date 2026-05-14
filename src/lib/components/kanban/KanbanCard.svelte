@@ -58,6 +58,12 @@
 	let mergeConflictFixState = $derived(getMergeConflictFixState(task));
 	let mergeDeployRequestError = $state<string | null>(null);
 	let mergeConflictFixRequestError = $state<string | null>(null);
+	let showTesterPicker = $state(false);
+	let testers = $state<{ name: string; role: string }[]>([]);
+	let selectedTester = $state('');
+	let sendingToQa = $state(false);
+	let sendToQaError = $state<string | null>(null);
+	const SAMWISE_API_BASE = 'https://samwise-board.vercel.app';
 	let showReviewActions = $derived(isReviewActionStatus(task.status) && !!(reviewPanel || task.pr_url));
 	let canMergeDeploy = $derived(!!task.pr_url && (task.status === 'approved' || mergeDeployState.status === 'failed'));
 	let canRequestMergeConflictFix = $derived(
@@ -185,6 +191,59 @@
 		e.preventDefault();
 		e.stopPropagation();
 		if (task.pr_url) openExternal(task.pr_url);
+	}
+
+	async function openSendToQa(e: MouseEvent) {
+		e.preventDefault();
+		e.stopPropagation();
+		sendToQaError = null;
+		showTesterPicker = true;
+		if (testers.length === 0) {
+			try {
+				const res = await fetch(`${SAMWISE_API_BASE}/api/qa-testers`);
+				if (res.ok) {
+					const data = await res.json();
+					testers = data.testers || [];
+					if (testers.length > 0 && !selectedTester) selectedTester = testers[0].name;
+				} else {
+					sendToQaError = `Could not load testers (${res.status})`;
+				}
+			} catch (err) {
+				sendToQaError = err instanceof Error ? err.message : String(err);
+			}
+		}
+	}
+
+	function cancelSendToQa(e: MouseEvent) {
+		e.preventDefault();
+		e.stopPropagation();
+		showTesterPicker = false;
+		sendToQaError = null;
+	}
+
+	async function confirmSendToQa(e: MouseEvent) {
+		e.preventDefault();
+		e.stopPropagation();
+		if (!selectedTester) { sendToQaError = 'Pick a tester first'; return; }
+		sendingToQa = true;
+		sendToQaError = null;
+		try {
+			const res = await fetch(`${SAMWISE_API_BASE}/api/send-to-qa`, {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ task_id: task.id, tester: selectedTester })
+			});
+			if (!res.ok) {
+				const body = await res.text();
+				throw new Error(body.slice(0, 200) || `HTTP ${res.status}`);
+			}
+			showTesterPicker = false;
+			await taskStore.fetchTasks({ silent: true });
+		} catch (err) {
+			sendToQaError = err instanceof Error ? err.message : String(err);
+		} finally {
+			sendingToQa = false;
+		}
 	}
 
 	function verdictColor(verdict: string | undefined): string {
@@ -526,6 +585,122 @@
 				overflow: hidden;
 			">
 				Sam conflict recovery failed: {mergeConflictFixRequestError || mergeConflictFixState.error}
+			</div>
+		{/if}
+	{/if}
+
+	{#if task.status === 'approved'}
+		{#if !showTesterPicker}
+			<button
+				type="button"
+				style="
+					width: 100%; margin-bottom: 8px; padding: 8px 10px; border-radius: 9px;
+					background: linear-gradient(135deg, rgba(20, 184, 166, 0.22), rgba(8, 145, 178, 0.18));
+					border: 1px solid rgba(45, 212, 191, 0.45);
+					color: #ccfbf1;
+					font-size: 10px; font-weight: 950; font-family: var(--font-ui);
+					text-transform: uppercase; letter-spacing: 0.04em;
+					cursor: pointer; transition: all 0.15s ease;
+				"
+				onmousedown={(e) => e.stopPropagation()}
+				onclick={openSendToQa}
+			>
+				Send to QA
+			</button>
+		{:else}
+			<div
+				onmousedown={(e) => e.stopPropagation()}
+				onclick={(e) => e.stopPropagation()}
+				onkeydown={(e) => e.stopPropagation()}
+				role="presentation"
+				style="
+					margin-bottom: 8px; padding: 10px;
+					border-radius: 10px;
+					background: rgba(20, 184, 166, 0.07);
+					border: 1px solid rgba(45, 212, 191, 0.38);
+				"
+			>
+				<div style="font-size: 10px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.06em; color: #99f6e4; margin-bottom: 6px;">Pick a tester</div>
+				{#if testers.length === 0 && !sendToQaError}
+					<div style="font-size: 10px; color: var(--text-secondary);">Loading testers...</div>
+				{:else}
+					<select
+						bind:value={selectedTester}
+						style="
+							width: 100%; padding: 6px 8px; border-radius: 7px;
+							background: rgba(13, 17, 23, 0.7);
+							border: 1px solid rgba(255, 255, 255, 0.14);
+							color: var(--text-primary);
+							font-size: 11px; font-family: var(--font-ui);
+							outline: none;
+						"
+					>
+						{#each testers as t (t.name)}
+							<option value={t.name}>{t.name}{t.role === 'admin' ? ' (admin)' : ''}</option>
+						{/each}
+					</select>
+				{/if}
+				{#if sendToQaError}
+					<div style="
+						margin-top: 6px; padding: 6px 8px; border-radius: 7px;
+						background: rgba(248, 81, 73, 0.12);
+						border: 1px solid rgba(248, 81, 73, 0.34);
+						color: #ffb4ae; font-size: 10px; font-weight: 700; line-height: 1.4;
+					">{sendToQaError}</div>
+				{/if}
+				<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 8px;">
+					<button
+						type="button"
+						onclick={cancelSendToQa}
+						disabled={sendingToQa}
+						style="
+							padding: 6px 8px; border-radius: 7px;
+							background: rgba(255, 255, 255, 0.05);
+							border: 1px solid rgba(255, 255, 255, 0.14);
+							color: var(--text-secondary);
+							font-size: 10px; font-weight: 900; text-transform: uppercase;
+							cursor: {sendingToQa ? 'wait' : 'pointer'};
+							opacity: {sendingToQa ? '0.6' : '1'};
+						"
+					>Cancel</button>
+					<button
+						type="button"
+						onclick={confirmSendToQa}
+						disabled={sendingToQa || !selectedTester}
+						style="
+							padding: 6px 8px; border-radius: 7px;
+							background: rgba(20, 184, 166, 0.28);
+							border: 1px solid rgba(45, 212, 191, 0.5);
+							color: #ccfbf1;
+							font-size: 10px; font-weight: 900; text-transform: uppercase;
+							cursor: {sendingToQa ? 'wait' : 'pointer'};
+							opacity: {(sendingToQa || !selectedTester) ? '0.6' : '1'};
+						"
+					>{sendingToQa ? 'Sending...' : 'Send'}</button>
+				</div>
+			</div>
+		{/if}
+	{/if}
+
+	{#if task.status === 'qa'}
+		{@const qaCtx = (task.context && (task.context as Record<string, unknown>).qa) as { tester?: string; ticket_id?: string } | undefined}
+		{#if qaCtx?.tester}
+			<div
+				onmousedown={(e) => e.stopPropagation()}
+				onclick={(e) => {
+					e.stopPropagation();
+					if (qaCtx.ticket_id) openExternal(`https://qa.stonelabs.app/dashboard.html?ticket=${qaCtx.ticket_id}`);
+				}}
+				role="presentation"
+				style="
+					margin-bottom: 8px; padding: 7px 9px; border-radius: 8px;
+					background: rgba(20, 184, 166, 0.10);
+					border: 1px solid rgba(45, 212, 191, 0.32);
+					color: #99f6e4; font-size: 10px; font-weight: 800; line-height: 1.4;
+					cursor: {qaCtx.ticket_id ? 'pointer' : 'default'};
+				"
+			>
+				In QA with {qaCtx.tester}{#if qaCtx.ticket_id} - view ticket{/if}
 			</div>
 		{/if}
 	{/if}
