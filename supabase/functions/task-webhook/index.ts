@@ -35,6 +35,7 @@ type Body = {
   priority?: "critical" | "high" | "medium" | "low";
   task_type?: "code" | "research";
   source?: string;
+  repo_url?: string;
   base_branch?: string;
   attachments?: AttachmentInput[];
   callback_url?: string;
@@ -52,12 +53,127 @@ const ORIGIN_SYSTEMS: ReadonlySet<OriginSystem> = new Set([
 ]);
 
 type StoredAttachment = { url: string; name: string; mime: string };
+type ProjectRow = {
+  name: string;
+  repo_url?: string | null;
+  repo_path?: string | null;
+  preview_url?: string | null;
+};
+type ProjectResolution = {
+  row: ProjectRow;
+  reason: string;
+  hint: string;
+  score: number;
+};
 
 function json(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: { "content-type": "application/json" },
   });
+}
+
+function normalizeRepoUrl(value: string): string {
+  return value.trim().toLowerCase().replace(/\/+$/, "").replace(/\.git$/, "").replace(/\/+$/, "");
+}
+
+function compactKey(input: string): string {
+  return input.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function tokens(input: string): string[] {
+  return input
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function tokenMatches(query: string, candidate: string): boolean {
+  return query === candidate ||
+    (query.length >= 3 && candidate.startsWith(query)) ||
+    (candidate.length >= 3 && query.startsWith(candidate));
+}
+
+function scoreProjectHint(input: string, name: string): number {
+  const queryCompact = compactKey(input);
+  const nameCompact = compactKey(name);
+  if (!queryCompact || !nameCompact) return 0;
+  if (queryCompact === nameCompact) return 100;
+  if (nameCompact.startsWith(queryCompact) && queryCompact.length >= 4) return 92;
+  if (queryCompact.startsWith(nameCompact) && nameCompact.length >= 4) return 90;
+  if (nameCompact.includes(queryCompact) && queryCompact.length >= 4) return 86;
+
+  const queryTokens = tokens(input);
+  const nameTokens = tokens(name);
+  if (!queryTokens.length || !nameTokens.length) return 0;
+
+  const matchedQuery = queryTokens.filter((q) => nameTokens.some((n) => tokenMatches(q, n))).length;
+  const matchedName = nameTokens.filter((n) => queryTokens.some((q) => tokenMatches(q, n))).length;
+  let score = Math.round((matchedQuery / queryTokens.length) * 72 + (matchedName / nameTokens.length) * 20);
+  if (matchedQuery === queryTokens.length && queryTokens.length > 1) score += 6;
+  return Math.min(score, 99);
+}
+
+function pushHint(hints: string[], value: unknown) {
+  if (typeof value !== "string") return;
+  const hint = value.trim().replace(/^['"`]+|['"`]+$/g, "");
+  if (hint.length < 3 || hint.length > 100 || !/[a-z]/i.test(hint)) return;
+  if (!hints.some((existing) => existing.toLowerCase() === hint.toLowerCase())) {
+    hints.push(hint);
+  }
+}
+
+function projectHints(project: string, title: string, description: string): string[] {
+  const hints: string[] = [];
+  pushHint(hints, project);
+  for (const text of [title, description]) {
+    for (const line of text.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      const lower = trimmed.toLowerCase();
+      for (const prefix of ["project:", "app:", "source:", "repository:", "repo:"]) {
+        if (lower.startsWith(prefix)) {
+          pushHint(hints, trimmed.slice(prefix.length).split("|")[0]);
+        }
+      }
+    }
+  }
+  return hints;
+}
+
+function resolveProject(
+  project: string,
+  repoUrl: string,
+  title: string,
+  description: string,
+  projects: ProjectRow[],
+): ProjectResolution | null {
+  if (repoUrl.trim()) {
+    const normalized = normalizeRepoUrl(repoUrl);
+    const byUrl = projects.find((row) => row.repo_url && normalizeRepoUrl(row.repo_url) === normalized);
+    if (byUrl) return { row: byUrl, reason: "repo_url", hint: repoUrl.trim(), score: 100 };
+  }
+
+  if (project.trim()) {
+    const exact = projects.find((row) => row.name.toLowerCase() === project.trim().toLowerCase());
+    if (exact?.repo_path) return { row: exact, reason: "exact_project", hint: project.trim(), score: 100 };
+  }
+
+  for (const hint of projectHints(project, title, description)) {
+    const scored = projects
+      .filter((row) => row.repo_path)
+      .map((row) => ({ row, score: scoreProjectHint(hint, row.name) }))
+      .filter((item) => item.score >= 65)
+      .sort((a, b) => b.score - a.score || a.row.name.localeCompare(b.row.name));
+    const best = scored[0];
+    if (!best) continue;
+    const second = scored[1]?.score ?? 0;
+    if (best.score >= 94 || best.score - second >= 4) {
+      return { row: best.row, reason: "hint", hint, score: best.score };
+    }
+  }
+
+  return null;
 }
 
 const ATTACHMENT_BUCKET = "task-attachments";
@@ -209,16 +325,9 @@ Deno.serve(async (req) => {
   }
 
   let project = (body.project ?? "").trim();
-  if (!project && projects && projects.length > 0) {
-    const haystack = `${title.toLowerCase()}\n${description.toLowerCase()}`;
-    const names = projects.map((p) => p.name as string).sort((a, b) => b.length - a.length);
-    for (const n of names) {
-      if (haystack.includes(n.toLowerCase())) {
-        project = n;
-        break;
-      }
-    }
-  }
+  const repoUrl = (body.repo_url ?? "").trim();
+  const resolution = resolveProject(project, repoUrl, title, description, projects ?? []);
+  if (resolution) project = resolution.row.name;
 
   const task: Record<string, unknown> = {
     title,
@@ -231,12 +340,23 @@ Deno.serve(async (req) => {
 
   if (project) {
     task.project = project;
-    const row = (projects ?? []).find((p) => p.name === project);
+    const row = resolution?.row ?? (projects ?? []).find((p) => p.name === project);
     if (row) {
       if (row.repo_url) task.repo_url = row.repo_url;
       if (row.repo_path) task.repo_path = row.repo_path;
       if (row.preview_url) task.preview_url = row.preview_url;
     }
+  }
+  if (!task.repo_url && repoUrl) task.repo_url = repoUrl;
+  if (resolution) {
+    task.context = {
+      project_resolution: {
+        reason: resolution.reason,
+        hint: resolution.hint,
+        score: resolution.score,
+        previous_project: body.project ?? null,
+      },
+    };
   }
 
   if (body.base_branch) task.base_branch = body.base_branch;

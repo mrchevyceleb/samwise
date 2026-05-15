@@ -1463,18 +1463,153 @@ fn legacy_task_project_candidate(text: &str) -> Option<String> {
     Some(candidate.to_string())
 }
 
-fn infer_legacy_task_project(
+#[derive(Clone)]
+struct ProjectRegistryMatch {
+    project: serde_json::Value,
+    name: String,
+    reason: String,
+    hint: String,
+    score: u32,
+}
+
+fn project_registry_match(
+    project_name: &str,
+    repo_url: &str,
     title: &str,
     description: &str,
     projects: &serde_json::Value,
-) -> Option<super::chat::ProjectPrefixMatch> {
-    for candidate in legacy_task_project_candidates(title, description) {
-        let synthetic = format!("{}: {}", candidate, title);
-        if let Some(matched) = super::chat::match_project_prefix(&synthetic, projects) {
-            return Some(matched);
+) -> Option<ProjectRegistryMatch> {
+    let arr = projects.as_array()?;
+
+    let trimmed_repo_url = repo_url.trim();
+    if !trimmed_repo_url.is_empty() {
+        let normalized = normalize_repo_url(trimmed_repo_url);
+        if let Some(project) = arr.iter().find(|p| {
+            let purl = p.get("repo_url").and_then(|v| v.as_str()).unwrap_or("");
+            !purl.is_empty() && normalize_repo_url(purl) == normalized
+        }) {
+            return project_registry_match_from_value(
+                project,
+                "repo_url".to_string(),
+                trimmed_repo_url.to_string(),
+                100,
+            );
         }
     }
+
+    let trimmed_project = project_name.trim();
+    if !trimmed_project.is_empty() {
+        if let Some(project) = arr.iter().find(|p| {
+            p.get("name")
+                .and_then(|v| v.as_str())
+                .map(|name| name.eq_ignore_ascii_case(trimmed_project))
+                .unwrap_or(false)
+        }) {
+            if project_has_repo_path(project) {
+                return project_registry_match_from_value(
+                    project,
+                    "exact_project".to_string(),
+                    trimmed_project.to_string(),
+                    100,
+                );
+            }
+        }
+    }
+
+    for hint in project_resolution_hints(trimmed_project, title, description) {
+        let synthetic = format!("{}: {}", hint, title);
+        let Some(matched) = super::chat::match_project_prefix(&synthetic, projects) else {
+            continue;
+        };
+        let Some(project) = arr.iter().find(|p| {
+            p.get("name")
+                .and_then(|v| v.as_str())
+                .map(|name| name == matched.project)
+                .unwrap_or(false)
+        }) else {
+            continue;
+        };
+        if !project_has_repo_path(project) {
+            continue;
+        }
+        return project_registry_match_from_value(
+            project,
+            "hint".to_string(),
+            hint,
+            matched.score,
+        );
+    }
+
     None
+}
+
+fn project_registry_match_from_value(
+    project: &serde_json::Value,
+    reason: String,
+    hint: String,
+    score: u32,
+) -> Option<ProjectRegistryMatch> {
+    let name = project.get("name").and_then(|v| v.as_str())?.to_string();
+    Some(ProjectRegistryMatch {
+        project: project.clone(),
+        name,
+        reason,
+        hint,
+        score,
+    })
+}
+
+fn project_has_repo_path(project: &serde_json::Value) -> bool {
+    project
+        .get("repo_path")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn project_resolution_hints(project_name: &str, title: &str, description: &str) -> Vec<String> {
+    let mut hints = Vec::new();
+    push_project_hint(&mut hints, project_name);
+
+    for text in [title, description] {
+        for line in text.lines() {
+            let trimmed = line.trim();
+            let lower = trimmed.to_ascii_lowercase();
+            for prefix in ["project:", "app:", "source:", "repository:", "repo:"] {
+                if lower.starts_with(prefix) {
+                    let original_rest = &trimmed[prefix.len()..];
+                    let hint = original_rest
+                        .split('|')
+                        .next()
+                        .unwrap_or(original_rest)
+                        .trim();
+                    push_project_hint(&mut hints, hint);
+                }
+            }
+        }
+    }
+
+    for candidate in legacy_task_project_candidates(title, description) {
+        push_project_hint(&mut hints, &candidate);
+    }
+
+    hints
+}
+
+fn push_project_hint(hints: &mut Vec<String>, value: &str) {
+    let hint = value
+        .trim()
+        .trim_matches(|c: char| c == '"' || c == '\'' || c == '`')
+        .trim();
+    if hint.len() < 3 || hint.len() > 100 {
+        return;
+    }
+    if !hint.chars().any(|c| c.is_ascii_alphabetic()) {
+        return;
+    }
+    if !hints.iter().any(|existing| existing.eq_ignore_ascii_case(hint)) {
+        hints.push(hint.to_string());
+    }
 }
 
 // ── Trigger Evaluation ──────────────────────────────────────────────
@@ -1520,6 +1655,11 @@ async fn evaluate_triggers(config: &super::supabase::SupabaseConfig, app: &tauri
             };
 
             let mut task = template.clone();
+            let mut task_context = if payload.is_object() {
+                payload.clone()
+            } else {
+                serde_json::json!({ "payload": payload })
+            };
             if let Some(obj) = task.as_object_mut() {
                 obj.insert("source".to_string(), serde_json::json!("trigger"));
                 obj.insert("trigger_id".to_string(), serde_json::json!(trigger_id));
@@ -1540,30 +1680,37 @@ async fn evaluate_triggers(config: &super::supabase::SupabaseConfig, app: &tauri
                     }
                 }
 
-                // Resolve repo_url -> project registry fields (repo_path, preview_url, project name)
+                // Resolve route hints from repo_url, exact project name, and
+                // Sentry-style text like `Project: studio-r-link` / `App: r-link-studio`.
                 let task_repo_url = obj.get("repo_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let task_project = obj.get("project").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                if !task_repo_url.is_empty() && task_project.is_empty() {
-                    if let Some(ref projects) = cached_projects {
-                        if let Some(proj_arr) = projects.as_array() {
-                            let normalized = normalize_repo_url(&task_repo_url);
-                            if let Some(proj) = proj_arr.iter().find(|p| {
-                                let purl = p.get("repo_url").and_then(|v| v.as_str()).unwrap_or("");
-                                normalize_repo_url(purl) == normalized
-                            }) {
-                                if let Some(name) = proj.get("name").and_then(|v| v.as_str()) {
-                                    obj.insert("project".to_string(), serde_json::json!(name));
-                                }
-                                for field in &["repo_path", "preview_url"] {
-                                    if let Some(v) = proj.get(*field).filter(|v| v.as_str().map(|s| !s.is_empty()).unwrap_or(false)) {
-                                        obj.insert(field.to_string(), v.clone());
-                                    }
-                                }
-                            } else {
-                                log::warn!("[worker] Trigger '{}': repo_url '{}' not found in project registry", trigger_name, task_repo_url);
-                                obj.insert("status".to_string(), serde_json::json!("pending_confirmation"));
+                let task_title = obj.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let task_description = obj.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if let Some(ref projects) = cached_projects {
+                    if let Some(resolved) = project_registry_match(
+                        &task_project,
+                        &task_repo_url,
+                        &task_title,
+                        &task_description,
+                        projects,
+                    ) {
+                        obj.insert("project".to_string(), serde_json::json!(resolved.name));
+                        for field in &["repo_path", "repo_url", "preview_url"] {
+                            if let Some(v) = resolved.project.get(*field).filter(|v| v.as_str().map(|s| !s.is_empty()).unwrap_or(false)) {
+                                obj.insert(field.to_string(), v.clone());
                             }
                         }
+                        if let Some(ctx) = task_context.as_object_mut() {
+                            ctx.insert("project_resolution".to_string(), serde_json::json!({
+                                "reason": resolved.reason,
+                                "hint": resolved.hint,
+                                "score": resolved.score,
+                                "previous_project": task_project,
+                            }));
+                        }
+                    } else if !task_repo_url.trim().is_empty() {
+                        log::warn!("[worker] Trigger '{}': repo_url '{}' not found in project registry", trigger_name, task_repo_url);
+                        obj.insert("status".to_string(), serde_json::json!("pending_confirmation"));
                     }
                 }
 
@@ -1571,7 +1718,7 @@ async fn evaluate_triggers(config: &super::supabase::SupabaseConfig, app: &tauri
                     obj.insert("priority".to_string(), serde_json::json!("medium"));
                 }
                 // Merge event payload into task context
-                obj.insert("context".to_string(), payload);
+                obj.insert("context".to_string(), task_context);
             }
 
             match supabase::create_task(config, &task).await {
@@ -1672,94 +1819,56 @@ async fn execute_task(
     let task_repo_url = task.get("repo_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let mut project_dev_command: Option<String> = None;
 
-    // Resolve project from registry: by project name, or by repo_url if no name is set
+    // Resolve project from registry: exact repo_url, exact project names with
+    // usable repo paths, then strong hints from triage payload text.
     if repo_path.is_none() || preview_url.is_none() || project_name.is_empty() {
         if let Ok(projects) = supabase::fetch_projects(config).await {
-            if let Some(arr) = projects.as_array() {
-                let legacy_match = if project_name.is_empty() && task_repo_url.is_empty() {
-                    infer_legacy_task_project(&title, &description, &projects)
-                } else {
-                    None
-                };
+            if let Some(resolved) = project_registry_match(
+                &project_name,
+                &task_repo_url,
+                &title,
+                &description,
+                &projects,
+            ) {
+                let previous_project = project_name.clone();
+                project_name = resolved.name.clone();
 
-                // Try matching by project name first, then fall back to repo_url,
-                // then rescue old cards whose title/description started with
-                // natural-language routing like `in r-link studio rebuild - ...`.
-                let matched_proj = if !project_name.is_empty() {
-                    let name_lower = project_name.to_lowercase();
-                    arr.iter().find(|p| {
-                        p.get("name").and_then(|v| v.as_str())
-                            .map(|n| n.to_lowercase() == name_lower)
-                            .unwrap_or(false)
-                    })
-                } else if !task_repo_url.is_empty() {
-                    let normalized = normalize_repo_url(&task_repo_url);
-                    arr.iter().find(|p| {
-                        let purl = p.get("repo_url").and_then(|v| v.as_str()).unwrap_or("");
-                        normalize_repo_url(purl) == normalized
-                    })
-                } else if let Some(matched) = legacy_match.as_ref() {
-                    arr.iter().find(|p| {
-                        p.get("name").and_then(|v| v.as_str())
-                            == Some(matched.project.as_str())
-                    })
-                } else {
-                    None
-                };
-
-                if let Some(proj) = matched_proj {
-                    // Backfill project name if resolved via repo_url
-                    if project_name.is_empty() {
-                        if let Some(name) = proj.get("name").and_then(|v| v.as_str()) {
-                            project_name = name.to_string();
-                            let mut updates = serde_json::json!({
-                                "project": &project_name,
-                            });
-                            if let Some(matched) = legacy_match.as_ref() {
-                                let mut context = task
-                                    .get("context")
-                                    .cloned()
-                                    .filter(|v| v.is_object())
-                                    .unwrap_or_else(|| serde_json::json!({}));
-                                context["legacy_project_prefix"] =
-                                    serde_json::Value::String(matched.prefix.clone());
-                                context["legacy_project_match_score"] =
-                                    serde_json::Value::Number(serde_json::Number::from(matched.score));
-                                context["legacy_project_inferred_from"] =
-                                    serde_json::Value::String("title_or_description".to_string());
-                                updates["context"] = context;
-                                log::info!(
-                                    "[worker] inferred project '{}' for legacy task {} from '{}'",
-                                    project_name,
-                                    task_id,
-                                    matched.prefix
-                                );
-                            }
-                            let _ = supabase::update_task(config, &task_id, &updates).await;
-                        }
-                    }
-                    if repo_path.is_none() {
-                        repo_path = proj.get("repo_path").and_then(|v| v.as_str())
-                            .filter(|s| !s.is_empty())
-                            .map(|s| s.to_string());
-                    }
-                    if preview_url.is_none() {
-                        preview_url = proj.get("preview_url").and_then(|v| v.as_str())
-                            .filter(|s| !s.is_empty())
-                            .map(|s| s.to_string());
-                    }
-                    project_dev_command = proj.get("dev_command").and_then(|v| v.as_str())
+                if repo_path.is_none() {
+                    repo_path = resolved.project.get("repo_path").and_then(|v| v.as_str())
                         .filter(|s| !s.is_empty())
                         .map(|s| s.to_string());
-                    // Backfill repo_url on the task if missing
-                    if task_repo_url.is_empty() {
-                        if let Some(url) = proj.get("repo_url").and_then(|v| v.as_str()) {
-                            let _ = supabase::update_task(config, &task_id, &serde_json::json!({
-                                "repo_url": url,
-                            })).await;
-                        }
+                }
+                if preview_url.is_none() {
+                    preview_url = resolved.project.get("preview_url").and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string());
+                }
+                project_dev_command = resolved.project.get("dev_command").and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+
+                let mut context = task
+                    .get("context")
+                    .cloned()
+                    .filter(|v| v.is_object())
+                    .unwrap_or_else(|| serde_json::json!({}));
+                context["project_resolution"] = serde_json::json!({
+                    "reason": resolved.reason,
+                    "hint": resolved.hint,
+                    "score": resolved.score,
+                    "previous_project": previous_project,
+                });
+
+                let mut updates = serde_json::json!({
+                    "project": &project_name,
+                    "context": context,
+                });
+                for field in &["repo_path", "repo_url", "preview_url"] {
+                    if let Some(v) = resolved.project.get(*field).filter(|v| v.as_str().map(|s| !s.is_empty()).unwrap_or(false)) {
+                        updates[*field] = v.clone();
                     }
                 }
+                let _ = supabase::update_task(config, &task_id, &updates).await;
             }
         }
     }
