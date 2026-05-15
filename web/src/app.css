@@ -12,6 +12,20 @@ html, body {
   overscroll-behavior-y: none;
 }
 
+select {
+  color-scheme: dark;
+}
+
+select option,
+select optgroup {
+  background-color: #0f172a;
+  color: #e2e8f0;
+}
+
+select option:disabled {
+  color: #64748b;
+}
+
 @keyframes drift {
   0%   { transform: translate3d(0, 0, 0) rotate(0deg); }
   50%  { transform: translate3d(20px, -30px, 0) rotate(8deg); }
