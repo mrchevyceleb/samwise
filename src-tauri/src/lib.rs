@@ -218,6 +218,7 @@ pub fn run() {
             commands::supabase::supabase_send_message,
             // Supabase - Crons
             commands::supabase::supabase_fetch_crons,
+            commands::supabase::supabase_fetch_cron_runs,
             commands::supabase::supabase_create_cron,
             commands::supabase::supabase_update_cron,
             // Supabase - Triggers

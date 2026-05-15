@@ -12,6 +12,8 @@ export type TaskStatus =
 export type TaskPriority = 'critical' | 'high' | 'medium' | 'low';
 export type TaskType = 'code' | 'research';
 export type OriginSystem = 'operly_triage' | 'banana_triage' | 'sentry' | 'manual';
+export type CronExecutionMode = 'full' | 'direct' | 'command';
+export type CronRunStatus = 'running' | 'succeeded' | 'failed' | 'skipped';
 
 export interface Attachment {
   url: string;
@@ -100,6 +102,21 @@ export interface AeCron {
   last_run: string | null;
   next_run: string | null;
   created_at: string;
+}
+
+export interface AeCronRun {
+  id: string;
+  cron_id: string;
+  status: CronRunStatus;
+  scheduled_for: string | null;
+  started_at: string;
+  completed_at: string | null;
+  task_ids: string[];
+  task_count: number;
+  execution_mode: CronExecutionMode | null;
+  summary: string | null;
+  error: string | null;
+  metadata: Record<string, unknown>;
 }
 
 export interface AeProject {

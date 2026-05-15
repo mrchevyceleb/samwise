@@ -452,6 +452,26 @@ pub async fn fetch_crons(config: &SupabaseConfig) -> Result<Value, String> {
     handle_response(client.get(&url).send().await.map_err(|e| e.to_string())?).await
 }
 
+pub async fn fetch_cron_runs(config: &SupabaseConfig, cron_id: Option<&str>) -> Result<Value, String> {
+    let client = build_client(config)?;
+    let mut url = format!("{}?order=started_at.desc&limit=200", rest_url(config, "ae_cron_runs"));
+    if let Some(id) = cron_id.filter(|s| !s.trim().is_empty()) {
+        url.push_str(&format!("&cron_id=eq.{}", id));
+    }
+    handle_response(client.get(&url).send().await.map_err(|e| e.to_string())?).await
+}
+
+pub async fn create_cron_run(config: &SupabaseConfig, run: &Value) -> Result<Value, String> {
+    let client = build_client(config)?;
+    handle_response(client.post(&rest_url(config, "ae_cron_runs")).json(run).send().await.map_err(|e| e.to_string())?).await
+}
+
+pub async fn update_cron_run(config: &SupabaseConfig, id: &str, updates: &Value) -> Result<Value, String> {
+    let client = build_client(config)?;
+    let url = format!("{}?id=eq.{}", rest_url(config, "ae_cron_runs"), id);
+    handle_response(client.patch(&url).json(updates).send().await.map_err(|e| e.to_string())?).await
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // TAURI COMMAND WRAPPERS (thin wrappers that read config from state)
 // ═══════════════════════════════════════════════════════════════════
@@ -661,6 +681,12 @@ pub async fn supabase_send_message(message: Value, state: tauri::State<'_, Supab
 pub async fn supabase_fetch_crons(state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
     let config = state.get_config().await;
     fetch_crons(&config).await
+}
+
+#[tauri::command]
+pub async fn supabase_fetch_cron_runs(cron_id: Option<String>, state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
+    let config = state.get_config().await;
+    fetch_cron_runs(&config, cron_id.as_deref()).await
 }
 
 #[tauri::command]

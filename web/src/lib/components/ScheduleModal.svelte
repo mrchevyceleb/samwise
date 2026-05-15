@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { cronsStore } from '$lib/stores/crons.svelte';
-  import type { AeCron } from '$lib/types';
+  import type { AeCron, AeCronRun, CronExecutionMode } from '$lib/types';
 
   let { onClose }: { onClose: () => void } = $props();
 
@@ -17,6 +17,12 @@
     { value: '0 */6 * * *', label: 'Every 6 hours' }
   ];
 
+  const executionModes: { value: CronExecutionMode; label: string; hint: string }[] = [
+    { value: 'full', label: 'PR pipeline', hint: 'Branch, commit, review' },
+    { value: 'direct', label: 'Direct done', hint: 'Run and mark Done' },
+    { value: 'command', label: 'Command', hint: 'Maintenance commands' }
+  ];
+
   let showForm = $state(false);
   let editing = $state<AeCron | null>(null);
   let prompt = $state('');
@@ -26,6 +32,7 @@
   let targetMode = $state<'project' | 'parent'>('project');
   let project = $state('');
   let repoParent = $state('');
+  let executionMode = $state<CronExecutionMode>('full');
   let enabled = $state(true);
   let adminKey = $state('');
   let localError = $state<string | null>(null);
@@ -49,6 +56,7 @@
     targetMode = 'project';
     project = '';
     repoParent = '';
+    executionMode = 'full';
     enabled = true;
     localError = null;
   }
@@ -56,6 +64,31 @@
   function deriveName(text: string) {
     const firstLine = text.split('\n').map((line) => line.trim()).find(Boolean) || 'Scheduled job';
     return firstLine.length > 80 ? `${firstLine.slice(0, 77)}...` : firstLine;
+  }
+
+  function templateContext(template: Record<string, unknown>): Record<string, unknown> {
+    const context = template.context;
+    return context && typeof context === 'object' && !Array.isArray(context)
+      ? context as Record<string, unknown>
+      : {};
+  }
+
+  function normalizeExecutionMode(value: unknown): CronExecutionMode {
+    return value === 'direct' || value === 'command' ? value : 'full';
+  }
+
+  function executionModeForCron(cron: AeCron): CronExecutionMode {
+    const template = cron.task_template ?? {};
+    const context = templateContext(template);
+    return normalizeExecutionMode(context.cron_execution_mode ?? context.execution_mode ?? template.execution_mode);
+  }
+
+  function executionLabel(mode: CronExecutionMode | null) {
+    return executionModes.find((item) => item.value === mode)?.label ?? 'PR pipeline';
+  }
+
+  function runsForCron(cronId: string): AeCronRun[] {
+    return cronsStore.cronRuns.filter((run) => run.cron_id === cronId).slice(0, 3);
   }
 
   function startCreate() {
@@ -73,6 +106,7 @@
     project = typeof template.project === 'string' ? template.project : '';
     repoParent = typeof template.repo_parent === 'string' ? template.repo_parent : '';
     targetMode = repoParent ? 'parent' : 'project';
+    executionMode = executionModeForCron(cron);
     enabled = cron.enabled;
 
     const preset = presets.find((item) => item.value === cron.schedule);
@@ -100,7 +134,10 @@
       title: name,
       description: promptText,
       priority: 'medium',
-      task_type: 'code'
+      task_type: 'code',
+      context: {
+        cron_execution_mode: executionMode
+      }
     };
 
     if (targetMode === 'project') {
@@ -166,6 +203,22 @@
     });
   }
 
+  function formatDuration(start: string, end: string | null) {
+    const endMs = end ? new Date(end).getTime() : Date.now();
+    const seconds = Math.max(0, Math.round((endMs - new Date(start).getTime()) / 1000));
+    if (seconds < 60) return `${seconds}s`;
+    const minutes = Math.round(seconds / 60);
+    if (minutes < 60) return `${minutes}m`;
+    return `${Math.round(minutes / 60)}h`;
+  }
+
+  function statusClass(status: AeCronRun['status']) {
+    if (status === 'succeeded') return 'text-emerald-200';
+    if (status === 'running') return 'text-sky-200';
+    if (status === 'skipped') return 'text-amber-200';
+    return 'text-rose-200';
+  }
+
   function targetLabel(cron: AeCron) {
     const template = cron.task_template ?? {};
     if (typeof template.repo_parent === 'string' && template.repo_parent) {
@@ -203,6 +256,13 @@
         <h2 class="mt-1 text-lg font-semibold text-slate-100">Cron Jobs</h2>
       </div>
       {#if cronsStore.adminUnlocked}
+        <button
+          type="button"
+          onclick={() => cronsStore.fetchCronRuns()}
+          class="rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-xs font-bold text-slate-200 transition hover:-translate-y-0.5 hover:bg-white/10"
+        >
+          Refresh History
+        </button>
         <button
           type="button"
           onclick={startCreate}
@@ -280,6 +340,8 @@
           </div>
         {:else}
           {#each cronsStore.crons as cron (cron.id)}
+            {@const mode = executionModeForCron(cron)}
+            {@const recentRuns = runsForCron(cron.id)}
             <article class="rounded-2xl border border-white/10 bg-white/[0.04] p-3 transition hover:-translate-y-0.5 hover:border-white/20 hover:bg-white/[0.07]">
               <div class="flex items-start gap-3">
                 <button
@@ -300,10 +362,31 @@
                     <span class="rounded-md border border-indigo-300/20 bg-indigo-400/10 px-2 py-0.5 font-mono text-indigo-100">
                       {targetLabel(cron)}
                     </span>
+                    <span class="rounded-md border px-2 py-0.5 font-bold {mode === 'full' ? 'border-emerald-300/20 bg-emerald-400/10 text-emerald-100' : 'border-amber-300/20 bg-amber-400/10 text-amber-100'}">
+                      {executionLabel(mode)}
+                    </span>
                     <span>Next: {formatDate(cron.next_run)}</span>
                     <span>Last: {formatDate(cron.last_run)}</span>
                   </div>
                 </div>
+              </div>
+              <div class="mt-3 rounded-xl border border-white/10 bg-black/10 p-2">
+                <div class="mb-1 text-[10px] font-black uppercase tracking-normal text-slate-500">Recent runs</div>
+                {#if recentRuns.length === 0}
+                  <div class="text-[11px] text-slate-500">No run history yet.</div>
+                {:else}
+                  <div class="space-y-1">
+                    {#each recentRuns as run (run.id)}
+                      <div class="grid grid-cols-[76px_minmax(0,1fr)_auto] gap-2 text-[11px] text-slate-400">
+                        <span class="font-black {statusClass(run.status)}">{run.status}</span>
+                        <span class="truncate" title={run.error || run.summary || ''}>
+                          {formatDate(run.started_at)} · {formatDuration(run.started_at, run.completed_at)} · {run.task_count} task{run.task_count === 1 ? '' : 's'}
+                        </span>
+                        <span class="font-mono text-slate-500">{executionLabel(run.execution_mode)}</span>
+                      </div>
+                    {/each}
+                  </div>
+                {/if}
               </div>
               <div class="mt-3 flex justify-end gap-2">
                 <button
@@ -346,6 +429,22 @@
                 class="mt-1 w-full resize-y rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm leading-relaxed text-slate-100 placeholder:text-slate-500 focus:border-white/30 focus:outline-none"
               ></textarea>
             </label>
+
+            <div class="space-y-2">
+              <div class="text-xs font-semibold text-slate-400">Run Mode</div>
+              <div class="grid grid-cols-1 gap-2">
+                {#each executionModes as mode}
+                  <button
+                    type="button"
+                    onclick={() => executionMode = mode.value}
+                    class="rounded-lg border px-3 py-2 text-left text-xs transition hover:scale-[1.02] {executionMode === mode.value ? 'border-amber-300/40 bg-amber-400/15 text-amber-100' : 'border-white/10 bg-white/5 text-slate-300'}"
+                  >
+                    <span class="block font-black">{mode.label}</span>
+                    <span class="mt-0.5 block text-[11px] font-medium text-slate-500">{mode.hint}</span>
+                  </button>
+                {/each}
+              </div>
+            </div>
 
             <div class="space-y-2">
               <div class="text-xs font-semibold text-slate-400">Repo Target</div>

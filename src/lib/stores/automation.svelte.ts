@@ -1,19 +1,23 @@
 /** Automation store using Svelte 5 runes - manages triggers and crons */
 
-import type { AeTrigger, AeCron, TriggerSourceType } from '$lib/types';
+import type { AeTrigger, AeCron, AeCronRun, TriggerSourceType } from '$lib/types';
 import { safeInvoke } from '$lib/utils/tauri';
 
 let triggers = $state<AeTrigger[]>([]);
 let crons = $state<AeCron[]>([]);
+let cronRuns = $state<AeCronRun[]>([]);
 let loadingTriggers = $state(false);
 let loadingCrons = $state(false);
+let loadingCronRuns = $state(false);
 
 export function getAutomationStore() {
   return {
     get triggers() { return triggers; },
     get crons() { return crons; },
+    get cronRuns() { return cronRuns; },
     get loadingTriggers() { return loadingTriggers; },
     get loadingCrons() { return loadingCrons; },
+    get loadingCronRuns() { return loadingCronRuns; },
 
     get activeTriggers() { return triggers.filter(t => t.enabled); },
     get activeCrons() { return crons.filter(c => c.enabled); },
@@ -85,6 +89,29 @@ export function getAutomationStore() {
       }
     },
 
+    async fetchCronRuns(cronId?: string) {
+      loadingCronRuns = true;
+      try {
+        const result = await safeInvoke<AeCronRun[]>('supabase_fetch_cron_runs', {
+          cronId: cronId ?? null,
+        });
+        if (result) {
+          if (cronId) {
+            const otherRuns = cronRuns.filter((run) => run.cron_id !== cronId);
+            cronRuns = [...result, ...otherRuns]
+              .sort((a, b) => new Date(b.started_at).getTime() - new Date(a.started_at).getTime())
+              .slice(0, 200);
+          } else {
+            cronRuns = result;
+          }
+        }
+      } catch (e) {
+        console.warn('[automation] fetch cron runs failed:', e);
+      } finally {
+        loadingCronRuns = false;
+      }
+    },
+
     async createCron(data: {
       name: string;
       schedule: string;
@@ -98,6 +125,7 @@ export function getAutomationStore() {
         if (result && Array.isArray(result) && result.length > 0) {
           const c = result[0] as AeCron;
           crons = [c, ...crons];
+          await this.fetchCronRuns();
           return c;
         }
       } catch (e) {
@@ -113,6 +141,7 @@ export function getAutomationStore() {
           updates,
         });
         crons = crons.map(c => c.id === id ? { ...c, ...updates } : c);
+        await this.fetchCronRuns(id);
       } catch (e) {
         console.warn('[automation] update cron failed:', e);
       }

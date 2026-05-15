@@ -122,6 +122,111 @@ async fn worker_made_changes(repo_path: &str) -> bool {
     false
 }
 
+fn first_returned_id(value: &Value) -> Option<String> {
+    value
+        .as_array()
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.get("id"))
+        .and_then(|id| id.as_str())
+        .map(|id| id.to_string())
+}
+
+fn normalize_cron_execution_mode(raw: Option<&str>) -> String {
+    match raw.unwrap_or("full").trim().to_ascii_lowercase().as_str() {
+        "direct" | "direct_done" | "direct-complete" | "no_pr" | "no-pr" => "direct".to_string(),
+        "command" | "commands" | "maintenance" => "command".to_string(),
+        _ => "full".to_string(),
+    }
+}
+
+fn cron_execution_mode_from_template(template: &Value) -> String {
+    let from_context = template
+        .get("context")
+        .and_then(|v| v.get("cron_execution_mode"))
+        .and_then(|v| v.as_str())
+        .or_else(|| template
+            .get("context")
+            .and_then(|v| v.get("execution_mode"))
+            .and_then(|v| v.as_str()));
+    normalize_cron_execution_mode(
+        from_context.or_else(|| template.get("execution_mode").and_then(|v| v.as_str()))
+    )
+}
+
+fn cron_execution_mode_from_task(task: &Value) -> String {
+    normalize_cron_execution_mode(
+        task.get("context")
+            .and_then(|v| v.get("cron_execution_mode"))
+            .and_then(|v| v.as_str())
+            .or_else(|| task
+                .get("context")
+                .and_then(|v| v.get("execution_mode"))
+                .and_then(|v| v.as_str()))
+    )
+}
+
+fn is_direct_cron_execution(mode: &str) -> bool {
+    matches!(mode, "direct" | "command")
+}
+
+fn builtin_direct_command_name(prompt: &str) -> Option<&'static str> {
+    let first_line = prompt.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let first_token = first_line.split_whitespace().next().unwrap_or_default();
+    match first_token {
+        "$match" | "/match" => Some("match"),
+        _ => None,
+    }
+}
+
+async fn run_match_maintenance_command(repo_path: &str) -> Result<String, String> {
+    run_git(&["rev-parse", "--is-inside-work-tree"], repo_path).await?;
+    run_git(&["fetch", "origin", "--prune"], repo_path).await?;
+
+    let current_branch = run_git(&["branch", "--show-current"], repo_path)
+        .await
+        .unwrap_or_default();
+    let default_branch = detect_default_branch(repo_path).await;
+    let preferred_branch = if current_branch.trim().is_empty() {
+        default_branch.clone()
+    } else {
+        current_branch.trim().to_string()
+    };
+
+    let mut target_ref = format!("origin/{}", preferred_branch);
+    if run_git(&["rev-parse", "--verify", &target_ref], repo_path).await.is_err() {
+        target_ref = format!("origin/{}", default_branch);
+    }
+    run_git(&["rev-parse", "--verify", &target_ref], repo_path).await?;
+
+    let local_branch = target_ref.trim_start_matches("origin/").to_string();
+    if current_branch.trim() != local_branch {
+        if run_git(&["rev-parse", "--verify", &local_branch], repo_path).await.is_ok() {
+            run_git(&["checkout", &local_branch], repo_path).await?;
+        } else {
+            run_git(&["checkout", "-B", &local_branch, &target_ref], repo_path).await?;
+        }
+    }
+
+    run_git(&["reset", "--hard", &target_ref], repo_path).await?;
+    run_git(&["clean", "-fd"], repo_path).await?;
+
+    let head = run_git(&["rev-parse", "--short", "HEAD"], repo_path).await.unwrap_or_default();
+    let status = run_git(&["status", "--porcelain"], repo_path).await.unwrap_or_default();
+    let cleanliness = if status.trim().is_empty() {
+        "Working tree is clean.".to_string()
+    } else {
+        format!("Working tree still has changes:\n{}", truncate(status.trim(), 800))
+    };
+
+    Ok(format!(
+        "Matched `{}` to `{}` at `{}`. {}",
+        local_branch,
+        target_ref,
+        head.trim(),
+        cleanliness
+    ))
+}
+
 /// Path where Sam keeps his worktrees, one subdirectory per repo, one leaf per task.
 fn worktrees_root() -> std::path::PathBuf {
     dirs::home_dir()
@@ -1078,8 +1183,8 @@ async fn evaluate_crons(config: &SupabaseConfig, app: &tauri::AppHandle) -> Resu
             .map(|dt| dt.with_timezone(&chrono::Utc));
 
         // If next_run is in the future, skip
-        if let Some(nr) = next_run {
-            if nr > now { continue; }
+        if let Some(nr) = next_run.as_ref() {
+            if *nr > now { continue; }
         }
 
         // Parse cron schedule - convert 5-field standard cron to 7-field (sec min hour dom month dow year)
@@ -1108,6 +1213,7 @@ async fn evaluate_crons(config: &SupabaseConfig, app: &tauri::AppHandle) -> Resu
                 continue;
             }
         };
+        let execution_mode = cron_execution_mode_from_template(&template);
 
         // `repo_parent` on the template is a cron-evaluator hint, not an
         // ae_tasks column. When set, fan out to one task per git subdir of
@@ -1117,9 +1223,29 @@ async fn evaluate_crons(config: &SupabaseConfig, app: &tauri::AppHandle) -> Resu
             .map(|s| s.to_string())
             .filter(|s| !s.is_empty());
 
+        let scheduled_for = next_run.unwrap_or(now);
+        let cron_run_id = match supabase::create_cron_run(config, &serde_json::json!({
+            "cron_id": cron_id,
+            "status": "running",
+            "scheduled_for": scheduled_for.to_rfc3339(),
+            "execution_mode": execution_mode.clone(),
+            "metadata": {
+                "cron_name": cron_name,
+                "schedule": schedule_str,
+                "repo_parent": repo_parent.clone(),
+            }
+        })).await {
+            Ok(row) => first_returned_id(&row),
+            Err(e) => {
+                log::warn!("[worker] Cron '{}' could not create run history row: {}", cron_name, e);
+                None
+            }
+        };
+
         let mut base_task = template.clone();
         if let Some(obj) = base_task.as_object_mut() {
             obj.remove("repo_parent");
+            obj.remove("execution_mode");
             obj.insert("source".to_string(), serde_json::json!("cron"));
             obj.insert("cron_id".to_string(), serde_json::json!(cron_id));
             if !obj.contains_key("status") {
@@ -1128,7 +1254,30 @@ async fn evaluate_crons(config: &SupabaseConfig, app: &tauri::AppHandle) -> Resu
             if !obj.contains_key("priority") {
                 obj.insert("priority".to_string(), serde_json::json!("medium"));
             }
+            if !obj.contains_key("task_type") {
+                obj.insert("task_type".to_string(), serde_json::json!("code"));
+            }
+            let mut context = obj
+                .get("context")
+                .cloned()
+                .filter(|v| v.is_object())
+                .unwrap_or_else(|| serde_json::json!({}));
+            if let Some(ctx) = context.as_object_mut() {
+                ctx.insert("cron_execution_mode".to_string(), serde_json::json!(execution_mode));
+                ctx.insert("cron_name".to_string(), serde_json::json!(cron_name));
+                ctx.insert("cron_schedule".to_string(), serde_json::json!(schedule_str));
+                if repo_parent.is_none() {
+                    if let Some(run_id) = cron_run_id.as_deref() {
+                        ctx.insert("cron_run_id".to_string(), serde_json::json!(run_id));
+                    }
+                }
+            }
+            obj.insert("context".to_string(), context);
         }
+
+        let mut created_task_ids: Vec<String> = Vec::new();
+        let mut created_count = 0usize;
+        let mut errors: Vec<String> = Vec::new();
 
         if let Some(parent_path) = repo_parent {
             let parent = std::path::PathBuf::from(&parent_path);
@@ -1144,6 +1293,7 @@ async fn evaluate_crons(config: &SupabaseConfig, app: &tauri::AppHandle) -> Resu
                 }
                 Err(e) => {
                     log::warn!("[worker] Cron '{}' repo_parent {} unreadable: {}", cron_name, parent_path, e);
+                    errors.push(format!("repo_parent {} unreadable: {}", parent_path, e));
                 }
             }
             subdirs.sort();
@@ -1170,8 +1320,18 @@ async fn evaluate_crons(config: &SupabaseConfig, app: &tauri::AppHandle) -> Resu
                     obj.insert("project".to_string(), serde_json::json!(repo_name));
                 }
                 match supabase::create_task(config, &task).await {
-                    Ok(_) => { created += 1; }
-                    Err(e) => log::error!("[worker] Cron '{}' fan-out task for {} failed: {}", cron_name, repo_name, e),
+                    Ok(row) => {
+                        created += 1;
+                        created_count += 1;
+                        if let Some(id) = first_returned_id(&row) {
+                            created_task_ids.push(id);
+                        }
+                    }
+                    Err(e) => {
+                        let msg = format!("fan-out task for {} failed: {}", repo_name, e);
+                        log::error!("[worker] Cron '{}' {}", cron_name, msg);
+                        errors.push(msg);
+                    }
                 }
             }
             if created > 0 {
@@ -1180,14 +1340,51 @@ async fn evaluate_crons(config: &SupabaseConfig, app: &tauri::AppHandle) -> Resu
             }
         } else {
             match supabase::create_task(config, &base_task).await {
-                Ok(_) => {
+                Ok(row) => {
+                    created_count += 1;
+                    if let Some(id) = first_returned_id(&row) {
+                        created_task_ids.push(id);
+                    }
                     log::info!("[worker] Cron '{}' created task", cron_name);
                     emit_worker_event(app, "cron_fired", &format!("Cron '{}' created a new task", cron_name), None);
                 }
                 Err(e) => {
                     log::error!("[worker] Cron '{}' failed to create task: {}", cron_name, e);
+                    errors.push(format!("failed to create task: {}", e));
                 }
             }
+        }
+
+        if let Some(run_id) = cron_run_id.as_deref() {
+            let run_status = if !errors.is_empty() {
+                "failed"
+            } else if created_count == 0 {
+                "skipped"
+            } else {
+                "succeeded"
+            };
+            let summary = if created_count == 0 {
+                "No tasks were created.".to_string()
+            } else {
+                format!(
+                    "Created {} task{}.",
+                    created_count,
+                    if created_count == 1 { "" } else { "s" }
+                )
+            };
+            let error_text = if errors.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(errors.join("\n"))
+            };
+            let _ = supabase::update_cron_run(config, run_id, &serde_json::json!({
+                "status": run_status,
+                "completed_at": chrono::Utc::now().to_rfc3339(),
+                "task_ids": created_task_ids,
+                "task_count": created_count,
+                "summary": summary,
+                "error": error_text,
+            })).await;
         }
 
         // Compute next run from schedule
@@ -1420,7 +1617,14 @@ async fn execute_task(
         .and_then(|v| v.as_str())
         .unwrap_or("project");
     let flexible_repo_mode = matches!(repo_mode, "none" | "multiple");
-    let uses_single_repo_pipeline = !is_research && !flexible_repo_mode;
+    let cron_execution_mode = cron_execution_mode_from_task(&task);
+    let bypass_pr_pipeline = !is_research && is_direct_cron_execution(&cron_execution_mode);
+    let uses_single_repo_pipeline = !is_research && !flexible_repo_mode && !bypass_pr_pipeline;
+    let cron_run_id = task
+        .get("context")
+        .and_then(|v| v.get("cron_run_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     // Read settings.json once and cache for both notification prefs and worker rules
     let cached_settings: Option<serde_json::Value> = if let Ok(data_dir) = app.path().app_data_dir() {
@@ -1639,6 +1843,80 @@ async fn execute_task(
         send_telegram(config, &format!("Working on: *{}*", escape_markdown_v2(&title))).await;
     }
 
+    if bypass_pr_pipeline {
+        let direct_request = if description.trim().is_empty() {
+            title.as_str()
+        } else {
+            description.as_str()
+        };
+
+        if let Some(command_name) = builtin_direct_command_name(direct_request) {
+            agent_comment(config, &task_id, &format!(
+                "Running direct maintenance command `{}` in `{}`. This will skip the PR/review pipeline.",
+                command_name,
+                repo_path
+            )).await;
+
+            let command_result = match command_name {
+                "match" => run_match_maintenance_command(&repo_path).await,
+                _ => Err(format!("Unknown direct command: {}", command_name)),
+            };
+
+            match command_result {
+                Ok(summary) => {
+                    agent_comment(config, &task_id, &format!("Direct command complete.\n\n{}", summary)).await;
+                    let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                        "status": "done",
+                        "completed_at": chrono::Utc::now().to_rfc3339(),
+                        "worker_id": serde_json::Value::Null,
+                        "claimed_at": serde_json::Value::Null,
+                        "updated_at": chrono::Utc::now().to_rfc3339(),
+                    })).await;
+                    if let Some(run_id) = cron_run_id.as_deref() {
+                        let _ = supabase::update_cron_run(config, run_id, &serde_json::json!({
+                            "status": "succeeded",
+                            "completed_at": chrono::Utc::now().to_rfc3339(),
+                            "summary": summary.clone(),
+                            "error": serde_json::Value::Null,
+                        })).await;
+                    }
+                    notify_callback(config, &task_id, "done", None, None);
+                    if notify_task_completed_code {
+                        send_telegram(config, &format!(
+                            "Direct cron command complete for *{}*\\.",
+                            escape_markdown_v2(&title)
+                        )).await;
+                    }
+                    return Ok(summary);
+                }
+                Err(e) => {
+                    let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                        "status": "failed",
+                        "failure_reason": &e,
+                        "updated_at": chrono::Utc::now().to_rfc3339(),
+                    })).await;
+                    if let Some(run_id) = cron_run_id.as_deref() {
+                        let _ = supabase::update_cron_run(config, run_id, &serde_json::json!({
+                            "status": "failed",
+                            "completed_at": chrono::Utc::now().to_rfc3339(),
+                            "error": &e,
+                        })).await;
+                    }
+                    notify_callback(config, &task_id, "failed", None, Some(&e));
+                    agent_comment(config, &task_id, &format!("Direct command failed: {}", e)).await;
+                    if notify_task_failed {
+                        send_telegram(config, &format!(
+                            "Direct cron command failed for *{}*: {}",
+                            escape_markdown_v2(&title),
+                            escape_markdown_v2(&e)
+                        )).await;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
     // 3. Create a git worktree for this task off a fresh origin/<base>. Matt's main
     // checkout at main_repo_path is untouched (he can keep editing it while Sam works).
     // The worktree lives at ~/samwise/worktrees/<repo>/<short_id> and persists through
@@ -1754,6 +2032,8 @@ async fn execute_task(
     // 5. Run Claude Code CLI
     let action_label = if is_research {
         "Running analysis with Claude Code..."
+    } else if bypass_pr_pipeline {
+        "Running scheduled maintenance directly with Claude Code..."
     } else if flexible_repo_mode {
         "Starting flexible repo task with Claude Code..."
     } else {
@@ -1856,6 +2136,16 @@ async fn execute_task(
         prompt_parts.push(format!(
             "## Task\n**{}**\n\n{}\n\n## Instructions\nThis is a RESEARCH/ANALYSIS task. The only restriction is on the repo: do NOT modify source files, do NOT commit, do NOT push, do NOT open a PR.\n\nEverything else is fair game and expected:\n- Run commands (read-only inspections, CLI calls, log fetches, MCP tools)\n- Call MCP tools (Railway, Supabase, GitHub, Slack, etc.)\n- Create new tasks/tickets via the tasks tool or Supabase MCP if the prompt asks you to file findings\n- Post plans, analysis, and reports as comments on this task\n\nIf the prompt asks you to file tickets for findings, that IS the deliverable. Do it. Do not refuse on grounds of \"read-only mode\" — read-only refers to the repo's source code, nothing else.\n\nProduce a thorough written report. Be detailed and specific.",
             title, description
+        ));
+    } else if bypass_pr_pipeline {
+        let mode_note = if cron_execution_mode == "command" {
+            "This is a scheduled command/maintenance task."
+        } else {
+            "This is a scheduled direct coding task."
+        };
+        prompt_parts.push(format!(
+            "## Task\n**{}**\n\n{}\n\n## Instructions\n{}\n\nRun in the existing checkout at `{}`. Do not create a git worktree, do not create a branch, do not open a PR, and do not route this task to review.\n\nYou may run commands and make tightly scoped edits if the prompt requires it. If you change source files, run the smallest relevant verification and commit locally with a clear message. Do not push or deploy unless the prompt explicitly asks for that.\n\nFor slash-style maintenance commands, execute the command's intent directly. `$match` means fetch origin and make the selected branch match its remote counterpart.\n\nWhen finished, report exactly what you ran, what changed, and any follow-up needed.",
+            title, description, mode_note, repo_path
         ));
     } else if flexible_repo_mode {
         let repo_scope = if repo_mode == "multiple" {
@@ -2035,6 +2325,50 @@ from Matt, stop without making changes and explain specifically what you need cl
                 }
                 if let Some(h) = dev_server_handle.take() { let _ = dev_server::kill_dev_server(h).await; }
                 return Ok("Analysis complete".to_string());
+            }
+
+            if bypass_pr_pipeline {
+                let comment_output = truncate(&output, 10_000);
+                let git_status = run_git(&["status", "--porcelain"], &repo_path)
+                    .await
+                    .unwrap_or_default();
+                let status_note = if git_status.trim().is_empty() {
+                    "Git status is clean after the run.".to_string()
+                } else {
+                    format!(
+                        "Git status after the run:\n```\n{}\n```",
+                        truncate(git_status.trim(), 2000)
+                    )
+                };
+                agent_comment(config, &task_id, &format!(
+                    "Scheduled direct task complete. I skipped the PR/review pipeline for this run.\n\n{}\n\n{}",
+                    comment_output,
+                    status_note
+                )).await;
+                let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                    "status": "done",
+                    "completed_at": chrono::Utc::now().to_rfc3339(),
+                    "worker_id": serde_json::Value::Null,
+                    "claimed_at": serde_json::Value::Null,
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                })).await;
+                if let Some(run_id) = cron_run_id.as_deref() {
+                    let _ = supabase::update_cron_run(config, run_id, &serde_json::json!({
+                        "status": "succeeded",
+                        "completed_at": chrono::Utc::now().to_rfc3339(),
+                        "summary": truncate(&output, 1200),
+                        "error": serde_json::Value::Null,
+                    })).await;
+                }
+                notify_callback(config, &task_id, "done", None, None);
+                if notify_task_completed_code {
+                    send_telegram(config, &format!(
+                        "Finished direct cron task on *{}*\\.",
+                        escape_markdown_v2(&title)
+                    )).await;
+                }
+                if let Some(h) = dev_server_handle.take() { let _ = dev_server::kill_dev_server(h).await; }
+                return Ok("Direct cron task complete".to_string());
             }
 
             if flexible_repo_mode {
@@ -2591,6 +2925,13 @@ When done, run `git add -A && git commit -m \"fix: address QA feedback\"` and st
                 "status": "failed",
                 "updated_at": chrono::Utc::now().to_rfc3339(),
             })).await;
+            if let Some(run_id) = cron_run_id.as_deref() {
+                let _ = supabase::update_cron_run(config, run_id, &serde_json::json!({
+                    "status": "failed",
+                    "completed_at": chrono::Utc::now().to_rfc3339(),
+                    "error": &e,
+                })).await;
+            }
             notify_callback(config, &task_id, "failed", None, Some(&e));
             agent_comment(config, &task_id, &format!("Ran into an issue: {}. You might want to re-queue this or take a look.", e)).await;
             if notify_task_failed {

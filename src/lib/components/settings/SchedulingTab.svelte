@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import type { AeCron, AeTrigger, TaskPriority, TaskType } from '$lib/types';
+	import type { AeCron, AeCronRun, CronExecutionMode, TaskPriority, TaskType } from '$lib/types';
 	import { getAutomationStore } from '$lib/stores/automation.svelte';
 	import { getProjectStore } from '$lib/stores/projects.svelte';
 	import { getSettings } from '$lib/stores/settings.svelte';
@@ -29,6 +29,7 @@
 	let cronRepoMode = $state<'project' | 'parent'>('project');
 	let cronProject = $state('');
 	let cronRepoParent = $state('');
+	let cronExecutionMode = $state<CronExecutionMode>('full');
 	let cronEnabled = $state(true);
 	let cronSaving = $state(false);
 
@@ -65,8 +66,15 @@
 		{ value: 'low', label: 'Low', color: '#6e7681' },
 	];
 
+	const executionModes: { value: CronExecutionMode; label: string; hint: string }[] = [
+		{ value: 'full', label: 'PR pipeline', hint: 'Branch, commit, PR, review' },
+		{ value: 'direct', label: 'Direct done', hint: 'Run, verify, mark Done' },
+		{ value: 'command', label: 'Command', hint: 'Maintenance like $match' },
+	];
+
 	onMount(() => {
 		automation.fetchCrons();
+		automation.fetchCronRuns();
 		automation.fetchTriggers();
 		projectStore.fetchProjects();
 	});
@@ -76,6 +84,7 @@
 		cronPrompt = ''; cronSchedule = '0 9 * * *';
 		cronScheduleMode = 'preset'; cronCustom = '';
 		cronRepoMode = 'project'; cronProject = ''; cronRepoParent = '';
+		cronExecutionMode = 'full';
 		cronEnabled = true; editingCron = null;
 	}
 
@@ -84,14 +93,41 @@
 		return firstLine.length > 80 ? firstLine.slice(0, 77) + '...' : firstLine;
 	}
 
+	function templateContext(template: Record<string, any>): Record<string, any> {
+		const context = template.context;
+		return context && typeof context === 'object' && !Array.isArray(context)
+			? context as Record<string, any>
+			: {};
+	}
+
+	function normalizeExecutionMode(value: unknown): CronExecutionMode {
+		return value === 'direct' || value === 'command' ? value : 'full';
+	}
+
+	function executionModeForCron(cron: AeCron): CronExecutionMode {
+		const tpl = (cron.task_template ?? {}) as Record<string, any>;
+		const ctx = templateContext(tpl);
+		return normalizeExecutionMode(ctx.cron_execution_mode ?? ctx.execution_mode ?? tpl.execution_mode);
+	}
+
+	function executionLabel(mode: CronExecutionMode | null): string {
+		return executionModes.find((item) => item.value === mode)?.label ?? 'PR pipeline';
+	}
+
+	function runsForCron(cronId: string): AeCronRun[] {
+		return automation.cronRuns.filter((run) => run.cron_id === cronId).slice(0, 3);
+	}
+
 	function editCron(cron: AeCron) {
 		editingCron = cron;
 		const tpl = (cron.task_template ?? {}) as Record<string, any>;
+		const ctx = templateContext(tpl);
 		// Migrate legacy templates: prefer description, fall back to title, fall back to name
 		cronPrompt = (tpl?.description as string) || (tpl?.title as string) || cron.name || '';
 		cronProject = (tpl?.project as string) || '';
 		cronRepoParent = (tpl?.repo_parent as string) || '';
 		cronRepoMode = cronRepoParent ? 'parent' : 'project';
+		cronExecutionMode = normalizeExecutionMode(ctx.cron_execution_mode ?? ctx.execution_mode ?? tpl.execution_mode);
 		cronEnabled = cron.enabled;
 		const matchesPreset = presets.find(p => p.value === cron.schedule);
 		if (matchesPreset) {
@@ -116,6 +152,10 @@
 				title: derivedName,
 				description: promptText,
 				priority: 'medium',
+				task_type: 'code',
+				context: {
+					cron_execution_mode: cronExecutionMode,
+				},
 			};
 			if (cronRepoMode === 'project') {
 				template.project = cronProject;
@@ -204,6 +244,22 @@
 		return new Date(dateStr).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 	}
 
+	function formatDuration(start: string, end: string | null): string {
+		const endTime = end ? new Date(end).getTime() : Date.now();
+		const seconds = Math.max(0, Math.round((endTime - new Date(start).getTime()) / 1000));
+		if (seconds < 60) return `${seconds}s`;
+		const minutes = Math.round(seconds / 60);
+		if (minutes < 60) return `${minutes}m`;
+		return `${Math.round(minutes / 60)}h`;
+	}
+
+	function statusColor(status: AeCronRun['status']): string {
+		if (status === 'succeeded') return '#3fb950';
+		if (status === 'running') return '#58a6ff';
+		if (status === 'skipped') return '#d29922';
+		return '#f85149';
+	}
+
 	let webhookTriggers = $derived(automation.triggers.filter(t => t.source_type === 'webhook'));
 
 	// Shared styles
@@ -240,6 +296,12 @@
 			<div style="display: flex; align-items: center;">
 				<div style="{sectionTitle} flex: 1; border: none; padding: 0;">Scheduled Recurring Tasks</div>
 				<button
+					onclick={() => automation.fetchCronRuns()}
+					style="margin-right: 6px; padding: 5px 10px; border: 1px solid var(--border-default); background: transparent; color: var(--text-muted); border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; font-family: var(--font-ui); transition: all 0.15s;"
+				>
+					Refresh History
+				</button>
+				<button
 					onclick={() => { resetCronForm(); showCronForm = true; }}
 					style="padding: 5px 12px; border: 1px solid rgba(99,102,241,0.3); background: rgba(99,102,241,0.08); color: var(--accent-indigo); border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; font-family: var(--font-ui); transition: all 0.15s;"
 				>
@@ -263,6 +325,23 @@
 						<span style="{labelStyle}">Prompt</span>
 						<textarea bind:value={cronPrompt} placeholder="What should Sam do? e.g. /match, or 'audit dependencies and report stale ones', or 'grab Railway logs and create triage tickets for critical issues'"
 							style="padding: 8px 10px; background: var(--bg-primary); border: 1px solid var(--border-default); border-radius: 6px; color: var(--text-primary); font-size: 13px; font-family: var(--font-ui); outline: none; resize: vertical; min-height: 80px; width: 100%; box-sizing: border-box; line-height: 1.5;"></textarea>
+					</div>
+
+					<!-- Execution mode -->
+					<div style="display: flex; flex-direction: column; gap: 6px;">
+						<span style="{labelStyle}">Run Mode</span>
+						<div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px;">
+							{#each executionModes as mode}
+								<button onclick={() => cronExecutionMode = mode.value}
+									style="padding: 7px 8px; border-radius: 6px; font-size: 11px; font-weight: 700; cursor: pointer; font-family: var(--font-ui); transition: all 0.15s; text-align: left;
+										border: 1px solid {cronExecutionMode === mode.value ? 'rgba(99,102,241,0.4)' : 'var(--border-default)'};
+										background: {cronExecutionMode === mode.value ? 'rgba(99,102,241,0.1)' : 'transparent'};
+										color: {cronExecutionMode === mode.value ? 'var(--accent-indigo)' : 'var(--text-secondary)'};">
+									<div>{mode.label}</div>
+									<div style="font-size: 10px; font-weight: 500; color: var(--text-muted); margin-top: 2px;">{mode.hint}</div>
+								</button>
+							{/each}
+						</div>
 					</div>
 
 					<!-- Repo target -->
@@ -370,6 +449,8 @@
 			{:else}
 				{#each automation.crons as cron (cron.id)}
 					{@const tpl = (cron.task_template ?? {}) as Record<string, any>}
+					{@const mode = executionModeForCron(cron)}
+					{@const recentRuns = runsForCron(cron.id)}
 					{@const repoParentTail = typeof tpl.repo_parent === 'string'
 						? (String(tpl.repo_parent).split(/[\\/]/).filter(Boolean).pop() || String(tpl.repo_parent))
 						: ''}
@@ -383,6 +464,9 @@
 							<span style="font-size: 13px; font-weight: 600; color: var(--text-primary); flex: 1;">{cron.name}</span>
 							<span style="padding: 2px 8px; border-radius: 4px; font-size: 11px; font-family: var(--font-mono, monospace); background: rgba(88,166,255,0.08); color: var(--accent-blue);">
 								{humanSchedule(cron.schedule)}
+							</span>
+							<span style="padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; background: {mode === 'full' ? 'rgba(63,185,80,0.08)' : 'rgba(210,153,34,0.1)'}; color: {mode === 'full' ? '#3fb950' : '#d29922'};">
+								{executionLabel(mode)}
 							</span>
 						</div>
 						<div style="display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--text-muted); flex-wrap: wrap;">
@@ -408,6 +492,22 @@
 								style="padding: 3px 8px; border: 1px solid var(--border-default); background: none; border-radius: 4px; color: {cron.enabled ? '#f85149' : '#3fb950'}; font-size: 10px; cursor: pointer; font-family: var(--font-ui); transition: all 0.15s;">
 								{cron.enabled ? 'Disable' : 'Enable'}
 							</button>
+						</div>
+						<div style="border-top: 1px solid var(--border-subtle); padding-top: 6px; display: flex; flex-direction: column; gap: 4px;">
+							<div style="font-size: 10px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0;">Recent runs</div>
+							{#if recentRuns.length === 0}
+								<div style="font-size: 11px; color: var(--text-muted);">No run history yet.</div>
+							{:else}
+								{#each recentRuns as run (run.id)}
+									<div style="display: grid; grid-template-columns: 82px 1fr auto; gap: 8px; align-items: center; font-size: 11px; color: var(--text-secondary);">
+										<span style="font-weight: 700; color: {statusColor(run.status)};">{run.status}</span>
+										<span style="min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title={run.error || run.summary || ''}>
+											{formatDate(run.started_at)} · {formatDuration(run.started_at, run.completed_at)} · {run.task_count} task{run.task_count === 1 ? '' : 's'}
+										</span>
+										<span style="font-family: var(--font-mono); color: var(--text-muted);">{executionLabel(run.execution_mode)}</span>
+									</div>
+								{/each}
+							{/if}
 						</div>
 					</div>
 				{/each}

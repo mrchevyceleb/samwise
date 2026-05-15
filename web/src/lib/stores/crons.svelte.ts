@@ -1,4 +1,4 @@
-import type { AeCron, AeProject } from '$lib/types';
+import type { AeCron, AeCronRun, AeProject } from '$lib/types';
 
 type CronInput = {
   name: string;
@@ -27,8 +27,10 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
 
 class CronsStore {
   crons = $state<AeCron[]>([]);
+  cronRuns = $state<AeCronRun[]>([]);
   projects = $state<AeProject[]>([]);
   loadingCrons = $state(false);
+  loadingCronRuns = $state(false);
   loadingProjects = $state(false);
   checkingAdmin = $state(false);
   adminUnlocked = $state(false);
@@ -37,7 +39,7 @@ class CronsStore {
 
   async init() {
     if (!this.adminUnlocked) return;
-    await Promise.all([this.fetchCrons(), this.fetchProjects()]);
+    await Promise.all([this.fetchCrons(), this.fetchProjects(), this.fetchCronRuns()]);
   }
 
   async checkAdminSession() {
@@ -88,6 +90,27 @@ class CronsStore {
     }
   }
 
+  async fetchCronRuns(cronId?: string) {
+    this.loadingCronRuns = true;
+    this.error = null;
+    try {
+      const qs = cronId ? `?cron_id=${encodeURIComponent(cronId)}` : '';
+      const runs = await requestJson<AeCronRun[]>(`/api/cron-runs${qs}`);
+      if (cronId) {
+        const otherRuns = this.cronRuns.filter((run) => run.cron_id !== cronId);
+        this.cronRuns = [...runs, ...otherRuns]
+          .sort((a, b) => new Date(b.started_at).getTime() - new Date(a.started_at).getTime())
+          .slice(0, 200);
+      } else {
+        this.cronRuns = runs;
+      }
+    } catch (e) {
+      this.error = e instanceof Error ? e.message : String(e);
+    } finally {
+      this.loadingCronRuns = false;
+    }
+  }
+
   async fetchProjects() {
     this.loadingProjects = true;
     this.error = null;
@@ -110,6 +133,7 @@ class CronsStore {
         body: JSON.stringify(input)
       });
       this.crons = [cron, ...this.crons];
+      await this.fetchCronRuns();
       return cron;
     } catch (e) {
       this.error = e instanceof Error ? e.message : String(e);
@@ -129,6 +153,7 @@ class CronsStore {
         body: JSON.stringify(updates)
       });
       this.crons = this.crons.map((item) => (item.id === id ? cron : item));
+      await this.fetchCronRuns(id);
       return cron;
     } catch (e) {
       this.error = e instanceof Error ? e.message : String(e);
@@ -150,6 +175,7 @@ class CronsStore {
     try {
       await requestJson<{ ok: true }>(`/api/crons/${id}`, { method: 'DELETE' });
       this.crons = this.crons.filter((item) => item.id !== id);
+      this.cronRuns = this.cronRuns.filter((item) => item.cron_id !== id);
       return true;
     } catch (e) {
       this.error = e instanceof Error ? e.message : String(e);
