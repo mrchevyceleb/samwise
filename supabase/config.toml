@@ -1,0 +1,21 @@
+# Supabase project config for AutoSam (project ref: meqtadfevxguishrlxyx)
+#
+# All three Edge Functions authenticate callers themselves (task-webhook uses
+# x-webhook-secret, agent-api uses x-api-key) or are invoked by internal
+# schedules. They must NOT sit behind the Supabase gateway JWT check, or
+# external callers that send only their own secret get a gateway-level
+# 401 UNAUTHORIZED_NO_AUTH_HEADER before the function ever runs.
+#
+# Without these entries a bulk `supabase functions deploy` defaults
+# verify_jwt to true and silently breaks the QA Hub -> Sam delegate path.
+
+project_id = "autosam"
+
+[functions.task-webhook]
+verify_jwt = false
+
+[functions.agent-api]
+verify_jwt = false
+
+[functions.worker-heartbeat-alarm]
+verify_jwt = false
