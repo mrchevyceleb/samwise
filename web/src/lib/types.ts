@@ -10,7 +10,7 @@ export type TaskStatus =
   | 'failed'
   | 'pending_confirmation';
 export type TaskPriority = 'critical' | 'high' | 'medium' | 'low';
-export type TaskType = 'code' | 'research';
+export type TaskType = 'code' | 'research' | 'qa-verify';
 export type OriginSystem = 'operly_triage' | 'banana_triage' | 'sentry' | 'manual';
 export type CronExecutionMode = 'full' | 'direct' | 'command';
 export type CronRunStatus = 'running' | 'succeeded' | 'failed' | 'skipped';

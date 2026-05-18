@@ -3,7 +3,7 @@ import { getSupabaseAdmin } from '$lib/server/supabase-admin';
 import type { RequestHandler } from './$types';
 
 type RepoMode = 'project' | 'none' | 'multiple';
-type TaskType = 'code' | 'research';
+type TaskType = 'code' | 'research' | 'qa-verify';
 
 function cleanString(value: unknown) {
   return typeof value === 'string' ? value.trim() : '';
@@ -22,7 +22,9 @@ function repoModeFrom(value: unknown): RepoMode {
 }
 
 function taskTypeFrom(value: unknown): TaskType {
-  return value === 'research' ? 'research' : 'code';
+  if (value === 'research') return 'research';
+  if (value === 'qa-verify') return 'qa-verify';
+  return 'code';
 }
 
 export const POST: RequestHandler = async ({ request }) => {
@@ -80,6 +82,15 @@ export const POST: RequestHandler = async ({ request }) => {
   if (repoMode === 'none') context.repo_label = 'No repo';
   if (repoMode === 'multiple') context.repo_label = 'Multiple repos';
   if (repoMode === 'project') context.project_id = cleanString(payload.project_id) || undefined;
+
+  // qa-verify: stamp the environment and let the worker resolve the QA target
+  // (staging preview_url vs production_url) at run time. Don't pin the project
+  // preview_url here unless the caller passed an explicit override.
+  if (taskType === 'qa-verify') {
+    context.qa_environment = payload.environment === 'production' ? 'production' : 'staging';
+    const explicitPreview = cleanString(payload.preview_url);
+    previewUrl = explicitPreview || null;
+  }
 
   const attachments = Array.isArray(payload.attachments) ? payload.attachments : undefined;
 

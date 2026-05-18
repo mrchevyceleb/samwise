@@ -19,6 +19,7 @@
 	let project = $state('');
 	let priority = $state<TaskPriority>('medium');
 	let taskType = $state<TaskType>('code');
+	let qaEnvironment = $state<'staging' | 'production'>('staging');
 	let repoUrl = $state('');
 	let repoPath = $state('');
 	let previewUrl = $state('');
@@ -94,6 +95,13 @@
 				context.project_id = selectedProjectId;
 			}
 
+			const isQa = taskType === 'qa-verify';
+			if (isQa) {
+				// Worker resolves the QA target from the project + this env at
+				// run time (production -> production_url, else staging).
+				context.qa_environment = qaEnvironment;
+			}
+
 			await taskStore.createTask({
 				title: titleFromPrompt(prompt),
 				description: prompt.trim(),
@@ -102,7 +110,11 @@
 				project: repoMode === 'project' ? project.trim() || undefined : undefined,
 				repo_url: repoMode === 'project' ? repoUrl.trim() || undefined : undefined,
 				repo_path: repoMode === 'project' ? repoPath.trim() || undefined : undefined,
-				preview_url: repoMode === 'project' ? previewUrl.trim() || undefined : undefined,
+				// For qa-verify leave preview_url unset unless the user typed an
+				// explicit override, so the worker picks staging/production.
+				preview_url: isQa
+					? (previewUrl.trim() || undefined)
+					: (repoMode === 'project' ? previewUrl.trim() || undefined : undefined),
 				context,
 			});
 			onClose();
@@ -292,7 +304,66 @@
 					</svg>
 					Research
 				</button>
+				<button
+					type="button"
+					style="
+						flex: 1; padding: 8px 10px; border-radius: 8px;
+						border: 1px solid {taskType === 'qa-verify' ? 'rgba(16, 185, 129, 0.5)' : 'var(--border-default)'};
+						background: {taskType === 'qa-verify' ? 'rgba(16, 185, 129, 0.12)' : 'var(--bg-primary)'};
+						color: {taskType === 'qa-verify' ? '#10b981' : 'var(--text-muted)'};
+						font-size: 11px; font-weight: 700; font-family: var(--font-ui);
+						cursor: pointer; transition: all 0.15s ease;
+						display: flex; align-items: center; gap: 6px; justify-content: center;
+					"
+					onclick={() => { taskType = 'qa-verify'; }}
+				>
+					<svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" opacity="0.8">
+						<path d="M13.854 3.646a.5.5 0 010 .708l-7 7a.5.5 0 01-.708 0l-3.5-3.5a.5.5 0 11.708-.708L6.5 10.293l6.646-6.647a.5.5 0 01.708 0z"/>
+					</svg>
+					QA Verify
+				</button>
 			</div>
+
+			{#if taskType === 'qa-verify'}
+				<div style="margin-top: 10px;">
+					<div style="font-size: 11px; font-weight: 600; color: var(--text-secondary); display: block; margin-bottom: 6px;">
+						QA Environment
+					</div>
+					<div style="display: flex; gap: 6px;">
+						<button
+							type="button"
+							style="
+								flex: 1; padding: 8px 10px; border-radius: 8px;
+								border: 1px solid {qaEnvironment === 'staging' ? 'rgba(16, 185, 129, 0.5)' : 'var(--border-default)'};
+								background: {qaEnvironment === 'staging' ? 'rgba(16, 185, 129, 0.12)' : 'var(--bg-primary)'};
+								color: {qaEnvironment === 'staging' ? '#10b981' : 'var(--text-muted)'};
+								font-size: 11px; font-weight: 700; font-family: var(--font-ui);
+								cursor: pointer; transition: all 0.15s ease;
+							"
+							onclick={() => { qaEnvironment = 'staging'; }}
+						>
+							Staging
+						</button>
+						<button
+							type="button"
+							style="
+								flex: 1; padding: 8px 10px; border-radius: 8px;
+								border: 1px solid {qaEnvironment === 'production' ? 'rgba(239, 68, 68, 0.5)' : 'var(--border-default)'};
+								background: {qaEnvironment === 'production' ? 'rgba(239, 68, 68, 0.12)' : 'var(--bg-primary)'};
+								color: {qaEnvironment === 'production' ? '#ef4444' : 'var(--text-muted)'};
+								font-size: 11px; font-weight: 700; font-family: var(--font-ui);
+								cursor: pointer; transition: all 0.15s ease;
+							"
+							onclick={() => { qaEnvironment = 'production'; }}
+						>
+							Production
+						</button>
+					</div>
+					<div style="font-size: 10px; color: var(--text-muted); margin-top: 5px;">
+						Resolves the project's staging or production URL automatically. Pick a project above.
+					</div>
+				</div>
+			{/if}
 		</div>
 
 		<div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px;">

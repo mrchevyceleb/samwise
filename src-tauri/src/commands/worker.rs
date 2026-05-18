@@ -4058,6 +4058,17 @@ fn title_from_prompt(prompt: &str, fallback: &str) -> String {
 
 fn infer_telegram_task_type(prompt: &str) -> &'static str {
     let lower = prompt.to_lowercase();
+    let trimmed = lower.trim_start();
+    // Explicit QA intent only (conservative so normal coding tasks that merely
+    // mention "test" aren't misrouted).
+    if trimmed.starts_with("qa ")
+        || trimmed.starts_with("qa:")
+        || trimmed.starts_with("qa-verify")
+        || lower.contains("qa verify")
+        || lower.contains("qa-verify")
+    {
+        return "qa-verify";
+    }
     if [
         "research",
         "investigate",
@@ -4665,6 +4676,40 @@ async fn process_telegram_message(config: &SupabaseConfig, user_message: &str, m
         context["telegram_project_match_score"] =
             serde_json::Value::Number(serde_json::Number::from(routed_project.score));
         context["original_telegram_message"] = serde_json::Value::String(user_message.to_string());
+
+        // qa-verify from Telegram: stamp the environment (mention "prod"/
+        // "production" -> production, else staging) and pre-resolve the QA
+        // target from the project so backfill doesn't pin the wrong one.
+        if enriched.get("task_type").and_then(|v| v.as_str()) == Some("qa-verify") {
+            let msg_lower = user_message.to_lowercase();
+            let want_production =
+                msg_lower.contains("production") || msg_lower.contains("prod ");
+            let env = if want_production { "production" } else { "staging" };
+            context["qa_environment"] = serde_json::Value::String(env.to_string());
+            if enriched.get("preview_url").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+                if let Some(row) = projects_all
+                    .as_array()
+                    .and_then(|arr| arr.iter().find(|p| {
+                        p.get("name").and_then(|v| v.as_str()) == Some(routed_project.project.as_str())
+                    }))
+                {
+                    let pick = |k: &str| {
+                        row.get(k)
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_string())
+                    };
+                    let url = if want_production {
+                        pick("production_url").or_else(|| pick("preview_url"))
+                    } else {
+                        pick("preview_url")
+                    };
+                    if let Some(u) = url {
+                        enriched["preview_url"] = serde_json::Value::String(u);
+                    }
+                }
+            }
+        }
         enriched["context"] = context;
 
         backfill_task_project_fields(&mut enriched, &projects_all, &routed_project.project);

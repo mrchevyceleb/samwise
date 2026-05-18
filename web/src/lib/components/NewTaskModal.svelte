@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { AeProject } from '$lib/types';
+  import type { AeProject, TaskType } from '$lib/types';
 
   type Uploaded = { url: string; name: string; mime: string };
   type RepoMode = 'project' | 'none' | 'multiple';
@@ -9,7 +9,8 @@
   let prompt = $state('');
   let repoMode = $state<RepoMode>('project');
   let selectedProjectId = $state('');
-  let task_type = $state<'code' | 'research'>('code');
+  let task_type = $state<TaskType>('code');
+  let qaEnvironment = $state<'staging' | 'production'>('staging');
   let submitting = $state(false);
   let errorMsg = $state<string | null>(null);
   let uploading = $state(0);
@@ -82,6 +83,7 @@
           repo_mode: repoMode,
           project_id: repoMode === 'project' ? selectedProjectId : undefined,
           task_type,
+          environment: task_type === 'qa-verify' ? qaEnvironment : undefined,
           attachments: attachments.map((a) => ({ url: a.url, name: a.name, mime: a.mime }))
         })
       });
@@ -104,9 +106,10 @@
     { v: 'multiple', l: 'Multiple repos' }
   ];
 
-  const taskModes: { v: 'code' | 'research'; l: string }[] = [
+  const taskModes: { v: TaskType; l: string }[] = [
     { v: 'code', l: 'Coding' },
-    { v: 'research', l: 'Research' }
+    { v: 'research', l: 'Research' },
+    { v: 'qa-verify', l: 'QA Verify' }
   ];
 </script>
 
@@ -177,7 +180,7 @@
 
     <fieldset class="space-y-2">
       <legend class="text-xs font-semibold text-slate-400">Mode</legend>
-      <div class="grid grid-cols-2 gap-2">
+      <div class="grid grid-cols-3 gap-2">
         {#each taskModes as opt}
           <button
             type="button"
@@ -189,6 +192,29 @@
         {/each}
       </div>
     </fieldset>
+
+    {#if task_type === 'qa-verify'}
+      <fieldset class="space-y-2">
+        <legend class="text-xs font-semibold text-slate-400">QA Environment</legend>
+        <div class="grid grid-cols-2 gap-2">
+          <button
+            type="button"
+            onclick={() => (qaEnvironment = 'staging')}
+            class="rounded-lg border px-3 py-2 text-center text-sm font-semibold transition {qaEnvironment === 'staging' ? 'border-emerald-400/60 bg-emerald-400/10 text-emerald-100' : 'border-white/10 bg-white/5 text-slate-300 hover:bg-white/10'}"
+          >
+            Staging
+          </button>
+          <button
+            type="button"
+            onclick={() => (qaEnvironment = 'production')}
+            class="rounded-lg border px-3 py-2 text-center text-sm font-semibold transition {qaEnvironment === 'production' ? 'border-rose-400/60 bg-rose-400/10 text-rose-100' : 'border-white/10 bg-white/5 text-slate-300 hover:bg-white/10'}"
+          >
+            Production
+          </button>
+        </div>
+        <p class="text-[11px] text-slate-500">Resolves the selected project's staging or production URL automatically.</p>
+      </fieldset>
+    {/if}
 
     <div>
       <div class="block text-xs font-semibold text-slate-400 mb-1">
