@@ -119,6 +119,11 @@ const MERGE_CONFLICT_FIX_STATUS_KEY: &str = "samwise_merge_conflict_fix_status";
 const MERGE_CONFLICT_FIX_ERROR_KEY: &str = "samwise_merge_conflict_fix_error";
 const SAMWISE_DEPLOY_MANIFEST_PATH: &str = ".samwise/deploy.json";
 const SAMWISE_SUPABASE_AUTO_COMMAND: &str = "samwise:supabase:auto";
+const KIM_FULL_PR_REVIEW_SOURCE: &str = "github-kim-pr-review";
+const KIM_FULL_PR_REVIEW_AUTHOR: &str = "kgenterprisesbiz";
+const KIM_FULL_PR_REVIEW_REPO: &str = "R-Link-LLC/r-link-studio-rebuild";
+const KIM_FULL_PR_REVIEW_FALLBACK_REPO_PATH: &str = "/Users/mjohnst/samwise/KG-Apps/r-link-studio-rebuild";
+const FULL_PR_REVIEW_STALE_RUNNING_SECS: i64 = 2 * 60 * 60;
 
 /// External edge function that closes the upstream ticket (Operly triage,
 /// Banana triage, Sentry issue) after Sam ships and the deploy is green.
@@ -1278,6 +1283,27 @@ async fn worker_loop(
         // deploy plan before the card moves to Done. Every ~60s (12 ticks).
         if tick % 12 == 0 {
             sweep_pr_merged_cards(&config).await;
+        }
+
+        // Kim's rebuild PRs should skip the manual "Ready to Merge" stop and
+        // go straight through Codex's full `$pr-review` final gate. This poller
+        // adopts non-draft open PRs from her GitHub account and launches one
+        // full review/merge/deploy run per PR.
+        if tick % 12 == 3 {
+            let settings: Option<serde_json::Value> = if let Ok(data_dir) = app.path().app_data_dir() {
+                let settings_path = data_dir.join("settings.json");
+                tokio::fs::read_to_string(&settings_path).await
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+            } else { None };
+            let enabled = settings
+                .as_ref()
+                .and_then(|s| s.get("kimFullPrReviewEnabled"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            if enabled {
+                sweep_kim_full_pr_review_queue(&config).await;
+            }
         }
 
         // Adopt orphan open `sam/*` PRs only when explicitly enabled. This used
@@ -5802,6 +5828,75 @@ pub fn spawn_pr_review_task(
     });
 }
 
+/// Spawn Codex's full `$pr-review` flow for an externally-authored PR. Unlike
+/// `spawn_pr_review_task`, this can merge and deploy. The task row here is an
+/// audit/lock row, not a normal Sam coding task.
+pub fn spawn_full_pr_review_task(
+    config: SupabaseConfig,
+    task_id: String,
+    pr_url: String,
+    repo_path: String,
+) {
+    tokio::spawn(async move {
+        let started_at = chrono::Utc::now().to_rfc3339();
+        let _ = supabase::update_task(&config, &task_id, &serde_json::json!({
+            "status": "in_progress",
+            "claimed_at": started_at,
+            "updated_at": started_at,
+            "failure_reason": serde_json::Value::Null,
+        })).await;
+
+        let result = review::run_full_pr_review(&pr_url, &repo_path).await;
+        match result {
+            Ok(report) => {
+                let capped = truncate(&report, 6000);
+                agent_comment(
+                    &config,
+                    &task_id,
+                    &format!("Full `$pr-review` completed.\n\n{}", capped),
+                ).await;
+                let _ = supabase::update_task(&config, &task_id, &serde_json::json!({
+                    "status": "done",
+                    "completed_at": chrono::Utc::now().to_rfc3339(),
+                    "worker_id": serde_json::Value::Null,
+                    "claimed_at": serde_json::Value::Null,
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                    "failure_reason": serde_json::Value::Null,
+                })).await;
+                send_telegram(
+                    &config,
+                    &format!(
+                        "Full `$pr-review` completed for Kim PR: {}",
+                        escape_markdown_v2(&pr_url),
+                    ),
+                ).await;
+            }
+            Err(e) => {
+                let reason = truncate(&e, 1800);
+                agent_comment(
+                    &config,
+                    &task_id,
+                    &format!("Full `$pr-review` failed. Leaving the audit card failed.\n\n{}", reason),
+                ).await;
+                let _ = supabase::update_task(&config, &task_id, &serde_json::json!({
+                    "status": "failed",
+                    "failure_reason": reason,
+                    "worker_id": serde_json::Value::Null,
+                    "claimed_at": serde_json::Value::Null,
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                })).await;
+                send_telegram(
+                    &config,
+                    &format!(
+                        "Full `$pr-review` failed for Kim PR: {}",
+                        escape_markdown_v2(&pr_url),
+                    ),
+                ).await;
+            }
+        }
+    });
+}
+
 /// Fire a Telegram notification at the end of Sam's automation for a task.
 /// Reads the notify-task-completed-code setting so it respects Matt's
 /// notification preferences. Includes the task title for context.
@@ -8826,6 +8921,255 @@ pub async fn sweep_pr_merged_cards(config: &SupabaseConfig) {
             continue;
         }
         // OPEN / anything else: leave alone.
+    }
+}
+
+fn resolve_kim_full_pr_review_repo(projects: &Value) -> Option<(String, String, String)> {
+    let target_url = normalize_repo_url(&format!("https://github.com/{}", KIM_FULL_PR_REVIEW_REPO));
+    if let Some(arr) = projects.as_array() {
+        for project in arr {
+            let repo_url = project.get("repo_url").and_then(|v| v.as_str()).unwrap_or("");
+            if repo_url.is_empty() || normalize_repo_url(repo_url) != target_url {
+                continue;
+            }
+            let repo_path = project
+                .get("repo_path")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())?;
+            if !Path::new(repo_path).exists() {
+                continue;
+            }
+            let project_name = project
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("r-link-studio-rebuild")
+                .to_string();
+            return Some((project_name, repo_path.to_string(), repo_url.to_string()));
+        }
+    }
+
+    if Path::new(KIM_FULL_PR_REVIEW_FALLBACK_REPO_PATH).exists() {
+        return Some((
+            "r-link-studio-rebuild".to_string(),
+            KIM_FULL_PR_REVIEW_FALLBACK_REPO_PATH.to_string(),
+            format!("https://github.com/{}", KIM_FULL_PR_REVIEW_REPO),
+        ));
+    }
+
+    None
+}
+
+fn full_pr_review_task_is_stale(task: &Value) -> bool {
+    let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    if status != "in_progress" {
+        return false;
+    }
+    let updated_at = task.get("updated_at").and_then(|v| v.as_str()).unwrap_or("");
+    let Ok(updated) = chrono::DateTime::parse_from_rfc3339(updated_at) else {
+        return true;
+    };
+    chrono::Utc::now().signed_duration_since(updated.with_timezone(&chrono::Utc))
+        > chrono::Duration::seconds(FULL_PR_REVIEW_STALE_RUNNING_SECS)
+}
+
+async fn list_kim_ready_prs(repo_path: &str) -> Result<Vec<Value>, String> {
+    let output = async_cmd("gh")
+        .args([
+            "pr", "list",
+            "--repo", KIM_FULL_PR_REVIEW_REPO,
+            "--state", "open",
+            "--author", KIM_FULL_PR_REVIEW_AUTHOR,
+            "--limit", "50",
+            "--json", "number,title,url,isDraft,headRefName,baseRefName,headRefOid,createdAt,updatedAt,author",
+        ])
+        .current_dir(repo_path)
+        .output()
+        .await
+        .map_err(|e| format!("spawn gh pr list: {}", e))?;
+    if !output.status.success() {
+        return Err(format!("gh pr list failed: {}", String::from_utf8_lossy(&output.stderr).trim()));
+    }
+    let body = String::from_utf8_lossy(&output.stdout);
+    let parsed: Value = serde_json::from_str(&body)
+        .map_err(|e| format!("parse gh pr list json: {}", e))?;
+    Ok(parsed.as_array().cloned().unwrap_or_default())
+}
+
+/// Watch Kim's rebuild PRs and run the full `$pr-review` automation exactly
+/// once for each non-draft open PR. The `ae_tasks` row is the audit trail and
+/// the dedupe lock, but the worker does not claim it through the normal queue.
+pub async fn sweep_kim_full_pr_review_queue(config: &SupabaseConfig) {
+    let projects = match supabase::fetch_projects(config).await {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("[kim-pr-review] fetch_projects failed: {}", e);
+            return;
+        }
+    };
+    let Some((project_name, repo_path, repo_url)) = resolve_kim_full_pr_review_repo(&projects) else {
+        log::warn!(
+            "[kim-pr-review] no usable repo_path for {}",
+            KIM_FULL_PR_REVIEW_REPO
+        );
+        return;
+    };
+
+    let known_tasks = match supabase::fetch_tasks(config, None).await {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("[kim-pr-review] fetch_tasks failed: {}", e);
+            return;
+        }
+    };
+
+    let mut existing_by_pr: HashMap<String, Value> = Default::default();
+    if let Some(arr) = known_tasks.as_array() {
+        for task in arr {
+            let source = task.get("source").and_then(|v| v.as_str()).unwrap_or("");
+            let is_kim_full_review = source == KIM_FULL_PR_REVIEW_SOURCE
+                || task
+                    .get("context")
+                    .and_then(|v| v.get("full_pr_review_automation"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+            if !is_kim_full_review {
+                continue;
+            }
+            let pr_url = task.get("pr_url").and_then(|v| v.as_str()).unwrap_or("");
+            if pr_url.is_empty() {
+                continue;
+            }
+            existing_by_pr.insert(normalize_pr_url(pr_url), task.clone());
+        }
+    }
+
+    let prs = match list_kim_ready_prs(&repo_path).await {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("[kim-pr-review] {}", e);
+            return;
+        }
+    };
+
+    for pr in prs {
+        if pr.get("isDraft").and_then(|v| v.as_bool()).unwrap_or(false) {
+            continue;
+        }
+        let pr_url = pr.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if pr_url.is_empty() {
+            continue;
+        }
+        let normalized_pr_url = normalize_pr_url(&pr_url);
+
+        if let Some(existing) = existing_by_pr.get(&normalized_pr_url) {
+            if full_pr_review_task_is_stale(existing) {
+                if let Some(task_id) = existing.get("id").and_then(|v| v.as_str()) {
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let _ = supabase::update_task(config, task_id, &serde_json::json!({
+                        "updated_at": now,
+                        "failure_reason": serde_json::Value::Null,
+                    })).await;
+                    agent_comment(
+                        config,
+                        task_id,
+                        "The previous `$pr-review` automation run looks stale, so I am restarting it now.",
+                    ).await;
+                    spawn_full_pr_review_task(
+                        config.clone(),
+                        task_id.to_string(),
+                        pr_url.clone(),
+                        repo_path.clone(),
+                    );
+                }
+            }
+            continue;
+        }
+
+        let pr_number = pr.get("number").and_then(|v| v.as_i64()).unwrap_or(0);
+        let pr_title = pr.get("title").and_then(|v| v.as_str()).unwrap_or("Kim PR");
+        let head_ref = pr.get("headRefName").and_then(|v| v.as_str()).unwrap_or("");
+        let base_ref = pr.get("baseRefName").and_then(|v| v.as_str()).unwrap_or("");
+        let head_oid = pr.get("headRefOid").and_then(|v| v.as_str()).unwrap_or("");
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let task = serde_json::json!({
+            "title": format!("Full $pr-review: PR #{} {}", pr_number, pr_title),
+            "description": format!(
+                "Automated full Codex `$pr-review` run for Kim's ready PR.\n\nPR: {}\nRepo: {}\nAuthor: {}\nHead: {}\nBase: {}",
+                pr_url,
+                KIM_FULL_PR_REVIEW_REPO,
+                KIM_FULL_PR_REVIEW_AUTHOR,
+                head_ref,
+                base_ref,
+            ),
+            "status": "in_progress",
+            "priority": "high",
+            "task_type": "code",
+            "project": project_name.clone(),
+            "source": KIM_FULL_PR_REVIEW_SOURCE,
+            "assignee": "codex",
+            "repo_url": repo_url.clone(),
+            "repo_path": repo_path.clone(),
+            "pr_url": pr_url.clone(),
+            "pr_number": pr_number,
+            "base_branch": if base_ref.is_empty() { Value::Null } else { Value::String(base_ref.to_string()) },
+            "context": {
+                "full_pr_review_automation": true,
+                "github_author": KIM_FULL_PR_REVIEW_AUTHOR,
+                "github_repo": KIM_FULL_PR_REVIEW_REPO,
+                "head_ref": head_ref,
+                "head_oid": head_oid,
+                "base_ref": base_ref,
+                "created_at": pr.get("createdAt").cloned().unwrap_or(Value::Null),
+                "updated_at": pr.get("updatedAt").cloned().unwrap_or(Value::Null),
+                "adopted_at": now.clone(),
+            },
+            "claimed_at": now.clone(),
+            "updated_at": now,
+        });
+
+        let task_id = match supabase::create_task(config, &task).await {
+            Ok(row) => first_returned_id(&row),
+            Err(e) => {
+                log::warn!("[kim-pr-review] create audit task failed for {}: {}", pr_url, e);
+                None
+            }
+        };
+        let Some(task_id) = task_id else {
+            continue;
+        };
+
+        agent_comment(
+            config,
+            &task_id,
+            &format!(
+                "Kim's PR is ready, so I am launching the full `$pr-review` automation now: {}",
+                pr_url
+            ),
+        ).await;
+        agent_chat(
+            config,
+            &format!(
+                "Kim opened PR #{} for review. I am running Codex `$pr-review` on it now: {}",
+                pr_number,
+                pr_url
+            ),
+        ).await;
+        send_telegram(
+            config,
+            &format!(
+                "Running full `$pr-review` for Kim PR #{}: {}",
+                pr_number,
+                escape_markdown_v2(pr_title),
+            ),
+        ).await;
+
+        spawn_full_pr_review_task(
+            config.clone(),
+            task_id,
+            pr_url,
+            repo_path.clone(),
+        );
     }
 }
 

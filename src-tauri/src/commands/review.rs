@@ -53,6 +53,7 @@ const CI_POLL_INTERVAL_SECS: u64 = 30;
 const CI_POLL_MAX_SECS: u64 = 15 * 60;
 const CI_MIN_OBSERVATIONS: u32 = 2; // don't trust an empty/first poll
 const CODEX_TIMEOUT_SECS: u64 = 20 * 60;
+const FULL_PR_REVIEW_TIMEOUT_SECS: u64 = 90 * 60;
 // Random delimiter so a malicious diff can't fake review JSON by closing a ``` fence.
 const DIFF_DELIMITER: &str = "===SAMWISE-DIFF-9f3c2a8b1d7e===";
 
@@ -966,6 +967,120 @@ pub async fn run_samwise_pr_review(
         markdown: body,
         requires_human,
     })
+}
+
+/// Run the full fire-and-forget `$pr-review` skill through Codex.
+///
+/// This is intentionally separate from `$samwise-pr-review`: the Samwise skill
+/// only reports a merge/fix verdict for board routing, while `$pr-review` is
+/// authorized to fix, merge, and deploy on its own. Use this only for explicit
+/// automations where Matt has asked for the full final-gate workflow.
+pub async fn run_full_pr_review(
+    pr_url: &str,
+    repo_path: &str,
+) -> Result<String, String> {
+    if !is_safe_pr_url(pr_url) {
+        return Err(format!("refusing pr_url that doesn't match the github shape: {}", pr_url));
+    }
+
+    let cwd = resolve_codex_cwd(repo_path);
+    let tmp_path = std::env::temp_dir().join(format!("samwise-full-pr-review-{}", uuid_like()));
+    tokio::fs::create_dir_all(&tmp_path).await
+        .map_err(|e| format!("create tmp dir: {}", e))?;
+    let _tmp_guard = TempDir(tmp_path.clone());
+    let output_path = tmp_path.join("last-message.txt");
+    let output_path_str = output_path.to_string_lossy().into_owned();
+
+    let prompt = format!(
+        "Use $pr-review on {pr_url}.\n\n\
+         Automation context:\n\
+         - Trigger: Kim PR watcher in Samwise.\n\
+         - Matt explicitly asked for this PR to go through the full `$pr-review` workflow automatically.\n\
+         - Do not ask for confirmation for normal review, fix, merge, or deploy steps.\n\
+         - If the PR is already closed or merged by the time you inspect it, report that clearly and exit cleanly.",
+        pr_url = pr_url
+    );
+
+    let mut cmd = async_cmd("codex");
+    cmd.args([
+        "--search",
+        "exec",
+        "-m", CODEX_MODEL,
+        "-c", CODEX_REASONING_CONFIG,
+        "--dangerously-bypass-approvals-and-sandbox",
+        "-C",
+    ])
+    .arg(&cwd)
+    .args(["-o"])
+    .arg(&output_path_str)
+    .arg(&prompt)
+    .current_dir(&cwd)
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| format!("failed to spawn codex: {}", e))?;
+
+    let stdout = child.stdout.take();
+    let stdout_handle = tokio::spawn(async move {
+        let mut output = String::new();
+        if let Some(mut reader) = stdout {
+            use tokio::io::AsyncReadExt;
+            let _ = reader.read_to_string(&mut output).await;
+        }
+        output
+    });
+
+    let stderr = child.stderr.take();
+    let stderr_handle = tokio::spawn(async move {
+        let mut output = String::new();
+        if let Some(mut reader) = stderr {
+            use tokio::io::AsyncReadExt;
+            let _ = reader.read_to_string(&mut output).await;
+        }
+        output
+    });
+
+    let status = match tokio::time::timeout(
+        Duration::from_secs(FULL_PR_REVIEW_TIMEOUT_SECS),
+        child.wait(),
+    ).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(format!("codex wait failed: {}", e)),
+        Err(_) => {
+            let _ = child.kill().await;
+            let stdout = stdout_handle.await.unwrap_or_default();
+            let stderr = stderr_handle.await.unwrap_or_default();
+            return Err(format!(
+                "codex timed out after {}s. Stderr tail: {} Stdout tail: {}",
+                FULL_PR_REVIEW_TIMEOUT_SECS,
+                trim_to(stderr.trim(), 1000),
+                trim_to(stdout.trim(), 1000),
+            ));
+        }
+    };
+
+    let stdout = stdout_handle.await.unwrap_or_default();
+    let stderr = stderr_handle.await.unwrap_or_default();
+    let final_message = tokio::fs::read_to_string(&output_path).await.unwrap_or_default();
+    let response = if final_message.trim().is_empty() {
+        stdout.trim().to_string()
+    } else {
+        final_message.trim().to_string()
+    };
+
+    if status.success() {
+        if response.trim().is_empty() {
+            return Ok("Codex completed `$pr-review`, but did not return a final message.".to_string());
+        }
+        return Ok(response);
+    }
+
+    Err(format!(
+        "codex exited with {}. Stderr tail:\n{}\n\nStdout tail:\n{}",
+        status,
+        trim_to(stderr.trim(), 2000),
+        trim_to(stdout.trim(), 2000),
+    ))
 }
 
 fn parse_pr_review_output(raw: &str) -> (PrReviewVerdict, bool, String) {
