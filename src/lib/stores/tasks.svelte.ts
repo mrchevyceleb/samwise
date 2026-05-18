@@ -26,14 +26,22 @@ function getTasksByColumn(): Record<TaskStatus, AeTask[]> {
       grouped[t.status].push(t);
     }
   }
-  // Sort each column by priority then created_at
+  // Terminal columns (done, failed) are about "what just happened", so sort
+  // them most-recently-updated first. Active work columns stay priority-first
+  // so the highest-priority work surfaces at the top of the queue.
   const priorityOrder: Record<TaskPriority, number> = { critical: 0, high: 1, medium: 2, low: 3 };
+  const recencyColumns = new Set<TaskStatus>(['done', 'failed']);
+  const recencyTs = (t: AeTask) => new Date(t.updated_at ?? t.created_at).getTime();
   for (const key of Object.keys(grouped) as TaskStatus[]) {
-    grouped[key].sort((a, b) => {
-      const pd = priorityOrder[a.priority] - priorityOrder[b.priority];
-      if (pd !== 0) return pd;
-      return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
-    });
+    if (recencyColumns.has(key)) {
+      grouped[key].sort((a, b) => recencyTs(b) - recencyTs(a));
+    } else {
+      grouped[key].sort((a, b) => {
+        const pd = priorityOrder[a.priority] - priorityOrder[b.priority];
+        if (pd !== 0) return pd;
+        return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+      });
+    }
   }
   return grouped;
 }
