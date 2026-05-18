@@ -201,7 +201,7 @@
 	async function handleStop() {
 		stopping = true;
 		try {
-			await safeInvoke('stop_current_task');
+			await safeInvoke('stop_current_task', { taskId: task.id });
 			await taskStore.fetchTasks();
 		} finally {
 			stopping = false;

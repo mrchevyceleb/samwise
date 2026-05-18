@@ -51,7 +51,7 @@ const TASK_FIELDS = new Set(["title", "description", "status", "priority", "task
 
 const VALID_STATUS = new Set(["queued", "in_progress", "testing", "review", "approved", "done", "failed"]);
 const VALID_PRIORITY = new Set(["critical", "high", "medium", "low"]);
-const VALID_TASK_TYPE = new Set(["code", "research"]);
+const VALID_TASK_TYPE = new Set(["code", "research", "qa-verify"]);
 const VALID_SOURCE = new Set(["manual", "trigger", "cron", "chat"]);
 const VALID_SOURCE_TYPE = new Set(["supabase", "webhook", "github", "triage"]);
 
