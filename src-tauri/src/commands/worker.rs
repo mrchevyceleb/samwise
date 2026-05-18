@@ -13,13 +13,82 @@ use crate::process::async_cmd;
 
 // ── State ────────────────────────────────────────────────────────────
 
+/// Per-task Claude Code PID slot. `execute_task` writes the spawned process id
+/// here so `stop_current_task` can kill it. One slot per active task.
+pub type PidSlot = Arc<tokio::sync::Mutex<Option<u32>>>;
+
+/// The active-task pool: `task_id -> that task's PID slot`. Sam can run several
+/// tasks at once; each builds in its own isolated worktree, and merge/deploy is
+/// still serialized per-repo via `MERGE_DEPLOY_LOCKS`, so concurrent builds are
+/// safe. The map's length is the live concurrency; capped by max concurrency.
+pub type ActiveTasks = Arc<tokio::sync::Mutex<HashMap<String, PidSlot>>>;
+
+/// Default ceiling on how many tasks Sam runs simultaneously. Override with
+/// `maxConcurrentTasks` in settings.json (clamped to 1..=8).
+pub const DEFAULT_MAX_CONCURRENT_TASKS: usize = 3;
+
+/// Set while a NON-isolated task is running. Research, flexible/no-repo, and
+/// direct-cron maintenance tasks don't get a private worktree: they run Claude
+/// in a shared checkout or `$HOME`, or run global commands. Two of those (or
+/// one of those plus anything else) racing would reintroduce the old
+/// overwrite/maintenance hazards, so a non-isolated task takes the worker
+/// exclusively: the loop claims nothing else until it clears. Isolated
+/// worktree tasks ignore this and run concurrently up to the configured max.
+static EXCLUSIVE_TASK_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// True when `task` will run in its own isolated git worktree (and so is safe
+/// to run alongside other isolated tasks). Mirrors the pipeline-mode logic in
+/// `execute_task`. `qa-verify` is browser-only and never mutates a checkout,
+/// so it counts as isolated/concurrency-safe.
+fn task_uses_isolated_worktree(task: &Value) -> bool {
+    let task_type = task
+        .get("task_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("code");
+    if task_type == "research" {
+        return false;
+    }
+    if task_type == "qa-verify" {
+        return true;
+    }
+    let repo_mode = task
+        .get("context")
+        .and_then(|v| v.get("repo_mode"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("project");
+    if matches!(repo_mode, "none" | "multiple") {
+        return false;
+    }
+    let cron_mode = cron_execution_mode_from_task(task);
+    if is_direct_cron_execution(&cron_mode) {
+        return false;
+    }
+    true
+}
+
+/// Resolve the configured concurrency ceiling from settings.json, clamped to a
+/// sane range. Falls back to the default if settings are missing/unreadable.
+async fn max_concurrent_tasks(app: &tauri::AppHandle) -> usize {
+    let raw = if let Ok(data_dir) = app.path().app_data_dir() {
+        let p = data_dir.join("settings.json");
+        tokio::fs::read_to_string(&p)
+            .await
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|s| s.get("maxConcurrentTasks").and_then(|v| v.as_u64()))
+    } else {
+        None
+    };
+    (raw.unwrap_or(DEFAULT_MAX_CONCURRENT_TASKS as u64) as usize).clamp(1, 8)
+}
+
 pub struct WorkerState {
     pub running: Arc<AtomicBool>,
     pub machine_name: Arc<tokio::sync::Mutex<Option<String>>>,
-    pub current_task_id: Arc<tokio::sync::Mutex<Option<String>>>,
+    /// Active-task pool. Replaces the old single-slot current_task_id /
+    /// current_process_id; the keys are the in-flight task ids.
+    pub active: ActiveTasks,
     pub last_telegram_update_id: Arc<tokio::sync::Mutex<Option<i64>>>,
-    /// PID of the currently running Claude Code process (for stop functionality)
-    pub current_process_id: Arc<tokio::sync::Mutex<Option<u32>>>,
 }
 
 impl Default for WorkerState {
@@ -27,9 +96,8 @@ impl Default for WorkerState {
         Self {
             running: Arc::new(AtomicBool::new(false)),
             machine_name: Arc::new(tokio::sync::Mutex::new(None)),
-            current_task_id: Arc::new(tokio::sync::Mutex::new(None)),
+            active: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             last_telegram_update_id: Arc::new(tokio::sync::Mutex::new(None)),
-            current_process_id: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 }
@@ -546,7 +614,12 @@ struct WorkerEvent {
 pub struct WorkerStatusInfo {
     pub running: bool,
     pub machine_name: Option<String>,
+    /// First active task id, kept for frontend backward-compat. Prefer
+    /// `active_task_ids` for the full picture now that Sam runs several at once.
     pub current_task_id: Option<String>,
+    /// All in-flight task ids (0..=max_concurrent).
+    #[serde(default)]
+    pub active_task_ids: Vec<String>,
 }
 
 // ── Commands ────────────────────────────────────────────────────────
@@ -599,15 +672,14 @@ pub async fn autostart_worker(app: tauri::AppHandle) {
     }
 
     let running = Arc::clone(&worker_state.running);
-    let current_task = Arc::clone(&worker_state.current_task_id);
+    let active = Arc::clone(&worker_state.active);
     let last_tg_update = Arc::clone(&worker_state.last_telegram_update_id);
-    let current_pid = Arc::clone(&worker_state.current_process_id);
     let sb_config_arc = Arc::clone(&sb_state.config);
     let app_handle = app.clone();
 
     log::info!("[worker] autostart: launching worker_loop (supervised) as {}", machine_name);
     tokio::spawn(async move {
-        supervise_worker_loop(running, current_task, last_tg_update, current_pid, machine_name, sb_config_arc, app_handle).await;
+        supervise_worker_loop(running, active, last_tg_update, machine_name, sb_config_arc, app_handle).await;
     });
 }
 
@@ -680,14 +752,13 @@ pub async fn worker_start(
     }
 
     let running = Arc::clone(&state.running);
-    let current_task = Arc::clone(&state.current_task_id);
+    let active = Arc::clone(&state.active);
     let last_tg_update = Arc::clone(&state.last_telegram_update_id);
-    let current_pid = Arc::clone(&state.current_process_id);
     let sb_config_arc = Arc::clone(&sb_state.config);
     let app_handle = app.clone();
 
     tokio::spawn(async move {
-        supervise_worker_loop(running, current_task, last_tg_update, current_pid, machine_name, sb_config_arc, app_handle).await;
+        supervise_worker_loop(running, active, last_tg_update, machine_name, sb_config_arc, app_handle).await;
     });
 
     Ok(())
@@ -713,56 +784,86 @@ pub async fn worker_status(
     state: tauri::State<'_, WorkerState>,
 ) -> Result<WorkerStatusInfo, String> {
     let name = state.machine_name.lock().await.clone();
-    let task = state.current_task_id.lock().await.clone();
+    let mut active_task_ids: Vec<String> = {
+        let active = state.active.lock().await;
+        active.keys().cloned().collect()
+    };
+    active_task_ids.sort();
     Ok(WorkerStatusInfo {
         running: state.running.load(Ordering::Relaxed),
         machine_name: name,
-        current_task_id: task,
+        current_task_id: active_task_ids.first().cloned(),
+        active_task_ids,
     })
 }
 
-/// Stop the currently running task by killing its Claude Code process.
-/// The task is marked as "failed" with a comment explaining it was manually stopped.
+/// Stop a running task by killing its Claude Code process and marking it
+/// "failed". When `task_id` is given, only that task is stopped (the per-card
+/// Stop button). When omitted, every active task is stopped (explicit
+/// all-stop). The stopped task ids are returned.
 #[tauri::command]
 pub async fn stop_current_task(
+    task_id: Option<String>,
     state: tauri::State<'_, WorkerState>,
     sb_state: tauri::State<'_, SupabaseState>,
 ) -> Result<String, String> {
-    let task_id = state.current_task_id.lock().await.clone();
-    let Some(task_id) = task_id else {
-        return Err("No task is currently running".to_string());
+    // Snapshot + remove the targeted entries so the loop sees free slots
+    // immediately and the per-task completion handlers don't double-remove.
+    let snapshot: Vec<(String, Option<u32>)> = {
+        let mut active = state.active.lock().await;
+        if active.is_empty() {
+            return Err("No task is currently running".to_string());
+        }
+        match &task_id {
+            Some(id) => {
+                let Some(slot) = active.remove(id) else {
+                    return Err(format!("Task {} is not currently running", id));
+                };
+                let pid = *slot.lock().await;
+                vec![(id.clone(), pid)]
+            }
+            None => {
+                let mut out = Vec::new();
+                for (tid, slot) in active.iter() {
+                    out.push((tid.clone(), *slot.lock().await));
+                }
+                active.clear();
+                out
+            }
+        }
     };
 
-    // Kill the Claude Code process
-    let pid = state.current_process_id.lock().await.take();
-    if let Some(pid) = pid {
-        #[cfg(target_os = "windows")]
-        {
-            // On Windows, kill the process tree (claude spawns child processes)
-            let _ = async_cmd("taskkill")
-                .args(["/F", "/T", "/PID", &pid.to_string()])
-                .output()
-                .await;
+    let config = sb_state.get_config().await;
+    let mut stopped: Vec<String> = Vec::new();
+    for (task_id, pid) in snapshot {
+        if let Some(pid) = pid {
+            #[cfg(target_os = "windows")]
+            {
+                // On Windows, kill the process tree (claude spawns child processes)
+                let _ = async_cmd("taskkill")
+                    .args(["/F", "/T", "/PID", &pid.to_string()])
+                    .output()
+                    .await;
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _ = async_cmd("kill")
+                    .args(["-9", &pid.to_string()])
+                    .output()
+                    .await;
+            }
+            log::info!("[worker] Killed Claude Code process {} for task {}", pid, task_id);
         }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = async_cmd("kill")
-                .args(["-9", &pid.to_string()])
-                .output()
-                .await;
-        }
-        log::info!("[worker] Killed Claude Code process {} for task {}", pid, task_id);
+
+        let _ = supabase::update_task(&config, &task_id, &serde_json::json!({
+            "status": "failed",
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+        })).await;
+        agent_comment(&config, &task_id, "Task stopped manually.").await;
+        stopped.push(task_id);
     }
 
-    // Mark task as failed with explanation
-    let config = sb_state.get_config().await;
-    let _ = supabase::update_task(&config, &task_id, &serde_json::json!({
-        "status": "failed",
-        "updated_at": chrono::Utc::now().to_rfc3339(),
-    })).await;
-    agent_comment(&config, &task_id, "Task stopped manually.").await;
-
-    Ok(task_id)
+    Ok(stopped.join(", "))
 }
 
 /// Restart a failed/stopped task by setting it back to queued.
@@ -791,9 +892,8 @@ pub async fn restart_task(
 // triggered by a Telegram caption hitting a non-char-boundary slice).
 async fn supervise_worker_loop(
     running: Arc<AtomicBool>,
-    current_task_id: Arc<tokio::sync::Mutex<Option<String>>>,
+    active: ActiveTasks,
     last_telegram_update_id: Arc<tokio::sync::Mutex<Option<i64>>>,
-    current_process_id: Arc<tokio::sync::Mutex<Option<u32>>>,
     machine_name: String,
     sb_config_arc: Arc<tokio::sync::RwLock<SupabaseConfig>>,
     app: tauri::AppHandle,
@@ -802,15 +902,14 @@ async fn supervise_worker_loop(
 
     while running.load(Ordering::Relaxed) {
         let running_c = running.clone();
-        let current_task_c = current_task_id.clone();
+        let active_c = active.clone();
         let last_tg_c = last_telegram_update_id.clone();
-        let current_pid_c = current_process_id.clone();
         let machine_c = machine_name.clone();
         let sb_c = sb_config_arc.clone();
         let app_c = app.clone();
 
         let handle = tokio::spawn(async move {
-            worker_loop(running_c, current_task_c, last_tg_c, current_pid_c, machine_c, sb_c, app_c).await;
+            worker_loop(running_c, active_c, last_tg_c, machine_c, sb_c, app_c).await;
         });
 
         match handle.await {
@@ -825,17 +924,16 @@ async fn supervise_worker_loop(
                     restarts, join_err
                 );
 
-                // Clear in-flight task pointer so we don't think we're still
-                // running whatever crashed; the orphaned ae_tasks row will be
-                // recovered by `recover_stuck_tasks` when worker_loop respawns.
+                // Clear the active pool so we don't think we're still running
+                // whatever crashed; the orphaned ae_tasks rows are recovered by
+                // `recover_stuck_tasks` when worker_loop respawns. Also drop the
+                // exclusive lock so a stale non-isolated task can't wedge the
+                // worker after a panic.
                 {
-                    let mut ct = current_task_id.lock().await;
-                    *ct = None;
+                    let mut pool = active.lock().await;
+                    pool.clear();
                 }
-                {
-                    let mut pid = current_process_id.lock().await;
-                    *pid = None;
-                }
+                EXCLUSIVE_TASK_ACTIVE.store(false, Ordering::Relaxed);
 
                 // Tell Matt the worker crashed and is auto-recovering.
                 let config = sb_config_arc.read().await.clone();
@@ -868,9 +966,8 @@ async fn supervise_worker_loop(
 
 async fn worker_loop(
     running: Arc<AtomicBool>,
-    current_task_id: Arc<tokio::sync::Mutex<Option<String>>>,
+    active: ActiveTasks,
     last_telegram_update_id: Arc<tokio::sync::Mutex<Option<i64>>>,
-    current_process_id: Arc<tokio::sync::Mutex<Option<u32>>>,
     machine_name: String,
     sb_config_arc: Arc<tokio::sync::RwLock<SupabaseConfig>>,
     app: tauri::AppHandle,
@@ -886,9 +983,9 @@ async fn worker_loop(
         agent_chat(&config, "Hey, Sam here. I'm online and ready. Drop a task or just tell me what you need.").await;
     }
 
-    // Recover tasks stuck in `in_progress` from a prior crash. Samwise is
-    // single-active (one worker row, enforced by heartbeat), so any in_progress
-    // row at startup is orphaned and safe to re-queue.
+    // Recover tasks stuck in `in_progress` from a prior crash. The pool is
+    // empty at startup (worker_loop just spawned), so any in_progress row is
+    // orphaned from a previous run and safe to re-queue.
     {
         let config = sb_config_arc.read().await.clone();
         let recovered = recover_stuck_tasks(&config).await;
@@ -925,7 +1022,7 @@ async fn worker_loop(
         // Periodic worktree sweep (every 6h). Only runs when idle to avoid racing
         // with an in-flight task touching the same branch/worktree.
         if tick > 0 && tick % SWEEP_TICKS == 0 {
-            let is_idle = current_task_id.lock().await.is_none();
+            let is_idle = active.lock().await.is_empty();
             if is_idle {
                 let (removed, kept) = sweep_worktrees_with_config(&config).await;
                 if removed > 0 {
@@ -936,8 +1033,8 @@ async fn worker_loop(
 
         // Poll for tasks every 10 seconds (every 2nd tick)
         if tick % 2 == 0 {
-            let is_idle = current_task_id.lock().await.is_none();
-            if is_idle {
+            let active_count = active.lock().await.len();
+            if active_count == 0 {
                 idle_ticks += 1;
 
                 // Proactive idle messages (every ~5 min = 60 ticks at 5s each)
@@ -948,7 +1045,16 @@ async fn worker_loop(
                     // 30 min idle
                     agent_chat(&config, "Still here, still idle. Queue's empty. Let me know when you've got something.").await;
                 }
+            } else {
+                idle_ticks = 0; // At least one task in flight; not idle.
+            }
 
+            // Fill up to `max_slots` concurrent tasks. Each runs in its own
+            // isolated worktree; merge/deploy stays serialized per-repo via
+            // MERGE_DEPLOY_LOCKS, so claiming several at once is safe.
+            let max_slots = max_concurrent_tasks(&app).await;
+            let free_slots = max_slots.saturating_sub(active_count);
+            if free_slots > 0 {
                 if let Ok(tasks) = supabase::fetch_tasks(&config, Some("queued")).await {
                     if let Some(arr) = tasks.as_array() {
                         // Sort by priority: critical=0, high=1, medium=2, low=3, then created_at asc
@@ -973,18 +1079,51 @@ async fn worker_loop(
                                 ta.cmp(tb)
                             })
                         });
-                        if let Some(task) = sorted.first() {
+                        let mut claimed_this_tick = 0usize;
+                        for task in sorted.iter() {
+                            if claimed_this_tick >= free_slots {
+                                break;
+                            }
+                            // A non-isolated task owns the worker exclusively;
+                            // while one runs, claim nothing.
+                            if EXCLUSIVE_TASK_ACTIVE.load(Ordering::Relaxed) {
+                                break;
+                            }
                             let task_id = task.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
                             let task_title = task.get("title").and_then(|v| v.as_str()).unwrap_or("a task").to_string();
 
                             if !task_id.is_empty() {
+                                // Defensive: never double-claim a task already in
+                                // our pool (claim_task is the cross-worker guard).
+                                if active.lock().await.contains_key(&task_id) {
+                                    continue;
+                                }
+                                // Tasks without a private worktree (research,
+                                // flexible/no-repo, direct-cron maintenance)
+                                // mutate a shared checkout or run global
+                                // commands. They must run alone: only start one
+                                // when the worker is completely free this pass.
+                                let isolated = task_uses_isolated_worktree(task);
+                                if !isolated {
+                                    let pool_now = active.lock().await.len();
+                                    if pool_now != 0 || claimed_this_tick != 0 {
+                                        continue;
+                                    }
+                                }
                                 match supabase::claim_task(&config, &task_id, &machine_name).await {
                                     Ok(_) => {
                                         idle_ticks = 0; // Reset idle counter
-                                        {
-                                            let mut ct = current_task_id.lock().await;
-                                            *ct = Some(task_id.clone());
+                                        if !isolated {
+                                            EXCLUSIVE_TASK_ACTIVE
+                                                .store(true, Ordering::Relaxed);
                                         }
+                                        let pid_slot: PidSlot =
+                                            Arc::new(tokio::sync::Mutex::new(None));
+                                        {
+                                            let mut pool = active.lock().await;
+                                            pool.insert(task_id.clone(), pid_slot.clone());
+                                        }
+                                        claimed_this_tick += 1;
                                         emit_worker_event(&app, "task_claimed", "Picked up a new task.", Some(&task_id));
 
                                         // Proactive chat: tell Matt what we're doing
@@ -995,23 +1134,30 @@ async fn worker_loop(
                                         // Run the task in a spawned tokio task so the worker
                                         // poll loop keeps ticking. Heartbeats, the merge-deploy
                                         // sweep, the PR-review sweep, telegram polls, crons, and
-                                        // triggers all need to run while a long task is in flight.
-                                        // Single-active is still enforced by `current_task_id`,
-                                        // which the loop checks before claiming the next task.
+                                        // triggers all need to run while long tasks are in flight.
+                                        // Concurrency is bounded by `max_slots`; each task holds
+                                        // a slot in the `active` pool until it finishes.
                                         let app_spawn = app.clone();
                                         let machine_name_spawn = machine_name.clone();
                                         let config_spawn = config.clone();
                                         let task_spawn = task.clone();
-                                        let current_process_id_spawn = current_process_id.clone();
-                                        let current_task_id_spawn = current_task_id.clone();
+                                        let pid_slot_spawn = pid_slot.clone();
+                                        let active_spawn = active.clone();
                                         let task_title_spawn = task_title.clone();
                                         let task_id_spawn = task_id.clone();
+                                        let was_exclusive = !isolated;
                                         tokio::spawn(async move {
-                                            let result = execute_task(&app_spawn, &machine_name_spawn, &config_spawn, task_spawn, current_process_id_spawn).await;
+                                            let result = execute_task(&app_spawn, &machine_name_spawn, &config_spawn, task_spawn, pid_slot_spawn).await;
 
+                                            // Release this task's slot so the pool frees up.
                                             {
-                                                let mut ct = current_task_id_spawn.lock().await;
-                                                *ct = None;
+                                                active_spawn.lock().await.remove(&task_id_spawn);
+                                            }
+                                            // Release the exclusive lock if this
+                                            // was a non-isolated task.
+                                            if was_exclusive {
+                                                EXCLUSIVE_TASK_ACTIVE
+                                                    .store(false, Ordering::Relaxed);
                                             }
 
                                             match &result {
@@ -1062,17 +1208,22 @@ async fn worker_loop(
                                                 }
                                             }
                                         });
+
+                                        // A non-isolated task now owns the
+                                        // worker; stop claiming this pass.
+                                        if !isolated {
+                                            break;
+                                        }
                                     }
                                     Err(_) => {
-                                        // Someone else claimed it, try next tick
+                                        // Someone else claimed it; try the next
+                                        // queued task on the next loop pass.
                                     }
                                 }
                             }
                         }
                     }
                 }
-            } else {
-                idle_ticks = 0; // Working on something, reset idle counter
             }
         }
 
@@ -1744,6 +1895,209 @@ async fn evaluate_triggers(config: &super::supabase::SupabaseConfig, app: &tauri
     Ok(())
 }
 
+// ── QA Verify ───────────────────────────────────────────────────────
+//
+// A `qa-verify` task replaces a human QA tester. Instead of writing code,
+// Sam drives a real logged-in browser (the assistant-mcp `browser_use`
+// tool, Browserbase-backed) against the card's preview URL, exercises the
+// feature against the acceptance criteria, captures console errors and a
+// screenshot, then emits a strict verdict:
+//   PASS -> card moves to `approved` (the merge/deploy + auto-merge sweep
+//           can take it from there, same as a clean Codex review).
+//   FAIL -> card moves to `fixes_needed` with the findings, so the
+//           existing fix loop (or Matt) picks it back up.
+async fn run_qa_verify(
+    config: &SupabaseConfig,
+    task: &serde_json::Value,
+    task_id: &str,
+    title: &str,
+    description: &str,
+    repo_path: &str,
+    preview_url: Option<&str>,
+    process_id_slot: PidSlot,
+) -> Result<String, String> {
+    // QA needs a URL to test. If none was resolved, pause for input rather
+    // than failing — mirrors how the code pipeline handles a missing repo.
+    let Some(target_url) = preview_url.map(|s| s.to_string()).filter(|s| !s.is_empty()) else {
+        agent_comment(
+            config,
+            task_id,
+            "I can't QA this without a preview URL. Set `preview_url` on the card (or on the project so I can resolve it) and I'll pick this back up.",
+        )
+        .await;
+        let _ = supabase::update_task(config, task_id, &serde_json::json!({
+            "status": "pending_confirmation",
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+        })).await;
+        return Ok("Waiting for a preview URL before I can run QA.".to_string());
+    };
+
+    let pr_url = task
+        .get("pr_url")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            task.get("context")
+                .and_then(|c| c.get("pr_url"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or("")
+        .to_string();
+
+    let _ = supabase::update_task(config, task_id, &serde_json::json!({
+        "status": "in_progress",
+        "updated_at": chrono::Utc::now().to_rfc3339(),
+    })).await;
+    notify_callback(config, task_id, "in_progress", None, None);
+    agent_comment(
+        config,
+        task_id,
+        &format!("Running browser QA against {} now. I'll post the verdict when I'm done.", target_url),
+    )
+    .await;
+
+    let acceptance = if description.trim().is_empty() {
+        "(No explicit acceptance criteria on the card. Verify the feature named in the title works, the page loads with no errors, and nothing is visibly broken.)".to_string()
+    } else {
+        description.trim().to_string()
+    };
+    let pr_line = if pr_url.is_empty() {
+        String::new()
+    } else {
+        format!("\nRelated PR (for context only, do NOT merge it): {}\n", pr_url)
+    };
+
+    // Heavily prescriptive prompt: the model gets exact tool flow, exact
+    // verdict format, and explicit failure handling so the output is
+    // machine-parseable.
+    let prompt = format!(
+        r#"You are an automated QA tester. You are NOT writing or changing any code. Your only job is to verify a feature in a real browser and return a strict verdict.
+
+FEATURE UNDER TEST: {title}
+
+TARGET URL: {target_url}
+{pr_line}
+ACCEPTANCE CRITERIA / WHAT TO VERIFY:
+{acceptance}
+
+HOW TO TEST (follow exactly):
+1. Use the `mcp__assistant-mcp__browser` tool. Call it with action `start` (pass `site` for the target URL's domain; include `account` if a stored login exists for it). Then `login` if the page requires auth (stored credentials + 2FA are handled automatically; if it returns needs_2fa for SMS/push, report that as a blocker, do not guess).
+2. Navigate to the TARGET URL. Use `snapshot` as your primary way to read the page. Use `screenshot` only to capture visual proof of a problem or of the working feature.
+3. Walk through every item in the acceptance criteria. Actually click and type — exercise the real flow, do not just look at the landing page.
+4. Watch for: JavaScript/console errors, failed network requests, broken layout, missing or non-functional elements, anything that contradicts the acceptance criteria.
+5. Always call the browser tool with action `end` before you finish, to release the session.
+
+VERDICT RULES:
+- PASS only if every acceptance item is satisfied AND there are no console errors or visibly broken UI.
+- FAIL if any acceptance item is unmet, OR there are console/network errors, OR the UI is broken, OR you could not complete the test (e.g. blocked by 2FA, page unreachable). When unsure, FAIL.
+
+OUTPUT (this must be the LAST thing you output, exactly this shape, nothing after it):
+QA_VERDICT: PASS
+or
+QA_VERDICT: FAIL
+followed immediately by a fenced json block:
+```json
+{{"summary": "one or two sentence plain-English summary", "issues": ["each concrete problem as its own string; empty array if PASS"], "checked": ["each acceptance item you verified"]}}
+```
+"#,
+        title = title,
+        target_url = target_url,
+        pr_line = pr_line,
+        acceptance = acceptance,
+    );
+
+    let raw = match run_claude_code_streaming(
+        repo_path,
+        &prompt,
+        0,
+        900,
+        config,
+        task_id,
+        process_id_slot,
+    )
+    .await
+    {
+        Ok(out) => out,
+        Err(e) => {
+            // Tooling failure is not a product verdict. Send it back for a
+            // human/fix pass rather than silently passing it.
+            let msg = format!("QA run could not complete: {}", truncate(&e, 300));
+            agent_comment(config, task_id, &msg).await;
+            let _ = supabase::update_task(config, task_id, &serde_json::json!({
+                "status": "fixes_needed",
+                "updated_at": chrono::Utc::now().to_rfc3339(),
+            })).await;
+            notify_callback(config, task_id, "fixes_needed", None, Some(&msg));
+            return Ok(msg);
+        }
+    };
+
+    // Parse the verdict. Be forgiving about casing/whitespace; default to
+    // FAIL when the marker is absent so a confused run never auto-approves.
+    let upper = raw.to_uppercase();
+    let passed = upper.contains("QA_VERDICT: PASS")
+        || upper.contains("QA_VERDICT:PASS");
+    let explicit_fail = upper.contains("QA_VERDICT: FAIL")
+        || upper.contains("QA_VERDICT:FAIL");
+
+    // Pull the JSON detail block if present (best-effort, for the comment).
+    let detail = raw
+        .rfind("```json")
+        .and_then(|i| raw[i + 7..].find("```").map(|j| raw[i + 7..i + 7 + j].trim().to_string()))
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    let summary = detail
+        .as_ref()
+        .and_then(|d| d.get("summary"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let issues: Vec<String> = detail
+        .as_ref()
+        .and_then(|d| d.get("issues"))
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+
+    if passed && !explicit_fail {
+        let mut body = String::from("QA PASSED ✅");
+        if !summary.is_empty() {
+            body.push_str(&format!("\n\n{}", summary));
+        }
+        body.push_str("\n\nMoving the card to approved.");
+        agent_comment(config, task_id, &body).await;
+        let _ = supabase::update_task(config, task_id, &serde_json::json!({
+            "status": "approved",
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+        })).await;
+        notify_callback(config, task_id, "approved", None, None);
+        Ok("QA passed; card approved.".to_string())
+    } else {
+        let mut body = String::from("QA FAILED ❌");
+        if !summary.is_empty() {
+            body.push_str(&format!("\n\n{}", summary));
+        }
+        if !issues.is_empty() {
+            body.push_str("\n\nIssues found:");
+            for it in &issues {
+                body.push_str(&format!("\n- {}", it));
+            }
+        }
+        if !passed && !explicit_fail {
+            body.push_str("\n\n(No clear verdict marker in the QA run; treating as a fail so it gets a second look.)");
+        }
+        body.push_str("\n\nMoving the card to fixes_needed.");
+        agent_comment(config, task_id, &body).await;
+        let _ = supabase::update_task(config, task_id, &serde_json::json!({
+            "status": "fixes_needed",
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+        })).await;
+        let reason = if issues.is_empty() { summary.clone() } else { issues.join("; ") };
+        notify_callback(config, task_id, "fixes_needed", None, Some(&reason));
+        Ok("QA failed; card moved to fixes_needed.".to_string())
+    }
+}
+
 // ── Task Execution ──────────────────────────────────────────────────
 
 async fn execute_task(
@@ -1871,6 +2225,27 @@ async fn execute_task(
                 let _ = supabase::update_task(config, &task_id, &updates).await;
             }
         }
+    }
+
+    // QA-verify tasks skip the entire code pipeline: no worktree, no Claude
+    // coding pass, no PR. They only need a browser target (preview_url), so
+    // run them BEFORE the repo_path requirement and fall back to $HOME as a
+    // neutral cwd when the card has no repo.
+    if task_type == "qa-verify" {
+        let qa_cwd = repo_path.clone().unwrap_or_else(|| {
+            std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
+        });
+        return run_qa_verify(
+            config,
+            &task,
+            &task_id,
+            &title,
+            &description,
+            &qa_cwd,
+            preview_url.as_deref(),
+            process_id_slot.clone(),
+        )
+        .await;
     }
 
     let mut repo_path = match repo_path {

@@ -409,14 +409,22 @@ pub async fn build_board_context(
 
     let running = worker_state.running.load(std::sync::atomic::Ordering::Relaxed);
     let machine = worker_state.machine_name.lock().await.clone();
-    let current_task = worker_state.current_task_id.lock().await.clone();
+    let active_ids: Vec<String> = {
+        let active = worker_state.active.lock().await;
+        active.keys().cloned().collect()
+    };
 
     if running {
         let machine_str = machine.as_deref().unwrap_or("unknown");
-        if let Some(task_id) = &current_task {
-            ctx.push_str(&format!("Worker: ONLINE on {}, currently working on task {}\n", machine_str, task_id));
-        } else {
+        if active_ids.is_empty() {
             ctx.push_str(&format!("Worker: ONLINE on {}, idle\n", machine_str));
+        } else {
+            ctx.push_str(&format!(
+                "Worker: ONLINE on {}, running {} task(s): {}\n",
+                machine_str,
+                active_ids.len(),
+                active_ids.join(", ")
+            ));
         }
     } else {
         ctx.push_str("Worker: OFFLINE (not running on this machine)\n");

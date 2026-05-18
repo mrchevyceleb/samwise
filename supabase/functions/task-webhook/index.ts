@@ -33,7 +33,7 @@ type Body = {
   description?: string;
   project?: string;
   priority?: "critical" | "high" | "medium" | "low";
-  task_type?: "code" | "research";
+  task_type?: "code" | "research" | "qa-verify";
   source?: string;
   repo_url?: string;
   base_branch?: string;

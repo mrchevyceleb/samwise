@@ -3,7 +3,7 @@
 export type TaskStatus = 'queued' | 'in_progress' | 'testing' | 'review' | 'fixes_needed' | 'approved' | 'qa' | 'done' | 'failed' | 'pending_confirmation';
 export type TaskPriority = 'critical' | 'high' | 'medium' | 'low';
 export type TaskSource = 'manual' | 'trigger' | 'cron' | 'chat';
-export type TaskType = 'code' | 'research';
+export type TaskType = 'code' | 'research' | 'qa-verify';
 export type MessageRole = 'user' | 'agent' | 'system';
 export type CommentAuthor = 'matt' | 'agent' | 'system';
 export type WorkerStatus = 'online' | 'offline' | 'busy';
