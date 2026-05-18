@@ -1981,16 +1981,21 @@ TARGET URL: {target_url}
 ACCEPTANCE CRITERIA / WHAT TO VERIFY:
 {acceptance}
 
-HOW TO TEST (follow exactly):
-1. Use the `mcp__assistant-mcp__browser` tool. Call it with action `start` (pass `site` for the target URL's domain; include `account` if a stored login exists for it). Then `login` if the page requires auth (stored credentials + 2FA are handled automatically; if it returns needs_2fa for SMS/push, report that as a blocker, do not guess).
-2. Navigate to the TARGET URL. Use `snapshot` as your primary way to read the page. Use `screenshot` only to capture visual proof of a problem or of the working feature.
-3. Walk through every item in the acceptance criteria. Actually click and type — exercise the real flow, do not just look at the landing page.
-4. Watch for: JavaScript/console errors, failed network requests, broken layout, missing or non-functional elements, anything that contradicts the acceptance criteria.
-5. Always call the browser tool with action `end` before you finish, to release the session.
+SESSION SETUP:
+- Use the `mcp__assistant-mcp__browser` tool. Call action `start` (pass `site` for the target URL's domain; include `account` if a stored login exists). Then `login` if the page requires auth — stored credentials + TOTP/email 2FA are handled automatically; if it returns needs_2fa for SMS/push, report that as a blocker and do NOT guess.
+- `snapshot` is your primary way to read the page. `screenshot` whenever something is notable — a bug, a rough edge, or proof the feature works. Keep an eye on the console/network the whole time (treat it like DevTools is open): capture every JS error, warning, and failed/4xx/5xx request, even if the feature still appears to work.
+- Always call action `end` before you finish.
+
+TEST HOLISTICALLY — do not just tick the acceptance list. Make zero assumptions about the codebase. Cover all of:
+1. FUNCTIONAL: exercise the real flow for every acceptance item. Actually click, type, submit, navigate — don't judge from the landing page. Try the unhappy paths too (empty input, invalid input, double-submit, back button, reload mid-flow).
+2. REGRESSIONS: the change can break things it didn't touch. Exercise the screens/flows adjacent to this feature and the obvious shared surfaces (nav, auth, the page the user lands on before/after, anything the feature links to). Flag anything that used to plausibly work and now looks broken.
+3. UI/UX QUALITY: judge it as a user, not just "does it render". Misalignment, overflow/clipping, contrast, inconsistent spacing, jank, slow or missing feedback on actions, confusing copy, dead ends, broken responsive layout at a narrow width. "Technically works but feels bad" is a reportable issue, not a pass.
+4. BLIND SPOTS / EXPLORATORY: spend real effort poking at things NOT in the acceptance criteria — edge cases, states the author likely didn't consider, anything that smells off. This is the most valuable part; be adversarial.
 
 VERDICT RULES:
-- PASS only if every acceptance item is satisfied AND there are no console errors or visibly broken UI.
-- FAIL if any acceptance item is unmet, OR there are console/network errors, OR the UI is broken, OR you could not complete the test (e.g. blocked by 2FA, page unreachable). When unsure, FAIL.
+- PASS only if every acceptance item is satisfied, you found no regressions, no console/network errors, and no UI/UX problems worse than trivial polish.
+- FAIL if any acceptance item is unmet, OR there are console/network errors, OR you found a regression, OR the UI/UX is broken or notably poor, OR you could not complete the test (blocked by 2FA, page unreachable). When unsure, FAIL.
+- Every problem you list must also be reflected in `issues` (that is what gets routed back for fixing). Tag each issue with its category, e.g. "[regression] ...", "[ux] ...", "[functional] ...", "[console] ...".
 
 OUTPUT (this must be the LAST thing you output, exactly this shape, nothing after it):
 QA_VERDICT: PASS
@@ -1998,7 +2003,7 @@ or
 QA_VERDICT: FAIL
 followed immediately by a fenced json block:
 ```json
-{{"summary": "one or two sentence plain-English summary", "issues": ["each concrete problem as its own string; empty array if PASS"], "checked": ["each acceptance item you verified"]}}
+{{"summary": "two or three sentence plain-English summary including overall UX impression", "issues": ["every concrete problem as its own string, each prefixed with [functional]/[regression]/[ux]/[console]/[blocker]; empty array only if a true PASS"], "checked": ["each thing you actually exercised, including regression and exploratory areas, not just the acceptance items"]}}
 ```
 "#,
         title = title,
