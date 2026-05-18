@@ -2198,9 +2198,27 @@ async fn execute_task(
                         .map(|s| s.to_string());
                 }
                 if preview_url.is_none() {
-                    preview_url = resolved.project.get("preview_url").and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string());
+                    // Honor the task's QA environment: production -> the
+                    // project's production_url (falling back to preview_url if
+                    // unset); anything else -> preview_url (staging/default).
+                    let want_production = task
+                        .get("context")
+                        .and_then(|c| c.get("qa_environment"))
+                        .and_then(|v| v.as_str())
+                        == Some("production");
+                    let pick = |key: &str| {
+                        resolved
+                            .project
+                            .get(key)
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_string())
+                    };
+                    preview_url = if want_production {
+                        pick("production_url").or_else(|| pick("preview_url"))
+                    } else {
+                        pick("preview_url")
+                    };
                 }
                 project_dev_command = resolved.project.get("dev_command").and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())

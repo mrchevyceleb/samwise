@@ -36,6 +36,11 @@ type Body = {
   task_type?: "code" | "research" | "qa-verify";
   source?: string;
   repo_url?: string;
+  // qa-verify QA target selection. `environment` picks the project's staging
+  // (preview_url, default) or production (production_url) URL. An explicit
+  // `preview_url` always overrides both.
+  environment?: "staging" | "production";
+  preview_url?: string;
   base_branch?: string;
   attachments?: AttachmentInput[];
   callback_url?: string;
@@ -58,6 +63,7 @@ type ProjectRow = {
   repo_url?: string | null;
   repo_path?: string | null;
   preview_url?: string | null;
+  production_url?: string | null;
 };
 type ProjectResolution = {
   row: ProjectRow;
@@ -319,7 +325,7 @@ Deno.serve(async (req) => {
   // Load registry once for project lookup + inference + backfill.
   const { data: projects, error: projErr } = await sb
     .from("ae_projects")
-    .select("name, repo_url, repo_path, preview_url");
+    .select("name, repo_url, repo_path, preview_url, production_url");
   if (projErr) {
     return json(500, { error: `Failed to load ae_projects: ${projErr.message}` });
   }
@@ -338,15 +344,23 @@ Deno.serve(async (req) => {
     source: body.source ?? "webhook",
   };
 
+  // QA target environment: explicit preview_url wins; otherwise the project's
+  // production_url when environment=production, else preview_url (staging).
+  const environment = body.environment === "production" ? "production" : "staging";
+  const explicitPreview = (body.preview_url ?? "").trim();
   if (project) {
     task.project = project;
     const row = resolution?.row ?? (projects ?? []).find((p) => p.name === project);
     if (row) {
       if (row.repo_url) task.repo_url = row.repo_url;
       if (row.repo_path) task.repo_path = row.repo_path;
-      if (row.preview_url) task.preview_url = row.preview_url;
+      const envUrl = environment === "production"
+        ? (row.production_url || row.preview_url)
+        : row.preview_url;
+      if (envUrl) task.preview_url = envUrl;
     }
   }
+  if (explicitPreview) task.preview_url = explicitPreview;
   if (!task.repo_url && repoUrl) task.repo_url = repoUrl;
   if (resolution) {
     task.context = {
@@ -358,6 +372,11 @@ Deno.serve(async (req) => {
       },
     };
   }
+  // Record the QA environment so the card/UI shows which target was used.
+  task.context = {
+    ...(task.context && typeof task.context === "object" ? task.context : {}),
+    qa_environment: environment,
+  };
 
   if (body.base_branch) task.base_branch = body.base_branch;
 
