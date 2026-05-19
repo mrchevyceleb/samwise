@@ -105,8 +105,11 @@ else
     echo "==> --force given, skipping in-flight check"
 fi
 
-echo "==> Building (doppler run -- npx tauri build)"
-doppler run -- npx tauri build
+# App-only bundle. We swap the .app into /Applications; the .dmg is never
+# used, and its bundle_dmg.sh step fails intermittently and would abort the
+# whole deploy before the app swap. Building only the app avoids that.
+echo "==> Building (doppler run -- npx tauri build --bundles app)"
+doppler run -- npx tauri build --bundles app
 
 if [ ! -d "$APP_SRC" ]; then
     echo "Build finished but $APP_SRC is missing. Aborting."
