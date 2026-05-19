@@ -1226,22 +1226,58 @@ fn push_tail(tail: &mut String, line: &str, cap: usize) {
 }
 
 fn summarize_codex_exec_event(event: &Value) -> Option<String> {
-    let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let payload = event.get("payload").unwrap_or(event);
+    let event_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
     let lower_type = event_type.to_ascii_lowercase();
+
+    if event_type == "function_call" {
+        let tool_name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
+        let args = payload.get("arguments").and_then(|v| v.as_str()).unwrap_or("");
+        if tool_name == "exec_command" {
+            if let Ok(parsed_args) = serde_json::from_str::<Value>(args) {
+                if let Some(cmd) = parsed_args.get("cmd").and_then(|v| v.as_str()) {
+                    return Some(format!("Running: {}", short_one_line(cmd, 120)));
+                }
+            }
+            return Some("Running a shell command.".to_string());
+        }
+        if tool_name == "apply_patch" {
+            return Some("Applying code changes.".to_string());
+        }
+        if tool_name == "write_stdin" {
+            return Some("Checking command output.".to_string());
+        }
+        return Some(format!("Using tool: {}", short_one_line(tool_name, 80)));
+    }
+
+    if event_type == "function_call_output" {
+        let output = payload.get("output").and_then(|v| v.as_str()).unwrap_or("");
+        if output.contains("Process exited with code 0") {
+            return Some("Command finished successfully.".to_string());
+        }
+        if output.contains("Process exited with code") {
+            return Some("Command finished with a non-zero exit.".to_string());
+        }
+        if output.contains("Process running with session ID") {
+            return Some("Command is still running.".to_string());
+        }
+    }
 
     if lower_type.contains("exec") || lower_type.contains("command") {
         if lower_type.contains("end") || lower_type.contains("complete") || lower_type.contains("completed") {
-            let code = event
+            let code = payload
                 .get("exit_code")
                 .or_else(|| event.pointer("/item/exit_code"))
+                .or_else(|| payload.pointer("/item/exit_code"))
                 .or_else(|| event.pointer("/output/exit_code"))
+                .or_else(|| payload.pointer("/output/exit_code"))
                 .and_then(|v| v.as_i64());
             return Some(match code {
                 Some(code) => format!("Command finished with exit code {}.", code),
                 None => "Command finished.".to_string(),
             });
         }
-        if let Some(command) = first_command_string(event, &[
+        if let Some(command) = first_command_string(payload, &[
             "/command",
             "/cmd",
             "/item/command",
@@ -1266,14 +1302,14 @@ fn summarize_codex_exec_event(event: &Value) -> Option<String> {
     }
 
     if lower_type.contains("mcp") {
-        if let Some(name) = first_string(event, &["/name", "/tool_name", "/item/name", "/call/name"]) {
+        if let Some(name) = first_string(payload, &["/name", "/tool_name", "/item/name", "/call/name"]) {
             return Some(format!("Using MCP tool: {}", short_one_line(name, 80)));
         }
         return Some("Using an MCP tool.".to_string());
     }
 
     if lower_type.contains("tool") {
-        if let Some(name) = first_string(event, &["/name", "/tool_name", "/item/name", "/call/name"]) {
+        if let Some(name) = first_string(payload, &["/name", "/tool_name", "/item/name", "/call/name"]) {
             return Some(format!("Using tool: {}", short_one_line(name, 80)));
         }
     }
@@ -1283,7 +1319,7 @@ fn summarize_codex_exec_event(event: &Value) -> Option<String> {
     }
 
     if lower_type.contains("error") {
-        if let Some(message) = first_string(event, &["/message", "/error", "/item/message"]) {
+        if let Some(message) = first_string(payload, &["/message", "/error", "/item/message"]) {
             return Some(format!("Codex reported: {}", short_one_line(message, 140)));
         }
     }
