@@ -1085,6 +1085,11 @@ async fn worker_loop(
                         // queued column visually but the worker won't claim them
                         // until he clicks the stamp off.
                         sorted.retain(|t| !t.get("on_hold").and_then(|v| v.as_bool()).unwrap_or(false));
+                        // `/plant` full-pr-review hand-offs are owned by
+                        // sweep_plant_full_pr_review_queue, not the normal
+                        // coding queue. Never let a worker claim one and try to
+                        // run it as a code task.
+                        sorted.retain(|t| !is_plant_full_pr_review_task(t));
                         sorted.sort_by(|a, b| {
                             let pa = priority_order(a.get("priority").and_then(|v| v.as_str()).unwrap_or("medium"));
                             let pb = priority_order(b.get("priority").and_then(|v| v.as_str()).unwrap_or("medium"));
@@ -1313,6 +1318,27 @@ async fn worker_loop(
                 .unwrap_or(true);
             if enabled {
                 sweep_kim_full_pr_review_queue(&config).await;
+            }
+        }
+
+        // Matt's `/plant` hand-offs: PRs he explicitly sent for the full
+        // `$pr-review` (review/fix/merge/deploy). Repo-agnostic and driven by
+        // the task row /plant inserted, not a GitHub author poll. Offset from
+        // the Kim sweep so the two never run on the same tick.
+        if tick % 12 == 6 {
+            let settings: Option<serde_json::Value> = if let Ok(data_dir) = app.path().app_data_dir() {
+                let settings_path = data_dir.join("settings.json");
+                tokio::fs::read_to_string(&settings_path).await
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+            } else { None };
+            let enabled = settings
+                .as_ref()
+                .and_then(|s| s.get("plantFullPrReviewEnabled"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            if enabled {
+                sweep_plant_full_pr_review_queue(&config).await;
             }
         }
 
@@ -9122,6 +9148,259 @@ async fn list_kim_ready_prs(repo_path: &str) -> Result<Vec<Value>, String> {
     let parsed: Value = serde_json::from_str(&body)
         .map_err(|e| format!("parse gh pr list json: {}", e))?;
     Ok(parsed.as_array().cloned().unwrap_or_default())
+}
+
+/// True when a task row is a `/plant` full-pr-review hand-off. The marker is
+/// set by the `/plant` command in `context.plant_full_pr_review`. These rows
+/// are owned exclusively by `sweep_plant_full_pr_review_queue`; the normal
+/// coding queue skips them.
+fn is_plant_full_pr_review_task(task: &Value) -> bool {
+    task.get("context")
+        .and_then(|c| c.get("plant_full_pr_review"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Repos `/plant` is allowed to drive through the full merge/deploy
+/// automation. `(owner, repo)` lowercased. The `/plant` command text guard is
+/// not a security boundary; this is the server-side one.
+const PLANT_ALLOWED_REPOS: &[(&str, &str)] = &[
+    ("r-link-llc", "operly"),
+    ("r-link-llc", "r-link-studio-rebuild"),
+];
+
+fn plant_repo_is_allowed(owner: &str, repo: &str) -> bool {
+    let o = owner.trim().to_ascii_lowercase();
+    let r = repo.trim().trim_end_matches(".git").to_ascii_lowercase();
+    PLANT_ALLOWED_REPOS.iter().any(|(ao, ar)| *ao == o && *ar == r)
+}
+
+/// Verify the local checkout's `origin` actually points at `owner/repo`, so a
+/// forged `repo_path` can't redirect Codex's merge/deploy at another repo.
+async fn plant_repo_path_origin_matches(repo_path: &str, owner: &str, repo: &str) -> bool {
+    let out = match async_cmd("git")
+        .args(["-C", repo_path, "remote", "get-url", "origin"])
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let raw = String::from_utf8_lossy(&out.stdout).trim().to_ascii_lowercase();
+    let url = raw.trim_end_matches(".git").trim_end_matches('/');
+    let needle = format!(
+        "{}/{}",
+        owner.trim().to_ascii_lowercase(),
+        repo.trim().trim_end_matches(".git").to_ascii_lowercase()
+    );
+    // Exact owner/repo tail match for both https (.../owner/repo) and ssh
+    // (git@host:owner/repo) remotes, so `operly` can't match `operly-support`.
+    url.ends_with(&format!("/{}", needle)) || url.ends_with(&format!(":{}", needle))
+}
+
+/// Adopt PRs Matt explicitly handed off via `/plant` and run the full Codex
+/// `$pr-review` (review -> fix -> merge -> deploy) on each. Queue-driven (not a
+/// GitHub author poll) but still server-side guarded: every row is checked
+/// against the repo allowlist and its local checkout's origin before launch.
+/// A queued row is claimed atomically (conditional queued -> in_progress
+/// PATCH) so two worker hosts can't double-launch; per-pass canonicalization
+/// keeps a stale-restart, a duplicate `/plant`, and a queued row from all
+/// firing for the same PR.
+pub async fn sweep_plant_full_pr_review_queue(config: &SupabaseConfig) {
+    let tasks = match supabase::fetch_tasks(config, None).await {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("[plant-pr-review] fetch_tasks failed: {}", e);
+            return;
+        }
+    };
+    let Some(arr) = tasks.as_array() else {
+        return;
+    };
+
+    // One normalized PR may have only one active full review. Seed from rows
+    // already running (in_progress + not stale) so a duplicate /plant insert,
+    // a stale-restart, and a queued row can never all fire for the same PR.
+    let mut handled_prs: std::collections::HashSet<String> = Default::default();
+    for task in arr {
+        if !is_plant_full_pr_review_task(task) {
+            continue;
+        }
+        let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        if status == "in_progress" && !full_pr_review_task_is_stale(task) {
+            if let Some(pr) = task.get("pr_url").and_then(|v| v.as_str()) {
+                if !pr.is_empty() {
+                    handled_prs.insert(normalize_pr_url(pr));
+                }
+            }
+        }
+    }
+
+    for task in arr {
+        if !is_plant_full_pr_review_task(task) {
+            continue;
+        }
+        let task_id = task.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let pr_url = task.get("pr_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let repo_path = task.get("repo_path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("");
+
+        if task_id.is_empty() {
+            continue;
+        }
+        if pr_url.is_empty() || repo_path.is_empty() {
+            let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                "status": "failed",
+                "failure_reason": "plant full-pr-review task is missing pr_url or repo_path",
+                "updated_at": chrono::Utc::now().to_rfc3339(),
+            })).await;
+            continue;
+        }
+        if !review::is_safe_pr_url(&pr_url) {
+            let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                "status": "failed",
+                "failure_reason": format!("plant pr_url failed safety validation: {}", pr_url),
+                "updated_at": chrono::Utc::now().to_rfc3339(),
+            })).await;
+            continue;
+        }
+
+        // Server-side allowlist. The /plant repo gate is instruction text, not
+        // a boundary: enforce it here from the PR URL, and verify the local
+        // checkout's origin really is that repo before any merge/deploy.
+        let Some(pref) = github_pull_ref_from_url(&pr_url) else {
+            let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                "status": "failed",
+                "failure_reason": format!("could not parse owner/repo from pr_url: {}", pr_url),
+                "updated_at": chrono::Utc::now().to_rfc3339(),
+            })).await;
+            continue;
+        };
+        if !plant_repo_is_allowed(&pref.owner, &pref.repo) {
+            let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                "status": "failed",
+                "failure_reason": format!(
+                    "repo {}/{} is not allowed for /plant full-pr-review automation",
+                    pref.owner, pref.repo
+                ),
+                "updated_at": chrono::Utc::now().to_rfc3339(),
+            })).await;
+            agent_comment(
+                config,
+                &task_id,
+                "This /plant hand-off points at a repo outside the allowed automation list (Operly or R-Link Studio only), so I will not run merge/deploy on it.",
+            ).await;
+            continue;
+        }
+        if !plant_repo_path_origin_matches(&repo_path, &pref.owner, &pref.repo).await {
+            let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                "status": "failed",
+                "failure_reason": format!(
+                    "repo_path origin does not match the PR repo {}/{}",
+                    pref.owner, pref.repo
+                ),
+                "updated_at": chrono::Utc::now().to_rfc3339(),
+            })).await;
+            agent_comment(
+                config,
+                &task_id,
+                "The local checkout for this /plant hand-off does not match the PR's repository, so I am refusing to run automated merge/deploy.",
+            ).await;
+            continue;
+        }
+
+        let normalized = normalize_pr_url(&pr_url);
+
+        // Another row for this PR is already running or was launched earlier
+        // in this same sweep pass. Retire a still-queued duplicate; leave any
+        // non-queued row alone (do not double-spawn).
+        if handled_prs.contains(&normalized) {
+            if status == "queued" {
+                let now = chrono::Utc::now().to_rfc3339();
+                let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                    "status": "done",
+                    "completed_at": now.clone(),
+                    "updated_at": now,
+                    "failure_reason": serde_json::Value::Null,
+                })).await;
+                agent_comment(
+                    config,
+                    &task_id,
+                    "This PR is already going through `$pr-review` from another /plant hand-off, so I am closing this duplicate.",
+                ).await;
+            }
+            continue;
+        }
+
+        let should_launch = match status {
+            "queued" => {
+                // Atomic cross-host claim: only the worker whose conditional
+                // PATCH actually flips queued -> in_progress proceeds. An empty
+                // result means another worker/tick already claimed it.
+                let now = chrono::Utc::now().to_rfc3339();
+                match supabase::update_task_if_status(
+                    config,
+                    &task_id,
+                    "queued",
+                    &serde_json::json!({
+                        "status": "in_progress",
+                        "claimed_at": now.clone(),
+                        "updated_at": now,
+                    }),
+                ).await {
+                    Ok(v) => v.as_array().map(|a| !a.is_empty()).unwrap_or(false),
+                    Err(e) => {
+                        log::warn!("[plant-pr-review] atomic claim failed for {}: {}", task_id, e);
+                        false
+                    }
+                }
+            }
+            "in_progress" => {
+                if full_pr_review_task_is_stale(task) {
+                    let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                        "updated_at": chrono::Utc::now().to_rfc3339(),
+                        "failure_reason": serde_json::Value::Null,
+                    })).await;
+                    agent_comment(
+                        config,
+                        &task_id,
+                        "The previous full `$pr-review` run for this /plant PR looks stale, so I am restarting it now.",
+                    ).await;
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        if !should_launch {
+            continue;
+        }
+
+        // Reserve this PR for the rest of the pass before spawning.
+        handled_prs.insert(normalized);
+
+        agent_comment(
+            config,
+            &task_id,
+            &format!(
+                "Picking up your /plant hand-off. Running the full Codex `$pr-review` (review, fix, merge, deploy) on {} now.",
+                pr_url
+            ),
+        ).await;
+        send_telegram(
+            config,
+            &format!(
+                "Running full `$pr-review` for /plant PR: {}",
+                escape_markdown_v2(&pr_url),
+            ),
+        ).await;
+
+        spawn_full_pr_review_task(config.clone(), task_id, pr_url, repo_path);
+    }
 }
 
 /// Watch Kim's rebuild PRs and run the full `$pr-review` automation exactly

@@ -320,6 +320,11 @@ async function handleTasks(method: string, id: string | null, _action: string | 
         source: (b.source as string) || "manual",
         assignee: (b.assignee as string) || "sam",
         context: (b.context as Record<string, unknown>) || null,
+        // PR fields are in TASK_FIELDS (PATCH-able) but were never persisted on
+        // create, so /plant hand-offs that need pr_url on the row would lose it.
+        pr_url: (b.pr_url as string) || null,
+        pr_number: (b.pr_number as number) || null,
+        branch: (b.branch as string) || null,
       })
       .select()
       .single();
