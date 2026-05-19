@@ -126,6 +126,7 @@ const KIM_FULL_PR_REVIEW_FALLBACK_REPO_PATH: &str = "/Users/mjohnst/samwise/KG-A
 const FULL_PR_REVIEW_STALE_RUNNING_SECS: i64 = 2 * 60 * 60;
 const MERGED_PR_IN_PROGRESS_RECONCILE_SECS: i64 = 30 * 60;
 const KIM_FULL_PR_REVIEW_CATCH_UP_SECS: i64 = 6 * 60 * 60;
+const FULL_PR_REVIEW_MAX_CONCURRENT: usize = 1;
 
 /// External edge function that closes the upstream ticket (Operly triage,
 /// Banana triage, Sentry issue) after Sam ships and the deploy is green.
@@ -143,6 +144,13 @@ const MERGE_DEPLOY_RUNNING_STALE_SECS: i64 = 90 * 60;
 /// before doing any work and releases when finished.
 static MERGE_DEPLOY_LOCKS: OnceLock<StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     OnceLock::new();
+static FULL_PR_REVIEW_SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+
+fn full_pr_review_semaphore() -> Arc<tokio::sync::Semaphore> {
+    FULL_PR_REVIEW_SEMAPHORE
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(FULL_PR_REVIEW_MAX_CONCURRENT)))
+        .clone()
+}
 
 fn merge_deploy_lock_for(repo_path: &str) -> Arc<tokio::sync::Mutex<()>> {
     let registry = MERGE_DEPLOY_LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
@@ -5847,6 +5855,53 @@ pub fn spawn_full_pr_review_task(
             "updated_at": started_at,
             "failure_reason": serde_json::Value::Null,
         })).await;
+
+        let semaphore = full_pr_review_semaphore();
+        let _permit = match semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                agent_comment(
+                    &config,
+                    &task_id,
+                    "Another full `$pr-review` is already running, so this one is queued behind it to keep Sam from overloading.",
+                ).await;
+                match semaphore.acquire_owned().await {
+                    Ok(permit) => {
+                        let acquired_at = chrono::Utc::now().to_rfc3339();
+                        let _ = supabase::update_task(&config, &task_id, &serde_json::json!({
+                            "claimed_at": acquired_at,
+                            "updated_at": acquired_at,
+                            "failure_reason": serde_json::Value::Null,
+                        })).await;
+                        permit
+                    }
+                    Err(_) => {
+                        let reason = "Full `$pr-review` throttle closed before this job could start.";
+                        agent_comment(&config, &task_id, reason).await;
+                        let _ = supabase::update_task(&config, &task_id, &serde_json::json!({
+                            "status": "failed",
+                            "failure_reason": reason,
+                            "worker_id": serde_json::Value::Null,
+                            "claimed_at": serde_json::Value::Null,
+                            "updated_at": chrono::Utc::now().to_rfc3339(),
+                        })).await;
+                        return;
+                    }
+                }
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                let reason = "Full `$pr-review` throttle is closed.";
+                agent_comment(&config, &task_id, reason).await;
+                let _ = supabase::update_task(&config, &task_id, &serde_json::json!({
+                    "status": "failed",
+                    "failure_reason": reason,
+                    "worker_id": serde_json::Value::Null,
+                    "claimed_at": serde_json::Value::Null,
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                })).await;
+                return;
+            }
+        };
 
         let result = review::run_full_pr_review(&config, &task_id, &pr_url, &repo_path).await;
         match result {
