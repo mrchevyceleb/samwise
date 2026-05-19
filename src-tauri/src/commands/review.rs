@@ -562,6 +562,8 @@ async fn run_codex_review(
         &prompt,
     ]);
 
+    cmd.stdin(std::process::Stdio::null());
+
     let mut child = cmd.spawn().map_err(|e| format!("spawn codex: {}", e))?;
     let wait_fut = child.wait();
     let status = match tokio::time::timeout(Duration::from_secs(CODEX_TIMEOUT_SECS), wait_fut).await {
@@ -885,6 +887,7 @@ pub async fn run_samwise_pr_review(
     ])
     .arg(&prompt)
     .current_dir(&cwd)
+    .stdin(std::process::Stdio::null())
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::piped());
 
@@ -1029,6 +1032,7 @@ pub async fn run_full_pr_review(
     .arg(&output_path_str)
     .arg(&prompt)
     .current_dir(&cwd)
+    .stdin(std::process::Stdio::null())
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::piped());
     // Run Codex as its own process-group leader so a kill can take down the
