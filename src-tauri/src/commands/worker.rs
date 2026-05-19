@@ -123,7 +123,15 @@ const KIM_FULL_PR_REVIEW_SOURCE: &str = "github-kim-pr-review";
 const KIM_FULL_PR_REVIEW_AUTHOR: &str = "kgenterprisesbiz";
 const KIM_FULL_PR_REVIEW_REPO: &str = "R-Link-LLC/r-link-studio-rebuild";
 const KIM_FULL_PR_REVIEW_FALLBACK_REPO_PATH: &str = "/Users/mjohnst/samwise/KG-Apps/r-link-studio-rebuild";
-const FULL_PR_REVIEW_STALE_RUNNING_SECS: i64 = 2 * 60 * 60;
+// The full-pr-review heartbeat now refreshes `updated_at` ONLY while Codex is
+// actively emitting events (see FULL_PR_REVIEW_FRESH_GUARD_SECS), so a stale
+// `updated_at` genuinely means "no real progress." Kept just above the
+// in-process quiet-kill (45 min) so that killer is first responder and this
+// sweep is the cross-host / app-restart backstop.
+const FULL_PR_REVIEW_NO_PROGRESS_STALE_SECS: i64 = 50 * 60;
+// How many times a wedged (quiet-killed) full review may be auto-retried
+// before the card is left failed for a human. Total attempts = this + 1.
+const FULL_PR_REVIEW_MAX_QUIET_RETRIES: i64 = 2;
 const MERGED_PR_IN_PROGRESS_RECONCILE_SECS: i64 = 30 * 60;
 const KIM_FULL_PR_REVIEW_CATCH_UP_SECS: i64 = 6 * 60 * 60;
 const FULL_PR_REVIEW_MAX_CONCURRENT: usize = 1;
@@ -5891,8 +5899,50 @@ pub fn spawn_full_pr_review_task(
                     &task_id,
                     "Another full `$pr-review` is already running, so this one is queued behind it to keep Sam from overloading.",
                 ).await;
-                match semaphore.acquire_owned().await {
+
+                // Keep the row fresh while blocked on the permit. Without this
+                // a long-running holder makes this waiter look stale and a
+                // sweep relaunches it as a duplicate run.
+                let waiting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+                {
+                    let cfg = config.clone();
+                    let tid = task_id.clone();
+                    let waiting_ka = waiting.clone();
+                    tokio::spawn(async move {
+                        use std::sync::atomic::Ordering;
+                        while waiting_ka.load(Ordering::Relaxed) {
+                            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                            if !waiting_ka.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            let _ = supabase::update_task(&cfg, &tid, &serde_json::json!({
+                                "updated_at": chrono::Utc::now().to_rfc3339(),
+                            })).await;
+                        }
+                    });
+                }
+                let acquired = semaphore.acquire_owned().await;
+                waiting.store(false, std::sync::atomic::Ordering::Relaxed);
+                match acquired {
                     Ok(permit) => {
+                        // A retry-exhaust, cancel, or other path may have
+                        // terminalized/removed this row while it waited.
+                        // Don't run a superseded duplicate.
+                        match supabase::fetch_task(&config, &task_id).await {
+                            Ok(Some(t)) => {
+                                let st = t.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                                if st != "in_progress" {
+                                    agent_comment(
+                                        &config,
+                                        &task_id,
+                                        &format!("Skipping this queued full `$pr-review`: the card moved to `{}` while it waited.", st),
+                                    ).await;
+                                    return;
+                                }
+                            }
+                            Ok(None) => return,
+                            Err(_) => {}
+                        }
                         let acquired_at = chrono::Utc::now().to_rfc3339();
                         let _ = supabase::update_task(&config, &task_id, &serde_json::json!({
                             "claimed_at": acquired_at,
@@ -5956,6 +6006,56 @@ pub fn spawn_full_pr_review_task(
             }
             Err(e) => {
                 let reason = truncate(&e, 1800);
+
+                // A wedge (no-progress quiet-kill) is retryable, not terminal.
+                // Re-queue by backdating updated_at so full_pr_review_task_is_stale
+                // fires on the next tick and the Kim/plant sweepers relaunch it.
+                // Bounded so a permanently-wedging PR can't loop forever.
+                if e.contains("killed as wedged") {
+                    let mut ctx = match supabase::fetch_task(&config, &task_id).await {
+                        Ok(Some(t)) => t
+                            .get("context")
+                            .and_then(|v| v.as_object())
+                            .cloned()
+                            .unwrap_or_default(),
+                        _ => serde_json::Map::new(),
+                    };
+                    let prior = ctx.get("quiet_kill_count").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let next = prior + 1;
+                    if next <= FULL_PR_REVIEW_MAX_QUIET_RETRIES {
+                        ctx.insert("quiet_kill_count".to_string(), serde_json::json!(next));
+                        let backdated = (chrono::Utc::now()
+                            - chrono::Duration::seconds(FULL_PR_REVIEW_NO_PROGRESS_STALE_SECS + 300))
+                            .to_rfc3339();
+                        agent_comment(
+                            &config,
+                            &task_id,
+                            &format!(
+                                "Codex `$pr-review` was wedged (no progress). Re-queuing a fresh automated run (attempt {} of {}).",
+                                next + 1,
+                                FULL_PR_REVIEW_MAX_QUIET_RETRIES + 1
+                            ),
+                        ).await;
+                        let _ = supabase::update_task(&config, &task_id, &serde_json::json!({
+                            "status": "in_progress",
+                            "worker_id": serde_json::Value::Null,
+                            "claimed_at": serde_json::Value::Null,
+                            "updated_at": backdated,
+                            "failure_reason": serde_json::Value::Null,
+                            "context": serde_json::Value::Object(ctx),
+                        })).await;
+                        send_telegram(
+                            &config,
+                            &format!(
+                                "Re-queuing wedged `$pr-review` for PR: {}",
+                                escape_markdown_v2(&pr_url),
+                            ),
+                        ).await;
+                        return;
+                    }
+                    // Retries exhausted: fall through to a real failure.
+                }
+
                 agent_comment(
                     &config,
                     &task_id,
@@ -8967,6 +9067,25 @@ pub async fn sweep_pr_merged_cards(config: &SupabaseConfig) {
 
     for task in arr {
         let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        // A full `$pr-review` owns its own merge+deploy and can be quiet for a
+        // long post-merge deploy, so don't let this generic reconciler fire a
+        // second merge/deploy WHILE it is still plausibly alive. But only
+        // shield it while fresh by the full-review clock: once it has been
+        // quiet longer than the full-review no-progress window, its own
+        // quiet-kill + stale-restart has failed to self-heal, and the
+        // idempotent reconciler is the right backstop to close out a merged
+        // PR instead of stranding it.
+        if status == "in_progress" && is_full_pr_review_owned(task) {
+            let still_fresh = task_time_field(task, "updated_at")
+                .map(|u| {
+                    chrono::Utc::now().signed_duration_since(u)
+                        <= chrono::Duration::seconds(FULL_PR_REVIEW_NO_PROGRESS_STALE_SECS)
+                })
+                .unwrap_or(false);
+            if still_fresh {
+                continue;
+            }
+        }
         let waiting_for_closeout = matches!(status, "approved" | "review" | "fixes_needed");
         if !waiting_for_closeout && !stale_in_progress_pr_card_for_reconcile(task) {
             continue;
@@ -9088,11 +9207,14 @@ fn full_pr_review_task_is_stale(task: &Value) -> bool {
     if status != "in_progress" {
         return false;
     }
+    // `updated_at` is only refreshed while Codex is actively emitting events
+    // (the heartbeat stops touching it once the run goes quiet), so a stale
+    // `updated_at` on an in_progress row genuinely means no real progress.
     let Some(updated) = task_time_field(task, "updated_at") else {
         return true;
     };
     chrono::Utc::now().signed_duration_since(updated)
-        > chrono::Duration::seconds(FULL_PR_REVIEW_STALE_RUNNING_SECS)
+        > chrono::Duration::seconds(FULL_PR_REVIEW_NO_PROGRESS_STALE_SECS)
 }
 
 fn kim_pr_github_state(pr: &Value) -> String {
@@ -9158,6 +9280,23 @@ fn is_plant_full_pr_review_task(task: &Value) -> bool {
     task.get("context")
         .and_then(|c| c.get("plant_full_pr_review"))
         .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// True for any audit row owned by the full `$pr-review` lifecycle (Kim
+/// author poll, automation flag, or a /plant hand-off). While such a row is
+/// `in_progress` the full review owns its own merge+deploy, so generic
+/// reconcilers must not act on it.
+fn is_full_pr_review_owned(task: &Value) -> bool {
+    let src = task.get("source").and_then(|v| v.as_str()).unwrap_or("");
+    if src == KIM_FULL_PR_REVIEW_SOURCE {
+        return true;
+    }
+    task.get("context")
+        .map(|c| {
+            c.get("full_pr_review_automation").and_then(|v| v.as_bool()).unwrap_or(false)
+                || c.get("plant_full_pr_review").and_then(|v| v.as_bool()).unwrap_or(false)
+        })
         .unwrap_or(false)
 }
 

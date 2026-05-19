@@ -54,6 +54,17 @@ const CI_POLL_MAX_SECS: u64 = 15 * 60;
 const CI_MIN_OBSERVATIONS: u32 = 2; // don't trust an empty/first poll
 const CODEX_TIMEOUT_SECS: u64 = 20 * 60;
 const FULL_PR_REVIEW_TIMEOUT_SECS: u64 = 90 * 60;
+// While Codex emits real events at least this recently, the heartbeat keeps
+// `updated_at` fresh; once it goes quieter than this, `updated_at` is allowed
+// to age so the sweep stale check can act as the backstop.
+const FULL_PR_REVIEW_FRESH_GUARD_SECS: u64 = 5 * 60;
+// If Codex emits zero real progress events for this long, treat it as wedged
+// and kill it so it can be retried fresh, instead of waiting out the 90 min
+// hard timeout. Deliberately generous: a legitimate long build/test/deploy
+// inside `$pr-review` can be quiet for a while, so this favors a false
+// negative over killing real post-merge work. First responder; the sweep
+// stale check (FULL_PR_REVIEW_NO_PROGRESS_STALE_SECS) is the backstop.
+const FULL_PR_REVIEW_QUIET_KILL_SECS: u64 = 45 * 60;
 // Random delimiter so a malicious diff can't fake review JSON by closing a ``` fence.
 const DIFF_DELIMITER: &str = "===SAMWISE-DIFF-9f3c2a8b1d7e===";
 
@@ -1020,6 +1031,12 @@ pub async fn run_full_pr_review(
     .current_dir(&cwd)
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::piped());
+    // Run Codex as its own process-group leader so a kill can take down the
+    // whole tree (gh, npm, deploy scripts it spawns), not just the Codex CLI.
+    // Otherwise a quiet-kill/cancel could leave an orphan still mutating the
+    // checkout or production while the row gets retried.
+    #[cfg(unix)]
+    cmd.process_group(0);
 
     let mut child = cmd.spawn().map_err(|e| format!("failed to spawn codex: {}", e))?;
     let child_pid = child.id().unwrap_or(0);
@@ -1032,6 +1049,7 @@ pub async fn run_full_pr_review(
     let last_activity = std::sync::Arc::new(std::sync::Mutex::new(Instant::now()));
     let heartbeat_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let quiet_killed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let started_at = Instant::now();
 
     {
@@ -1040,6 +1058,7 @@ pub async fn run_full_pr_review(
         let last_activity_hb = last_activity.clone();
         let heartbeat_alive_hb = heartbeat_alive.clone();
         let cancelled_hb = cancelled.clone();
+        let quiet_killed_hb = quiet_killed.clone();
         tokio::spawn(async move {
             use std::sync::atomic::Ordering;
             let mut last_comment_at = Instant::now();
@@ -1059,23 +1078,67 @@ pub async fn run_full_pr_review(
                     cancelled_hb.store(true, Ordering::Relaxed);
                     if child_pid > 0 {
                         #[cfg(unix)]
-                        unsafe { libc::kill(child_pid as i32, libc::SIGTERM); }
+                        {
+                            let pid = child_pid as i32;
+                            // Negative pid = whole process group (Codex is a
+                            // group leader), so subprocesses die too.
+                            unsafe { libc::kill(-pid, libc::SIGTERM); }
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_secs(10)).await;
+                                unsafe { libc::kill(-pid, libc::SIGKILL); }
+                            });
+                        }
                     }
                     heartbeat_alive_hb.store(false, Ordering::Relaxed);
                     break;
-                }
-
-                if last_touch_at.elapsed() >= Duration::from_secs(60) {
-                    let _ = supabase::update_task(&config_hb, &task_id_hb, &serde_json::json!({
-                        "updated_at": chrono::Utc::now().to_rfc3339(),
-                    })).await;
-                    last_touch_at = Instant::now();
                 }
 
                 let quiet_for = {
                     let guard = last_activity_hb.lock().unwrap_or_else(|e| e.into_inner());
                     guard.elapsed()
                 };
+
+                // Only mark the row fresh while Codex is actually active.
+                // When it goes quiet we deliberately let `updated_at` age so
+                // the sweep stale check (the cross-host / app-restart
+                // backstop) can fire. The liveness heartbeat must never mask
+                // a wedge by refreshing `updated_at` unconditionally.
+                if quiet_for < Duration::from_secs(FULL_PR_REVIEW_FRESH_GUARD_SECS)
+                    && last_touch_at.elapsed() >= Duration::from_secs(60)
+                {
+                    let _ = supabase::update_task(&config_hb, &task_id_hb, &serde_json::json!({
+                        "updated_at": chrono::Utc::now().to_rfc3339(),
+                    })).await;
+                    last_touch_at = Instant::now();
+                }
+
+                if quiet_for >= Duration::from_secs(FULL_PR_REVIEW_QUIET_KILL_SECS) {
+                    let mins = quiet_for.as_secs() / 60;
+                    post_full_pr_review_comment(
+                        &config_hb,
+                        &task_id_hb,
+                        &format!("Codex `$pr-review` produced no progress for {} min. Treating it as wedged and killing it so it can be retried fresh.", mins),
+                    ).await;
+                    quiet_killed_hb.store(true, Ordering::Relaxed);
+                    if child_pid > 0 {
+                        #[cfg(unix)]
+                        {
+                            let pid = child_pid as i32;
+                            // Negative pid = whole process group. Escalate to
+                            // SIGKILL if it ignores SIGTERM so a stuck child
+                            // (or any deploy subprocess it spawned) can't block
+                            // child.wait() until the 90 min hard timeout or
+                            // outlive the row's restart window.
+                            unsafe { libc::kill(-pid, libc::SIGTERM); }
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_secs(10)).await;
+                                unsafe { libc::kill(-pid, libc::SIGKILL); }
+                            });
+                        }
+                    }
+                    heartbeat_alive_hb.store(false, Ordering::Relaxed);
+                    break;
+                }
                 if quiet_for >= Duration::from_secs(120)
                     && last_comment_at.elapsed() >= Duration::from_secs(120)
                 {
@@ -1118,12 +1181,15 @@ pub async fn run_full_pr_review(
                 let Some(progress) = summarize_codex_exec_event(&parsed) else {
                     continue;
                 };
+                // Any real Codex event is progress for wedge detection, even
+                // if the user-facing comment is throttled. This is what keeps
+                // `updated_at` advancing (via the heartbeat) for a healthy run.
+                if let Ok(mut guard) = last_activity_stdout.lock() {
+                    *guard = Instant::now();
+                }
                 if last_comment_time.elapsed() >= MIN_COMMENT_INTERVAL {
                     post_full_pr_review_comment(&config_stdout, &task_id_stdout, &progress).await;
                     last_comment_time = Instant::now();
-                    if let Ok(mut guard) = last_activity_stdout.lock() {
-                        *guard = Instant::now();
-                    }
                 }
             }
         }
@@ -1151,6 +1217,11 @@ pub async fn run_full_pr_review(
         }
         Err(_) => {
             heartbeat_alive.store(false, std::sync::atomic::Ordering::Relaxed);
+            // Group-kill so a hung deploy subprocess can't outlive the timeout.
+            #[cfg(unix)]
+            if child_pid > 0 {
+                unsafe { libc::kill(-(child_pid as i32), libc::SIGKILL); }
+            }
             let _ = child.kill().await;
             let stdout = stdout_handle.await.unwrap_or_default();
             let stderr = stderr_handle.await.unwrap_or_default();
@@ -1164,6 +1235,13 @@ pub async fn run_full_pr_review(
     };
 
     heartbeat_alive.store(false, std::sync::atomic::Ordering::Relaxed);
+    // child.wait() returned, so the process is gone (killed or natural exit).
+    // Order matters:
+    //  1. cancelled (Matt deleted the card): honor regardless of exit code.
+    //  2. genuine success: if Codex actually finished, a quiet-kill that lost
+    //     the race must NOT requeue a duplicate run that already merged/deployed.
+    //  3. quiet-kill: only now treat it as the retryable wedge.
+    //  4. any other non-zero exit: hard failure.
     if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
         return Err("TASK_CANCELLED".to_string());
     }
@@ -1182,6 +1260,13 @@ pub async fn run_full_pr_review(
             return Ok("Codex completed `$pr-review`, but did not return a final message.".to_string());
         }
         return Ok(response);
+    }
+
+    if quiet_killed.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(
+            "Codex $pr-review made no progress and was killed as wedged; it will be retried fresh."
+                .to_string(),
+        );
     }
 
     Err(format!(
