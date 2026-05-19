@@ -2233,24 +2233,13 @@ followed immediately by a fenced json block:
         if let Some(u) = &session_url {
             body.push_str(&format!("\n\n🎥 Watch the run: {}", u));
         }
-        body.push_str("\n\nMoving the card to fixes_needed and queuing a fix task.");
         agent_comment(config, task_id, &body).await;
-        let mut updates = serde_json::json!({
-            "status": "fixes_needed",
-            "updated_at": chrono::Utc::now().to_rfc3339(),
-        });
-        if let Some(u) = &session_url {
-            updates["report_url"] = serde_json::json!(u);
-        }
-        let _ = supabase::update_task(config, task_id, &updates).await;
-        let reason = if issues.is_empty() { summary.clone() } else { issues.join("; ") };
-        notify_callback(config, task_id, "fixes_needed", None, Some(&reason));
 
         // Turn the QA findings into a queued code task so the normal
         // worktree -> Claude -> PR -> review pipeline fixes it. Bind to the
         // RESOLVED repo/env that QA actually tested (not the stale task row).
         // Refuses to spawn when there's no single resolvable repo.
-        spawn_qa_fix_task(
+        let spawned_fix_id = spawn_qa_fix_task(
             config,
             task,
             task_id,
@@ -2266,7 +2255,27 @@ followed immediately by a fenced json block:
         )
         .await;
 
-        Ok("QA failed; card moved to fixes_needed; fix task queued.".to_string())
+        // Card status: if the findings handed off cleanly to a new fix task,
+        // close THIS QA card as `done` — the work is owned by the fix task
+        // now and the board shouldn't keep showing it in Fixes Needed. If
+        // the spawn refused/failed/dup-skipped, leave the card at
+        // fixes_needed so Matt sees it still needs attention.
+        let final_status = if spawned_fix_id.is_some() { "done" } else { "fixes_needed" };
+        let mut updates = serde_json::json!({
+            "status": final_status,
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+        });
+        if let Some(u) = &session_url {
+            updates["report_url"] = serde_json::json!(u);
+        }
+        let _ = supabase::update_task(config, task_id, &updates).await;
+        let reason = if issues.is_empty() { summary.clone() } else { issues.join("; ") };
+        notify_callback(config, task_id, final_status, None, Some(&reason));
+
+        Ok(match spawned_fix_id {
+            Some(id) => format!("QA failed; fix task {} queued; card closed as done.", id),
+            None => "QA failed; card moved to fixes_needed (no fix task queued).".to_string(),
+        })
     }
 }
 
@@ -2285,6 +2294,12 @@ followed immediately by a fenced json block:
 // closed (does NOT spawn) when the guard query itself errors, so a flaky
 // network can't accidentally let duplicates through.
 #[allow(clippy::too_many_arguments)]
+/// Returns Some(new_fix_task_id) when a NEW fix task was successfully
+/// queued (the caller will close the QA card as `done` — the work is fully
+/// handed off). Returns None in every other case (refused for lack of repo,
+/// duplicate guard hit, create_task error, dup-guard query error) — the
+/// caller leaves the QA card at `fixes_needed` so Matt sees it needs manual
+/// attention.
 async fn spawn_qa_fix_task(
     config: &SupabaseConfig,
     qa_task: &serde_json::Value,
@@ -2298,7 +2313,7 @@ async fn spawn_qa_fix_task(
     resolved_repo_url: &str,
     target_url: &str,
     qa_environment: Option<&str>,
-) {
+) -> Option<String> {
     // Read repo_mode straight from the QA card's context (resolution doesn't
     // mutate this field; "project" is the default when unset).
     let repo_mode = qa_task
@@ -2330,7 +2345,7 @@ async fn spawn_qa_fix_task(
                 "I can't auto-queue a fix: this QA card has no single resolved repo to write code into. The findings are above — please pick this up manually (or set repo_path / project on the card and re-run QA).",
             )
             .await;
-            return;
+            return None;
         }
     };
     if matches!(repo_mode.as_str(), "none" | "multiple") {
@@ -2341,7 +2356,7 @@ async fn spawn_qa_fix_task(
             &format!("I can't auto-queue a fix: repo_mode is `{}` so there isn't a single repo to write a PR against. Findings are above for manual triage.", repo_mode),
         )
         .await;
-        return;
+        return None;
     }
 
     // Dup-guard: skip if a linked task already exists in any NON-terminal
@@ -2372,10 +2387,10 @@ async fn spawn_qa_fix_task(
                     agent_comment(
                         config,
                         qa_task_id,
-                        &format!("A fix task for these findings is already in flight ({}, status {}). Not queuing a duplicate.", eid, est),
+                        &format!("A fix task for these findings is already in flight ({}, status {}). Not queuing a duplicate; leaving this card open until you decide.", eid, est),
                     )
                     .await;
-                    return;
+                    return None;
                 }
             }
         }
@@ -2388,7 +2403,7 @@ async fn spawn_qa_fix_task(
                 &format!("Couldn't verify whether a fix task already exists ({}). Skipping auto-queue to avoid duplicates — pick this up manually.", truncate(&e, 200)),
             )
             .await;
-            return;
+            return None;
         }
     }
 
@@ -2507,9 +2522,10 @@ RULES (trusted):
             agent_comment(
                 config,
                 qa_task_id,
-                &format!("Queued a fix task from these findings: {} (code task, same repo, same environment). It'll run through the normal PR + review pipeline.", new_id),
+                &format!("Queued a fix task from these findings: {} (code task, same repo, same environment). It'll run through the normal PR + review pipeline. Closing this QA card as done — the work has been handed off.", new_id),
             )
             .await;
+            Some(new_id)
         }
         Err(e) => {
             log::error!("[qa-fix] failed to create fix task for {}: {}", qa_task_id, e);
@@ -2519,6 +2535,7 @@ RULES (trusted):
                 &format!("Couldn't auto-queue a fix task ({}). The findings are above — pick this up manually.", truncate(&e, 200)),
             )
             .await;
+            None
         }
     }
 }
