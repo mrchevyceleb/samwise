@@ -124,6 +124,8 @@ const KIM_FULL_PR_REVIEW_AUTHOR: &str = "kgenterprisesbiz";
 const KIM_FULL_PR_REVIEW_REPO: &str = "R-Link-LLC/r-link-studio-rebuild";
 const KIM_FULL_PR_REVIEW_FALLBACK_REPO_PATH: &str = "/Users/mjohnst/samwise/KG-Apps/r-link-studio-rebuild";
 const FULL_PR_REVIEW_STALE_RUNNING_SECS: i64 = 2 * 60 * 60;
+const MERGED_PR_IN_PROGRESS_RECONCILE_SECS: i64 = 30 * 60;
+const KIM_FULL_PR_REVIEW_CATCH_UP_SECS: i64 = 6 * 60 * 60;
 
 /// External edge function that closes the upstream ticket (Operly triage,
 /// Banana triage, Sentry issue) after Sam ships and the deploy is green.
@@ -8817,6 +8819,26 @@ fn shell_quote_simple(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+fn parse_rfc3339_utc(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+fn task_time_field(task: &Value, field: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    task.get(field)
+        .and_then(|v| v.as_str())
+        .and_then(parse_rfc3339_utc)
+}
+
+fn timestamp_is_recent(value: Option<&str>, max_age_secs: i64) -> bool {
+    let Some(ts) = value.and_then(parse_rfc3339_utc) else {
+        return false;
+    };
+    chrono::Utc::now().signed_duration_since(ts)
+        <= chrono::Duration::seconds(max_age_secs)
+}
+
 fn redact_secrets(value: &str) -> String {
     let mut out = value.to_string();
     let patterns = [
@@ -8835,18 +8857,39 @@ fn redact_secrets(value: &str) -> String {
 
 /// Scan cards whose PR status on GitHub has advanced without Sam knowing
 /// — PR merged or closed while the card was still sitting in review /
-/// fixes_needed / approved. Merged PRs run the post-merge deploy plan before
-/// moving to done. Runs on the poll-loop cadence.
+/// fixes_needed / approved, or while an in-progress worker has gone stale.
+/// Merged PRs run the post-merge deploy plan before moving to done. Runs on
+/// the poll-loop cadence.
+fn stale_in_progress_pr_card_for_reconcile(task: &Value) -> bool {
+    let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    if status != "in_progress" {
+        return false;
+    }
+    let Some(last_seen) = task_time_field(task, "updated_at")
+        .or_else(|| task_time_field(task, "claimed_at"))
+    else {
+        return true;
+    };
+    chrono::Utc::now().signed_duration_since(last_seen)
+        > chrono::Duration::seconds(MERGED_PR_IN_PROGRESS_RECONCILE_SECS)
+}
+
 pub async fn sweep_pr_merged_cards(config: &SupabaseConfig) {
     // Candidate statuses: any state where the card is "waiting on Matt" but
     // GitHub could have moved on. `review` is in scope for the case where
-    // Matt merges a PR before (or instead of) a Codex verdict landing.
+    // Matt merges a PR before (or instead of) a Codex verdict landing. Stale
+    // `in_progress` cards are included so a worker crash or manual merge does
+    // not leave a card wedged forever, while fresh active PR reviews are left
+    // alone.
     let Ok(tasks) = supabase::fetch_tasks(config, None).await else { return };
     let Some(arr) = tasks.as_array() else { return };
 
     for task in arr {
         let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("");
-        if !matches!(status, "approved" | "review" | "fixes_needed") { continue; }
+        let waiting_for_closeout = matches!(status, "approved" | "review" | "fixes_needed");
+        if !waiting_for_closeout && !stale_in_progress_pr_card_for_reconcile(task) {
+            continue;
+        }
 
         let pr_url = task.get("pr_url").and_then(|v| v.as_str()).unwrap_or("");
         let task_id = task.get("id").and_then(|v| v.as_str()).unwrap_or("");
@@ -8964,12 +9007,43 @@ fn full_pr_review_task_is_stale(task: &Value) -> bool {
     if status != "in_progress" {
         return false;
     }
-    let updated_at = task.get("updated_at").and_then(|v| v.as_str()).unwrap_or("");
-    let Ok(updated) = chrono::DateTime::parse_from_rfc3339(updated_at) else {
+    let Some(updated) = task_time_field(task, "updated_at") else {
         return true;
     };
-    chrono::Utc::now().signed_duration_since(updated.with_timezone(&chrono::Utc))
+    chrono::Utc::now().signed_duration_since(updated)
         > chrono::Duration::seconds(FULL_PR_REVIEW_STALE_RUNNING_SECS)
+}
+
+fn kim_pr_github_state(pr: &Value) -> String {
+    pr.get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_uppercase()
+}
+
+fn kim_pr_is_closed_or_merged(pr: &Value) -> bool {
+    matches!(kim_pr_github_state(pr).as_str(), "MERGED" | "CLOSED")
+        || pr
+            .get("mergedAt")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .is_some()
+        || pr
+            .get("closedAt")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .is_some()
+}
+
+fn kim_pr_recent_enough_for_catch_up(pr: &Value) -> bool {
+    ["mergedAt", "closedAt", "updatedAt", "createdAt"]
+        .iter()
+        .any(|field| {
+            timestamp_is_recent(
+                pr.get(*field).and_then(|v| v.as_str()),
+                KIM_FULL_PR_REVIEW_CATCH_UP_SECS,
+            )
+        })
 }
 
 async fn list_kim_ready_prs(repo_path: &str) -> Result<Vec<Value>, String> {
@@ -8977,10 +9051,10 @@ async fn list_kim_ready_prs(repo_path: &str) -> Result<Vec<Value>, String> {
         .args([
             "pr", "list",
             "--repo", KIM_FULL_PR_REVIEW_REPO,
-            "--state", "open",
+            "--state", "all",
             "--author", KIM_FULL_PR_REVIEW_AUTHOR,
             "--limit", "50",
-            "--json", "number,title,url,isDraft,headRefName,baseRefName,headRefOid,createdAt,updatedAt,author",
+            "--json", "number,title,url,isDraft,state,mergedAt,closedAt,headRefName,baseRefName,headRefOid,createdAt,updatedAt,author",
         ])
         .current_dir(repo_path)
         .output()
@@ -8996,8 +9070,10 @@ async fn list_kim_ready_prs(repo_path: &str) -> Result<Vec<Value>, String> {
 }
 
 /// Watch Kim's rebuild PRs and run the full `$pr-review` automation exactly
-/// once for each non-draft open PR. The `ae_tasks` row is the audit trail and
-/// the dedupe lock, but the worker does not claim it through the normal queue.
+/// once for each non-draft open PR. Recently merged/closed PRs without a row
+/// get a completed catch-up audit task so a quick manual merge is visible
+/// instead of silent. The `ae_tasks` row is the audit trail and the dedupe
+/// lock, but the worker does not claim it through the normal queue.
 pub async fn sweep_kim_full_pr_review_queue(config: &SupabaseConfig) {
     let projects = match supabase::fetch_projects(config).await {
         Ok(v) => v,
@@ -9060,8 +9136,18 @@ pub async fn sweep_kim_full_pr_review_queue(config: &SupabaseConfig) {
             continue;
         }
         let normalized_pr_url = normalize_pr_url(&pr_url);
+        let pr_number = pr.get("number").and_then(|v| v.as_i64()).unwrap_or(0);
+        let pr_title = pr.get("title").and_then(|v| v.as_str()).unwrap_or("Kim PR");
+        let head_ref = pr.get("headRefName").and_then(|v| v.as_str()).unwrap_or("");
+        let base_ref = pr.get("baseRefName").and_then(|v| v.as_str()).unwrap_or("");
+        let head_oid = pr.get("headRefOid").and_then(|v| v.as_str()).unwrap_or("");
+        let pr_state = kim_pr_github_state(&pr);
+        let pr_closed_or_merged = kim_pr_is_closed_or_merged(&pr);
 
         if let Some(existing) = existing_by_pr.get(&normalized_pr_url) {
+            if pr_closed_or_merged {
+                continue;
+            }
             if full_pr_review_task_is_stale(existing) {
                 if let Some(task_id) = existing.get("id").and_then(|v| v.as_str()) {
                     let now = chrono::Utc::now().to_rfc3339();
@@ -9085,11 +9171,83 @@ pub async fn sweep_kim_full_pr_review_queue(config: &SupabaseConfig) {
             continue;
         }
 
-        let pr_number = pr.get("number").and_then(|v| v.as_i64()).unwrap_or(0);
-        let pr_title = pr.get("title").and_then(|v| v.as_str()).unwrap_or("Kim PR");
-        let head_ref = pr.get("headRefName").and_then(|v| v.as_str()).unwrap_or("");
-        let base_ref = pr.get("baseRefName").and_then(|v| v.as_str()).unwrap_or("");
-        let head_oid = pr.get("headRefOid").and_then(|v| v.as_str()).unwrap_or("");
+        if pr_closed_or_merged {
+            if !kim_pr_recent_enough_for_catch_up(&pr) {
+                continue;
+            }
+            let now = chrono::Utc::now().to_rfc3339();
+            let task = serde_json::json!({
+                "title": format!("Full $pr-review catch-up: PR #{} {}", pr_number, pr_title),
+                "description": format!(
+                    "Kim's PR had already reached {} before Sam could launch the full `$pr-review` automation.\n\nPR: {}\nRepo: {}\nAuthor: {}\nHead: {}\nBase: {}",
+                    if pr_state.is_empty() { "a closed state" } else { pr_state.as_str() },
+                    pr_url,
+                    KIM_FULL_PR_REVIEW_REPO,
+                    KIM_FULL_PR_REVIEW_AUTHOR,
+                    head_ref,
+                    base_ref,
+                ),
+                "status": "done",
+                "priority": "normal",
+                "task_type": "code",
+                "project": project_name.clone(),
+                "source": KIM_FULL_PR_REVIEW_SOURCE,
+                "assignee": "codex",
+                "repo_url": repo_url.clone(),
+                "repo_path": repo_path.clone(),
+                "pr_url": pr_url.clone(),
+                "pr_number": pr_number,
+                "base_branch": if base_ref.is_empty() { Value::Null } else { Value::String(base_ref.to_string()) },
+                "context": {
+                    "full_pr_review_automation": true,
+                    "catch_up_audit": true,
+                    "github_author": KIM_FULL_PR_REVIEW_AUTHOR,
+                    "github_repo": KIM_FULL_PR_REVIEW_REPO,
+                    "github_state": pr_state.clone(),
+                    "head_ref": head_ref,
+                    "head_oid": head_oid,
+                    "base_ref": base_ref,
+                    "created_at": pr.get("createdAt").cloned().unwrap_or(Value::Null),
+                    "updated_at": pr.get("updatedAt").cloned().unwrap_or(Value::Null),
+                    "merged_at": pr.get("mergedAt").cloned().unwrap_or(Value::Null),
+                    "closed_at": pr.get("closedAt").cloned().unwrap_or(Value::Null),
+                    "adopted_at": now.clone(),
+                },
+                "completed_at": now.clone(),
+                "updated_at": now,
+            });
+
+            let task_id = match supabase::create_task(config, &task).await {
+                Ok(row) => first_returned_id(&row),
+                Err(e) => {
+                    log::warn!("[kim-pr-review] create catch-up audit task failed for {}: {}", pr_url, e);
+                    None
+                }
+            };
+            let Some(task_id) = task_id else {
+                continue;
+            };
+
+            agent_comment(
+                config,
+                &task_id,
+                &format!(
+                    "Kim's PR was already {} before Sam could launch the full `$pr-review`; recording a catch-up audit row without starting a duplicate review.",
+                    if pr_state.is_empty() { "closed" } else { pr_state.as_str() }
+                ),
+            ).await;
+            agent_chat(
+                config,
+                &format!(
+                    "Kim PR #{} was already {} before I could start `$pr-review`; I recorded the catch-up audit row: {}",
+                    pr_number,
+                    if pr_state.is_empty() { "closed" } else { pr_state.as_str() },
+                    pr_url
+                ),
+            ).await;
+            continue;
+        }
+
         let now = chrono::Utc::now().to_rfc3339();
 
         let task = serde_json::json!({
