@@ -5846,7 +5846,7 @@ pub fn spawn_full_pr_review_task(
             "failure_reason": serde_json::Value::Null,
         })).await;
 
-        let result = review::run_full_pr_review(&pr_url, &repo_path).await;
+        let result = review::run_full_pr_review(&config, &task_id, &pr_url, &repo_path).await;
         match result {
             Ok(report) => {
                 let capped = truncate(&report, 6000);

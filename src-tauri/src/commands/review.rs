@@ -6,7 +6,7 @@
 
 use serde_json::Value;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::process::async_cmd;
 use super::supabase::{self, SupabaseConfig};
@@ -976,6 +976,8 @@ pub async fn run_samwise_pr_review(
 /// authorized to fix, merge, and deploy on its own. Use this only for explicit
 /// automations where Matt has asked for the full final-gate workflow.
 pub async fn run_full_pr_review(
+    config: &SupabaseConfig,
+    task_id: &str,
     pr_url: &str,
     repo_path: &str,
 ) -> Result<String, String> {
@@ -1005,6 +1007,7 @@ pub async fn run_full_pr_review(
     cmd.args([
         "--search",
         "exec",
+        "--json",
         "-m", CODEX_MODEL,
         "-c", CODEX_REASONING_CONFIG,
         "--dangerously-bypass-approvals-and-sandbox",
@@ -1019,15 +1022,112 @@ pub async fn run_full_pr_review(
     .stderr(std::process::Stdio::piped());
 
     let mut child = cmd.spawn().map_err(|e| format!("failed to spawn codex: {}", e))?;
+    let child_pid = child.id().unwrap_or(0);
+    post_full_pr_review_comment(
+        config,
+        task_id,
+        &format!("Codex `$pr-review` process started for this PR (pid {}).", child_pid),
+    ).await;
+
+    let last_activity = std::sync::Arc::new(std::sync::Mutex::new(Instant::now()));
+    let heartbeat_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let started_at = Instant::now();
+
+    {
+        let config_hb = config.clone();
+        let task_id_hb = task_id.to_string();
+        let last_activity_hb = last_activity.clone();
+        let heartbeat_alive_hb = heartbeat_alive.clone();
+        let cancelled_hb = cancelled.clone();
+        tokio::spawn(async move {
+            use std::sync::atomic::Ordering;
+            let mut last_comment_at = Instant::now();
+            let mut last_touch_at = Instant::now() - Duration::from_secs(60);
+            while heartbeat_alive_hb.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                if !heartbeat_alive_hb.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                if !full_pr_review_task_is_live(&config_hb, &task_id_hb).await {
+                    log::info!(
+                        "[full-pr-review] task {} was deleted/cancelled; killing Codex subprocess {}",
+                        task_id_hb,
+                        child_pid
+                    );
+                    cancelled_hb.store(true, Ordering::Relaxed);
+                    if child_pid > 0 {
+                        #[cfg(unix)]
+                        unsafe { libc::kill(child_pid as i32, libc::SIGTERM); }
+                    }
+                    heartbeat_alive_hb.store(false, Ordering::Relaxed);
+                    break;
+                }
+
+                if last_touch_at.elapsed() >= Duration::from_secs(60) {
+                    let _ = supabase::update_task(&config_hb, &task_id_hb, &serde_json::json!({
+                        "updated_at": chrono::Utc::now().to_rfc3339(),
+                    })).await;
+                    last_touch_at = Instant::now();
+                }
+
+                let quiet_for = {
+                    let guard = last_activity_hb.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.elapsed()
+                };
+                if quiet_for >= Duration::from_secs(120)
+                    && last_comment_at.elapsed() >= Duration::from_secs(120)
+                {
+                    let mins = started_at.elapsed().as_secs() / 60;
+                    post_full_pr_review_comment(
+                        &config_hb,
+                        &task_id_hb,
+                        &format!("Still running full `$pr-review`. {} min in, Codex is quiet but the process is alive.", mins),
+                    ).await;
+                    last_comment_at = Instant::now();
+                }
+            }
+        });
+    }
 
     let stdout = child.stdout.take();
+    let config_stdout = config.clone();
+    let task_id_stdout = task_id.to_string();
+    let last_activity_stdout = last_activity.clone();
     let stdout_handle = tokio::spawn(async move {
-        let mut output = String::new();
-        if let Some(mut reader) = stdout {
-            use tokio::io::AsyncReadExt;
-            let _ = reader.read_to_string(&mut output).await;
+        const RAW_TAIL_CAP: usize = 6000;
+        const MIN_COMMENT_INTERVAL: Duration = Duration::from_secs(15);
+        let mut raw_tail = String::new();
+        let mut last_comment_time = Instant::now() - MIN_COMMENT_INTERVAL;
+
+        if let Some(reader) = stdout {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut lines = BufReader::new(reader).lines();
+
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.trim().is_empty() {
+                    continue;
+                }
+
+                push_tail(&mut raw_tail, &line, RAW_TAIL_CAP);
+
+                let Ok(parsed) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let Some(progress) = summarize_codex_exec_event(&parsed) else {
+                    continue;
+                };
+                if last_comment_time.elapsed() >= MIN_COMMENT_INTERVAL {
+                    post_full_pr_review_comment(&config_stdout, &task_id_stdout, &progress).await;
+                    last_comment_time = Instant::now();
+                    if let Ok(mut guard) = last_activity_stdout.lock() {
+                        *guard = Instant::now();
+                    }
+                }
+            }
         }
-        output
+        raw_tail
     });
 
     let stderr = child.stderr.take();
@@ -1045,8 +1145,12 @@ pub async fn run_full_pr_review(
         child.wait(),
     ).await {
         Ok(Ok(s)) => s,
-        Ok(Err(e)) => return Err(format!("codex wait failed: {}", e)),
+        Ok(Err(e)) => {
+            heartbeat_alive.store(false, std::sync::atomic::Ordering::Relaxed);
+            return Err(format!("codex wait failed: {}", e));
+        }
         Err(_) => {
+            heartbeat_alive.store(false, std::sync::atomic::Ordering::Relaxed);
             let _ = child.kill().await;
             let stdout = stdout_handle.await.unwrap_or_default();
             let stderr = stderr_handle.await.unwrap_or_default();
@@ -1058,6 +1162,11 @@ pub async fn run_full_pr_review(
             ));
         }
     };
+
+    heartbeat_alive.store(false, std::sync::atomic::Ordering::Relaxed);
+    if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("TASK_CANCELLED".to_string());
+    }
 
     let stdout = stdout_handle.await.unwrap_or_default();
     let stderr = stderr_handle.await.unwrap_or_default();
@@ -1081,6 +1190,134 @@ pub async fn run_full_pr_review(
         trim_to(stderr.trim(), 2000),
         trim_to(stdout.trim(), 2000),
     ))
+}
+
+async fn post_full_pr_review_comment(config: &SupabaseConfig, task_id: &str, content: &str) {
+    let _ = supabase::post_comment(config, &serde_json::json!({
+        "task_id": task_id,
+        "author": "agent",
+        "content": content,
+        "mentions": [],
+    })).await;
+}
+
+async fn full_pr_review_task_is_live(config: &SupabaseConfig, task_id: &str) -> bool {
+    match supabase::fetch_task(config, task_id).await {
+        Ok(Some(task)) => {
+            let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            !matches!(status, "cancelled")
+        }
+        Ok(None) => false,
+        Err(_) => true,
+    }
+}
+
+fn push_tail(tail: &mut String, line: &str, cap: usize) {
+    tail.push_str(line);
+    tail.push('\n');
+    if tail.len() <= cap {
+        return;
+    }
+    let mut drop = tail.len().saturating_sub(cap);
+    while drop < tail.len() && !tail.is_char_boundary(drop) {
+        drop += 1;
+    }
+    tail.drain(..drop);
+}
+
+fn summarize_codex_exec_event(event: &Value) -> Option<String> {
+    let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let lower_type = event_type.to_ascii_lowercase();
+
+    if lower_type.contains("exec") || lower_type.contains("command") {
+        if lower_type.contains("end") || lower_type.contains("complete") || lower_type.contains("completed") {
+            let code = event
+                .get("exit_code")
+                .or_else(|| event.pointer("/item/exit_code"))
+                .or_else(|| event.pointer("/output/exit_code"))
+                .and_then(|v| v.as_i64());
+            return Some(match code {
+                Some(code) => format!("Command finished with exit code {}.", code),
+                None => "Command finished.".to_string(),
+            });
+        }
+        if let Some(command) = first_command_string(event, &[
+            "/command",
+            "/cmd",
+            "/item/command",
+            "/item/cmd",
+            "/item/input/command",
+            "/item/args/command",
+            "/call/command",
+            "/call/args/command",
+            "/message/command",
+        ]) {
+            return Some(format!("Running: {}", short_one_line(&command, 120)));
+        }
+        return Some("Running a shell command.".to_string());
+    }
+
+    if lower_type.contains("patch") && (lower_type.contains("apply") || lower_type.contains("edit")) {
+        return Some("Applying code changes.".to_string());
+    }
+
+    if lower_type.contains("web_search") || lower_type.contains("web-search") {
+        return Some("Searching the web.".to_string());
+    }
+
+    if lower_type.contains("mcp") {
+        if let Some(name) = first_string(event, &["/name", "/tool_name", "/item/name", "/call/name"]) {
+            return Some(format!("Using MCP tool: {}", short_one_line(name, 80)));
+        }
+        return Some("Using an MCP tool.".to_string());
+    }
+
+    if lower_type.contains("tool") {
+        if let Some(name) = first_string(event, &["/name", "/tool_name", "/item/name", "/call/name"]) {
+            return Some(format!("Using tool: {}", short_one_line(name, 80)));
+        }
+    }
+
+    if lower_type.contains("turn") && lower_type.contains("start") {
+        return Some("Codex started a new review step.".to_string());
+    }
+
+    if lower_type.contains("error") {
+        if let Some(message) = first_string(event, &["/message", "/error", "/item/message"]) {
+            return Some(format!("Codex reported: {}", short_one_line(message, 140)));
+        }
+    }
+
+    None
+}
+
+fn first_string<'a>(value: &'a Value, pointers: &[&str]) -> Option<&'a str> {
+    pointers.iter().find_map(|p| value.pointer(p).and_then(|v| v.as_str()))
+}
+
+fn first_command_string(value: &Value, pointers: &[&str]) -> Option<String> {
+    for pointer in pointers {
+        let Some(v) = value.pointer(pointer) else { continue; };
+        if let Some(s) = v.as_str() {
+            return Some(s.to_string());
+        }
+        if let Some(arr) = v.as_array() {
+            let parts: Vec<&str> = arr.iter().filter_map(|item| item.as_str()).collect();
+            if !parts.is_empty() {
+                return Some(parts.join(" "));
+            }
+        }
+    }
+    None
+}
+
+fn short_one_line(s: &str, max_chars: usize) -> String {
+    let compact = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out: String = compact.chars().take(max_chars).collect();
+    if compact.chars().count() > max_chars {
+        out.push_str("...");
+    }
+    out
 }
 
 fn parse_pr_review_output(raw: &str) -> (PrReviewVerdict, bool, String) {
