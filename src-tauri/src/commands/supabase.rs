@@ -94,6 +94,15 @@ pub async fn create_task(config: &SupabaseConfig, task: &Value) -> Result<Value,
     handle_response(client.post(&rest_url(config, "ae_tasks")).json(task).send().await.map_err(|e| e.to_string())?).await
 }
 
+/// Run an arbitrary PostgREST query string against ae_tasks (e.g.
+/// "select=id,status&context->>qa_source_task_id=eq.<uuid>"). Used for
+/// targeted existence checks without pulling the whole queue.
+pub async fn query_tasks(config: &SupabaseConfig, query: &str) -> Result<Value, String> {
+    let client = build_client(config)?;
+    let url = format!("{}?{}", rest_url(config, "ae_tasks"), query);
+    handle_response(client.get(&url).send().await.map_err(|e| e.to_string())?).await
+}
+
 pub async fn record_task_tombstone(config: &SupabaseConfig, task: &Value) -> Result<Value, String> {
     let client = build_client(config)?;
     let context = task.get("context").and_then(|v| v.as_object());
