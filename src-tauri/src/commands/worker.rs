@@ -45,8 +45,14 @@ fn task_uses_isolated_worktree(task: &Value) -> bool {
         .get("task_type")
         .and_then(|v| v.as_str())
         .unwrap_or("code");
+    // Research tasks are read-only investigations that run from $HOME and
+    // never touch any shared checkout. Treat them as concurrency-safe so they
+    // can claim alongside worktree-isolated tasks instead of starving behind
+    // them. Non-isolated WRITE tasks still gate research via
+    // EXCLUSIVE_TASK_ACTIVE; non-isolated writes still wait for research via
+    // the pool_now != 0 check in the claim loop.
     if task_type == "research" {
-        return false;
+        return true;
     }
     if task_type == "qa-verify" {
         return true;
