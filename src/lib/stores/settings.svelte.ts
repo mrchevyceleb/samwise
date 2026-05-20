@@ -196,7 +196,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   autoMergeMaxDiffLines: 400,
   autoPrReviewEnabled: true,
   autoFixFromFixesNeededEnabled: true,
-  visualQaEnabled: false,
+  visualQaEnabled: true,
 };
 
 // ---- Svelte 5 Runes State ----

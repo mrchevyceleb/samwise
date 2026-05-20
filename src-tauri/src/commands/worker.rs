@@ -2940,15 +2940,20 @@ async fn execute_task(
             tokio::fs::read_to_string(&p).await.ok()
                 .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
                 .and_then(|s| s.get("visualQaEnabled").and_then(|v| v.as_bool()))
-                .unwrap_or(false)
+                .unwrap_or(true)
         } else {
             false
         }
     };
 
-    // 3b. Start dev server if no preview_url and repo has a package.json (code tasks only)
+    // 3b. Start a local dev server when visual QA is on, regardless of whether
+    // a staging preview_url was already set. Visual self-verification needs to
+    // see the agent's LIVE changes (via HMR), and a staging URL only shows
+    // pre-change state — pointing browser_use at it produces false-positive
+    // misses ("looks fine, ship it"). When the dev server starts cleanly, its
+    // URL takes over preview_url for this task's verification phase.
     let mut dev_server_handle: Option<dev_server::DevServerHandle> = None;
-    if uses_single_repo_pipeline && preview_url.is_none() && visual_qa_enabled {
+    if uses_single_repo_pipeline && visual_qa_enabled {
         let pkg_json = std::path::Path::new(&repo_path).join("package.json");
         if tokio::fs::metadata(&pkg_json).await.is_ok() {
             agent_comment(config, &task_id, "No preview URL set. Starting a dev server...").await;
@@ -3147,6 +3152,49 @@ async fn execute_task(
         } else {
             "Do not add a CS Message, For Customer Success, or paste-ready customer-service message anywhere. Customer Success copy is currently Operly-only.\n\n"
         };
+        // Visual self-verification block. Only included when visual QA is on
+        // AND we have a verification URL (dev server URL preferred; staging
+        // preview URL only if the dev server didn't start). When omitted, the
+        // agent just does its normal write-then-commit flow.
+        let visual_verification_section = if visual_qa_enabled {
+            if let Some(ref verify_url) = preview_url {
+                format!(
+                    "## VISUAL SELF-VERIFICATION (before you commit)\n\
+After you finish editing files and BEFORE you stage/commit, you MUST visually verify your changes IF this task changed anything user-facing (UI, layout, copy, styling, client-side behavior, new routes, modal flows).\n\n\
+**Skip the visual phase entirely** if your changes are non-UI: backend handlers, edge functions, server routes, migrations, CI scripts, docs/markdown, comment-only edits, internal utilities with no UI surface. In that case, write `Visual verification: skipped (non-UI change)` into the commit body's Fixes Made section and move on.\n\n\
+**When you DO verify, follow these phases exactly:**\n\n\
+PHASE 1 \u{2014} Identify the surface you changed.\n\
+- From your diff, list which screen(s)/component(s) a user would see differently.\n\
+- If you cannot name a concrete screen the change affects, skip the visual phase (see above).\n\n\
+PHASE 2 \u{2014} Open it.\n\
+- Use the `mcp__assistant-mcp__browser` tool. Call action `start` with the target URL `{verify_url}` and an appropriate `site` value (the URL's hostname). If a stored login exists for the site, include `account`.\n\
+- Call `login` if the page requires auth. Stored credentials + TOTP/email 2FA are automatic; if you get `needs_2fa` for SMS/push, write `Visual verification: blocked (SMS/push 2FA required)` in the commit body and skip the rest of this phase.\n\
+- Navigate to the screen identified in Phase 1.\n\n\
+PHASE 3 \u{2014} Drive the flow you changed.\n\
+- Perform the user action your change is about (click the button, submit the form, open the modal, toggle the setting, etc.).\n\
+- Capture a snapshot or screenshot of the result.\n\
+- Read the snapshot text and visually inspect against the task's acceptance criteria. Specifically check: is the new behavior present? Is the layout sane (nothing overflowing, overlapping, or cut off)? Are labels/copy correct? Are there any console errors that originate in this repo's code (ignore third-party CDN noise, Sentry rate-limits, browser-extension chatter)?\n\n\
+PHASE 4 \u{2014} Iterate if needed (max 3 rounds total).\n\
+- If the result does NOT match the acceptance criteria, edit the code to fix it, wait ~3s for HMR to reload the dev server, and re-run Phase 3 against the same URL.\n\
+- After 3 rounds, stop iterating regardless of state.\n\n\
+PHASE 5 \u{2014} Close the browser session.\n\
+- Call `mcp__assistant-mcp__browser` with action `end` to release the Browserbase session. Do this even if verification failed.\n\n\
+PHASE 6 \u{2014} Record the verdict.\n\
+- In the commit body's Fixes Made section, add one of these one-liners:\n\
+  - `Visual verification: PASS (verified at {verify_url} via mcp__assistant-mcp__browser)`\n\
+  - `Visual verification: PARTIAL after 3 iterations \u{2014} <one-sentence what is still off>`\n\
+  - `Visual verification: skipped (non-UI change)` / `Visual verification: blocked (<reason>)`\n\n\
+Do NOT fabricate a PASS without actually driving the flow. Do NOT loop more than 3 times. Do NOT use this phase to fix unrelated issues you notice along the way \u{2014} keep changes targeted to the task.\n\n",
+                    verify_url = verify_url
+                )
+            } else {
+                String::from(
+                    "## VISUAL SELF-VERIFICATION\nVisual QA is on, but no verification URL is available (no dev server started, no staging preview URL). Note `Visual verification: skipped (no verification URL)` in the commit body's Fixes Made section.\n\n"
+                )
+            }
+        } else {
+            String::new()
+        };
         prompt_parts.push(format!(
             "## Task\n**{title}**\n\n{description}\n\n\
 ## Instructions\n\
@@ -3154,7 +3202,8 @@ Make the code changes required by this task. You have approval to edit \
 any file in this repo \u{2014} do not ask for confirmation before writing.\n\n\
 Explore only what the task needs. Do not read the whole codebase or add \
 unrelated cleanup \u{2014} those will bloat the diff and slow review.\n\n\
-When you are done making changes, stage everything and write a structured commit. \
+{visual_verification_section}\
+When you are done making changes (and visual verification, if applicable), stage everything and write a structured commit. \
 Use a HEREDOC so the body is multi-line:\n\
 ```\n\
 git add -A && git commit -m \"$(cat <<'EOF'\n\
