@@ -3163,10 +3163,10 @@ from Matt, stop without making changes and explain specifically what you need cl
 
     let prompt = prompt_parts.join("\n");
 
-    // 30-minute timeout, UNLIMITED turns. A hard cap just surfaces as
+    // 60-minute timeout, UNLIMITED turns. A hard cap just surfaces as
     // error_max_turns mid-run on complex tasks — the timeout is the real
     // guard. Pass 0 so `--max-turns` is omitted entirely.
-    let claude_result = run_claude_code_streaming(&repo_path, &prompt, 0, 1800, config, &task_id, process_id_slot.clone()).await;
+    let claude_result = run_claude_code_streaming(&repo_path, &prompt, 0, 3600, config, &task_id, process_id_slot.clone()).await;
     // Clear PID after process completes
     { let mut pid = process_id_slot.lock().await; *pid = None; }
 
