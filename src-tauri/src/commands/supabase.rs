@@ -395,39 +395,6 @@ pub async fn fetch_artifacts(config: &SupabaseConfig, task_id: &str) -> Result<V
     handle_response(client.get(&url).send().await.map_err(|e| e.to_string())?).await
 }
 
-// ── Storage (internal) ──────────────────────────────────────────────
-
-/// Upload a file to Supabase Storage and return the public URL.
-pub async fn upload_to_storage(config: &SupabaseConfig, bucket: &str, path: &str, file_path: &str) -> Result<String, String> {
-    let key = config.service_role_key.as_deref().unwrap_or(&config.anon_key);
-    let file_bytes = tokio::fs::read(file_path).await.map_err(|e| format!("Failed to read file: {}", e))?;
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
-    let url = format!("{}/storage/v1/object/{}/{}", config.url, bucket, path);
-
-    let resp = client.post(&url)
-        .header("apikey", key)
-        .header("Authorization", format!("Bearer {}", key))
-        .header("Content-Type", "image/png")
-        .header("x-upsert", "true")
-        .body(file_bytes)
-        .send()
-        .await
-        .map_err(|e| format!("Storage upload failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Storage upload error: {}", body));
-    }
-
-    // Return public URL
-    Ok(format!("{}/storage/v1/object/public/{}/{}", config.url, bucket, path))
-}
-
 // ── Projects (internal) ─────────────────────────────────────────────
 
 pub async fn fetch_projects(config: &SupabaseConfig) -> Result<Value, String> {

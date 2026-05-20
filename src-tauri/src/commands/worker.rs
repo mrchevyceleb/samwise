@@ -2985,30 +2985,10 @@ async fn execute_task(
         }
     }
 
-    // 4. Take BEFORE screenshots if preview_url is set (code tasks only).
-    // Skipped when visual QA is disabled.
-    let screenshot_dir = dirs::cache_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("agent-one-screenshots")
-        .join(&task_id)
-        .to_string_lossy()
-        .into_owned();
-    if uses_single_repo_pipeline && visual_qa_enabled {
-        if let Some(ref preview) = preview_url {
-            let _ = tokio::fs::create_dir_all(&screenshot_dir).await;
-            agent_comment(config, &task_id, "Taking before screenshots...").await;
-
-            for (label, name, viewport) in [
-                ("desktop", "before-desktop.png", "1280,720"),
-                ("mobile",  "before-mobile.png",  "393,852"),
-            ] {
-                if let Err(e) = take_screenshot(preview, &join_path(&screenshot_dir, name), viewport).await {
-                    agent_comment(config, &task_id, &format!("Before-{} screenshot failed: {}", label, e)).await;
-                    log::warn!("[worker] before-{} screenshot failed: {}", label, e);
-                }
-            }
-        }
-    }
+    // BEFORE/AFTER Puppeteer screenshots + out-of-band run_visual_qa removed
+    // in favor of the agent's inline visual self-verification via
+    // mcp__assistant-mcp__browser. The dev server above still starts; the
+    // agent drives it directly inside its Claude Code session.
 
     // 5. Run Claude Code CLI
     let action_label = if is_research {
@@ -3576,23 +3556,9 @@ from Matt, stop without making changes and explain specifically what you need cl
                 }
             }
 
-            // 6. Take AFTER screenshots (may be re-taken inside the QA retry loop below).
-            // Skipped when visual QA is disabled.
-            if visual_qa_enabled {
-              if let Some(ref preview) = preview_url {
-                agent_comment(config, &task_id, "Taking after screenshots...").await;
-
-                for (label, name, viewport) in [
-                    ("desktop", "after-desktop.png", "1280,720"),
-                    ("mobile",  "after-mobile.png",  "393,852"),
-                ] {
-                    if let Err(e) = take_screenshot(preview, &join_path(&screenshot_dir, name), viewport).await {
-                        agent_comment(config, &task_id, &format!("After-{} screenshot failed: {}", label, e)).await;
-                        log::warn!("[worker] after-{} screenshot failed: {}", label, e);
-                    }
-                }
-              }
-            }
+            // AFTER Puppeteer screenshots removed — inline visual self-verification
+            // (see VISUAL SELF-VERIFICATION section in the code-task prompt) now
+            // owns post-edit visual checks and runs inside the agent's session.
 
             // Mark first unchecked subtask as done (re-fetch fresh subtasks to avoid stale data)
             let fresh_subtasks = {
@@ -3662,146 +3628,14 @@ from Matt, stop without making changes and explain specifically what you need cl
                 }
             }
 
-            // 7. Visual QA with self-correct loop.
-            // If QA flags a problem, feed the explanation back to Claude Code as a fix-it
-            // prompt, re-screenshot, re-QA. Up to MAX_QA_ATTEMPTS (3) total attempts so
-            // Sam can't spiral. On exhaustion we push anyway with an honest note.
-            // Skipped when visual QA is disabled.
-            const MAX_QA_ATTEMPTS: u32 = 3;
-            if visual_qa_enabled {
-                let _ = supabase::update_task(config, &task_id, &serde_json::json!({
-                    "status": "testing",
-                    "updated_at": chrono::Utc::now().to_rfc3339(),
-                })).await;
-            }
-
-            let mut qa_attempts: u32 = 0;
-            let mut final_qa: Option<(bool, String)> = None;
-
-            if visual_qa_enabled && preview_url.is_some() {
-                loop {
-                    qa_attempts += 1;
-                    let starting_msg = if qa_attempts == 1 {
-                        "Running visual QA...".to_string()
-                    } else {
-                        format!("Re-running visual QA (attempt {}/{})...", qa_attempts, MAX_QA_ATTEMPTS)
-                    };
-                    agent_comment(config, &task_id, &starting_msg).await;
-
-                    match run_visual_qa(&repo_path, &title, &description, &screenshot_dir).await {
-                        Ok((passed, explanation)) => {
-                            if passed {
-                                let msg = if qa_attempts == 1 {
-                                    format!("Visual QA passed. {}", explanation)
-                                } else {
-                                    format!("Visual QA passed on attempt {}/{}. {}", qa_attempts, MAX_QA_ATTEMPTS, explanation)
-                                };
-                                agent_comment(config, &task_id, &msg).await;
-                                final_qa = Some((true, explanation));
-                                break;
-                            }
-
-                            final_qa = Some((false, explanation.clone()));
-
-                            if qa_attempts >= MAX_QA_ATTEMPTS {
-                                agent_comment(config, &task_id, &format!(
-                                    "QA still flagging after {} attempts: {}. Pushing anyway with a note so you can review.",
-                                    MAX_QA_ATTEMPTS, explanation
-                                )).await;
-                                break;
-                            }
-
-                            agent_comment(config, &task_id, &format!(
-                                "QA flagged: {}. Having a go at fixing it (attempt {}/{}).",
-                                explanation, qa_attempts + 1, MAX_QA_ATTEMPTS
-                            )).await;
-
-                            let fix_prompt = format!(
-                                "## Fix visual QA feedback\n\n\
-The visual QA reviewer looked at before/after screenshots of your last changes \
-and flagged this problem:\n\n\
-> {explanation}\n\n\
-## Original task\n\
-**{title}**\n\n\
-{description}\n\n\
-## Instructions\n\
-Your previous changes are already committed on this branch. Make additional edits \
-to fix *only* the issue QA described. Don't add unrelated changes or touch files \
-that weren't involved.\n\n\
-When done, run `git add -A && git commit -m \"fix: address QA feedback\"` and stop."
-                            );
-
-                            let fix_result = run_claude_code_streaming(
-                                &repo_path, &fix_prompt, 0, 900, config, &task_id, process_id_slot.clone()
-                            ).await;
-                            { let mut pid = process_id_slot.lock().await; *pid = None; }
-                            if matches!(&fix_result, Err(e) if e == "TASK_CANCELLED") {
-                                log::info!("[worker] Task {} cancelled during QA-retry fix; stopping", task_id);
-                                if let Some(h) = dev_server_handle.take() { let _ = dev_server::kill_dev_server(h).await; }
-                                return Ok("Task was cancelled".to_string());
-                            }
-
-                            if let Err(e) = fix_result {
-                                agent_comment(config, &task_id, &format!(
-                                    "Fix attempt {} errored: {}. Pushing what we have.", qa_attempts, e
-                                )).await;
-                                break;
-                            }
-
-                            // Re-take AFTER screenshots so the next QA round sees the fixed app.
-                            if let Some(ref preview) = preview_url {
-                                let _ = take_screenshot(preview, &join_path(&screenshot_dir, "after-desktop.png"), "1280,720").await;
-                                let _ = take_screenshot(preview, &join_path(&screenshot_dir, "after-mobile.png"), "393,852").await;
-                            }
-                        }
-                        Err(e) => {
-                            agent_comment(config, &task_id, &format!("Visual QA couldn't run: {}. Skipping.", e)).await;
-                            break;
-                        }
-                    }
-                }
-
-                if let Some((passed, explanation)) = &final_qa {
-                    let _ = supabase::update_task(config, &task_id, &serde_json::json!({
-                        "visual_qa_result": { "pass": passed, "explanation": explanation, "attempts": qa_attempts },
-                    })).await;
-                }
-            }
-
-            // 7b. Upload the (possibly revised) screenshots to Supabase Storage now that
-            // the QA loop has settled. Task record points at the final images only.
-            // Skipped when visual QA is disabled (no screenshots to upload).
-            if visual_qa_enabled && preview_url.is_some() {
-                let (urls, _) = upload_screenshots_to_storage(config, &task_id, &screenshot_dir).await
-                    .unwrap_or_default();
-                let before_urls: Vec<&String> = urls.iter().filter(|u| u.contains("before-")).collect();
-                let after_urls: Vec<&String> = urls.iter().filter(|u| u.contains("after-")).collect();
-                let _ = supabase::update_task(config, &task_id, &serde_json::json!({
-                    "screenshots_before": before_urls,
-                    "screenshots_after": after_urls,
-                })).await;
-            } else if !visual_qa_enabled {
-                // Re-runs of a card whose previous run was QA'd would otherwise show
-                // stale screenshots and pass/fail results in the UI. Clear them.
-                let _ = supabase::update_task(config, &task_id, &serde_json::json!({
-                    "screenshots_before": serde_json::Value::Null,
-                    "screenshots_after": serde_json::Value::Null,
-                    "visual_qa_result": serde_json::Value::Null,
-                })).await;
-            }
-
-            let qa_note_for_pr = match &final_qa {
-                Some((false, explanation)) => Some(format!(
-                    "\n\n> **Visual QA flagged after {} attempt{}:** {}",
-                    qa_attempts,
-                    if qa_attempts == 1 { "" } else { "s" },
-                    explanation
-                )),
-                _ => None,
-            };
+            // Out-of-band Puppeteer visual QA + retry loop + Supabase Storage
+            // screenshot upload all removed. Inline visual self-verification
+            // (driven by mcp__assistant-mcp__browser from inside the agent's
+            // Claude Code session) now owns the verdict, and the agent records
+            // it directly into the commit body's "Visual verification: ..." line.
 
             // Last cancellation check before the PR is opened. If Matt deleted
-            // the task during QA, don't create a PR for it.
+            // the task during the run, don't create a PR for it.
             if !task_is_live(config, &task_id).await {
                 log::info!("[worker] Task {} cancelled before PR creation; skipping", task_id);
                 if let Some(h) = dev_server_handle.take() { let _ = dev_server::kill_dev_server(h).await; }
@@ -3812,8 +3646,6 @@ When done, run `git add -A && git commit -m \"fix: address QA feedback\"` and st
             let pr_result = create_pr(
                 config, &repo_path, &title, &description, &task_id,
                 &branch, resolved_base_branch.as_deref(),
-                &screenshot_dir, preview_url.is_some(),
-                qa_note_for_pr.as_deref(),
                 include_customer_success,
             ).await;
 
@@ -5970,179 +5802,6 @@ async fn task_is_live(config: &SupabaseConfig, task_id: &str) -> bool {
     !matches!(status, "cancelled")
 }
 
-/// Take a screenshot using Playwright (headless chromium).
-/// Retries once if the first capture fails, since the app may still be hydrating.
-async fn take_screenshot(url: &str, output_path: &str, viewport: &str) -> Result<(), String> {
-    // Playwright is installed as a dev dep of the AutoSam repo (not globally),
-    // so `npx playwright` has to run with cwd inside that repo or npx tries to
-    // download a fresh copy that doesn't have the chromium browser installed.
-    // Under launchd SamWise's cwd is `/` so the bare call silently fails.
-    let playwright_cwd = std::env::var("HOME")
-        .map(|h| format!("{}/samwise/Personal-Apps/AutoSam", h))
-        .unwrap_or_else(|_| "/Users/mjohnst/samwise/Personal-Apps/AutoSam".to_string());
-
-    // Give Chromium an isolated user-data-dir inside Samwise's own container
-    // area so it never touches ~/Library/Application Support/Google/Chrome or
-    // ~/Library/Application Support/Chromium. Under macOS Sequoia's stricter
-    // TCC, reading another app's Application Support triggers the "SamWise
-    // would like to access data from other apps" prompt and blocks the
-    // worker until Matt dismisses it. A fresh scratch dir per run avoids
-    // state leakage too.
-    let samwise_scratch = std::env::var("HOME")
-        .map(|h| format!("{}/Library/Application Support/com.mattjohnston.agent-one/playwright-profile", h))
-        .unwrap_or_else(|_| "/tmp/samwise-playwright-profile".to_string());
-    let _ = tokio::fs::create_dir_all(&samwise_scratch).await;
-
-    for attempt in 1..=2 {
-        let output = async_cmd("npx")
-            .args([
-                "playwright", "screenshot",
-                "--browser", "chromium",
-                "--viewport-size", viewport,
-                // Give the SPA time to finish auth/Supabase hydration before
-                // the snapshot. Two seconds was routinely catching Operly's
-                // splash screen even when the dev server had the right env.
-                "--wait-for-timeout", "6000",
-                "--timeout", "30000",
-                // Chromium probes macOS for media devices on launch, which
-                // triggers the "Apple Music" / microphone / camera TCC
-                // prompts. We never need any of that for a screenshot.
-                // These flags skip those subsystems entirely.
-                "--user-agent", "Mozilla/5.0 SamWise-QA",
-                url, output_path,
-            ])
-            .env("PLAYWRIGHT_CHROMIUM_ARGS", format!(
-                "--user-data-dir={} --disable-features=MediaSessionService,MediaRouter,MediaFoundationVideoCapture,HardwareMediaKeyHandling --mute-audio --disable-audio-output --use-fake-ui-for-media-stream --deny-permission-prompts --no-default-browser-check --disable-sync --disable-background-networking --no-first-run --password-store=basic --use-mock-keychain",
-                samwise_scratch
-            ))
-            .current_dir(&playwright_cwd)
-            .output()
-            .await
-            .map_err(|e| format!("Playwright failed: {}", e))?;
-        if output.status.success() {
-            return Ok(());
-        }
-        if attempt == 2 {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            return Err(format!("playwright screenshot: {}", {
-                let s = if stderr.trim().is_empty() { stdout.to_string() } else { stderr.to_string() };
-                let s = s.trim();
-                tail_chars(s, 400)
-            }));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
-    }
-    Ok(())
-}
-
-/// Run visual QA: compare before/after screenshots using Claude Code vision.
-/// Uses absolute paths so Claude Code can reliably read the images.
-/// Retries once with a stricter prompt if JSON parsing fails.
-async fn run_visual_qa(cwd: &str, title: &str, description: &str, screenshot_dir: &str) -> Result<(bool, String), String> {
-    // Copy screenshots into the working directory so Claude Code can access them
-    let agent_dir = join_path(cwd, ".agent-one");
-    let _ = tokio::fs::create_dir_all(&agent_dir).await;
-
-    let screenshot_names = ["before-desktop.png", "after-desktop.png", "before-mobile.png", "after-mobile.png"];
-    for name in &screenshot_names {
-        let src = join_path(screenshot_dir, name);
-        let dst = join_path(&agent_dir, name);
-        let _ = tokio::fs::copy(&src, &dst).await;
-    }
-
-    // Build absolute paths for the prompt (forward slashes for cross-platform clarity)
-    let abs_agent_dir = std::path::Path::new(cwd).join(".agent-one");
-    let abs_path = abs_agent_dir.to_string_lossy().replace('\\', "/");
-
-    let prompt = format!(
-        r#"You are a visual QA reviewer. Read these screenshot files using their absolute paths:
-
-BEFORE (desktop): {abs}/before-desktop.png
-AFTER  (desktop): {abs}/after-desktop.png
-BEFORE (mobile):  {abs}/before-mobile.png
-AFTER  (mobile):  {abs}/after-mobile.png
-
-Task: {title}
-Description: {desc}
-
-Compare the before and after screenshots. Check:
-1. Does the change match the task description?
-2. Are there any visual regressions (broken layout, missing elements, overlapping text)?
-3. Does the mobile view look correct?
-
-Reply with ONLY this JSON (no markdown, no code fences):
-{{"pass": true, "explanation": "brief explanation"}}
-or
-{{"pass": false, "explanation": "what's wrong"}}"#,
-        abs = abs_path, title = title, desc = description
-    );
-
-    // First attempt: 5 max turns, 120s timeout
-    let result = run_claude_code_opts(cwd, &prompt, 5, 120).await?;
-
-    if let Some(parsed) = try_parse_qa_json(&result) {
-        cleanup_agent_dir(&agent_dir).await;
-        return Ok(parsed);
-    }
-
-    // Retry with a stricter prompt if JSON parsing failed
-    log::warn!("[worker] Visual QA first attempt returned unparseable output, retrying with stricter prompt");
-
-    let retry_prompt = format!(
-        r#"Read these image files and compare them:
-- {abs}/before-desktop.png vs {abs}/after-desktop.png
-- {abs}/before-mobile.png vs {abs}/after-mobile.png
-
-Does the visual change look correct for this task: "{title}"?
-
-IMPORTANT: Your entire response must be valid JSON with no other text. Example:
-{{"pass": true, "explanation": "Changes look correct"}}"#,
-        abs = abs_path, title = title
-    );
-
-    let retry_result = run_claude_code_opts(cwd, &retry_prompt, 3, 90).await?;
-
-    let parsed = try_parse_qa_json(&retry_result)
-        .unwrap_or((true, format!("QA output (unparseable after retry): {}", truncate(&retry_result, 200))));
-
-    cleanup_agent_dir(&agent_dir).await;
-    Ok(parsed)
-}
-
-/// Try to extract {"pass": bool, "explanation": string} from Claude's response.
-fn try_parse_qa_json(text: &str) -> Option<(bool, String)> {
-    // Try direct parse first
-    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
-        if let Some(pass) = parsed.get("pass").and_then(|v| v.as_bool()) {
-            let explanation = parsed.get("explanation").and_then(|v| v.as_str()).unwrap_or("No explanation").to_string();
-            return Some((pass, explanation));
-        }
-    }
-
-    // Try to find JSON in the response text (Claude sometimes wraps in markdown)
-    if let Some(start) = text.find('{') {
-        if let Some(end) = text.rfind('}') {
-            let json_str = &text[start..=end];
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
-                if let Some(pass) = parsed.get("pass").and_then(|v| v.as_bool()) {
-                    let explanation = parsed.get("explanation").and_then(|v| v.as_str()).unwrap_or("No explanation").to_string();
-                    return Some((pass, explanation));
-                }
-            }
-        }
-    }
-
-    None
-}
-
-/// Remove the .agent-one/ temp directory after QA
-async fn cleanup_agent_dir(agent_dir: &str) {
-    if let Err(e) = tokio::fs::remove_dir_all(agent_dir).await {
-        log::warn!("[worker] Failed to clean up {}: {}", agent_dir, e);
-    }
-}
-
 /// Detect the default branch for a repo (main, master, etc.)
 async fn detect_base_branch(repo_path: &str) -> String {
     // Try git symbolic-ref for the remote HEAD
@@ -6171,42 +5830,6 @@ async fn detect_base_branch(repo_path: &str) -> String {
         if output.status.success() { return "main".to_string(); }
     }
     "master".to_string()
-}
-
-/// Upload before/after screenshots to Supabase Storage, return markdown image links.
-async fn upload_screenshots_to_storage(
-    config: &super::supabase::SupabaseConfig,
-    task_id: &str,
-    screenshot_dir: &str,
-) -> Result<(Vec<String>, String), String> {
-    let mut urls = Vec::new();
-    let screenshot_names = ["before-desktop.png", "after-desktop.png", "before-mobile.png", "after-mobile.png"];
-
-    for name in &screenshot_names {
-        let local_path = join_path(screenshot_dir, name);
-        if tokio::fs::metadata(&local_path).await.is_ok() {
-            let storage_path = format!("{}/{}", task_id, name);
-            match supabase::upload_to_storage(config, "agent-one-screenshots", &storage_path, &local_path).await {
-                Ok(url) => urls.push(url),
-                Err(e) => log::warn!("[worker] Failed to upload {}: {}", name, e),
-            }
-        }
-    }
-
-    // Build markdown for PR body
-    let mut md = String::new();
-    if urls.len() >= 4 {
-        md.push_str("### Visual QA\n\n");
-        md.push_str("| Desktop Before | Desktop After |\n|--------|-------|\n");
-        md.push_str(&format!("| ![before]({}) | ![after]({}) |\n\n", urls[0], urls[1]));
-        md.push_str("| Mobile Before | Mobile After |\n|--------|-------|\n");
-        md.push_str(&format!("| ![before]({}) | ![after]({}) |\n\n", urls[2], urls[3]));
-    } else if urls.len() >= 2 {
-        md.push_str("### Visual QA\n\n");
-        md.push_str(&format!("| Before | After |\n|--------|-------|\n| ![before]({}) | ![after]({}) |\n\n", urls[0], urls[1]));
-    }
-
-    Ok((urls, md))
 }
 
 /// Spawn a detached Codex `$samwise-pr-review` run for a task. On verdict,
@@ -11317,18 +10940,17 @@ Field rules:\n\
     Some(md)
 }
 
-/// Create a PR with before/after screenshots uploaded to Supabase Storage.
+/// Create a PR from the worktree branch. Visual verification verdicts now
+/// land in the commit body itself (from the inline self-verification phase),
+/// so this function no longer manages screenshots or out-of-band QA notes.
 async fn create_pr(
-    config: &super::supabase::SupabaseConfig,
+    _config: &super::supabase::SupabaseConfig,
     repo_path: &str,
     title: &str,
     description: &str,
-    task_id: &str,
+    _task_id: &str,
     branch: &Option<String>,
     base_branch_override: Option<&str>,
-    screenshot_dir: &str,
-    has_screenshots: bool,
-    qa_note: Option<&str>,
     include_customer_success: bool,
 ) -> Result<String, String> {
     // Branch should already be resolved by execute_task, but fallback just in case
@@ -11412,14 +11034,6 @@ async fn create_pr(
         pr_body.push('\n');
     }
 
-    if has_screenshots {
-        let (_, screenshot_md) = upload_screenshots_to_storage(config, task_id, screenshot_dir).await
-            .unwrap_or_default();
-        pr_body.push_str(&screenshot_md);
-    }
-    if let Some(note) = qa_note {
-        pr_body.push_str(note);
-    }
     pr_body.push_str("\n\n---\nAutomated by SamWise");
 
     // Create PR with explicit base branch
@@ -11455,7 +11069,7 @@ async fn create_pr(
             if url.is_empty() {
                 return Err(format!("gh pr create failed: {}", stderr));
             }
-            // Refresh the body so re-runs get the latest screenshots and summary.
+            // Refresh the body so re-runs get the latest commit summary.
             let _ = async_cmd("gh")
                 .args(["pr", "edit", &branch_name, "--body", &pr_body])
                 .current_dir(repo_path)
@@ -11466,9 +11080,6 @@ async fn create_pr(
             return Err(format!("gh pr create failed: {}", stderr));
         }
     };
-
-    // Clean up local screenshot directory
-    let _ = tokio::fs::remove_dir_all(screenshot_dir).await;
 
     Ok(pr_url)
 }
