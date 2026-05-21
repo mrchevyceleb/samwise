@@ -49,6 +49,8 @@
   let mergeConflictFixState = $derived(getMergeConflictFixState(task));
   let mergeDeployRequestError = $state<string | null>(null);
   let mergeConflictFixRequestError = $state<string | null>(null);
+  let visualQA = $derived(task.visual_qa_result);
+  let visualQaVerdict = $derived((visualQA?.verdict || (visualQA?.pass ? 'PASS' : 'FAIL')).toUpperCase());
   let canMergeDeploy = $derived(!!task.pr_url && (task.status === 'approved' || mergeDeployState.status === 'failed'));
   let canRequestMergeConflictFix = $derived(
     !!task.pr_url &&
@@ -62,6 +64,12 @@
     if (verdict === 'fix' || verdict === 'blocked') return '#fb923c';
     if (verdict === 'errored') return '#fb7185';
     return '#60a5fa';
+  }
+
+  function visualQaColor(verdict: string) {
+    if (verdict === 'PASS') return '#34d399';
+    if (verdict === 'SKIP') return '#fbbf24';
+    return '#fb7185';
   }
 
   function openPr() {
@@ -220,6 +228,21 @@
               Sam conflict recovery failed: {mergeConflictFixRequestError || mergeConflictFixState.error}
             </div>
           {/if}
+        </section>
+      {/if}
+
+      {#if visualQA}
+        <section
+          class="rounded-lg border p-3"
+          style="border-color: {visualQaColor(visualQaVerdict)}55; background: {visualQaColor(visualQaVerdict)}14;"
+        >
+          <h3 class="text-xs uppercase tracking-wide mb-1" style="color: {visualQaColor(visualQaVerdict)};">Visual QA</h3>
+          <div class="flex items-start gap-2">
+            <span class="shrink-0 rounded-md border px-2 py-0.5 text-[10px] font-black uppercase tracking-wide" style="border-color: {visualQaColor(visualQaVerdict)}55; color: {visualQaColor(visualQaVerdict)};">
+              {visualQaVerdict}
+            </span>
+            <p class="text-sm text-slate-200 whitespace-pre-wrap">{visualQA.explanation}</p>
+          </div>
         </section>
       {/if}
 

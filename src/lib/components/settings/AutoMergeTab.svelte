@@ -213,7 +213,7 @@
   </div>
 
   <div style="font-size: 12px; color: var(--text-secondary); line-height: 1.5;">
-    When on, Sam starts a dev server, moves code tasks into Testing after implementation, and runs the <code style="font-family: var(--font-mono, monospace); font-size: 11px; color: var(--accent-blue);">/browse</code> Browserbase gate before opening a PR. If the gate finds product issues, Sam gets one targeted repair pass and reruns it. Browser-visible changes fail closed when no live dev server is available.
+    When on, Sam starts a dev server, moves code tasks into Testing after implementation, and runs the <code style="font-family: var(--font-mono, monospace); font-size: 11px; color: var(--accent-blue);">/browse</code> Browserbase gate before opening a PR. If the gate finds a focused set of product issues, Sam gets one targeted repair pass and reruns it. Large issue sets and missing live dev servers fail closed into Fixes Needed.
   </div>
 
   <div

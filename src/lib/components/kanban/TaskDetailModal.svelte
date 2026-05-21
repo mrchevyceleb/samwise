@@ -111,6 +111,30 @@
 	let hasAfter = $derived(task.screenshots_after && task.screenshots_after.length > 0);
 	let hasScreenshots = $derived(hasBefore || hasAfter);
 	let hasVisualQA = $derived(task.visual_qa_result !== null);
+	let visualQA = $derived(task.visual_qa_result);
+	let visualQaVerdict = $derived((visualQA?.verdict || (visualQA?.pass ? 'PASS' : 'FAIL')).toUpperCase());
+	let visualQaIsPass = $derived(visualQaVerdict === 'PASS');
+	let visualQaIsSkip = $derived(visualQaVerdict === 'SKIP');
+	let visualQaBg = $derived(
+		visualQaIsPass ? 'rgba(63, 185, 80, 0.06)' :
+		visualQaIsSkip ? 'rgba(245, 158, 11, 0.08)' :
+		'rgba(248, 81, 73, 0.06)'
+	);
+	let visualQaBorder = $derived(
+		visualQaIsPass ? 'rgba(63, 185, 80, 0.15)' :
+		visualQaIsSkip ? 'rgba(245, 158, 11, 0.24)' :
+		'rgba(248, 81, 73, 0.15)'
+	);
+	let visualQaBadgeBg = $derived(
+		visualQaIsPass ? 'rgba(63, 185, 80, 0.15)' :
+		visualQaIsSkip ? 'rgba(245, 158, 11, 0.16)' :
+		'rgba(248, 81, 73, 0.15)'
+	);
+	let visualQaColor = $derived(
+		visualQaIsPass ? 'var(--accent-green)' :
+		visualQaIsSkip ? '#f59e0b' :
+		'var(--accent-red)'
+	);
 	let comments = $derived(commentStore.getComments(task.id));
 	let reviewPanel = $derived(extractReviewActionPanel(task, comments));
 	let uiStamp = $derived(getUiStamp(task));
@@ -782,16 +806,16 @@
 						<div style="
 							display: flex; align-items: flex-start; gap: 10px;
 							padding: 12px; border-radius: 10px;
-							background: {task.visual_qa_result.pass ? 'rgba(63, 185, 80, 0.06)' : 'rgba(248, 81, 73, 0.06)'};
-							border: 1px solid {task.visual_qa_result.pass ? 'rgba(63, 185, 80, 0.15)' : 'rgba(248, 81, 73, 0.15)'};
+							background: {visualQaBg};
+							border: 1px solid {visualQaBorder};
 						">
 							<span style="
 								padding: 3px 10px; border-radius: 6px; font-size: 11px; font-weight: 700;
-								background: {task.visual_qa_result.pass ? 'rgba(63, 185, 80, 0.15)' : 'rgba(248, 81, 73, 0.15)'};
-								color: {task.visual_qa_result.pass ? 'var(--accent-green)' : 'var(--accent-red)'};
+								background: {visualQaBadgeBg};
+								color: {visualQaColor};
 								text-transform: uppercase; flex-shrink: 0;
 							">
-								{task.visual_qa_result.pass ? 'PASS' : 'FAIL'}
+								{visualQaVerdict}
 							</span>
 							<div style="font-size: 12px; color: var(--text-secondary); line-height: 1.5;">
 								{task.visual_qa_result.explanation}

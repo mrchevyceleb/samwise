@@ -28,6 +28,17 @@ export interface Subtask {
   order: number;
 }
 
+export interface VisualQaResult {
+  pass: boolean;
+  explanation: string;
+  verdict?: 'PASS' | 'FAIL' | 'SKIP' | 'BLOCKED' | string;
+  tool?: string;
+  issues?: string[];
+  raw_issue_count?: number;
+  duplicate_issue_count?: number;
+  session_url?: string;
+}
+
 export interface AeTask {
   id: string;
   title: string;
@@ -47,7 +58,7 @@ export interface AeTask {
   report_url: string | null;
   screenshots_before: string[] | null;
   screenshots_after: string[] | null;
-  visual_qa_result: { pass: boolean; explanation: string } | null;
+  visual_qa_result: VisualQaResult | null;
   assignee: string;
   worker_id: string | null;
   trigger_id?: string | null;

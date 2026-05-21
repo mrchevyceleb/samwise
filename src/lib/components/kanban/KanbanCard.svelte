@@ -73,6 +73,25 @@
 		!isMergeConflictFixBusy(mergeConflictFixState)
 	);
 	let qaResult = $derived(task.visual_qa_result);
+	let qaVerdict = $derived((qaResult?.verdict || (qaResult?.pass ? 'PASS' : 'FAIL')).toUpperCase());
+	let qaIsPass = $derived(qaVerdict === 'PASS');
+	let qaIsSkip = $derived(qaVerdict === 'SKIP');
+	let qaBadgeLabel = $derived(qaIsSkip ? 'QA Skipped' : qaIsPass ? 'QA Passed' : 'QA Failed');
+	let qaBadgeBg = $derived(
+		qaIsPass ? 'rgba(63, 185, 80, 0.08)' :
+		qaIsSkip ? 'rgba(245, 158, 11, 0.08)' :
+		'rgba(248, 81, 73, 0.08)'
+	);
+	let qaBadgeColor = $derived(
+		qaIsPass ? 'var(--accent-green)' :
+		qaIsSkip ? '#f59e0b' :
+		'var(--accent-red)'
+	);
+	let qaBadgeBorder = $derived(
+		qaIsPass ? 'rgba(63, 185, 80, 0.2)' :
+		qaIsSkip ? 'rgba(245, 158, 11, 0.24)' :
+		'rgba(248, 81, 73, 0.2)'
+	);
 	let originBadge = $derived(
 		task.origin_system && task.origin_system !== 'manual'
 			? ORIGIN_BADGES[task.origin_system]
@@ -497,15 +516,15 @@
 	<!-- Visual QA result badge -->
 	{#if qaResult}
 		<div style="
-			font-size: 10px; font-weight: 600; padding: 3px 8px; margin-bottom: 8px;
-			border-radius: 5px; display: inline-flex; align-items: center; gap: 4px;
-			background: {qaResult.pass ? 'rgba(63, 185, 80, 0.08)' : 'rgba(248, 81, 73, 0.08)'};
-			color: {qaResult.pass ? 'var(--accent-green)' : 'var(--accent-red)'};
-			border: 1px solid {qaResult.pass ? 'rgba(63, 185, 80, 0.2)' : 'rgba(248, 81, 73, 0.2)'};
-		">
-			{qaResult.pass ? 'QA Passed' : 'QA Failed'}
-		</div>
-	{/if}
+				font-size: 10px; font-weight: 600; padding: 3px 8px; margin-bottom: 8px;
+				border-radius: 5px; display: inline-flex; align-items: center; gap: 4px;
+				background: {qaBadgeBg};
+				color: {qaBadgeColor};
+				border: 1px solid {qaBadgeBorder};
+			">
+				{qaBadgeLabel}
+			</div>
+		{/if}
 
 	{#if showReviewActions && task.status !== 'done'}
 		<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 8px;">
