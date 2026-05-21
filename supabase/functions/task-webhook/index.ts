@@ -130,6 +130,60 @@ function pushHint(hints: string[], value: unknown) {
   }
 }
 
+function cleanBaseBranch(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  let branch = value.trim().replace(/^['"`]+|['"`]+$/g, "");
+  branch = branch.replace(/^refs\/heads\//, "").replace(/^origin\//, "");
+  branch = branch.replace(/\\+$/g, "").trim();
+  if (!branch) return null;
+  if (!/^[A-Za-z0-9._/-]+$/.test(branch)) return null;
+  if (
+    branch.startsWith("/") ||
+    branch.endsWith("/") ||
+    branch.includes("//") ||
+    branch.includes("..") ||
+    branch.includes("@{")
+  ) {
+    return null;
+  }
+  return branch;
+}
+
+function cleanInboundDescription(source: string, value: string): string {
+  let description = value.trim();
+  if (!description) return description;
+
+  // QA Hub can send both the real QA review prompt and an older generated
+  // Claude prompt. The legacy section may directly contradict the QA findings,
+  // so keep the verified QA handoff and drop the stale prompt.
+  const legacyPrompt = description.search(/\n+\s*Claude prompt:\s*/i);
+  if (legacyPrompt >= 0) {
+    description = description.slice(0, legacyPrompt).trim();
+  }
+
+  const isQaHub = source.trim().toLowerCase() === "qa-hub" ||
+    /\bQA Hub ticket:/i.test(description) ||
+    /\bQA verification findings\b/i.test(description);
+  const qaMarker = "Fix this R-Link Studio bug based on QA verification findings:";
+  const markerIndex = description.indexOf(qaMarker);
+  if (isQaHub && markerIndex > 0) {
+    const prefix = description.slice(0, markerIndex).trim();
+    const findings = description.slice(markerIndex).trim();
+    const preface = prefix
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => /^(App|Reporter|QA Hub ticket):/i.test(line));
+    description = [
+      "QA Hub verified the findings below. Treat this as a fix ticket, not a request to decide whether the original report was valid.",
+      ...preface,
+      "",
+      findings,
+    ].join("\n").trim();
+  }
+
+  return description;
+}
+
 function projectHints(project: string, title: string, description: string): string[] {
   const hints: string[] = [];
   pushHint(hints, project);
@@ -314,7 +368,11 @@ Deno.serve(async (req) => {
   }
 
   const title = (body.title ?? "").trim();
-  const description = (body.description ?? "").trim();
+  const source = typeof body.source === "string" && body.source.trim()
+    ? body.source.trim()
+    : "webhook";
+  const rawDescription = (body.description ?? "").trim();
+  const description = cleanInboundDescription(source, rawDescription);
   if (!title) return json(400, { error: "title is required" });
   if (!description) return json(400, { error: "description is required" });
 
@@ -341,7 +399,7 @@ Deno.serve(async (req) => {
     status: "queued",
     priority: body.priority ?? "medium",
     task_type: body.task_type ?? "code",
-    source: body.source ?? "webhook",
+    source,
   };
 
   // QA target environment: explicit preview_url wins; otherwise the project's
@@ -378,7 +436,8 @@ Deno.serve(async (req) => {
     qa_environment: environment,
   };
 
-  if (body.base_branch) task.base_branch = body.base_branch;
+  const baseBranch = cleanBaseBranch(body.base_branch);
+  if (baseBranch) task.base_branch = baseBranch;
 
   if (typeof body.callback_url === "string") {
     const cb = body.callback_url.trim();

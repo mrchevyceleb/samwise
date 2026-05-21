@@ -213,10 +213,7 @@
   </div>
 
   <div style="font-size: 12px; color: var(--text-secondary); line-height: 1.5;">
-    When on, Sam starts a dev server, takes before/after screenshots (desktop and mobile), and runs a Claude vision pass that flags regressions
-    and feeds the explanation back to Claude Code as a fix-it prompt (up to 3 attempts). Off by default. Currently the screenshotter has no
-    authentication support, so for auth-walled apps it only sees the login page and rubber-stamps every PR. Leave off until per-project storage
-    state is wired up.
+    When on, Sam starts a dev server, moves code tasks into Testing after implementation, and runs the <code style="font-family: var(--font-mono, monospace); font-size: 11px; color: var(--accent-blue);">/browse</code> Browserbase gate before opening a PR. If the gate finds product issues, Sam gets one targeted repair pass and reruns it. Browser-visible changes fail closed when no live dev server is available.
   </div>
 
   <div
@@ -225,8 +222,8 @@
     onmouseleave={() => hovered = null}
   >
     <div>
-      <div style="font-size: 13px; font-weight: 600; color: var(--text-primary);">Run Visual QA on every code task</div>
-      <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">Off by default. Turn on once your project has authenticated screenshots set up.</div>
+      <div style="font-size: 13px; font-weight: 600; color: var(--text-primary);">Run /browse QA in Testing</div>
+      <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">Runs after code work and before PR creation.</div>
     </div>
     <button
       onclick={toggleVisualQa}

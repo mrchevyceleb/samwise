@@ -552,6 +552,33 @@ fn worktree_pr_head_candidates(
     candidates
 }
 
+fn clean_base_branch_name(raw: &str) -> Option<String> {
+    let mut value = raw.trim().trim_matches('"').trim_matches('\'').to_string();
+    value = value.trim_start_matches("refs/heads/").to_string();
+    value = value.trim_start_matches("origin/").to_string();
+    while value.ends_with('\\') || value.ends_with('/') {
+        value.pop();
+    }
+    let value = value.trim().to_string();
+    if value.is_empty()
+        || value.starts_with('-')
+        || value.contains("..")
+        || value.contains(' ')
+        || value.contains('\\')
+        || value.contains('~')
+        || value.contains('^')
+        || value.contains(':')
+        || value.contains('?')
+        || value.contains('*')
+        || value.contains('[')
+        || value.ends_with(".lock")
+    {
+        None
+    } else {
+        Some(value)
+    }
+}
+
 /// Fetch latest origin state into Matt's main repo, then create a worktree for Sam
 /// to work in. Matt's checkout is never touched. Returns (worktree_path, base_branch,
 /// task_branch).
@@ -576,9 +603,8 @@ async fn create_task_worktree(
     }
 
     run_git(&["fetch", "origin", "--prune"], main_repo_path).await?;
-    let base_branch = match base_branch_override {
-        Some(b) if !b.trim().is_empty() => {
-            let b = b.trim().to_string();
+    let base_branch = match base_branch_override.and_then(clean_base_branch_name) {
+        Some(b) => {
             // Verify origin/<b> resolves before proceeding.
             if run_git(&["rev-parse", "--verify", &format!("origin/{}", b)], main_repo_path).await.is_err() {
                 return Err(format!("base branch `origin/{}` doesn't exist on remote. Push it or pick a different base.", b));
@@ -2022,10 +2048,9 @@ fn extract_session_url(raw: &str) -> Option<String> {
 // ── QA Verify ───────────────────────────────────────────────────────
 //
 // A `qa-verify` task replaces a human QA tester. Instead of writing code,
-// Sam drives a real logged-in browser (the assistant-mcp `browser_use`
-// tool, Browserbase-backed) against the card's preview URL, exercises the
-// feature against the acceptance criteria, captures console errors and a
-// screenshot, then emits a strict verdict:
+// Sam drives Matt's `/browse` workflow against the card's preview URL,
+// exercises the feature against the acceptance criteria, captures console
+// errors and a screenshot, then emits a strict verdict:
 //   PASS -> card moves to `approved` (the merge/deploy + auto-merge sweep
 //           can take it from there, same as a clean Codex review).
 //   FAIL -> card moves to `fixes_needed` with the findings, so the
@@ -2103,7 +2128,7 @@ async fn run_qa_verify(
     // verdict format, and explicit failure handling so the output is
     // machine-parseable.
     let prompt = format!(
-        r#"You are an automated QA tester. You are NOT writing or changing any code. Your only job is to verify a feature in a real browser and return a strict verdict.
+        r#"/browse You are an automated QA tester. You are NOT writing or changing any code. Your only job is to verify a feature in a real browser and return a strict verdict.
 
 FEATURE UNDER TEST: {title}
 
@@ -2113,9 +2138,9 @@ ACCEPTANCE CRITERIA / WHAT TO VERIFY:
 {acceptance}
 
 SESSION SETUP:
-- Use the `mcp__assistant-mcp__browser` tool. Call action `start` (pass `site` for the target URL's domain; include `account` if a stored login exists). The `start` result includes a `liveViewUrl` — SAVE that exact string, you must report it at the end (it is the recorded replay of this whole QA run). Then `login` if the page requires auth — stored credentials + TOTP/email 2FA are handled automatically; if it returns needs_2fa for SMS/push, report that as a blocker and do NOT guess.
-- `snapshot` is your primary way to read the page. `screenshot` whenever something is notable — a bug, a rough edge, or proof the feature works.
-- CONSOLE/NETWORK IS NOW READABLE. The browser tool captures every console message, uncaught JS error, failed request, and HTTP 4xx/5xx continuously from `start` onward (across navigations and popups). Call action `console` at the natural checkpoints — after the main flow, after each unhappy path, and once more right before your verdict. `console` returns `clean` plus counts and entries; treat it exactly like having DevTools open. A non-clean console with real errors/4xx/5xx is a FAIL even if the UI looked fine. (Use `console` with includeAll only if you need the full log.) Inability to read the console is no longer a valid blocker — you have the tool, use it.
+- Follow the `/browse` workflow exactly. Identify the site from the target URL, call `start`, save the returned `liveViewUrl`, call `login` if auth is required, use `snapshot` as your primary page reader, use `screenshot` when pixels matter, and always call `end`.
+- The `start` result includes a `liveViewUrl`. SAVE that exact string, you must report it at the end because it is the recorded replay of this whole QA run. Stored credentials plus TOTP/email 2FA are handled automatically. If `login` returns needs_2fa for SMS/push, report that as a blocker and do NOT guess.
+- CONSOLE/NETWORK IS NOW READABLE. The browser tool captures every console message, uncaught JS error, failed request, and HTTP 4xx/5xx continuously from `start` onward across navigations and popups. Call action `console` at the natural checkpoints: after the main flow, after each unhappy path, and once more right before your verdict. `console` returns `clean` plus counts and entries; treat it exactly like having DevTools open. A non-clean console with real errors/4xx/5xx is a FAIL even if the UI looked fine. Use `console` with includeAll only if you need the full log. Inability to read the console is no longer a valid blocker; you have the tool, use it.
 - Always call action `end` before you finish.
 
 TEST HOLISTICALLY — do not just tick the acceptance list. Make zero assumptions about the codebase. Cover all of:
@@ -2930,9 +2955,9 @@ async fn execute_task(
         }
     }
 
-    // Read the Visual QA gate from settings.json once per task. When disabled
-    // (default) Sam skips the dev server, before/after screenshots, the QA
-    // loop, and the screenshot upload. The toggle lives in Settings -> Auto-Merge.
+    // Read the Visual QA gate from settings.json once per task. When disabled,
+    // Sam skips the dev server and the `/browse` Testing gate. The toggle
+    // lives in Settings -> Auto-Merge.
     let visual_qa_enabled = {
         use tauri::Manager;
         if let Ok(data_dir) = app.path().app_data_dir() {
@@ -2946,12 +2971,10 @@ async fn execute_task(
         }
     };
 
-    // 3b. Start a local dev server when visual QA is on, regardless of whether
-    // a staging preview_url was already set. Visual self-verification needs to
-    // see the agent's LIVE changes (via HMR), and a staging URL only shows
-    // pre-change state — pointing browser_use at it produces false-positive
-    // misses ("looks fine, ship it"). When the dev server starts cleanly, its
-    // URL takes over preview_url for this task's verification phase.
+    // 3b. Start a local dev server when visual QA is on. The Testing stage
+    // `/browse` gate needs to see the agent's live branch changes via HMR; a
+    // staging preview_url usually shows pre-change state and can false-pass.
+    // The Testing gate reads the dev server handle directly.
     let mut dev_server_handle: Option<dev_server::DevServerHandle> = None;
     if uses_single_repo_pipeline && visual_qa_enabled {
         let pkg_json = std::path::Path::new(&repo_path).join("package.json");
@@ -2960,7 +2983,7 @@ async fn execute_task(
 
             // Ensure node_modules exists before trying to start the dev server
             if let Err(e) = dev_server::ensure_deps_installed(&repo_path).await {
-                agent_comment(config, &task_id, &format!("npm install failed: {}. Proceeding without screenshots or visual QA.", e)).await;
+                agent_comment(config, &task_id, &format!("npm install failed: {}. Proceeding without browser QA.", e)).await;
             } else {
                 match dev_server::start_dev_server(&repo_path, project_dev_command.as_deref()).await {
                     Ok(handle) => {
@@ -2968,27 +2991,25 @@ async fn execute_task(
                         match dev_server::wait_for_ready(&handle.url, 60).await {
                             Ok(()) => {
                                 agent_comment(config, &task_id, &format!("Dev server running at {}", handle.url)).await;
-                                preview_url = Some(handle.url.clone());
                                 dev_server_handle = Some(handle);
                             }
                             Err(e) => {
-                                agent_comment(config, &task_id, &format!("Dev server started but not responding: {}. Proceeding without screenshots or visual QA.", e)).await;
+                                agent_comment(config, &task_id, &format!("Dev server started but not responding: {}. Browser QA will fail closed if the diff is browser-visible.", e)).await;
                                 let _ = dev_server::kill_dev_server(handle).await;
                             }
                         }
                     }
                     Err(e) => {
-                        agent_comment(config, &task_id, &format!("Couldn't start dev server: {}. Proceeding without screenshots or visual QA.", e)).await;
+                        agent_comment(config, &task_id, &format!("Couldn't start dev server: {}. Browser QA will fail closed if the diff is browser-visible.", e)).await;
                     }
                 }
             }
         }
     }
 
-    // BEFORE/AFTER Puppeteer screenshots + out-of-band run_visual_qa removed
-    // in favor of the agent's inline visual self-verification via
-    // mcp__assistant-mcp__browser. The dev server above still starts; the
-    // agent drives it directly inside its Claude Code session.
+    // BEFORE/AFTER Puppeteer screenshots + out-of-band run_visual_qa were
+    // removed. The dev server above now feeds the board-visible `/browse`
+    // Testing gate after code work completes.
 
     // 5. Run Claude Code CLI
     let action_label = if is_research {
@@ -3132,46 +3153,14 @@ async fn execute_task(
         } else {
             "Do not add a CS Message, For Customer Success, or paste-ready customer-service message anywhere. Customer Success copy is currently Operly-only.\n\n"
         };
-        // Visual self-verification block. Only included when visual QA is on
-        // AND we have a verification URL (dev server URL preferred; staging
-        // preview URL only if the dev server didn't start). When omitted, the
-        // agent just does its normal write-then-commit flow.
+        // Browser validation now runs as a separate board-visible Testing
+        // stage after code changes, codex-fix, and build. Keep the coding
+        // prompt focused on implementation so the gate can fail closed before
+        // PR creation.
         let visual_verification_section = if visual_qa_enabled {
-            if let Some(ref verify_url) = preview_url {
-                format!(
-                    "## VISUAL SELF-VERIFICATION (before you commit)\n\
-After you finish editing files and BEFORE you stage/commit, you MUST visually verify your changes IF this task changed anything user-facing (UI, layout, copy, styling, client-side behavior, new routes, modal flows).\n\n\
-**Skip the visual phase entirely** if your changes are non-UI: backend handlers, edge functions, server routes, migrations, CI scripts, docs/markdown, comment-only edits, internal utilities with no UI surface. In that case, write `Visual verification: skipped (non-UI change)` into the commit body's Fixes Made section and move on.\n\n\
-**When you DO verify, follow these phases exactly:**\n\n\
-PHASE 1 \u{2014} Identify the surface you changed.\n\
-- From your diff, list which screen(s)/component(s) a user would see differently.\n\
-- If you cannot name a concrete screen the change affects, skip the visual phase (see above).\n\n\
-PHASE 2 \u{2014} Open it.\n\
-- Use the `mcp__assistant-mcp__browser` tool. Call action `start` with the target URL `{verify_url}` and an appropriate `site` value (the URL's hostname). If a stored login exists for the site, include `account`.\n\
-- Call `login` if the page requires auth. Stored credentials + TOTP/email 2FA are automatic; if you get `needs_2fa` for SMS/push, write `Visual verification: blocked (SMS/push 2FA required)` in the commit body and skip the rest of this phase.\n\
-- Navigate to the screen identified in Phase 1.\n\n\
-PHASE 3 \u{2014} Drive the flow you changed.\n\
-- Perform the user action your change is about (click the button, submit the form, open the modal, toggle the setting, etc.).\n\
-- Capture a snapshot or screenshot of the result.\n\
-- Read the snapshot text and visually inspect against the task's acceptance criteria. Specifically check: is the new behavior present? Is the layout sane (nothing overflowing, overlapping, or cut off)? Are labels/copy correct? Are there any console errors that originate in this repo's code (ignore third-party CDN noise, Sentry rate-limits, browser-extension chatter)?\n\n\
-PHASE 4 \u{2014} Iterate if needed (max 3 rounds total).\n\
-- If the result does NOT match the acceptance criteria, edit the code to fix it, wait ~3s for HMR to reload the dev server, and re-run Phase 3 against the same URL.\n\
-- After 3 rounds, stop iterating regardless of state.\n\n\
-PHASE 5 \u{2014} Close the browser session.\n\
-- Call `mcp__assistant-mcp__browser` with action `end` to release the Browserbase session. Do this even if verification failed.\n\n\
-PHASE 6 \u{2014} Record the verdict.\n\
-- In the commit body's Fixes Made section, add one of these one-liners:\n\
-  - `Visual verification: PASS (verified at {verify_url} via mcp__assistant-mcp__browser)`\n\
-  - `Visual verification: PARTIAL after 3 iterations \u{2014} <one-sentence what is still off>`\n\
-  - `Visual verification: skipped (non-UI change)` / `Visual verification: blocked (<reason>)`\n\n\
-Do NOT fabricate a PASS without actually driving the flow. Do NOT loop more than 3 times. Do NOT use this phase to fix unrelated issues you notice along the way \u{2014} keep changes targeted to the task.\n\n",
-                    verify_url = verify_url
-                )
-            } else {
-                String::from(
-                    "## VISUAL SELF-VERIFICATION\nVisual QA is on, but no verification URL is available (no dev server started, no staging preview URL). Note `Visual verification: skipped (no verification URL)` in the commit body's Fixes Made section.\n\n"
-                )
-            }
+            String::from(
+                "## TESTING STAGE BROWSER QA\nAfter you commit, Samwise will move this card to Testing and run the `/browse` browser gate against the live dev server before opening a PR. Do not run your own browser QA inside this coding pass. If your change is not browser-visible, mention that in the Fixes Made section.\n\n"
+            )
         } else {
             String::new()
         };
@@ -3556,9 +3545,316 @@ from Matt, stop without making changes and explain specifically what you need cl
                 }
             }
 
-            // AFTER Puppeteer screenshots removed — inline visual self-verification
-            // (see VISUAL SELF-VERIFICATION section in the code-task prompt) now
-            // owns post-edit visual checks and runs inside the agent's session.
+            // Board-visible Testing stage. This is the post-code browser gate:
+            // code work and repair checks happen in `in_progress`, then `/browse`
+            // validates the live changes before any PR is opened.
+            if visual_qa_enabled {
+                let changed_files = changed_files_for_testing(
+                    &repo_path,
+                    resolved_base_branch.as_deref(),
+                ).await;
+                let browser_visible = changed_files_look_browser_visible(&changed_files);
+                let testing_url = dev_server_handle.as_ref().map(|h| h.url.clone());
+
+                let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                    "status": "testing",
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                })).await;
+                notify_callback(config, &task_id, "testing", None, None);
+
+                if !task_is_live(config, &task_id).await {
+                    log::info!("[worker] Task {} cancelled before browse QA; stopping", task_id);
+                    if let Some(h) = dev_server_handle.take() { let _ = dev_server::kill_dev_server(h).await; }
+                    return Ok("Task was cancelled".to_string());
+                }
+
+                if let Some(verify_url) = testing_url {
+                    agent_comment(
+                        config,
+                        &task_id,
+                        &format!("Testing stage: running `/browse` validation against {} before PR creation.", verify_url),
+                    ).await;
+
+                    let browse_result = run_browse_validation_gate(
+                        config,
+                        &task_id,
+                        &title,
+                        &description,
+                        &repo_path,
+                        &verify_url,
+                        &changed_files,
+                        process_id_slot.clone(),
+                    ).await;
+                    { let mut pid = process_id_slot.lock().await; *pid = None; }
+
+                    let mut outcome = match browse_result {
+                        Ok(outcome) => outcome,
+                        Err(e) if e == "TASK_CANCELLED" => {
+                            log::info!("[worker] Task {} cancelled during browse QA; stopping", task_id);
+                            if let Some(h) = dev_server_handle.take() { let _ = dev_server::kill_dev_server(h).await; }
+                            return Ok("Task was cancelled".to_string());
+                        }
+                        Err(e) => {
+                            let reason = format!("browse QA could not complete: {}", truncate(&e, 300));
+                            agent_comment(config, &task_id, &reason).await;
+                            let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                                "status": "fixes_needed",
+                                "failure_reason": &reason,
+                                "visual_qa_result": {
+                                    "pass": false,
+                                    "tool": "browse",
+                                    "verdict": "BLOCKED",
+                                    "explanation": &reason,
+                                },
+                                "updated_at": chrono::Utc::now().to_rfc3339(),
+                            })).await;
+                            notify_callback(config, &task_id, "fixes_needed", None, Some(&reason));
+                            if let Some(h) = dev_server_handle.take() { let _ = dev_server::kill_dev_server(h).await; }
+                            return Ok("Browse QA blocked; routed to fixes_needed".to_string());
+                        }
+                    };
+
+                    let mut visual_result = serde_json::json!({
+                        "pass": outcome.pass || outcome.skip,
+                        "tool": "browse",
+                        "verdict": outcome.verdict,
+                        "explanation": outcome.summary,
+                        "issues": outcome.issues,
+                    });
+                    if let Some(u) = &outcome.session_url {
+                        visual_result["session_url"] = serde_json::json!(u);
+                    }
+                    let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                        "visual_qa_result": visual_result,
+                        "updated_at": chrono::Utc::now().to_rfc3339(),
+                    })).await;
+
+                    if outcome.pass || outcome.skip {
+                        let replay = outcome
+                            .session_url
+                            .as_deref()
+                            .map(|u| format!("\n\nBrowse replay: {}", u))
+                            .unwrap_or_default();
+                        agent_comment(
+                            config,
+                            &task_id,
+                            &format!("Testing stage passed via `/browse`.\n\n{}{}", outcome.summary, replay),
+                        ).await;
+                    } else {
+                        let issues_block = if outcome.issues.is_empty() {
+                            "(No structured issues returned.)".to_string()
+                        } else {
+                            outcome
+                                .issues
+                                .iter()
+                                .map(|issue| format!("- {}", issue))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        };
+                        agent_comment(
+                            config,
+                            &task_id,
+                            &format!(
+                                "`/browse` found issues in Testing. I'll make one targeted repair pass, then rerun the gate.\n\n{}\n\n{}",
+                                outcome.summary,
+                                issues_block
+                            ),
+                        ).await;
+
+                        let repair_prompt = format!(
+                            "The Testing stage `/browse` validation failed after the task implementation.\n\nTask: {}\n\nBrowser QA summary:\n{}\n\nIssues:\n{}\n\nFix only these validated issues in this checkout. Do not refactor unrelated code. After editing, run the smallest relevant verification you can, then stop. Do not open a PR.",
+                            title,
+                            outcome.summary,
+                            issues_block
+                        );
+                        let repair_result = run_claude_code_streaming(
+                            &repo_path,
+                            &repair_prompt,
+                            0,
+                            1200,
+                            config,
+                            &task_id,
+                            process_id_slot.clone(),
+                        ).await;
+                        { let mut pid = process_id_slot.lock().await; *pid = None; }
+                        if matches!(&repair_result, Err(e) if e == "TASK_CANCELLED") {
+                            log::info!("[worker] Task {} cancelled during browse QA repair; stopping", task_id);
+                            if let Some(h) = dev_server_handle.take() { let _ = dev_server::kill_dev_server(h).await; }
+                            return Ok("Task was cancelled".to_string());
+                        }
+                        if let Err(e) = repair_result {
+                            log::warn!("[worker] browse QA repair failed: {}", e);
+                        }
+                        match commit_testing_repairs(&repo_path).await {
+                            Ok(true) => {
+                                agent_comment(config, &task_id, "Committed repairs from Testing stage findings. Rerunning `/browse`.").await;
+                            }
+                            Ok(false) => {
+                                agent_comment(config, &task_id, "Testing repair pass made no file changes. Rerunning `/browse` once to confirm.").await;
+                            }
+                            Err(e) => {
+                                let reason = format!("testing repair commit failed: {}", truncate(&e, 300));
+                                agent_comment(config, &task_id, &reason).await;
+                                let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                                    "status": "fixes_needed",
+                                    "failure_reason": &reason,
+                                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                                })).await;
+                                notify_callback(config, &task_id, "fixes_needed", None, Some(&reason));
+                                if let Some(h) = dev_server_handle.take() { let _ = dev_server::kill_dev_server(h).await; }
+                                return Ok("Testing repair commit failed; routed to fixes_needed".to_string());
+                            }
+                        }
+
+                        match run_build_check(&repo_path).await {
+                            Ok(Some(cmd)) => {
+                                agent_comment(config, &task_id, &format!("Build passed after Testing repairs ({}).", cmd)).await;
+                            }
+                            Ok(None) => {}
+                            Err((cmd, log_tail)) => {
+                                let reason = format!("build failed after Testing repairs: {}", cmd);
+                                agent_comment(config, &task_id, &format!(
+                                    "{}\n\n```\n{}\n```",
+                                    reason,
+                                    log_tail
+                                )).await;
+                                let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                                    "status": "fixes_needed",
+                                    "failure_reason": &reason,
+                                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                                })).await;
+                                notify_callback(config, &task_id, "fixes_needed", None, Some(&reason));
+                                if let Some(h) = dev_server_handle.take() { let _ = dev_server::kill_dev_server(h).await; }
+                                return Ok("Build failed after Testing repairs; routed to fixes_needed".to_string());
+                            }
+                        }
+
+                        let changed_files_after_repair = changed_files_for_testing(
+                            &repo_path,
+                            resolved_base_branch.as_deref(),
+                        ).await;
+                        let browse_rerun_result = run_browse_validation_gate(
+                            config,
+                            &task_id,
+                            &title,
+                            &description,
+                            &repo_path,
+                            &verify_url,
+                            &changed_files_after_repair,
+                            process_id_slot.clone(),
+                        ).await;
+                        { let mut pid = process_id_slot.lock().await; *pid = None; }
+
+                        outcome = match browse_rerun_result {
+                            Ok(outcome) => outcome,
+                            Err(e) if e == "TASK_CANCELLED" => {
+                                log::info!("[worker] Task {} cancelled during browse QA rerun; stopping", task_id);
+                                if let Some(h) = dev_server_handle.take() { let _ = dev_server::kill_dev_server(h).await; }
+                                return Ok("Task was cancelled".to_string());
+                            }
+                            Err(e) => {
+                                let reason = format!("browse QA rerun could not complete: {}", truncate(&e, 300));
+                                agent_comment(config, &task_id, &reason).await;
+                                let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                                    "status": "fixes_needed",
+                                    "failure_reason": &reason,
+                                    "visual_qa_result": {
+                                        "pass": false,
+                                        "tool": "browse",
+                                        "verdict": "BLOCKED",
+                                        "explanation": &reason,
+                                    },
+                                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                                })).await;
+                                notify_callback(config, &task_id, "fixes_needed", None, Some(&reason));
+                                if let Some(h) = dev_server_handle.take() { let _ = dev_server::kill_dev_server(h).await; }
+                                return Ok("Browse QA rerun blocked; routed to fixes_needed".to_string());
+                            }
+                        };
+
+                        let mut visual_result = serde_json::json!({
+                            "pass": outcome.pass || outcome.skip,
+                            "tool": "browse",
+                            "verdict": outcome.verdict,
+                            "explanation": outcome.summary,
+                            "issues": outcome.issues,
+                        });
+                        if let Some(u) = &outcome.session_url {
+                            visual_result["session_url"] = serde_json::json!(u);
+                        }
+                        let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                            "visual_qa_result": visual_result,
+                            "updated_at": chrono::Utc::now().to_rfc3339(),
+                        })).await;
+
+                        if outcome.pass || outcome.skip {
+                            let replay = outcome
+                                .session_url
+                                .as_deref()
+                                .map(|u| format!("\n\nBrowse replay: {}", u))
+                                .unwrap_or_default();
+                            agent_comment(
+                                config,
+                                &task_id,
+                                &format!("Testing stage passed on rerun via `/browse`.\n\n{}{}", outcome.summary, replay),
+                            ).await;
+                        } else {
+                            let reason = format!("Testing stage `/browse` gate failed: {}", truncate(&outcome.summary, 300));
+                            let final_issues = if outcome.issues.is_empty() {
+                                String::new()
+                            } else {
+                                format!(
+                                    "\n\nIssues:\n{}",
+                                    outcome
+                                        .issues
+                                        .iter()
+                                        .map(|issue| format!("- {}", issue))
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                )
+                            };
+                            agent_comment(config, &task_id, &format!("{}{}", reason, final_issues)).await;
+                            let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                                "status": "fixes_needed",
+                                "failure_reason": &reason,
+                                "updated_at": chrono::Utc::now().to_rfc3339(),
+                            })).await;
+                            notify_callback(config, &task_id, "fixes_needed", None, Some(&reason));
+                            if let Some(h) = dev_server_handle.take() { let _ = dev_server::kill_dev_server(h).await; }
+                            return Ok("Testing browse QA failed; routed to fixes_needed".to_string());
+                        }
+                    }
+                } else if browser_visible {
+                    let reason = "Testing stage needs `/browse`, but no live dev server URL is available for browser-visible changes.".to_string();
+                    agent_comment(config, &task_id, &reason).await;
+                    let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                        "status": "fixes_needed",
+                        "failure_reason": &reason,
+                        "visual_qa_result": {
+                            "pass": false,
+                            "tool": "browse",
+                            "verdict": "BLOCKED",
+                            "explanation": &reason,
+                        },
+                        "updated_at": chrono::Utc::now().to_rfc3339(),
+                    })).await;
+                    notify_callback(config, &task_id, "fixes_needed", None, Some(&reason));
+                    if let Some(h) = dev_server_handle.take() { let _ = dev_server::kill_dev_server(h).await; }
+                    return Ok("Testing browse QA blocked; routed to fixes_needed".to_string());
+                } else {
+                    let explanation = "Testing stage `/browse` skipped because the committed diff is not browser-visible.";
+                    agent_comment(config, &task_id, explanation).await;
+                    let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                        "visual_qa_result": {
+                            "pass": true,
+                            "tool": "browse",
+                            "verdict": "SKIP",
+                            "explanation": explanation,
+                        },
+                        "updated_at": chrono::Utc::now().to_rfc3339(),
+                    })).await;
+                }
+            }
 
             // Mark first unchecked subtask as done (re-fetch fresh subtasks to avoid stale data)
             let fresh_subtasks = {
@@ -3628,11 +3924,8 @@ from Matt, stop without making changes and explain specifically what you need cl
                 }
             }
 
-            // Out-of-band Puppeteer visual QA + retry loop + Supabase Storage
-            // screenshot upload all removed. Inline visual self-verification
-            // (driven by mcp__assistant-mcp__browser from inside the agent's
-            // Claude Code session) now owns the verdict, and the agent records
-            // it directly into the commit body's "Visual verification: ..." line.
+            // Older Puppeteer screenshot QA was removed. The `/browse` Testing
+            // gate above now owns browser validation before PR creation.
 
             // Last cancellation check before the PR is opened. If Matt deleted
             // the task during the run, don't create a PR for it.
@@ -3837,6 +4130,204 @@ async fn current_worktree_branch(wt_str: &str) -> Option<String> {
     }
 }
 
+#[derive(Debug)]
+struct BrowseValidationOutcome {
+    verdict: String,
+    pass: bool,
+    skip: bool,
+    summary: String,
+    issues: Vec<String>,
+    session_url: Option<String>,
+}
+
+fn extract_json_detail(raw: &str) -> Option<serde_json::Value> {
+    raw.rfind("```json")
+        .and_then(|i| raw[i + 7..].find("```").map(|j| raw[i + 7..i + 7 + j].trim().to_string()))
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+}
+
+fn parse_json_string_array(value: Option<&serde_json::Value>) -> Vec<String> {
+    value
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default()
+}
+
+fn parse_browse_validation_outcome(raw: &str) -> BrowseValidationOutcome {
+    let upper = raw.to_uppercase();
+    let pass = upper.contains("BROWSE_QA_VERDICT: PASS")
+        || upper.contains("BROWSE_QA_VERDICT:PASS");
+    let skip = upper.contains("BROWSE_QA_VERDICT: SKIP")
+        || upper.contains("BROWSE_QA_VERDICT:SKIP");
+    let blocked = upper.contains("BROWSE_QA_VERDICT: BLOCKED")
+        || upper.contains("BROWSE_QA_VERDICT:BLOCKED");
+    let fail = upper.contains("BROWSE_QA_VERDICT: FAIL")
+        || upper.contains("BROWSE_QA_VERDICT:FAIL");
+    let verdict = if pass {
+        "PASS"
+    } else if skip {
+        "SKIP"
+    } else if blocked {
+        "BLOCKED"
+    } else if fail {
+        "FAIL"
+    } else {
+        "FAIL"
+    }.to_string();
+
+    let detail = extract_json_detail(raw);
+    let summary = detail
+        .as_ref()
+        .and_then(|d| d.get("summary"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| {
+            if pass {
+                "Browse QA passed."
+            } else if skip {
+                "Browse QA skipped because the diff was not browser-visible."
+            } else {
+                "Browse QA did not return a clean pass."
+            }
+        })
+        .to_string();
+    let issues = parse_json_string_array(detail.as_ref().and_then(|d| d.get("issues")));
+    let session_url = extract_session_url(raw);
+
+    BrowseValidationOutcome { verdict, pass, skip, summary, issues, session_url }
+}
+
+async fn changed_files_for_testing(repo_path: &str, base_branch: Option<&str>) -> Vec<String> {
+    let base_sha = if let Some(base) = base_branch {
+        let origin_ref = format!("origin/{}", base);
+        run_git(&["merge-base", "HEAD", &origin_ref], repo_path).await.ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+
+    let diff_output = if let Some(sha) = base_sha {
+        let range = format!("{}..HEAD", sha);
+        run_git(&["diff", "--name-only", &range], repo_path).await.ok()
+    } else {
+        run_git(&["diff", "--name-only", "HEAD~1..HEAD"], repo_path).await.ok()
+    }.unwrap_or_default();
+
+    diff_output
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+fn changed_files_look_browser_visible(files: &[String]) -> bool {
+    files.iter().any(|file| {
+        let f = file.to_lowercase();
+        f.ends_with(".svelte")
+            || f.ends_with(".tsx")
+            || f.ends_with(".jsx")
+            || f.ends_with(".vue")
+            || f.ends_with(".css")
+            || f.ends_with(".scss")
+            || f.ends_with(".html")
+            || f.starts_with("src/routes/")
+            || f.starts_with("web/src/routes/")
+            || f.starts_with("src/lib/components/")
+            || f.starts_with("web/src/lib/components/")
+            || f.starts_with("public/")
+            || f.starts_with("web/static/")
+    })
+}
+
+fn format_changed_files_for_prompt(files: &[String]) -> String {
+    if files.is_empty() {
+        "(No changed files detected.)".to_string()
+    } else {
+        files.iter().take(80).map(|f| format!("- {}", f)).collect::<Vec<_>>().join("\n")
+    }
+}
+
+async fn run_browse_validation_gate(
+    config: &SupabaseConfig,
+    task_id: &str,
+    title: &str,
+    description: &str,
+    repo_path: &str,
+    verify_url: &str,
+    changed_files: &[String],
+    process_id_slot: PidSlot,
+) -> Result<BrowseValidationOutcome, String> {
+    let changed_files_block = format_changed_files_for_prompt(changed_files);
+    let acceptance = if description.trim().is_empty() {
+        "(No explicit acceptance criteria on the card. Verify the feature named in the title works, the page loads with no product errors, and nothing visible regressed.)".to_string()
+    } else {
+        description.trim().to_string()
+    };
+    let prompt = format!(
+        r#"/browse Validate Sam's just-finished code changes in a real Browserbase browser. This is the Samwise Testing stage after code work and before PR creation.
+
+Task: {title}
+
+Verification URL: {verify_url}
+
+Acceptance criteria:
+{acceptance}
+
+Changed files:
+{changed_files_block}
+
+Rules:
+- Do not edit files, stage, commit, push, or open a PR in this run. This is a browser validation gate only.
+- Follow the `/browse` workflow exactly: identify the site, call `start`, save the `liveViewUrl`, call `login` if auth is required, use `snapshot` as the primary page reader, use `screenshot` when pixels matter, and always call `end`.
+- If the changed files are clearly not browser-visible, do not start a browser session. Return BROWSE_QA_VERDICT: SKIP with a short reason.
+- If a browser-visible change was made, actually drive the changed user flow at {verify_url}. Click, type, submit, navigate, reload, and exercise obvious unhappy paths. Do not judge from the landing page.
+- Run the browser `console` action after the main flow and once more before the verdict. Real app-origin console errors, uncaught exceptions, failed requests, or HTTP 4xx/5xx responses are a FAIL.
+- Check UX quality: overlap, overflow, clipped text, broken responsive behavior, confusing labels, missing feedback, dead ends, and anything that feels unfinished.
+- BLOCKED means the browser session cannot start, the page is unreachable, SMS/push 2FA is required, or the flow cannot be accessed. This gate fails closed on BLOCKED.
+
+OUTPUT (this must be the last thing you output, exactly this shape, nothing after it):
+BROWSE_QA_SESSION_URL: <the exact liveViewUrl from start, or none if skipped before start>
+BROWSE_QA_VERDICT: PASS
+or
+BROWSE_QA_VERDICT: FAIL
+or
+BROWSE_QA_VERDICT: SKIP
+or
+BROWSE_QA_VERDICT: BLOCKED
+followed immediately by a fenced json block:
+```json
+{{"summary": "two or three sentence plain-English summary including console health", "issues": ["every concrete problem as its own string; empty only on PASS or SKIP"], "checked": ["each thing you actually exercised, including console checks"]}}
+```
+"#,
+        title = title,
+        verify_url = verify_url,
+        acceptance = acceptance,
+        changed_files_block = changed_files_block,
+    );
+
+    let raw = run_claude_code_streaming(
+        repo_path,
+        &prompt,
+        0,
+        900,
+        config,
+        task_id,
+        process_id_slot,
+    ).await?;
+
+    Ok(parse_browse_validation_outcome(&raw))
+}
+
+async fn commit_testing_repairs(repo_path: &str) -> Result<bool, String> {
+    let porcelain = run_git(&["status", "--porcelain"], repo_path).await.unwrap_or_default();
+    if porcelain.trim().is_empty() {
+        return Ok(false);
+    }
+    run_git(&["add", "-A"], repo_path).await?;
+    run_git(&["commit", "-m", "testing: address browse QA findings"], repo_path).await?;
+    Ok(true)
+}
+
 /// Walk ~/samwise/worktrees/<repo>/<short_id>, query matching PR heads from the
 /// checked-out branch, stored task context, and legacy `sam/<short_id>` branch,
 /// then remove worktrees whose PRs are merged or closed. Worktrees without a PR
@@ -3910,25 +4401,27 @@ async fn run_build_check(repo_path: &str) -> Result<Option<String>, (String, Str
     Err((cmd_label, tail.trim().to_string()))
 }
 
-/// Reset any tasks stuck in `in_progress` back to `queued`. Runs at worker
+/// Reset any tasks stuck in `in_progress` or `testing` back to `queued`. Runs at worker
 /// startup to recover from crashes (the sole worker exited mid-task, leaving
 /// the row claimed forever). Also clears claimed_by/claimed_at so the next
 /// poll cycle picks them up normally.
 async fn recover_stuck_tasks(config: &SupabaseConfig) -> usize {
-    let Ok(tasks) = supabase::fetch_tasks(config, Some("in_progress")).await else {
-        return 0;
-    };
-    let Some(arr) = tasks.as_array() else { return 0; };
     let mut recovered = 0usize;
-    for task in arr {
-        let Some(id) = task.get("id").and_then(|v| v.as_str()) else { continue; };
-        let updates = serde_json::json!({
-            "status": "queued",
-            "worker_id": serde_json::Value::Null,
-            "claimed_at": serde_json::Value::Null,
-        });
-        if supabase::update_task(config, id, &updates).await.is_ok() {
-            recovered += 1;
+    for status in ["in_progress", "testing"] {
+        let Ok(tasks) = supabase::fetch_tasks(config, Some(status)).await else {
+            continue;
+        };
+        let Some(arr) = tasks.as_array() else { continue; };
+        for task in arr {
+            let Some(id) = task.get("id").and_then(|v| v.as_str()) else { continue; };
+            let updates = serde_json::json!({
+                "status": "queued",
+                "worker_id": serde_json::Value::Null,
+                "claimed_at": serde_json::Value::Null,
+            });
+            if supabase::update_task(config, id, &updates).await.is_ok() {
+                recovered += 1;
+            }
         }
     }
     recovered

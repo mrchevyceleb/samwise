@@ -9,6 +9,24 @@ function cleanString(value: unknown) {
   return typeof value === 'string' ? value.trim() : '';
 }
 
+function cleanBaseBranch(value: unknown) {
+  let branch = cleanString(value).replace(/^['"`]+|['"`]+$/g, '');
+  branch = branch.replace(/^refs\/heads\//, '').replace(/^origin\//, '');
+  branch = branch.replace(/\\+$/g, '').trim();
+  if (!branch) return null;
+  if (!/^[A-Za-z0-9._/-]+$/.test(branch)) return null;
+  if (
+    branch.startsWith('/') ||
+    branch.endsWith('/') ||
+    branch.includes('//') ||
+    branch.includes('..') ||
+    branch.includes('@{')
+  ) {
+    return null;
+  }
+  return branch;
+}
+
 function titleFromPrompt(prompt: string) {
   const first = prompt
     .split(/\n+/)
@@ -105,7 +123,7 @@ export const POST: RequestHandler = async ({ request }) => {
     repo_url: repoUrl,
     repo_path: repoPath,
     preview_url: previewUrl,
-    base_branch: cleanString(payload.base_branch) || null,
+    base_branch: cleanBaseBranch(payload.base_branch),
     context,
   };
 

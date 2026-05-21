@@ -32,7 +32,7 @@ check_inflight() {
         return 0
     fi
 
-    # Tasks claimed and still running, OR cards in review whose codex run is
+    # Tasks claimed and still running/testing, OR cards in review whose codex run is
     # recent (<25 min). The codex review timeout is 20 minutes, so the window
     # must be wider than that or we'd clear the guard while a review is still
     # active and kill its child process.
@@ -41,7 +41,7 @@ check_inflight() {
         -H "apikey: $SB_KEY" \
         -H "Authorization: Bearer $SB_KEY" \
         --data-urlencode "select=id,title,status,last_pr_review_at" \
-        --data-urlencode "or=(status.eq.in_progress,and(status.eq.review,last_pr_review_at.gt.$(date -u -v-25M +%Y-%m-%dT%H:%M:%SZ)))" \
+        --data-urlencode "or=(status.in.(in_progress,testing),and(status.eq.review,last_pr_review_at.gt.$(date -u -v-25M +%Y-%m-%dT%H:%M:%SZ)))" \
         "$SB_URL/rest/v1/ae_tasks" || echo "[]")
 
     # Merge/deploy and conflict-fix work runs from approved/review cards, so it
