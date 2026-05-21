@@ -147,7 +147,7 @@ const FULL_PR_REVIEW_MAX_CONCURRENT: usize = 1;
 /// Lives outside the Samwise Supabase project; URL is the source of truth.
 const CLOSE_ORIGIN_TICKET_URL: &str =
     "https://iycloielqcjnjqddeuet.supabase.co/functions/v1/close-origin-ticket";
-const POST_MERGE_DEPLOY_GREEN_TIMEOUT_SECS: u64 = 10 * 60;
+const POST_MERGE_DEPLOY_GREEN_TIMEOUT_SECS: u64 = 60 * 60;
 const POST_MERGE_DEPLOY_GREEN_POLL_SECS: u64 = 20;
 const MERGE_DEPLOY_RUNNING_STALE_SECS: i64 = 90 * 60;
 
