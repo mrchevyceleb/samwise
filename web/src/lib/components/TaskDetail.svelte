@@ -58,6 +58,17 @@
     isMergeConflictError(mergeDeployState.error) &&
     !isMergeConflictFixBusy(mergeConflictFixState)
   );
+  // Re-queue is for stuck non-terminal statuses. `in_progress`/`testing`
+  // would need the live worker killed first, so leave those out; the
+  // wedge sweep handles them server-side after 60/45 min.
+  let isRequeueable = $derived(
+    task.status === 'failed' ||
+    task.status === 'fixes_needed' ||
+    task.status === 'pending_confirmation' ||
+    task.status === 'review' ||
+    task.status === 'approved'
+  );
+  let requeueing = $state(false);
 
   function verdictColor(verdict: string | undefined) {
     if (verdict === 'merge') return '#34d399';
@@ -101,6 +112,16 @@
   async function markDone() {
     await tasksStore.setStatus(task.id, 'done');
     onClose();
+  }
+
+  async function handleRequeue() {
+    if (requeueing) return;
+    requeueing = true;
+    try {
+      await tasksStore.requeueTask(task.id);
+    } finally {
+      requeueing = false;
+    }
   }
 </script>
 
@@ -216,6 +237,16 @@
                   {mergeConflictFixButtonLabel(mergeConflictFixState)}
                 </button>
               {/if}
+            {/if}
+            {#if isRequeueable}
+              <button
+                type="button"
+                onclick={handleRequeue}
+                disabled={requeueing}
+                class="rounded-lg border border-indigo-300/35 bg-indigo-400/10 px-3 py-2 text-xs font-black text-indigo-100 hover:bg-indigo-400/15 {requeueing ? 'opacity-70 cursor-wait' : ''}"
+              >
+                {requeueing ? 'Re-queuing...' : 'Re-queue Task'}
+              </button>
             {/if}
           </div>
           {#if mergeDeployRequestError || mergeDeployState.error}

@@ -107,6 +107,12 @@
     await tasksStore.updateTask(task.id, { on_hold: !task.on_hold });
   }
 
+  async function handleRequeue(e: MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    await tasksStore.requeueTask(task.id);
+  }
+
   async function openSendToQa(e: MouseEvent) {
     e.preventDefault();
     e.stopPropagation();
@@ -335,6 +341,20 @@
         Sam conflict recovery failed: {mergeConflictFixRequestError || mergeConflictFixState.error}
       </div>
     {/if}
+  {/if}
+
+  <!-- Re-queue: kick a stuck non-terminal card back into the queue. Clears
+       worker_id/claimed_at/failure_reason so the worker can re-claim cleanly.
+       in_progress/testing intentionally excluded (live subprocess needs to be
+       killed first). -->
+  {#if task.status === 'failed' || task.status === 'fixes_needed' || task.status === 'pending_confirmation' || task.status === 'review' || task.status === 'approved'}
+    <button
+      type="button"
+      onclick={handleRequeue}
+      class="mt-2 w-full rounded-lg border border-indigo-300/35 bg-indigo-400/10 px-2 py-1.5 text-[10px] font-black uppercase tracking-wide text-indigo-100 transition hover:bg-indigo-400/15"
+    >
+      Re-queue
+    </button>
   {/if}
 
   {#if task.status === 'approved'}

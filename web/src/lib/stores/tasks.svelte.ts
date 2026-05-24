@@ -140,6 +140,23 @@ class TasksStore {
     if (ok && status === 'done') void this.closeOriginTicket(task);
   }
 
+  /**
+   * Force a stuck card back into `queued` and clear every field a stale
+   * worker claim leaves behind. Mirrors the desktop store's requeueTask;
+   * the worker treats rows with a populated `worker_id` as still claimed,
+   * so a plain status flip can leave the card invisible to the queue.
+   */
+  async requeueTask(taskId: string) {
+    const task = this.tasks.find((t) => t.id === taskId);
+    if (!task) return false;
+    return this.updateTask(taskId, {
+      status: 'queued',
+      worker_id: null,
+      claimed_at: null,
+      failure_reason: null,
+    } as Partial<AeTask>);
+  }
+
   private async closeOriginTicket(task: AeTask) {
     if (task.origin_system === 'manual' || task.source === 'manual') return;
     if (!task.origin_system && !task.callback_url) return;
