@@ -1,9 +1,9 @@
+use crate::process::async_cmd;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use crate::process::async_cmd;
 
 // ── Config State ────────────────────────────────────────────────────
 
@@ -34,7 +34,9 @@ impl SupabaseState {
             telegram_bot_token: option_env!("TELEGRAM_BOT_TOKEN").map(String::from),
             telegram_chat_id: option_env!("TELEGRAM_CHAT_ID").map(String::from),
         };
-        Self { config: Arc::new(RwLock::new(config)) }
+        Self {
+            config: Arc::new(RwLock::new(config)),
+        }
     }
 }
 
@@ -44,10 +46,19 @@ impl SupabaseState {
 // ═══════════════════════════════════════════════════════════════════
 
 fn build_client(config: &SupabaseConfig) -> Result<reqwest::Client, String> {
-    let key = config.service_role_key.as_deref().unwrap_or(&config.anon_key);
+    let key = config
+        .service_role_key
+        .as_deref()
+        .unwrap_or(&config.anon_key);
     let mut headers = HeaderMap::new();
-    headers.insert("apikey", HeaderValue::from_str(key).map_err(|e| e.to_string())?);
-    headers.insert(AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {}", key)).map_err(|e| e.to_string())?);
+    headers.insert(
+        "apikey",
+        HeaderValue::from_str(key).map_err(|e| e.to_string())?,
+    );
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {}", key)).map_err(|e| e.to_string())?,
+    );
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert("Prefer", HeaderValue::from_static("return=representation"));
     reqwest::Client::builder()
@@ -68,14 +79,22 @@ async fn handle_response(resp: reqwest::Response) -> Result<Value, String> {
         let body = resp.text().await.unwrap_or_default();
         return Err(format!("Supabase error ({}): {}", status, body));
     }
-    resp.json::<Value>().await.map_err(|e| format!("Failed to parse response: {}", e))
+    resp.json::<Value>()
+        .await
+        .map_err(|e| format!("Failed to parse response: {}", e))
 }
 
 // ── Tasks (internal) ────────────────────────────────────────────────
 
-pub async fn fetch_tasks(config: &SupabaseConfig, status_filter: Option<&str>) -> Result<Value, String> {
+pub async fn fetch_tasks(
+    config: &SupabaseConfig,
+    status_filter: Option<&str>,
+) -> Result<Value, String> {
     let client = build_client(config)?;
-    let mut url = format!("{}?order=priority.asc,created_at.asc", rest_url(config, "ae_tasks"));
+    let mut url = format!(
+        "{}?order=priority.asc,created_at.asc",
+        rest_url(config, "ae_tasks")
+    );
     if let Some(status) = status_filter {
         url.push_str(&format!("&status=eq.{}", status));
     }
@@ -85,13 +104,22 @@ pub async fn fetch_tasks(config: &SupabaseConfig, status_filter: Option<&str>) -
 pub async fn fetch_task(config: &SupabaseConfig, id: &str) -> Result<Option<Value>, String> {
     let client = build_client(config)?;
     let url = format!("{}?id=eq.{}&limit=1", rest_url(config, "ae_tasks"), id);
-    let val: Value = handle_response(client.get(&url).send().await.map_err(|e| e.to_string())?).await?;
+    let val: Value =
+        handle_response(client.get(&url).send().await.map_err(|e| e.to_string())?).await?;
     Ok(val.as_array().and_then(|a| a.first().cloned()))
 }
 
 pub async fn create_task(config: &SupabaseConfig, task: &Value) -> Result<Value, String> {
     let client = build_client(config)?;
-    handle_response(client.post(&rest_url(config, "ae_tasks")).json(task).send().await.map_err(|e| e.to_string())?).await
+    handle_response(
+        client
+            .post(&rest_url(config, "ae_tasks"))
+            .json(task)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?,
+    )
+    .await
 }
 
 /// Run an arbitrary PostgREST query string against ae_tasks (e.g.
@@ -127,7 +155,15 @@ pub async fn record_task_tombstone(config: &SupabaseConfig, task: &Value) -> Res
         "head_ref": head_ref.map(Value::from).unwrap_or(Value::Null),
         "orphan_short_id": orphan_short_id.map(Value::from).unwrap_or(Value::Null),
     });
-    handle_response(client.post(&rest_url(config, "ae_task_tombstones")).json(&body).send().await.map_err(|e| e.to_string())?).await
+    handle_response(
+        client
+            .post(&rest_url(config, "ae_task_tombstones"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?,
+    )
+    .await
 }
 
 pub async fn fetch_task_tombstones(config: &SupabaseConfig) -> Result<Value, String> {
@@ -159,27 +195,65 @@ fn task_requires_delete_tombstone(task: &Value) -> bool {
     has_pr_url || has_head_ref || has_orphan_short_id
 }
 
-pub async fn update_task(config: &SupabaseConfig, id: &str, updates: &Value) -> Result<Value, String> {
+pub async fn update_task(
+    config: &SupabaseConfig,
+    id: &str,
+    updates: &Value,
+) -> Result<Value, String> {
     let client = build_client(config)?;
     let url = format!("{}?id=eq.{}", rest_url(config, "ae_tasks"), id);
-    handle_response(client.patch(&url).json(updates).send().await.map_err(|e| e.to_string())?).await
+    handle_response(
+        client
+            .patch(&url)
+            .json(updates)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?,
+    )
+    .await
 }
 
 /// Update a task only if its current status matches `expected_status` (optimistic locking).
 /// Returns Ok with empty array if the status already changed (no rows affected).
-pub async fn update_task_if_status(config: &SupabaseConfig, id: &str, expected_status: &str, updates: &Value) -> Result<Value, String> {
+pub async fn update_task_if_status(
+    config: &SupabaseConfig,
+    id: &str,
+    expected_status: &str,
+    updates: &Value,
+) -> Result<Value, String> {
     let client = build_client(config)?;
-    let url = format!("{}?id=eq.{}&status=eq.{}", rest_url(config, "ae_tasks"), id, expected_status);
-    handle_response(client.patch(&url).json(updates).send().await.map_err(|e| e.to_string())?).await
+    let url = format!(
+        "{}?id=eq.{}&status=eq.{}",
+        rest_url(config, "ae_tasks"),
+        id,
+        expected_status
+    );
+    handle_response(
+        client
+            .patch(&url)
+            .json(updates)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?,
+    )
+    .await
 }
 
-pub async fn claim_task(config: &SupabaseConfig, task_id: &str, worker_id: &str) -> Result<Value, String> {
+pub async fn claim_task(
+    config: &SupabaseConfig,
+    task_id: &str,
+    worker_id: &str,
+) -> Result<Value, String> {
     let client = build_client(config)?;
     // Filter on `on_hold=false` at PATCH time too. The worker loop already
     // skips held tasks before calling this, but Matt could stamp HOLD between
     // the fetch and the PATCH. Including the gate in the SQL filter makes the
     // claim atomic with the hold check.
-    let url = format!("{}?id=eq.{}&status=eq.queued&on_hold=eq.false", rest_url(config, "ae_tasks"), task_id);
+    let url = format!(
+        "{}?id=eq.{}&status=eq.queued&on_hold=eq.false",
+        rest_url(config, "ae_tasks"),
+        task_id
+    );
     let now = chrono::Utc::now().to_rfc3339();
     let body = serde_json::json!({
         "status": "in_progress",
@@ -187,7 +261,15 @@ pub async fn claim_task(config: &SupabaseConfig, task_id: &str, worker_id: &str)
         "claimed_at": now,
         "updated_at": now,
     });
-    let result = handle_response(client.patch(&url).json(&body).send().await.map_err(|e| e.to_string())?).await?;
+    let result = handle_response(
+        client
+            .patch(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?,
+    )
+    .await?;
     if let Some(arr) = result.as_array() {
         if arr.is_empty() {
             return Err("Task is no longer queued (already claimed, held, or changed)".to_string());
@@ -200,26 +282,50 @@ pub async fn claim_task(config: &SupabaseConfig, task_id: &str, worker_id: &str)
 
 pub async fn fetch_comments(config: &SupabaseConfig, task_id: &str) -> Result<Value, String> {
     let client = build_client(config)?;
-    let url = format!("{}?task_id=eq.{}&order=created_at.asc", rest_url(config, "ae_comments"), task_id);
+    let url = format!(
+        "{}?task_id=eq.{}&order=created_at.asc",
+        rest_url(config, "ae_comments"),
+        task_id
+    );
     handle_response(client.get(&url).send().await.map_err(|e| e.to_string())?).await
 }
 
 pub async fn fetch_recent_comments(config: &SupabaseConfig, limit: u32) -> Result<Value, String> {
     let client = build_client(config)?;
-    let url = format!("{}?order=created_at.desc&limit={}", rest_url(config, "ae_comments"), limit);
+    let url = format!(
+        "{}?order=created_at.desc&limit={}",
+        rest_url(config, "ae_comments"),
+        limit
+    );
     handle_response(client.get(&url).send().await.map_err(|e| e.to_string())?).await
 }
 
 pub async fn post_comment(config: &SupabaseConfig, comment: &Value) -> Result<Value, String> {
     let client = build_client(config)?;
-    handle_response(client.post(&rest_url(config, "ae_comments")).json(comment).send().await.map_err(|e| e.to_string())?).await
+    handle_response(
+        client
+            .post(&rest_url(config, "ae_comments"))
+            .json(comment)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?,
+    )
+    .await
 }
 
 // ── Review log (internal) ───────────────────────────────────────────
 
 pub async fn insert_review_log(config: &SupabaseConfig, row: &Value) -> Result<Value, String> {
     let client = build_client(config)?;
-    handle_response(client.post(&rest_url(config, "ae_review_log")).json(row).send().await.map_err(|e| e.to_string())?).await
+    handle_response(
+        client
+            .post(&rest_url(config, "ae_review_log"))
+            .json(row)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?,
+    )
+    .await
 }
 
 // ── Messages (internal) ─────────────────────────────────────────────
@@ -242,7 +348,15 @@ pub async fn fetch_messages(config: &SupabaseConfig) -> Result<Value, String> {
 
 pub async fn send_message(config: &SupabaseConfig, message: &Value) -> Result<Value, String> {
     let client = build_client(config)?;
-    handle_response(client.post(&rest_url(config, "ae_messages")).json(message).send().await.map_err(|e| e.to_string())?).await
+    handle_response(
+        client
+            .post(&rest_url(config, "ae_messages"))
+            .json(message)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?,
+    )
+    .await
 }
 
 // ── Pending Chat Messages (internal) ─────────────────────────────────
@@ -256,26 +370,35 @@ pub async fn fetch_pending_chat_messages(config: &SupabaseConfig) -> Result<Vec<
     );
     let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
-        return Err(format!("fetch_pending_chat_messages: HTTP {}", resp.status()));
+        return Err(format!(
+            "fetch_pending_chat_messages: HTTP {}",
+            resp.status()
+        ));
     }
     let rows: Vec<Value> = resp.json().await.map_err(|e| e.to_string())?;
     Ok(rows)
 }
 
 /// Mark a message as responded to
-pub async fn mark_message_responded(config: &SupabaseConfig, message_id: &str) -> Result<(), String> {
+pub async fn mark_message_responded(
+    config: &SupabaseConfig,
+    message_id: &str,
+) -> Result<(), String> {
     // Validate UUID format to prevent URL injection
-    if !message_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+    if !message_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
         return Err("Invalid message_id format".to_string());
     }
     let client = build_client(config)?;
-    let url = format!(
-        "{}/rest/v1/ae_messages?id=eq.{}",
-        config.url, message_id
-    );
-    let resp = client.patch(&url)
+    let url = format!("{}/rest/v1/ae_messages?id=eq.{}", config.url, message_id);
+    let resp = client
+        .patch(&url)
         .json(&serde_json::json!({ "needs_response": false }))
-        .send().await.map_err(|e| e.to_string())?;
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!("mark_message_responded: HTTP {}", resp.status()));
     }
@@ -284,7 +407,11 @@ pub async fn mark_message_responded(config: &SupabaseConfig, message_id: &str) -
 
 // ── Workers (internal) ──────────────────────────────────────────────
 
-pub async fn worker_heartbeat(config: &SupabaseConfig, machine_name: &str) -> Result<Value, String> {
+pub async fn worker_heartbeat(
+    config: &SupabaseConfig,
+    machine_name: &str,
+    current_task_id: Option<&str>,
+) -> Result<Value, String> {
     let client = build_client(config)?;
     let now = chrono::Utc::now().to_rfc3339();
     // id = machine_name (text PK has no default, machine_name is the stable identity)
@@ -294,10 +421,17 @@ pub async fn worker_heartbeat(config: &SupabaseConfig, machine_name: &str) -> Re
         "machine_name": machine_name,
         "status": "online",
         "last_heartbeat": now,
+        "current_task_id": current_task_id.map(Value::from).unwrap_or(Value::Null),
     });
     let resp = client
-        .post(&format!("{}?on_conflict=machine_name", rest_url(config, "ae_workers")))
-        .header("Prefer", "resolution=merge-duplicates,return=representation")
+        .post(&format!(
+            "{}?on_conflict=machine_name",
+            rest_url(config, "ae_workers")
+        ))
+        .header(
+            "Prefer",
+            "resolution=merge-duplicates,return=representation",
+        )
         .json(&body)
         .send()
         .await
@@ -305,13 +439,27 @@ pub async fn worker_heartbeat(config: &SupabaseConfig, machine_name: &str) -> Re
     handle_response(resp).await
 }
 
-pub async fn update_cron(config: &SupabaseConfig, id: &str, updates: &Value) -> Result<Value, String> {
+pub async fn update_cron(
+    config: &SupabaseConfig,
+    id: &str,
+    updates: &Value,
+) -> Result<Value, String> {
     let client = build_client(config)?;
     let url = format!("{}?id=eq.{}", rest_url(config, "ae_crons"), id);
-    handle_response(client.patch(&url).json(updates).send().await.map_err(|e| e.to_string())?).await
+    handle_response(
+        client
+            .patch(&url)
+            .json(updates)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?,
+    )
+    .await
 }
 
-pub async fn check_active_worker(config: &SupabaseConfig) -> Result<(bool, Option<String>), String> {
+pub async fn check_active_worker(
+    config: &SupabaseConfig,
+) -> Result<(bool, Option<String>), String> {
     let client = build_client(config)?;
     let url = format!(
         "{}?status=eq.online&select=machine_name,last_heartbeat&order=last_heartbeat.desc&limit=1",
@@ -339,12 +487,22 @@ pub async fn check_active_worker(config: &SupabaseConfig) -> Result<(bool, Optio
 
 pub async fn worker_offline(config: &SupabaseConfig, machine_name: &str) -> Result<(), String> {
     let client = build_client(config)?;
-    let url = format!("{}?machine_name=eq.{}", rest_url(config, "ae_workers"), machine_name);
+    let url = format!(
+        "{}?machine_name=eq.{}",
+        rest_url(config, "ae_workers"),
+        machine_name
+    );
     let body = serde_json::json!({
         "status": "offline",
         "last_heartbeat": chrono::Utc::now().to_rfc3339(),
+        "current_task_id": serde_json::Value::Null,
     });
-    let resp = client.patch(&url).json(&body).send().await.map_err(|e| e.to_string())?;
+    let resp = client
+        .patch(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         let body = resp.text().await.unwrap_or_default();
         return Err(format!("Failed to set offline: {}", body));
@@ -360,38 +518,83 @@ pub async fn fetch_triggers(config: &SupabaseConfig) -> Result<Value, String> {
     handle_response(client.get(&url).send().await.map_err(|e| e.to_string())?).await
 }
 
-pub async fn update_trigger(config: &SupabaseConfig, id: &str, updates: &Value) -> Result<Value, String> {
+pub async fn update_trigger(
+    config: &SupabaseConfig,
+    id: &str,
+    updates: &Value,
+) -> Result<Value, String> {
     let client = build_client(config)?;
     let url = format!("{}?id=eq.{}", rest_url(config, "ae_triggers"), id);
-    handle_response(client.patch(&url).json(updates).send().await.map_err(|e| e.to_string())?).await
+    handle_response(
+        client
+            .patch(&url)
+            .json(updates)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?,
+    )
+    .await
 }
 
 // ── Trigger Events (internal) ───────────────────────────────────────
 
-pub async fn fetch_trigger_events(config: &SupabaseConfig, trigger_id: &str) -> Result<Value, String> {
+pub async fn fetch_trigger_events(
+    config: &SupabaseConfig,
+    trigger_id: &str,
+) -> Result<Value, String> {
     let client = build_client(config)?;
-    let url = format!("{}?trigger_id=eq.{}&processed=eq.false&order=created_at.asc&limit=10",
-        rest_url(config, "ae_trigger_events"), trigger_id);
+    let url = format!(
+        "{}?trigger_id=eq.{}&processed=eq.false&order=created_at.asc&limit=10",
+        rest_url(config, "ae_trigger_events"),
+        trigger_id
+    );
     handle_response(client.get(&url).send().await.map_err(|e| e.to_string())?).await
 }
 
-pub async fn mark_trigger_event_processed(config: &SupabaseConfig, event_id: &str) -> Result<Value, String> {
+pub async fn mark_trigger_event_processed(
+    config: &SupabaseConfig,
+    event_id: &str,
+) -> Result<Value, String> {
     let client = build_client(config)?;
-    let url = format!("{}?id=eq.{}", rest_url(config, "ae_trigger_events"), event_id);
+    let url = format!(
+        "{}?id=eq.{}",
+        rest_url(config, "ae_trigger_events"),
+        event_id
+    );
     let body = serde_json::json!({ "processed": true });
-    handle_response(client.patch(&url).json(&body).send().await.map_err(|e| e.to_string())?).await
+    handle_response(
+        client
+            .patch(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?,
+    )
+    .await
 }
 
 // ── Artifacts (internal) ────────────────────────────────────────────
 
 pub async fn create_artifact(config: &SupabaseConfig, artifact: &Value) -> Result<Value, String> {
     let client = build_client(config)?;
-    handle_response(client.post(&rest_url(config, "ae_artifacts")).json(artifact).send().await.map_err(|e| e.to_string())?).await
+    handle_response(
+        client
+            .post(&rest_url(config, "ae_artifacts"))
+            .json(artifact)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?,
+    )
+    .await
 }
 
 pub async fn fetch_artifacts(config: &SupabaseConfig, task_id: &str) -> Result<Value, String> {
     let client = build_client(config)?;
-    let url = format!("{}?task_id=eq.{}&order=created_at.asc", rest_url(config, "ae_artifacts"), task_id);
+    let url = format!(
+        "{}?task_id=eq.{}&order=created_at.asc",
+        rest_url(config, "ae_artifacts"),
+        task_id
+    );
     handle_response(client.get(&url).send().await.map_err(|e| e.to_string())?).await
 }
 
@@ -399,25 +602,55 @@ pub async fn fetch_artifacts(config: &SupabaseConfig, task_id: &str) -> Result<V
 
 pub async fn fetch_projects(config: &SupabaseConfig) -> Result<Value, String> {
     let client = build_client(config)?;
-    let url = format!("{}?order=client.asc,name.asc", rest_url(config, "ae_projects"));
+    let url = format!(
+        "{}?order=client.asc,name.asc",
+        rest_url(config, "ae_projects")
+    );
     handle_response(client.get(&url).send().await.map_err(|e| e.to_string())?).await
 }
 
 pub async fn create_project(config: &SupabaseConfig, project: &Value) -> Result<Value, String> {
     let client = build_client(config)?;
-    handle_response(client.post(&rest_url(config, "ae_projects")).json(project).send().await.map_err(|e| e.to_string())?).await
+    handle_response(
+        client
+            .post(&rest_url(config, "ae_projects"))
+            .json(project)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?,
+    )
+    .await
 }
 
-pub async fn update_project(config: &SupabaseConfig, id: &str, updates: &Value) -> Result<Value, String> {
+pub async fn update_project(
+    config: &SupabaseConfig,
+    id: &str,
+    updates: &Value,
+) -> Result<Value, String> {
     let client = build_client(config)?;
     let url = format!("{}?id=eq.{}", rest_url(config, "ae_projects"), id);
-    handle_response(client.patch(&url).json(updates).send().await.map_err(|e| e.to_string())?).await
+    handle_response(
+        client
+            .patch(&url)
+            .json(updates)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?,
+    )
+    .await
 }
 
 pub async fn delete_project(config: &SupabaseConfig, id: &str) -> Result<Value, String> {
     let client = build_client(config)?;
     let url = format!("{}?id=eq.{}", rest_url(config, "ae_projects"), id);
-    handle_response(client.delete(&url).send().await.map_err(|e| e.to_string())?).await
+    handle_response(
+        client
+            .delete(&url)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?,
+    )
+    .await
 }
 
 // ── Crons (internal) ────────────────────────────────────────────────
@@ -428,9 +661,15 @@ pub async fn fetch_crons(config: &SupabaseConfig) -> Result<Value, String> {
     handle_response(client.get(&url).send().await.map_err(|e| e.to_string())?).await
 }
 
-pub async fn fetch_cron_runs(config: &SupabaseConfig, cron_id: Option<&str>) -> Result<Value, String> {
+pub async fn fetch_cron_runs(
+    config: &SupabaseConfig,
+    cron_id: Option<&str>,
+) -> Result<Value, String> {
     let client = build_client(config)?;
-    let mut url = format!("{}?order=started_at.desc&limit=200", rest_url(config, "ae_cron_runs"));
+    let mut url = format!(
+        "{}?order=started_at.desc&limit=200",
+        rest_url(config, "ae_cron_runs")
+    );
     if let Some(id) = cron_id.filter(|s| !s.trim().is_empty()) {
         url.push_str(&format!("&cron_id=eq.{}", id));
     }
@@ -439,13 +678,33 @@ pub async fn fetch_cron_runs(config: &SupabaseConfig, cron_id: Option<&str>) -> 
 
 pub async fn create_cron_run(config: &SupabaseConfig, run: &Value) -> Result<Value, String> {
     let client = build_client(config)?;
-    handle_response(client.post(&rest_url(config, "ae_cron_runs")).json(run).send().await.map_err(|e| e.to_string())?).await
+    handle_response(
+        client
+            .post(&rest_url(config, "ae_cron_runs"))
+            .json(run)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?,
+    )
+    .await
 }
 
-pub async fn update_cron_run(config: &SupabaseConfig, id: &str, updates: &Value) -> Result<Value, String> {
+pub async fn update_cron_run(
+    config: &SupabaseConfig,
+    id: &str,
+    updates: &Value,
+) -> Result<Value, String> {
     let client = build_client(config)?;
     let url = format!("{}?id=eq.{}", rest_url(config, "ae_cron_runs"), id);
-    handle_response(client.patch(&url).json(updates).send().await.map_err(|e| e.to_string())?).await
+    handle_response(
+        client
+            .patch(&url)
+            .json(updates)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?,
+    )
+    .await
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -499,7 +758,17 @@ pub async fn supabase_load_doppler(
     state: tauri::State<'_, SupabaseState>,
 ) -> Result<SupabaseConfig, String> {
     let output = async_cmd("doppler")
-        .args(["secrets", "download", "--project", "agent-one", "--config", "prd", "--no-file", "--format", "json"])
+        .args([
+            "secrets",
+            "download",
+            "--project",
+            "agent-one",
+            "--config",
+            "prd",
+            "--no-file",
+            "--format",
+            "json",
+        ])
         .output()
         .await
         .map_err(|e| format!("Failed to run doppler: {}", e))?;
@@ -513,10 +782,19 @@ pub async fn supabase_load_doppler(
         .map_err(|e| format!("Failed to parse Doppler output: {}", e))?;
 
     // SB_ prefix per Matt's Doppler naming rule (full word "supabase" blocks Vercel Config Sync).
-    let pick = |k: &str| secrets.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
+    let pick = |k: &str| {
+        secrets
+            .get(k)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
     let new_config = SupabaseConfig {
-        url: pick("SB_URL").or_else(|| pick("SUPABASE_URL")).unwrap_or_default(),
-        anon_key: pick("SB_ANON_KEY").or_else(|| pick("SUPABASE_ANON_KEY")).unwrap_or_default(),
+        url: pick("SB_URL")
+            .or_else(|| pick("SUPABASE_URL"))
+            .unwrap_or_default(),
+        anon_key: pick("SB_ANON_KEY")
+            .or_else(|| pick("SUPABASE_ANON_KEY"))
+            .unwrap_or_default(),
         service_role_key: pick("SB_SERVICE_ROLE_KEY").or_else(|| pick("SUPABASE_SERVICE_ROLE_KEY")),
         telegram_bot_token: pick("TELEGRAM_BOT_TOKEN"),
         telegram_chat_id: pick("TELEGRAM_CHAT_ID"),
@@ -530,19 +808,29 @@ pub async fn supabase_load_doppler(
 // ── Task Commands ───────────────────────────────────────────────────
 
 #[tauri::command]
-pub async fn supabase_fetch_tasks(status_filter: Option<String>, state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
+pub async fn supabase_fetch_tasks(
+    status_filter: Option<String>,
+    state: tauri::State<'_, SupabaseState>,
+) -> Result<Value, String> {
     let config = state.get_config().await;
     fetch_tasks(&config, status_filter.as_deref()).await
 }
 
 #[tauri::command]
-pub async fn supabase_create_task(task: Value, state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
+pub async fn supabase_create_task(
+    task: Value,
+    state: tauri::State<'_, SupabaseState>,
+) -> Result<Value, String> {
     let config = state.get_config().await;
     create_task(&config, &task).await
 }
 
 #[tauri::command]
-pub async fn supabase_update_task(id: String, updates: Value, state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
+pub async fn supabase_update_task(
+    id: String,
+    updates: Value,
+    state: tauri::State<'_, SupabaseState>,
+) -> Result<Value, String> {
     let config = state.get_config().await;
     let result = update_task(&config, &id, &updates).await?;
     if updates.get("status").and_then(|v| v.as_str()) == Some("done") {
@@ -551,7 +839,11 @@ pub async fn supabase_update_task(id: String, updates: Value, state: tauri::Stat
     Ok(result)
 }
 
-async fn close_origin_ticket_for_done_update(config: &SupabaseConfig, id: &str, update_result: &Value) {
+async fn close_origin_ticket_for_done_update(
+    config: &SupabaseConfig,
+    id: &str,
+    update_result: &Value,
+) {
     let mut task = update_result
         .as_array()
         .and_then(|rows| rows.first())
@@ -560,15 +852,24 @@ async fn close_origin_ticket_for_done_update(config: &SupabaseConfig, id: &str, 
         task = fetch_task(config, id).await.ok().flatten();
     }
     let Some(task) = task else {
-        log::warn!("[close-origin] skipped: could not load task {} after Done update", id);
+        log::warn!(
+            "[close-origin] skipped: could not load task {} after Done update",
+            id
+        );
         return;
     };
 
     let pr_url = task.get("pr_url").and_then(|v| v.as_str()).unwrap_or("");
-    let origin_system = task.get("origin_system").and_then(|v| v.as_str()).unwrap_or("");
+    let origin_system = task
+        .get("origin_system")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let origin_id = task.get("origin_id").and_then(|v| v.as_str()).unwrap_or("");
     let task_source = task.get("source").and_then(|v| v.as_str()).unwrap_or("");
-    let callback_url = task.get("callback_url").and_then(|v| v.as_str()).unwrap_or("");
+    let callback_url = task
+        .get("callback_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     crate::commands::worker::close_origin_ticket(
         config,
         id,
@@ -581,7 +882,10 @@ async fn close_origin_ticket_for_done_update(config: &SupabaseConfig, id: &str, 
 }
 
 #[tauri::command]
-pub async fn supabase_delete_task(id: String, state: tauri::State<'_, SupabaseState>) -> Result<(), String> {
+pub async fn supabase_delete_task(
+    id: String,
+    state: tauri::State<'_, SupabaseState>,
+) -> Result<(), String> {
     let config = state.get_config().await;
     if let Some(task) = fetch_task(&config, &id).await? {
         if let Err(e) = record_task_tombstone(&config, &task).await {
@@ -591,12 +895,20 @@ pub async fn supabase_delete_task(id: String, state: tauri::State<'_, SupabaseSt
                     e
                 ));
             }
-            log::warn!("[tasks] failed to record deletion tombstone for {}: {}", id, e);
+            log::warn!(
+                "[tasks] failed to record deletion tombstone for {}: {}",
+                id,
+                e
+            );
         }
     }
     let client = build_client(&config)?;
     let url = format!("{}?id=eq.{}", rest_url(&config, "ae_tasks"), id);
-    let resp = client.delete(&url).send().await.map_err(|e| e.to_string())?;
+    let resp = client
+        .delete(&url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         let body = resp.text().await.unwrap_or_default();
         return Err(format!("Delete failed: {}", body));
@@ -605,7 +917,11 @@ pub async fn supabase_delete_task(id: String, state: tauri::State<'_, SupabaseSt
 }
 
 #[tauri::command]
-pub async fn supabase_claim_task(task_id: String, worker_id: String, state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
+pub async fn supabase_claim_task(
+    task_id: String,
+    worker_id: String,
+    state: tauri::State<'_, SupabaseState>,
+) -> Result<Value, String> {
     let config = state.get_config().await;
     claim_task(&config, &task_id, &worker_id).await
 }
@@ -613,23 +929,36 @@ pub async fn supabase_claim_task(task_id: String, worker_id: String, state: taur
 // ── Comment Commands ────────────────────────────────────────────────
 
 #[tauri::command]
-pub async fn supabase_fetch_comments(task_id: String, state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
+pub async fn supabase_fetch_comments(
+    task_id: String,
+    state: tauri::State<'_, SupabaseState>,
+) -> Result<Value, String> {
     let config = state.get_config().await;
     fetch_comments(&config, &task_id).await
 }
 
 #[tauri::command]
-pub async fn supabase_post_comment(comment: Value, state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
+pub async fn supabase_post_comment(
+    comment: Value,
+    state: tauri::State<'_, SupabaseState>,
+) -> Result<Value, String> {
     let config = state.get_config().await;
     post_comment(&config, &comment).await
 }
 
 #[tauri::command]
-pub async fn supabase_delete_comment(comment_id: String, state: tauri::State<'_, SupabaseState>) -> Result<(), String> {
+pub async fn supabase_delete_comment(
+    comment_id: String,
+    state: tauri::State<'_, SupabaseState>,
+) -> Result<(), String> {
     let config = state.get_config().await;
     let client = build_client(&config)?;
     let url = format!("{}?id=eq.{}", rest_url(&config, "ae_comments"), comment_id);
-    let resp = client.delete(&url).send().await.map_err(|e| e.to_string())?;
+    let resp = client
+        .delete(&url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         let body = resp.text().await.unwrap_or_default();
         return Err(format!("Delete failed: {}", body));
@@ -640,13 +969,18 @@ pub async fn supabase_delete_comment(comment_id: String, state: tauri::State<'_,
 // ── Message Commands ────────────────────────────────────────────────
 
 #[tauri::command]
-pub async fn supabase_fetch_messages(state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
+pub async fn supabase_fetch_messages(
+    state: tauri::State<'_, SupabaseState>,
+) -> Result<Value, String> {
     let config = state.get_config().await;
     fetch_messages(&config).await
 }
 
 #[tauri::command]
-pub async fn supabase_send_message(message: Value, state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
+pub async fn supabase_send_message(
+    message: Value,
+    state: tauri::State<'_, SupabaseState>,
+) -> Result<Value, String> {
     let config = state.get_config().await;
     send_message(&config, &message).await
 }
@@ -660,30 +994,58 @@ pub async fn supabase_fetch_crons(state: tauri::State<'_, SupabaseState>) -> Res
 }
 
 #[tauri::command]
-pub async fn supabase_fetch_cron_runs(cron_id: Option<String>, state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
+pub async fn supabase_fetch_cron_runs(
+    cron_id: Option<String>,
+    state: tauri::State<'_, SupabaseState>,
+) -> Result<Value, String> {
     let config = state.get_config().await;
     fetch_cron_runs(&config, cron_id.as_deref()).await
 }
 
 #[tauri::command]
-pub async fn supabase_create_cron(cron: Value, state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
+pub async fn supabase_create_cron(
+    cron: Value,
+    state: tauri::State<'_, SupabaseState>,
+) -> Result<Value, String> {
     let config = state.get_config().await;
     let client = build_client(&config)?;
-    handle_response(client.post(&rest_url(&config, "ae_crons")).json(&cron).send().await.map_err(|e| e.to_string())?).await
+    handle_response(
+        client
+            .post(&rest_url(&config, "ae_crons"))
+            .json(&cron)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?,
+    )
+    .await
 }
 
 #[tauri::command]
-pub async fn supabase_update_cron(id: String, updates: Value, state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
+pub async fn supabase_update_cron(
+    id: String,
+    updates: Value,
+    state: tauri::State<'_, SupabaseState>,
+) -> Result<Value, String> {
     let config = state.get_config().await;
     let client = build_client(&config)?;
     let url = format!("{}?id=eq.{}", rest_url(&config, "ae_crons"), id);
-    handle_response(client.patch(&url).json(&updates).send().await.map_err(|e| e.to_string())?).await
+    handle_response(
+        client
+            .patch(&url)
+            .json(&updates)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?,
+    )
+    .await
 }
 
 // ── Trigger Commands ────────────────────────────────────────────────
 
 #[tauri::command]
-pub async fn supabase_fetch_triggers(state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
+pub async fn supabase_fetch_triggers(
+    state: tauri::State<'_, SupabaseState>,
+) -> Result<Value, String> {
     let config = state.get_config().await;
     let client = build_client(&config)?;
     let url = format!("{}?order=created_at.asc", rest_url(&config, "ae_triggers"));
@@ -691,42 +1053,77 @@ pub async fn supabase_fetch_triggers(state: tauri::State<'_, SupabaseState>) -> 
 }
 
 #[tauri::command]
-pub async fn supabase_create_trigger(trigger: Value, state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
+pub async fn supabase_create_trigger(
+    trigger: Value,
+    state: tauri::State<'_, SupabaseState>,
+) -> Result<Value, String> {
     let config = state.get_config().await;
     let client = build_client(&config)?;
-    handle_response(client.post(&rest_url(&config, "ae_triggers")).json(&trigger).send().await.map_err(|e| e.to_string())?).await
+    handle_response(
+        client
+            .post(&rest_url(&config, "ae_triggers"))
+            .json(&trigger)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?,
+    )
+    .await
 }
 
 #[tauri::command]
-pub async fn supabase_update_trigger(id: String, updates: Value, state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
+pub async fn supabase_update_trigger(
+    id: String,
+    updates: Value,
+    state: tauri::State<'_, SupabaseState>,
+) -> Result<Value, String> {
     let config = state.get_config().await;
     let client = build_client(&config)?;
     let url = format!("{}?id=eq.{}", rest_url(&config, "ae_triggers"), id);
-    handle_response(client.patch(&url).json(&updates).send().await.map_err(|e| e.to_string())?).await
+    handle_response(
+        client
+            .patch(&url)
+            .json(&updates)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?,
+    )
+    .await
 }
 
 // ── Project Commands ────────────────────────────────────────────────
 
 #[tauri::command]
-pub async fn supabase_fetch_projects(state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
+pub async fn supabase_fetch_projects(
+    state: tauri::State<'_, SupabaseState>,
+) -> Result<Value, String> {
     let config = state.get_config().await;
     fetch_projects(&config).await
 }
 
 #[tauri::command]
-pub async fn supabase_create_project(project: Value, state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
+pub async fn supabase_create_project(
+    project: Value,
+    state: tauri::State<'_, SupabaseState>,
+) -> Result<Value, String> {
     let config = state.get_config().await;
     create_project(&config, &project).await
 }
 
 #[tauri::command]
-pub async fn supabase_update_project(id: String, updates: Value, state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
+pub async fn supabase_update_project(
+    id: String,
+    updates: Value,
+    state: tauri::State<'_, SupabaseState>,
+) -> Result<Value, String> {
     let config = state.get_config().await;
     update_project(&config, &id, &updates).await
 }
 
 #[tauri::command]
-pub async fn supabase_delete_project(id: String, state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
+pub async fn supabase_delete_project(
+    id: String,
+    state: tauri::State<'_, SupabaseState>,
+) -> Result<Value, String> {
     let config = state.get_config().await;
     delete_project(&config, &id).await
 }
@@ -734,13 +1131,19 @@ pub async fn supabase_delete_project(id: String, state: tauri::State<'_, Supabas
 // ── Artifact Commands ────────────────────────────────────────────────
 
 #[tauri::command]
-pub async fn supabase_create_artifact(artifact: Value, state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
+pub async fn supabase_create_artifact(
+    artifact: Value,
+    state: tauri::State<'_, SupabaseState>,
+) -> Result<Value, String> {
     let config = state.get_config().await;
     create_artifact(&config, &artifact).await
 }
 
 #[tauri::command]
-pub async fn supabase_fetch_artifacts(task_id: String, state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
+pub async fn supabase_fetch_artifacts(
+    task_id: String,
+    state: tauri::State<'_, SupabaseState>,
+) -> Result<Value, String> {
     let config = state.get_config().await;
     fetch_artifacts(&config, &task_id).await
 }
@@ -748,13 +1151,18 @@ pub async fn supabase_fetch_artifacts(task_id: String, state: tauri::State<'_, S
 // ── Worker Commands ─────────────────────────────────────────────────
 
 #[tauri::command]
-pub async fn supabase_worker_heartbeat(machine_name: String, state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
+pub async fn supabase_worker_heartbeat(
+    machine_name: String,
+    state: tauri::State<'_, SupabaseState>,
+) -> Result<Value, String> {
     let config = state.get_config().await;
-    worker_heartbeat(&config, &machine_name).await
+    worker_heartbeat(&config, &machine_name, None).await
 }
 
 #[tauri::command]
-pub async fn supabase_check_active_worker(state: tauri::State<'_, SupabaseState>) -> Result<Value, String> {
+pub async fn supabase_check_active_worker(
+    state: tauri::State<'_, SupabaseState>,
+) -> Result<Value, String> {
     let config = state.get_config().await;
     let (active, machine_name) = check_active_worker(&config).await?;
     Ok(serde_json::json!({
@@ -764,7 +1172,10 @@ pub async fn supabase_check_active_worker(state: tauri::State<'_, SupabaseState>
 }
 
 #[tauri::command]
-pub async fn supabase_worker_offline(machine_name: String, state: tauri::State<'_, SupabaseState>) -> Result<(), String> {
+pub async fn supabase_worker_offline(
+    machine_name: String,
+    state: tauri::State<'_, SupabaseState>,
+) -> Result<(), String> {
     let config = state.get_config().await;
     worker_offline(&config, &machine_name).await
 }

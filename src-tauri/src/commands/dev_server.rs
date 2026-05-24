@@ -1,7 +1,9 @@
+use crate::process::async_cmd;
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::{Mutex, OnceLock};
 use tokio::process::Child;
-use crate::process::async_cmd;
 
 /// Single-quote a string for safe embedding in `sh -c` / `cmd /C` input.
 /// Used for the --scope argument on the custom-command path where we're
@@ -30,10 +32,16 @@ async fn resolve_main_repo(worktree: &str) -> String {
         .current_dir(worktree)
         .output()
         .await;
-    let Ok(o) = out else { return worktree.to_string(); };
-    if !o.status.success() { return worktree.to_string(); }
+    let Ok(o) = out else {
+        return worktree.to_string();
+    };
+    if !o.status.success() {
+        return worktree.to_string();
+    }
     let common = String::from_utf8_lossy(&o.stdout).trim().to_string();
-    if common.is_empty() { return worktree.to_string(); }
+    if common.is_empty() {
+        return worktree.to_string();
+    }
     let abs = if Path::new(&common).is_absolute() {
         std::path::PathBuf::from(&common)
     } else {
@@ -48,15 +56,21 @@ async fn resolve_main_repo(worktree: &str) -> String {
 /// Uses `doppler configure get enclave.project --scope <path> --plain` which
 /// returns the project name for that scope (or nothing if no scope exists).
 async fn scope_has_doppler_project(scope: &str) -> bool {
-    if which::which("doppler").is_err() { return false; }
+    if which::which("doppler").is_err() {
+        return false;
+    }
     for key in ["enclave.project", "project"] {
         let out = async_cmd("doppler")
             .args(["configure", "get", key, "--scope", scope, "--plain"])
             .output()
             .await
             .ok();
-        let Some(out) = out else { continue; };
-        if !out.status.success() { continue; }
+        let Some(out) = out else {
+            continue;
+        };
+        if !out.status.success() {
+            continue;
+        }
         let project = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if !project.is_empty() {
             return true;
@@ -74,7 +88,9 @@ async fn scope_has_doppler_project(scope: &str) -> bool {
 async fn doppler_scope_for(main_repo: &str, worktree: &str) -> Option<String> {
     let explicitly_configured_scopes = configured_doppler_scopes().await;
     for scope in candidate_doppler_scopes(main_repo, worktree, &explicitly_configured_scopes) {
-        if explicitly_configured_scopes.iter().any(|configured| configured == &scope)
+        if explicitly_configured_scopes
+            .iter()
+            .any(|configured| configured == &scope)
             || scope_has_doppler_project(&scope).await
         {
             return Some(scope);
@@ -91,21 +107,29 @@ pub async fn doppler_scope_for_checkout(repo_path: &str) -> Option<String> {
 }
 
 async fn configured_doppler_scopes() -> Vec<String> {
-    if which::which("doppler").is_err() { return Vec::new(); }
+    if which::which("doppler").is_err() {
+        return Vec::new();
+    }
     let out = async_cmd("doppler")
         .args(["configure", "--all", "--json"])
         .output()
         .await
         .ok();
-    let Some(out) = out else { return Vec::new(); };
-    if !out.status.success() { return Vec::new(); }
+    let Some(out) = out else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
 
     let parsed: serde_json::Value = match serde_json::from_slice(&out.stdout) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
 
-    let Some(obj) = parsed.as_object() else { return Vec::new(); };
+    let Some(obj) = parsed.as_object() else {
+        return Vec::new();
+    };
     obj.iter()
         .filter_map(|(scope, config)| {
             if scope == "/" || !doppler_config_can_run(config) {
@@ -117,10 +141,13 @@ async fn configured_doppler_scopes() -> Vec<String> {
 }
 
 fn doppler_config_can_run(config: &serde_json::Value) -> bool {
-    if ["enclave.project", "project"]
-        .iter()
-        .any(|key| config.get(*key).and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false))
-    {
+    if ["enclave.project", "project"].iter().any(|key| {
+        config
+            .get(*key)
+            .and_then(|v| v.as_str())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+    }) {
         return true;
     }
 
@@ -171,11 +198,15 @@ fn repo_names_for_doppler(main_repo: &str, worktree: &str) -> Vec<String> {
 }
 
 fn samwise_worktree_repo_name(path: &str) -> Option<String> {
-    let Ok(home) = std::env::var("HOME") else { return None; };
+    let Ok(home) = std::env::var("HOME") else {
+        return None;
+    };
     let marker = format!("{}/samwise/worktrees/", home);
     let rest = path.strip_prefix(&marker)?;
     let repo_name = rest.split('/').next().unwrap_or("").trim();
-    if repo_name.is_empty() { return None; }
+    if repo_name.is_empty() {
+        return None;
+    }
     Some(repo_name.to_string())
 }
 
@@ -185,7 +216,9 @@ fn add_matching_configured_scopes(
     explicitly_configured_scopes: &[String],
 ) {
     for scope in explicitly_configured_scopes {
-        let Some(name) = Path::new(scope).file_name().and_then(|s| s.to_str()) else { continue; };
+        let Some(name) = Path::new(scope).file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
         if repo_names.iter().any(|repo_name| repo_name == name) {
             push_unique(scopes, scope.to_string());
         }
@@ -193,13 +226,21 @@ fn add_matching_configured_scopes(
 }
 
 fn add_documents_repo_scopes(scopes: &mut Vec<String>, repo_names: &[String]) {
-    let Some(home) = dirs::home_dir() else { return; };
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
     let documents = home.join("Documents");
-    let Ok(entries) = std::fs::read_dir(documents) else { return; };
+    let Ok(entries) = std::fs::read_dir(documents) else {
+        return;
+    };
 
     for entry in entries.flatten() {
-        let Ok(metadata) = entry.metadata() else { continue; };
-        if !metadata.is_dir() { continue; }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
         for repo_name in repo_names {
             let candidate = entry.path().join(repo_name);
             if candidate.is_dir() {
@@ -210,18 +251,32 @@ fn add_documents_repo_scopes(scopes: &mut Vec<String>, repo_names: &[String]) {
 }
 
 fn add_mirrored_documents_scope(scopes: &mut Vec<String>, path: &str) {
-    let Ok(home) = std::env::var("HOME") else { return; };
+    let Ok(home) = std::env::var("HOME") else {
+        return;
+    };
     let marker = format!("{}/samwise/", home);
-    let Some(rest) = path.strip_prefix(&marker) else { return; };
+    let Some(rest) = path.strip_prefix(&marker) else {
+        return;
+    };
     let mut parts = rest.split('/');
-    let Some(bucket) = parts.next().filter(|s| !s.is_empty() && *s != "worktrees") else { return; };
-    let Some(repo_name) = parts.next().filter(|s| !s.is_empty()) else { return; };
+    let Some(bucket) = parts.next().filter(|s| !s.is_empty() && *s != "worktrees") else {
+        return;
+    };
+    let Some(repo_name) = parts.next().filter(|s| !s.is_empty()) else {
+        return;
+    };
 
-    push_unique(scopes, format!("{}/Documents/{}/{}", home, bucket, repo_name));
+    push_unique(
+        scopes,
+        format!("{}/Documents/{}/{}", home, bucket, repo_name),
+    );
 
     if let Some(prefix) = bucket.strip_suffix("-Apps") {
         let project_bucket = format!("{}-PROJECTS", prefix.to_ascii_uppercase());
-        push_unique(scopes, format!("{}/Documents/{}/{}", home, project_bucket, repo_name));
+        push_unique(
+            scopes,
+            format!("{}/Documents/{}/{}", home, project_bucket, repo_name),
+        );
     }
 }
 
@@ -236,12 +291,15 @@ pub struct DevServerHandle {
 /// Returns (script_name, default_port) where script_name is "dev" or "start".
 async fn detect_dev_command(repo_path: &str) -> Result<(String, u16), String> {
     let pkg_path = std::path::Path::new(repo_path).join("package.json");
-    let content = tokio::fs::read_to_string(&pkg_path).await
+    let content = tokio::fs::read_to_string(&pkg_path)
+        .await
         .map_err(|e| format!("Failed to read package.json: {}", e))?;
     let pkg: serde_json::Value = serde_json::from_str(&content)
         .map_err(|e| format!("Failed to parse package.json: {}", e))?;
 
-    let scripts = pkg.get("scripts").and_then(|v| v.as_object())
+    let scripts = pkg
+        .get("scripts")
+        .and_then(|v| v.as_object())
         .ok_or_else(|| "No scripts in package.json".to_string())?;
 
     // Prefer "dev", then "start"
@@ -303,26 +361,46 @@ fn detect_port_style(script: &str) -> PortStyle {
 /// Binds to both IPv4 and IPv6 loopback to catch dual-stack conflicts. On macOS,
 /// `TcpListener::bind("127.0.0.1:port")` will succeed even when something else is
 /// listening on `[::1]:port` — so we have to check both. This was the cause of
-/// the "screenshots show a different app" bug: find_open_port returned a port that
-/// was actually owned by another app on the IPv6 side.
+/// the "screenshots show a different app" bug: the open-port probe returned a
+/// port that was actually owned by another app on the IPv6 side.
 fn port_is_free(port: u16) -> bool {
     let v4 = std::net::TcpListener::bind(format!("127.0.0.1:{}", port));
     let v6 = std::net::TcpListener::bind(format!("[::1]:{}", port));
     v4.is_ok() && v6.is_ok()
 }
 
-pub fn find_open_port(starting_from: u16) -> u16 {
+static RESERVED_DEV_PORTS: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+
+fn reserved_dev_ports() -> &'static Mutex<HashSet<u16>> {
+    RESERVED_DEV_PORTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn reserve_open_port(starting_from: u16) -> u16 {
+    let mut reserved = reserved_dev_ports()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     for port in starting_from..=starting_from + 20 {
-        if port_is_free(port) {
+        if !reserved.contains(&port) && port_is_free(port) {
+            reserved.insert(port);
             return port;
         }
     }
     for port in 10000..10100 {
-        if port_is_free(port) {
+        if !reserved.contains(&port) && port_is_free(port) {
+            reserved.insert(port);
             return port;
         }
     }
     9876
+}
+
+fn release_reserved_port(port: u16) {
+    if let Some(reserved) = RESERVED_DEV_PORTS.get() {
+        let mut reserved = reserved
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reserved.remove(&port);
+    }
 }
 
 /// Run `npm install` if node_modules doesn't exist. Ensures deps are available before starting the dev server.
@@ -332,7 +410,10 @@ pub async fn ensure_deps_installed(repo_path: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    log::info!("[dev_server] node_modules missing in {}, running npm install", repo_path);
+    log::info!(
+        "[dev_server] node_modules missing in {}, running npm install",
+        repo_path
+    );
 
     let output = async_cmd("npm")
         .args(["install"])
@@ -367,10 +448,9 @@ pub async fn start_dev_server(
     // Matt runs on the mini. We still care about framework detection for the port
     // *flag style* (--port vs -p vs PORT env) but the port number is always ours.
     const SAM_PORT_START: u16 = 47100;
-    let port = find_open_port(SAM_PORT_START);
+    let port = reserve_open_port(SAM_PORT_START);
 
-    let custom_with_port = dev_command
-        .filter(|s| !s.is_empty() && s.contains("{port}"));
+    let custom_with_port = dev_command.filter(|s| !s.is_empty() && s.contains("{port}"));
 
     let npm_script = if let Some(custom_cmd) = custom_with_port {
         custom_cmd.replace("{port}", &port.to_string())
@@ -393,14 +473,21 @@ pub async fn start_dev_server(
     if let Some(scope) = doppler_scope.as_deref() {
         log::info!("[dev_server] wrapping dev server with `doppler run --scope {}` (main repo of worktree {})", scope, repo_path);
     } else {
-        log::info!("[dev_server] no doppler scope found for main repo {}; running dev server bare", main_repo);
+        log::info!(
+            "[dev_server] no doppler scope found for main repo {}; running dev server bare",
+            main_repo
+        );
     }
 
     let mut cmd = if is_custom {
         // Custom command: execute via shell to handle paths with spaces and complex commands.
         // Prefix with `doppler run --scope <path> --` when the main repo has a Doppler scope.
         let shell_script = if let Some(scope) = doppler_scope.as_deref() {
-            format!("doppler run --scope {} -- {}", shell_quote(scope), npm_script)
+            format!(
+                "doppler run --scope {} -- {}",
+                shell_quote(scope),
+                npm_script
+            )
         } else {
             npm_script.clone()
         };
@@ -426,7 +513,16 @@ pub async fn start_dev_server(
         // flags / env handling are preserved.
         let mut c = if let Some(scope) = doppler_scope.as_deref() {
             let mut c0 = async_cmd("doppler");
-            c0.args(["run", "--scope", scope, "--", "npm", "run", &npm_script, "--"]);
+            c0.args([
+                "run",
+                "--scope",
+                scope,
+                "--",
+                "npm",
+                "run",
+                &npm_script,
+                "--",
+            ]);
             c0
         } else {
             let mut c0 = async_cmd("npm");
@@ -465,8 +561,13 @@ pub async fn start_dev_server(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = cmd.spawn()
-        .map_err(|e| format!("Failed to spawn dev server: {}", e))?;
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            release_reserved_port(port);
+            return Err(format!("Failed to spawn dev server: {}", e));
+        }
+    };
 
     let pid = child.id().unwrap_or(0);
 
@@ -499,7 +600,12 @@ pub async fn start_dev_server(
         });
     }
 
-    log::info!("[dev_server] Started dev server (pid={}, port={}) in {}", pid, port, repo_path);
+    log::info!(
+        "[dev_server] Started dev server (pid={}, port={}) in {}",
+        pid,
+        port,
+        repo_path
+    );
 
     Ok(DevServerHandle {
         child,
@@ -512,7 +618,8 @@ pub async fn start_dev_server(
 /// Read the actual script content from package.json for a given script name.
 async fn read_script_content(repo_path: &str, script_name: &str) -> Result<String, String> {
     let pkg_path = std::path::Path::new(repo_path).join("package.json");
-    let content = tokio::fs::read_to_string(&pkg_path).await
+    let content = tokio::fs::read_to_string(&pkg_path)
+        .await
         .map_err(|e| format!("Failed to read package.json: {}", e))?;
     let pkg: serde_json::Value = serde_json::from_str(&content)
         .map_err(|e| format!("Failed to parse package.json: {}", e))?;
@@ -542,7 +649,10 @@ pub async fn wait_for_ready(url: &str, timeout_secs: u64) -> Result<(), String> 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
         if tokio::time::Instant::now() >= deadline {
-            return Err(format!("Dev server didn't return 2xx/3xx at {} within {}s", url, timeout_secs));
+            return Err(format!(
+                "Dev server didn't return 2xx/3xx at {} within {}s",
+                url, timeout_secs
+            ));
         }
         if let Ok(resp) = client.get(url).send().await {
             let s = resp.status();
@@ -557,7 +667,11 @@ pub async fn wait_for_ready(url: &str, timeout_secs: u64) -> Result<(), String> 
 /// Kill the dev server and its entire process tree.
 pub async fn kill_dev_server(mut handle: DevServerHandle) -> Result<(), String> {
     let pid = handle.pid;
-    log::info!("[dev_server] Killing dev server (pid={}, port={})", pid, handle.port);
+    log::info!(
+        "[dev_server] Killing dev server (pid={}, port={})",
+        pid,
+        handle.port
+    );
 
     #[cfg(target_os = "windows")]
     {
@@ -572,7 +686,11 @@ pub async fn kill_dev_server(mut handle: DevServerHandle) -> Result<(), String> 
                 }
                 Ok(o) => {
                     let stderr = String::from_utf8_lossy(&o.stderr);
-                    log::warn!("[dev_server] taskkill warning (pid={}): {}", pid, stderr.trim());
+                    log::warn!(
+                        "[dev_server] taskkill warning (pid={}): {}",
+                        pid,
+                        stderr.trim()
+                    );
                 }
                 Err(e) => {
                     log::warn!("[dev_server] taskkill failed (pid={}): {}", pid, e);
@@ -591,6 +709,7 @@ pub async fn kill_dev_server(mut handle: DevServerHandle) -> Result<(), String> 
     }
 
     let _ = handle.child.kill().await;
+    release_reserved_port(handle.port);
     Ok(())
 }
 
@@ -600,7 +719,11 @@ async fn kill_tree_unix(pid: u32) {
     let mut frontier = vec![pid];
     let mut all = vec![pid];
     while let Some(parent) = frontier.pop() {
-        if let Ok(out) = async_cmd("pgrep").args(["-P", &parent.to_string()]).output().await {
+        if let Ok(out) = async_cmd("pgrep")
+            .args(["-P", &parent.to_string()])
+            .output()
+            .await
+        {
             if out.status.success() {
                 for line in String::from_utf8_lossy(&out.stdout).lines() {
                     if let Ok(child) = line.trim().parse::<u32>() {
@@ -613,10 +736,32 @@ async fn kill_tree_unix(pid: u32) {
     }
     // TERM leaves first so parents don't respawn children, then mop up with KILL.
     for p in all.iter().rev() {
-        let _ = async_cmd("kill").args(["-TERM", &p.to_string()]).output().await;
+        let _ = async_cmd("kill")
+            .args(["-TERM", &p.to_string()])
+            .output()
+            .await;
     }
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     for p in all.iter().rev() {
-        let _ = async_cmd("kill").args(["-KILL", &p.to_string()]).output().await;
+        let _ = async_cmd("kill")
+            .args(["-KILL", &p.to_string()])
+            .output()
+            .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reserved_ports_are_not_reused_before_release() {
+        let first = reserve_open_port(49100);
+        let second = reserve_open_port(first);
+
+        assert_ne!(first, second);
+
+        release_reserved_port(first);
+        release_reserved_port(second);
     }
 }

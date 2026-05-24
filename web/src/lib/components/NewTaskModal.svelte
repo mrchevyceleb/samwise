@@ -9,6 +9,7 @@
   let prompt = $state('');
   let repoMode = $state<RepoMode>('project');
   let selectedProjectId = $state('');
+  let baseBranch = $state('');
   let task_type = $state<TaskType>('code');
   let qaEnvironment = $state<'staging' | 'production'>('staging');
   let submitting = $state(false);
@@ -36,7 +37,10 @@
 
   function setRepoMode(mode: RepoMode) {
     repoMode = mode;
-    if (mode !== 'project') selectedProjectId = '';
+    if (mode !== 'project') {
+      selectedProjectId = '';
+      baseBranch = '';
+    }
   }
 
   async function uploadFiles(files: FileList | null) {
@@ -82,6 +86,12 @@
           prompt: prompt.trim(),
           repo_mode: repoMode,
           project_id: repoMode === 'project' ? selectedProjectId : undefined,
+          // qa-verify checks staging/production URLs — base branch is ignored
+          // by the worker for that path, so don't send a stale value.
+          base_branch:
+            repoMode === 'project' && task_type !== 'qa-verify'
+              ? baseBranch.trim() || undefined
+              : undefined,
           task_type,
           environment: task_type === 'qa-verify' ? qaEnvironment : undefined,
           attachments: attachments.map((a) => ({ url: a.url, name: a.name, mime: a.mime }))
@@ -154,7 +164,11 @@
     {#if repoMode === 'project'}
       <label class="block text-xs font-semibold text-slate-400">
         Select repo
-        <select bind:value={selectedProjectId} class="mt-1 w-full rounded-lg bg-white/5 border border-white/10 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-white/30">
+        <select
+          bind:value={selectedProjectId}
+          onchange={() => { baseBranch = ''; }}
+          class="mt-1 w-full rounded-lg bg-white/5 border border-white/10 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-white/30"
+        >
           <option value="">{projects.length === 0 ? 'No projects configured' : 'Choose a project...'}</option>
           {#each groupedProjects as [client, clientProjects]}
             <optgroup label={client}>
@@ -165,6 +179,20 @@
           {/each}
         </select>
       </label>
+
+      {#if task_type !== 'qa-verify'}
+        <label class="block text-xs font-semibold text-slate-400">
+          Base branch (optional)
+          <input
+            type="text"
+            bind:value={baseBranch}
+            placeholder="Leave blank for default branch"
+            autocomplete="off"
+            spellcheck="false"
+            class="mt-1 w-full rounded-lg bg-white/5 border border-white/10 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-white/30"
+          />
+        </label>
+      {/if}
     {/if}
 
     <label class="block text-xs font-semibold text-slate-400">

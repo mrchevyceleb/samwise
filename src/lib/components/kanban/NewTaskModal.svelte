@@ -23,6 +23,7 @@
 	let repoUrl = $state('');
 	let repoPath = $state('');
 	let previewUrl = $state('');
+	let baseBranch = $state('');
 	let saving = $state(false);
 
 	let projects = $derived(projectStore.projects);
@@ -45,6 +46,7 @@
 		repoUrl = '';
 		repoPath = '';
 		previewUrl = '';
+		baseBranch = '';
 	}
 
 	function setRepoMode(mode: RepoMode) {
@@ -55,6 +57,9 @@
 	function handleProjectSelect(e: Event) {
 		const selectedId = (e.currentTarget as HTMLSelectElement).value;
 		selectedProjectId = selectedId;
+		// Branch names are repo-specific, so switching projects must wipe any
+		// stale branch the user typed for the previous repo.
+		baseBranch = '';
 		if (!selectedId) {
 			clearProject();
 			return;
@@ -115,6 +120,9 @@
 				preview_url: isQa
 					? (previewUrl.trim() || undefined)
 					: (repoMode === 'project' ? previewUrl.trim() || undefined : undefined),
+				// qa-verify checks staging/production URLs — base branch is ignored
+				// by the worker for that path, so don't send a stale value.
+				base_branch: (repoMode === 'project' && !isQa) ? baseBranch.trim() || undefined : undefined,
 				context,
 			});
 			onClose();
@@ -237,6 +245,31 @@
 					{/each}
 				</select>
 			</div>
+
+			{#if taskType !== 'qa-verify'}
+				<div style="margin-bottom: 16px;">
+					<label for="new-task-base-branch" style="font-size: 11px; font-weight: 600; color: var(--text-secondary); display: block; margin-bottom: 6px;">
+						Base branch (optional)
+					</label>
+					<input
+						id="new-task-base-branch"
+						type="text"
+						bind:value={baseBranch}
+						placeholder="Leave blank for default branch"
+						autocomplete="off"
+						spellcheck="false"
+						style="
+							width: 100%; padding: 10px 12px;
+							background: var(--bg-primary); border: 1px solid var(--border-default);
+							border-radius: 8px; color: var(--text-primary);
+							font-family: var(--font-ui); font-size: 13px;
+							outline: none; transition: border-color 0.15s;
+						"
+						onfocus={(e) => { (e.currentTarget as HTMLElement).style.borderColor = 'rgba(99, 102, 241, 0.4)'; }}
+						onblur={(e) => { (e.currentTarget as HTMLElement).style.borderColor = 'var(--border-default)'; }}
+					/>
+				</div>
+			{/if}
 		{/if}
 
 		<div style="margin-bottom: 16px;">

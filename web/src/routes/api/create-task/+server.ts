@@ -112,6 +112,15 @@ export const POST: RequestHandler = async ({ request }) => {
 
   const attachments = Array.isArray(payload.attachments) ? payload.attachments : undefined;
 
+  // Fail-closed on bad base_branch: if the caller supplied a non-empty value
+  // but it doesn't survive cleaning, reject the request rather than silently
+  // routing work to the default branch.
+  const rawBaseBranch = cleanString(payload.base_branch);
+  const cleanedBaseBranch = cleanBaseBranch(payload.base_branch);
+  if (rawBaseBranch && !cleanedBaseBranch) {
+    throw error(400, `invalid base_branch: ${rawBaseBranch}`);
+  }
+
   const row: Record<string, unknown> = {
     title: cleanString(payload.title) || titleFromPrompt(prompt),
     description: prompt,
@@ -123,7 +132,7 @@ export const POST: RequestHandler = async ({ request }) => {
     repo_url: repoUrl,
     repo_path: repoPath,
     preview_url: previewUrl,
-    base_branch: cleanBaseBranch(payload.base_branch),
+    base_branch: cleanedBaseBranch,
     context,
   };
 
