@@ -164,6 +164,25 @@ export function getTaskStore() {
       await this.updateTask(id, updates);
     },
 
+    /**
+     * Force a card back into the `queued` lane and clear every field a stale
+     * worker claim leaves behind. Use this for stuck cards — particularly
+     * `review` cards where the PR's CI is wedged, `pending_confirmation`
+     * cards waiting on the user, or `fixes_needed` cards Matt wants Sam to
+     * try again on. Without clearing `worker_id`/`claimed_at`/`failure_reason`
+     * the worker may treat the row as still claimed or refuse to re-pick it.
+     */
+    async requeueTask(id: string) {
+      const task = tasks.find(t => t.id === id);
+      if (!task) return;
+      await this.updateTask(id, {
+        status: 'queued',
+        worker_id: null,
+        claimed_at: null,
+        failure_reason: null,
+      } as Partial<AeTask>);
+    },
+
     getTask(id: string): AeTask | undefined {
       return tasks.find(t => t.id === id);
     },

@@ -106,6 +106,18 @@
 	let isInProgress = $derived(task.status === 'in_progress');
 	let isStoppable = $derived(task.status === 'in_progress' || task.status === 'testing');
 	let isRestartable = $derived(task.status === 'failed');
+	// Any non-terminal status where Matt might want to kick a stuck card
+	// back into the queue. Includes `review` (PR CI wedged), `approved`
+	// (merge sweep stuck), `fixes_needed`/`pending_confirmation`/`failed`
+	// (manual retry). `in_progress` and `testing` use Stop + Restart
+	// instead so the live worker is killed first.
+	let isRequeueable = $derived(
+		task.status === 'failed' ||
+		task.status === 'fixes_needed' ||
+		task.status === 'pending_confirmation' ||
+		task.status === 'review' ||
+		task.status === 'approved'
+	);
 	let isAgent = $derived(task.assignee === 'agent');
 	let hasBefore = $derived(task.screenshots_before && task.screenshots_before.length > 0);
 	let hasAfter = $derived(task.screenshots_after && task.screenshots_after.length > 0);
@@ -177,7 +189,7 @@
 	}
 
 	async function handleRequeue() {
-		await taskStore.moveTask(task.id, 'queued');
+		await taskStore.requeueTask(task.id);
 	}
 
 	async function handleMarkDone() {
@@ -1109,7 +1121,7 @@
 						</button>
 					{/if}
 
-					{#if isFailed}
+					{#if isRequeueable}
 						<button
 							style="
 								width: 100%; padding: 7px 12px; border-radius: 8px;

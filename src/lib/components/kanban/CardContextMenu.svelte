@@ -336,8 +336,12 @@
 			<div style="height: 1px; background: var(--border-subtle); margin: 4px 6px;"></div>
 		{/if}
 
-		<!-- Re-queue (only if failed) -->
-		{#if task.status === 'failed'}
+		<!-- Re-queue (any stuck non-terminal status). Calls the store's
+		     requeueTask which also clears worker_id/claimed_at/failure_reason
+		     so the worker doesn't treat the card as still claimed by a dead
+		     run. `in_progress`/`testing` go through Stop + Restart instead so
+		     the live subprocess is killed first. -->
+		{#if task.status === 'failed' || task.status === 'fixes_needed' || task.status === 'pending_confirmation' || task.status === 'review' || task.status === 'approved'}
 			<button
 				class="ctx-item"
 				style="
@@ -349,7 +353,7 @@
 				"
 				onmouseenter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(99, 102, 241, 0.08)'; submenu = null; }}
 				onmouseleave={(e) => { (e.currentTarget as HTMLElement).style.background = 'none'; }}
-				onclick={() => moveToStatus('queued')}
+				onclick={async () => { await taskStore.requeueTask(task.id); onClose(); }}
 			>
 				<svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" style="opacity: 0.7;">
 					<path d="M1.705 8.005a.75.75 0 01.834.656 5.5 5.5 0 009.592 2.97l-1.204-1.204a.25.25 0 01.177-.427h3.646a.25.25 0 01.25.25v3.646a.25.25 0 01-.427.177l-1.38-1.38A7.002 7.002 0 011.05 8.84a.75.75 0 01.656-.834zM8 2.5a5.487 5.487 0 00-4.131 1.869l1.204 1.204A.25.25 0 014.896 6H1.25A.25.25 0 011 5.75V2.104a.25.25 0 01.427-.177l1.38 1.38A7.002 7.002 0 0114.95 7.16a.75.75 0 11-1.49.178A5.5 5.5 0 008 2.5z"/>
