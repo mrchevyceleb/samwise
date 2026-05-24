@@ -1727,6 +1727,17 @@ async fn worker_loop(
             expire_pending_confirmations(&config).await;
         }
 
+        // Wedge sweep: cards stuck in `in_progress`, `testing`, or `review`
+        // for too long get unwedged (kill children + requeue for active
+        // statuses; comment + clear worker_id for review wedges where the
+        // PR's upstream CI is hung). Runs every 5 min like the
+        // pending_confirmation expiry, offset to a different tick so we
+        // don't cluster the load. Skip startup tick to give recovery a
+        // chance to finish first.
+        if tick > 0 && tick % 60 == 30 {
+            sweep_wedged_cards(&config, &active).await;
+        }
+
         // Sweep the PR-review queue every ~30s (6 ticks). Picks up cards that
         // just entered review (fresh PRs) and cards you dragged back from
         // fixes_needed -> review so they get re-reviewed automatically.
@@ -7758,6 +7769,299 @@ async fn expire_pending_confirmations(config: &SupabaseConfig) {
             format!("{} tasks expired waiting for project confirmation: {}. Create new tasks with @project to retry.", expired_titles.len(), names.join(", "))
         };
         agent_chat(config, &msg).await;
+    }
+}
+
+const WEDGE_IN_PROGRESS_MIN: i64 = 60;
+const WEDGE_TESTING_MIN: i64 = 45;
+const WEDGE_REVIEW_MIN: i64 = 45;
+const WEDGE_PR_CHECK_STUCK_MIN: i64 = 30;
+
+/// Periodic sweep that catches cards stuck in a non-terminal status with no
+/// progress for too long. Three classes:
+///   - `in_progress` > 60 min: worker is wedged between phases or its child
+///     process died without unwinding. Kill any recorded child PIDs, drop the
+///     pool slot, and route back to `queued` for a fresh attempt.
+///   - `testing` > 45 min: same treatment as in_progress; /browse + repair
+///     loop should never legitimately take this long.
+///   - `review` > 45 min: the card has a PR open and the merge sweep is
+///     polling it. If the PR has a check-run that's been in_progress/queued
+///     for > 30 min, the upstream CI is wedged (not Sam). Post a clear
+///     comment, clear `worker_id` so the review sweep stops polling, and
+///     leave the card in review for human triage. Don't touch the card if
+///     PR checks look healthy — codex review just takes a while sometimes.
+async fn sweep_wedged_cards(config: &SupabaseConfig, active: &ActiveTasks) {
+    let tasks = match supabase::fetch_tasks(config, None).await {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    let Some(arr) = tasks.as_array() else {
+        return;
+    };
+    let now = chrono::Utc::now();
+
+    for task in arr {
+        let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        let task_id = task
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if task_id.is_empty() {
+            continue;
+        }
+        let updated_at = task
+            .get("updated_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if updated_at.is_empty() {
+            continue;
+        }
+        let Ok(updated) = chrono::DateTime::parse_from_rfc3339(updated_at) else {
+            continue;
+        };
+        let age_min = (now - updated.with_timezone(&chrono::Utc)).num_minutes();
+
+        match status {
+            "in_progress" if age_min >= WEDGE_IN_PROGRESS_MIN => {
+                handle_wedged_active_card(config, active, &task_id, "in_progress", age_min)
+                    .await;
+            }
+            "testing" if age_min >= WEDGE_TESTING_MIN => {
+                handle_wedged_active_card(config, active, &task_id, "testing", age_min).await;
+            }
+            "review" if age_min >= WEDGE_REVIEW_MIN => {
+                handle_wedged_review_card(config, task, &task_id, age_min).await;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Force-kill any recorded child PID for this task, drop the active pool
+/// slot, and route the card back to `queued`. Used by the wedge sweep for
+/// `in_progress` and `testing` rows that haven't moved in too long.
+async fn handle_wedged_active_card(
+    config: &SupabaseConfig,
+    active: &ActiveTasks,
+    task_id: &str,
+    status: &str,
+    age_min: i64,
+) {
+    log::warn!(
+        "[wedge-sweep] {} task {} stale for {} min; killing children and requeuing",
+        status,
+        task_id,
+        age_min
+    );
+
+    {
+        let pool = active.lock().await;
+        if let Some(pid_slot) = pool.get(task_id) {
+            let pid_opt = { *pid_slot.lock().await };
+            if let Some(pid) = pid_opt {
+                if pid > 0 {
+                    #[cfg(unix)]
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGKILL);
+                    }
+                    log::warn!(
+                        "[wedge-sweep] SIGKILL pid {} for wedged {} task {}",
+                        pid,
+                        status,
+                        task_id
+                    );
+                }
+            }
+        }
+    }
+    {
+        let mut pool = active.lock().await;
+        pool.remove(task_id);
+    }
+
+    agent_comment(
+        config,
+        task_id,
+        &format!(
+            "Card stalled in `{}` for {} min with no progress. Killing the worker and re-queuing so a fresh attempt can pick it up.",
+            status, age_min
+        ),
+    )
+    .await;
+
+    let _ = supabase::update_task(
+        config,
+        task_id,
+        &serde_json::json!({
+            "status": "queued",
+            "worker_id": serde_json::Value::Null,
+            "claimed_at": serde_json::Value::Null,
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+        }),
+    )
+    .await;
+}
+
+/// Inspect a stale `review` card. If its PR has a check-run hung for more
+/// than `WEDGE_PR_CHECK_STUCK_MIN`, that's upstream CI infrastructure, not
+/// Sam. Post a clear comment, clear `worker_id` so the review sweep stops
+/// polling, and leave the card in `review` for human triage (admin merge
+/// override or fix the CI). If PR checks look healthy, leave the card alone
+/// — codex review can legitimately take a while on big diffs.
+async fn handle_wedged_review_card(
+    config: &SupabaseConfig,
+    task: &Value,
+    task_id: &str,
+    age_min: i64,
+) {
+    let pr_url = task
+        .get("pr_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let worker_id = task
+        .get("worker_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    if pr_url.is_empty() {
+        if worker_id.is_empty() {
+            return;
+        }
+        log::warn!(
+            "[wedge-sweep] review task {} stale {} min with worker_id but no PR URL; clearing worker_id",
+            task_id,
+            age_min
+        );
+        agent_comment(
+            config,
+            task_id,
+            &format!(
+                "Card has been in `review` for {} min and is claimed by a worker but no PR URL is recorded. Clearing worker so the review queue can re-claim or you can triage.",
+                age_min
+            ),
+        )
+        .await;
+        let _ = supabase::update_task(
+            config,
+            task_id,
+            &serde_json::json!({
+                "worker_id": serde_json::Value::Null,
+                "updated_at": chrono::Utc::now().to_rfc3339(),
+            }),
+        )
+        .await;
+        return;
+    }
+
+    match detect_stuck_pr_checks(&pr_url).await {
+        Some(detail) => {
+            log::warn!(
+                "[wedge-sweep] review task {} stale {} min; PR check stuck: {}",
+                task_id,
+                age_min,
+                detail
+            );
+            agent_comment(
+                config,
+                task_id,
+                &format!(
+                    "Card has been in `review` for {} min. The PR's CI looks wedged upstream: {}. This is GitHub Actions / CI infra, not a code defect. Clearing worker_id so the review sweep stops polling — admin-merge the PR if the other checks are fine, or fix the CI workflow and the sweep will pick it back up automatically.",
+                    age_min, detail
+                ),
+            )
+            .await;
+            let _ = supabase::update_task(
+                config,
+                task_id,
+                &serde_json::json!({
+                    "worker_id": serde_json::Value::Null,
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                }),
+            )
+            .await;
+        }
+        None => {
+            log::info!(
+                "[wedge-sweep] review task {} aged {} min but PR checks look healthy; leaving alone",
+                task_id,
+                age_min
+            );
+        }
+    }
+}
+
+/// Returns a short description of any check-runs that have been
+/// in_progress or queued on the PR head for longer than
+/// `WEDGE_PR_CHECK_STUCK_MIN`. None means no stuck check found.
+async fn detect_stuck_pr_checks(pr_url: &str) -> Option<String> {
+    let pr_ref = github_pull_ref_from_url(pr_url)?;
+    let head_output = async_cmd("gh")
+        .args([
+            "api",
+            &format!(
+                "repos/{}/{}/pulls/{}",
+                pr_ref.owner, pr_ref.repo, pr_ref.number
+            ),
+            "--jq",
+            ".head.sha",
+        ])
+        .output()
+        .await
+        .ok()?;
+    if !head_output.status.success() {
+        return None;
+    }
+    let head_sha = String::from_utf8_lossy(&head_output.stdout)
+        .trim()
+        .to_string();
+    if head_sha.is_empty() || head_sha == "null" {
+        return None;
+    }
+
+    let check_output = async_cmd("gh")
+        .args([
+            "api",
+            &format!(
+                "repos/{}/{}/commits/{}/check-runs?per_page=100",
+                pr_ref.owner, pr_ref.repo, head_sha
+            ),
+        ])
+        .output()
+        .await
+        .ok()?;
+    if !check_output.status.success() {
+        return None;
+    }
+    let body = String::from_utf8_lossy(&check_output.stdout);
+    let data: Value = serde_json::from_str(&body).ok()?;
+    let check_runs = data.get("check_runs")?.as_array()?;
+
+    let now = chrono::Utc::now();
+    let stuck: Vec<String> = check_runs
+        .iter()
+        .filter_map(|cr| {
+            let status = cr.get("status").and_then(|v| v.as_str())?;
+            if status != "in_progress" && status != "queued" {
+                return None;
+            }
+            let started_at = cr.get("started_at").and_then(|v| v.as_str())?;
+            let started = chrono::DateTime::parse_from_rfc3339(started_at).ok()?;
+            let age_min = (now - started.with_timezone(&chrono::Utc)).num_minutes();
+            if age_min < WEDGE_PR_CHECK_STUCK_MIN {
+                return None;
+            }
+            let name = cr.get("name").and_then(|v| v.as_str()).unwrap_or("unnamed");
+            Some(format!("'{}' ({} for {} min)", name, status, age_min))
+        })
+        .collect();
+
+    if stuck.is_empty() {
+        None
+    } else {
+        Some(stuck.join(", "))
     }
 }
 
