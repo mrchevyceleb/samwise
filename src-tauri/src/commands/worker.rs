@@ -4710,19 +4710,35 @@ from Matt, stop without making changes and explain specifically what you need cl
                         }
                     };
 
-                    // Codex-fix already vetted this diff before `/browse` ran, so an environmental
-                    // BLOCKED outcome (Browserbase can't reach localhost, mobile-only feature on
-                    // desktop harness, no usable creds in vault, etc.) is treated as SKIP and
-                    // ships to PR. FAIL outcomes are NOT overridden here: `/codex-fix` is a code
-                    // review pass and never exercises the browser flow, so a real functional FAIL
-                    // still has to go through the repair pass + rerun below before any override
-                    // can kick in.
-                    if codex_fix_passed && outcome.verdict == "BLOCKED" && !outcome.skip {
+                    // Codex-fix already vetted this diff before `/browse` ran, so two flavors of
+                    // "/browse can't act on this" convert to SKIP and ship to PR:
+                    //   1. verdict == BLOCKED: environmental limit (Browserbase can't reach
+                    //      localhost, mobile-only feature on desktop harness, no usable creds in
+                    //      vault, etc.). No code defect.
+                    //   2. issues.is_empty(): /browse returned a non-PASS verdict but couldn't
+                    //      articulate any concrete issue. This is the same condition
+                    //      `browse_needs_confirmation` uses to park the card in
+                    //      pending_confirmation, which then expires to `failed` after 30 min.
+                    //      Codex's prior review is the more trustworthy signal than an
+                    //      unstructured FAIL.
+                    // A FAIL WITH structured issues still falls through to the repair pass
+                    // below; only the degenerate "no issues" case is overridden.
+                    if codex_fix_passed
+                        && !outcome.skip
+                        && !outcome.pass
+                        && (outcome.verdict == "BLOCKED" || outcome.issues.is_empty())
+                    {
+                        let reason_label = if outcome.verdict == "BLOCKED" {
+                            "BLOCKED for environmental reasons"
+                        } else {
+                            "FAIL without structured issues (unrepairable)"
+                        };
                         agent_comment(
                             config,
                             &task_id,
                             &format!(
-                                "`/browse` returned BLOCKED for environmental reasons. Codex review already approved this diff; shipping to PR. Manual verification recommended.\n\n{}",
+                                "`/browse` returned {}. Codex review already approved this diff; shipping to PR. Manual verification recommended.\n\n{}",
+                                reason_label,
                                 browse_summary(&outcome.summary)
                             ),
                         )
@@ -5068,16 +5084,27 @@ from Matt, stop without making changes and explain specifically what you need cl
                             }
                         };
 
-                        // Same codex-fix override on rerun: only environmental BLOCKED converts to
-                        // SKIP. A FAIL on rerun (after the repair attempt) still routes to the
-                        // existing fixes_needed path so the browser-visible issues are triaged
-                        // rather than auto-shipped on a code-review-only signal.
-                        if codex_fix_passed && outcome.verdict == "BLOCKED" && !outcome.skip {
+                        // Same codex-fix override on rerun: environmental BLOCKED and the
+                        // degenerate "FAIL with no structured issues" case both convert to
+                        // SKIP. A FAIL on rerun WITH structured issues still routes to the
+                        // existing fixes_needed path so concrete browser-visible problems
+                        // are triaged rather than auto-shipped on a code-review-only signal.
+                        if codex_fix_passed
+                            && !outcome.skip
+                            && !outcome.pass
+                            && (outcome.verdict == "BLOCKED" || outcome.issues.is_empty())
+                        {
+                            let reason_label = if outcome.verdict == "BLOCKED" {
+                                "BLOCKED for environmental reasons"
+                            } else {
+                                "FAIL without structured issues (unrepairable)"
+                            };
                             agent_comment(
                                 config,
                                 &task_id,
                                 &format!(
-                                    "`/browse` rerun returned BLOCKED for environmental reasons. Codex review already approved this diff; shipping to PR. Manual verification recommended.\n\n{}",
+                                    "`/browse` rerun returned {}. Codex review already approved this diff; shipping to PR. Manual verification recommended.\n\n{}",
+                                    reason_label,
                                     browse_summary(&outcome.summary)
                                 ),
                             )
