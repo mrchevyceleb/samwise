@@ -101,7 +101,8 @@
 	// Derived
 	let elapsed = $derived(formatTimeAgo(new Date(task.created_at).getTime()));
 	let priorityColor = $derived(PRIORITY_COLORS[task.priority]);
-	let statusColumn = $derived(KANBAN_COLUMNS.find(c => c.status === (task.status === 'testing' ? 'in_progress' : task.status)));
+	let displayStatus = $derived(task.status === 'testing' ? 'in_progress' : task.status);
+	let statusColumn = $derived(KANBAN_COLUMNS.find(c => c.status === displayStatus));
 	let isFailed = $derived(task.status === 'failed');
 	let isInProgress = $derived(task.status === 'in_progress');
 	let isStoppable = $derived(task.status === 'in_progress' || task.status === 'testing');
@@ -877,15 +878,15 @@
 								style="
 									display: flex; align-items: center; gap: 6px;
 									padding: 5px 8px; border-radius: 6px;
-									border: 1px solid {task.status === col.status ? col.color + '40' : 'transparent'};
-									background: {task.status === col.status ? col.color + '12' : 'transparent'};
-									color: {task.status === col.status ? col.color : 'var(--text-muted)'};
+									border: 1px solid {displayStatus === col.status ? col.color + '40' : 'transparent'};
+									background: {displayStatus === col.status ? col.color + '12' : 'transparent'};
+									color: {displayStatus === col.status ? col.color : 'var(--text-muted)'};
 									font-size: 11px; font-weight: 600; cursor: pointer;
 									font-family: var(--font-ui); transition: all 0.12s;
 									text-align: left; width: 100%;
 								"
-								onmouseenter={(e) => { if (task.status !== col.status) (e.currentTarget as HTMLElement).style.background = 'var(--bg-column-header-hover)'; }}
-								onmouseleave={(e) => { if (task.status !== col.status) (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
+								onmouseenter={(e) => { if (displayStatus !== col.status) (e.currentTarget as HTMLElement).style.background = 'var(--bg-column-header-hover)'; }}
+								onmouseleave={(e) => { if (displayStatus !== col.status) (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
 								onclick={() => changeStatus(col.status)}
 							>
 								<span style="width: 6px; height: 6px; border-radius: 50%; background: {col.color}; flex-shrink: 0;"></span>

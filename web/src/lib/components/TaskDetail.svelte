@@ -47,7 +47,7 @@
   let uiStamp = $derived(getUiStamp(task));
   let mergeDeployState = $derived(getMergeDeployState(task));
   let mergeConflictFixState = $derived(getMergeConflictFixState(task));
-  let statusOptions = $derived(STATUSES.includes(task.status) ? STATUSES : [task.status, ...STATUSES]);
+  let displayStatus = $derived(task.status === 'testing' ? 'in_progress' : task.status);
   let mergeDeployRequestError = $state<string | null>(null);
   let mergeConflictFixRequestError = $state<string | null>(null);
   let visualQA = $derived(task.visual_qa_result);
@@ -145,7 +145,7 @@
       <div class="flex-1 min-w-0">
         <div class="flex items-center gap-2 flex-wrap">
           <select
-            value={task.status}
+            value={displayStatus}
             onchange={(e) => {
               const next = (e.currentTarget as HTMLSelectElement).value as TaskStatus;
               if (next !== task.status) tasksStore.setStatus(task.id, next);
@@ -153,7 +153,7 @@
             class="text-[10px] uppercase tracking-wide rounded-md border px-1.5 py-0.5 border-white/20 bg-slate-900 text-slate-200 focus:outline-none focus:border-white/40"
             aria-label="Move task"
           >
-            {#each statusOptions as s}
+            {#each STATUSES as s}
               <option value={s}>{STATUS_LABEL[s]}</option>
             {/each}
           </select>
