@@ -10,7 +10,6 @@
   let maxDiff = $derived(settingsStore.value.autoMergeMaxDiffLines);
   let prReviewEnabled = $derived(settingsStore.value.autoPrReviewEnabled);
   let autoFixEnabled = $derived(settingsStore.value.autoFixFromFixesNeededEnabled);
-  let visualQaEnabled = $derived(settingsStore.value.visualQaEnabled);
 
   function toggleEnabled() {
     updateSetting('autoMergeEnabled', !enabled);
@@ -22,10 +21,6 @@
 
   function toggleAutoFix() {
     updateSetting('autoFixFromFixesNeededEnabled', !autoFixEnabled);
-  }
-
-  function toggleVisualQa() {
-    updateSetting('visualQaEnabled', !visualQaEnabled);
   }
 
   function setMinScore(v: number) {
@@ -201,47 +196,6 @@
         position: absolute; top: 2px; left: {autoFixEnabled ? '22px' : '2px'};
         width: 18px; height: 18px; border-radius: 50%;
         background: {autoFixEnabled ? 'white' : 'var(--text-muted)'};
-        transition: all 0.2s ease;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.3);
-      "></span>
-    </button>
-  </div>
-
-  <!-- Visual QA -->
-  <div style="font-size: 13px; font-weight: 600; color: var(--text-primary); padding-bottom: 4px; border-top: 1px solid var(--border-default); padding-top: 20px; margin-top: 4px;">
-    Visual QA
-  </div>
-
-  <div style="font-size: 12px; color: var(--text-secondary); line-height: 1.5;">
-    When on, Sam starts a dev server, moves code tasks into Testing after implementation, and runs the <code style="font-family: var(--font-mono, monospace); font-size: 11px; color: var(--accent-blue);">/browse</code> Browserbase gate before opening a PR. If the gate finds a focused set of product issues, Sam gets one targeted repair pass and reruns it. Large issue sets and missing live dev servers fail closed into Fixes Needed.
-  </div>
-
-  <div
-    style="display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; background: var(--bg-primary); border: 1px solid var(--border-default); border-radius: 10px;"
-    onmouseenter={() => hovered = 'visualqa'}
-    onmouseleave={() => hovered = null}
-  >
-    <div>
-      <div style="font-size: 13px; font-weight: 600; color: var(--text-primary);">Run /browse QA in Testing</div>
-      <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">Runs after code work and before PR creation.</div>
-    </div>
-    <button
-      onclick={toggleVisualQa}
-      role="switch"
-      aria-checked={visualQaEnabled}
-      aria-label="Toggle Visual QA"
-      style="
-        position: relative; width: 44px; height: 24px; border-radius: 12px; cursor: pointer;
-        background: {visualQaEnabled ? '#6366f1' : 'var(--bg-elevated)'};
-        border: 1px solid {visualQaEnabled ? '#6366f1' : 'var(--border-default)'};
-        transition: all 0.2s ease;
-        transform: {hovered === 'visualqa' ? 'scale(1.05)' : 'scale(1)'};
-      "
-    >
-      <span style="
-        position: absolute; top: 2px; left: {visualQaEnabled ? '22px' : '2px'};
-        width: 18px; height: 18px; border-radius: 50%;
-        background: {visualQaEnabled ? 'white' : 'var(--text-muted)'};
         transition: all 0.2s ease;
         box-shadow: 0 1px 3px rgba(0,0,0,0.3);
       "></span>

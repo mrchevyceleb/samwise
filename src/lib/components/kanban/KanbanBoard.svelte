@@ -25,11 +25,6 @@
 	let addBtnHovered = $state(false);
 	let contextMenu = $state<{ task: AeTask; x: number; y: number } | null>(null);
 
-	/** Failed tasks shown in a collapsed row at the bottom */
-	let failedTasks = $derived(taskStore.tasks.filter(t => t.status === 'failed'));
-	let failedExpanded = $state(false);
-	let failedHovered = $state(false);
-
 	let columnsContainer = $state<HTMLDivElement | null>(null);
 
 	/** Auto-poll comments for active/reviewed tasks so card summaries update live */
@@ -110,6 +105,19 @@
 			drag.cancelDrag();
 		}
 	}
+
+	function isColumnCollapsed(status: TaskStatus): boolean {
+		return status === 'done'
+			? layout.doneColumnCollapsed
+			: status === 'failed'
+				? layout.failedColumnCollapsed
+				: false;
+	}
+
+	function toggleColumnCollapse(status: TaskStatus) {
+		if (status === 'done') layout.toggleDoneColumn();
+		if (status === 'failed') layout.toggleFailedColumn();
+	}
 </script>
 
 <svelte:window onkeydown={handleKeyDown} onmousemove={handleMouseMove} onmouseup={handleMouseUp} />
@@ -175,89 +183,14 @@
 				glowColor={column.glowColor}
 				icon={column.icon}
 				tasks={taskStore.tasksByColumn[column.status] || []}
-				collapsed={column.status === 'done' && layout.doneColumnCollapsed}
-				onToggleCollapse={column.status === 'done' ? () => layout.toggleDoneColumn() : undefined}
+				collapsed={isColumnCollapsed(column.status)}
+				onToggleCollapse={column.status === 'done' || column.status === 'failed' ? () => toggleColumnCollapse(column.status) : undefined}
 				onTaskClick={handleTaskClick}
 				onTaskContextMenu={handleTaskContextMenu}
 				isDragTarget={drag.dragging && drag.hoverColumn === column.status && drag.draggedTask?.status !== column.status}
 			/>
 		{/each}
 	</div>
-
-	<!-- Failed tasks row (collapsed at bottom) -->
-	{#if failedTasks.length > 0}
-		<!-- svelte-ignore a11y_no_static_element_interactions -->
-		<div style="
-			flex-shrink: 0; border-top: 1px solid rgba(248, 81, 73, 0.15);
-			background: rgba(248, 81, 73, 0.03);
-		">
-			<button
-				style="
-					width: 100%; display: flex; align-items: center; gap: 8px;
-					padding: 8px 14px; border: none; background: none;
-					cursor: pointer; transition: background 0.15s;
-					{failedHovered ? 'background: rgba(248, 81, 73, 0.06);' : ''}
-				"
-				onmouseenter={() => failedHovered = true}
-				onmouseleave={() => failedHovered = false}
-				onclick={() => failedExpanded = !failedExpanded}
-			>
-				<span style="
-					width: 8px; height: 8px; border-radius: 50%;
-					background: var(--accent-red);
-					box-shadow: 0 0 8px rgba(248, 81, 73, 0.4);
-					animation: pulse-dot 2s ease-in-out infinite;
-				"></span>
-				<span style="font-size: 11px; font-weight: 700; color: var(--accent-red); text-transform: uppercase; letter-spacing: 0.5px;">
-					Failed
-				</span>
-				<span style="
-					font-size: 10px; font-weight: 700; padding: 1px 6px; border-radius: 6px;
-					background: rgba(248, 81, 73, 0.12); color: var(--accent-red);
-					font-family: var(--font-mono);
-				">
-					{failedTasks.length}
-				</span>
-				<div style="flex: 1;"></div>
-				<svg
-					width="10" height="10" viewBox="0 0 10 10" fill="none"
-					stroke="var(--accent-red)" stroke-width="1.5" stroke-linecap="round"
-					style="transition: transform 0.2s; transform: rotate({failedExpanded ? '180deg' : '0'});"
-				>
-					<path d="M2 3.5l3 3 3-3"/>
-				</svg>
-			</button>
-
-			{#if failedExpanded}
-				<div style="
-					display: flex; gap: 8px; padding: 4px 14px 10px;
-					overflow-x: auto; animation: slide-in-top 0.15s ease;
-				">
-					{#each failedTasks as task (task.id)}
-						<!-- svelte-ignore a11y_no_static_element_interactions -->
-						<!-- svelte-ignore a11y_click_events_have_key_events -->
-						<div
-							style="
-								flex-shrink: 0; padding: 8px 12px; border-radius: 8px;
-								background: rgba(248, 81, 73, 0.06);
-								border: 1px solid rgba(248, 81, 73, 0.15);
-								cursor: pointer; transition: all 0.15s ease;
-								max-width: 200px;
-							"
-							onclick={() => handleTaskClick(task)}
-						>
-							<div style="font-size: 12px; font-weight: 600; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
-								{task.title}
-							</div>
-							<div style="font-size: 10px; color: var(--accent-red); margin-top: 2px;">
-								{task.priority} priority
-							</div>
-						</div>
-					{/each}
-				</div>
-			{/if}
-		</div>
-	{/if}
 
 	<!-- Drag ghost (floating card that follows the cursor) -->
 	{#if drag.dragging && drag.draggedTask}

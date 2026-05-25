@@ -3358,7 +3358,6 @@ async fn execute_task(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let mut project_dev_command: Option<String> = None;
 
     // Resolve project from registry: exact repo_url, exact project names with
     // usable repo paths, then strong hints from triage payload text.
@@ -3405,13 +3404,6 @@ async fn execute_task(
                         pick("preview_url")
                     };
                 }
-                project_dev_command = resolved
-                    .project
-                    .get("dev_command")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string());
-
                 let mut context = task
                     .get("context")
                     .cloned()
@@ -3742,79 +3734,16 @@ async fn execute_task(
         }
     }
 
-    // Read the Visual QA gate from settings.json once per task. When disabled,
-    // Sam skips the dev server and the `/browse` Testing gate. The toggle
-    // lives in Settings -> Auto-Merge.
-    let visual_qa_enabled = {
-        use tauri::Manager;
-        if let Ok(data_dir) = app.path().app_data_dir() {
-            let p = data_dir.join("settings.json");
-            tokio::fs::read_to_string(&p)
-                .await
-                .ok()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                .and_then(|s| s.get("visualQaEnabled").and_then(|v| v.as_bool()))
-                .unwrap_or(true)
-        } else {
-            false
-        }
-    };
-
-    // 3b. Start a local dev server when visual QA is on. The Testing stage
-    // `/browse` gate needs to see the agent's live branch changes via HMR; a
-    // staging preview_url usually shows pre-change state and can false-pass.
-    // The Testing gate reads the dev server handle directly.
+    // Automatic Visual QA is retired. It was spinning up extra dev servers and
+    // browser validation processes on an already busy worker host. Keep the
+    // old gate code below compiled but permanently disabled so saved settings
+    // from previous builds cannot turn it back on.
+    let visual_qa_enabled = false;
     let mut dev_server_handle: Option<dev_server::DevServerHandle> = None;
-    if uses_single_repo_pipeline && visual_qa_enabled {
-        let pkg_json = std::path::Path::new(&repo_path).join("package.json");
-        if tokio::fs::metadata(&pkg_json).await.is_ok() {
-            agent_comment(
-                config,
-                &task_id,
-                "No preview URL set. Starting a dev server...",
-            )
-            .await;
 
-            // Ensure node_modules exists before trying to start the dev server
-            if let Err(e) = dev_server::ensure_deps_installed(&repo_path).await {
-                agent_comment(
-                    config,
-                    &task_id,
-                    &format!("npm install failed: {}. Proceeding without browser QA.", e),
-                )
-                .await;
-            } else {
-                match dev_server::start_dev_server(&repo_path, project_dev_command.as_deref()).await
-                {
-                    Ok(handle) => {
-                        // 60s timeout: Next.js and large projects can take 30-60s on first start
-                        match dev_server::wait_for_ready(&handle.url, 60).await {
-                            Ok(()) => {
-                                agent_comment(
-                                    config,
-                                    &task_id,
-                                    &format!("Dev server running at {}", handle.url),
-                                )
-                                .await;
-                                dev_server_handle = Some(handle);
-                            }
-                            Err(e) => {
-                                agent_comment(config, &task_id, &format!("Dev server started but not responding: {}. Browser QA will fail closed if the diff is browser-visible.", e)).await;
-                                let _ = dev_server::kill_dev_server(handle).await;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        agent_comment(config, &task_id, &format!("Couldn't start dev server: {}. Browser QA will fail closed if the diff is browser-visible.", e)).await;
-                    }
-                }
-            }
-        }
-    }
-
-    // BEFORE/AFTER Puppeteer screenshots + out-of-band run_visual_qa were
-    // removed. The dev server above now feeds the board-visible `/browse`
-    // Testing gate after code work completes.
+    // BEFORE/AFTER Puppeteer screenshots and the later `/browse` Testing gate
+    // are both off the critical path now; code tasks continue straight through
+    // build, PR creation, and review without launching browser QA.
 
     // 5. Run Claude Code CLI
     let action_label = if is_research {

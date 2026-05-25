@@ -2,7 +2,7 @@
   import { onMount, onDestroy } from 'svelte';
   import { tasksStore } from '$lib/stores/tasks.svelte';
   import { supabase } from '$lib/supabase';
-  import { STATUSES, type AeTask, type AeProject } from '$lib/types';
+  import { STATUSES, type AeTask, type AeProject, type TaskStatus } from '$lib/types';
   import KanbanColumn from '$lib/components/KanbanColumn.svelte';
   import TaskDetail from '$lib/components/TaskDetail.svelte';
   import NewTaskModal from '$lib/components/NewTaskModal.svelte';
@@ -17,6 +17,8 @@
   let buildVersion = $state('');
   let versionTimer: ReturnType<typeof setInterval> | null = null;
   let refreshing = $state(false);
+  let collapsedColumns = $state<Record<'done' | 'failed', boolean>>({ done: false, failed: false });
+  const COLLAPSED_COLUMNS_KEY = 'samwise-board-collapsed-columns';
 
   async function refreshAll() {
     refreshing = true;
@@ -53,6 +55,7 @@
   }
 
   onMount(() => {
+    loadCollapsedColumns();
     tasksStore.init();
     fetchProjectRegistry();
     checkBuildVersion(false);
@@ -91,11 +94,50 @@
     const map = new Map<string, AeTask[]>();
     for (const s of STATUSES) map.set(s, []);
     for (const t of filtered) {
-      if (!map.has(t.status)) map.set(t.status, []);
-      map.get(t.status)!.push(t);
+      const status = displayStatus(t.status);
+      if (!map.has(status)) map.set(status, []);
+      map.get(status)!.push(t);
     }
     return map;
   });
+
+  function displayStatus(status: TaskStatus): TaskStatus {
+    return status === 'testing' ? 'in_progress' : status;
+  }
+
+  function loadCollapsedColumns() {
+    if (typeof localStorage === 'undefined') return;
+    try {
+      const raw = localStorage.getItem(COLLAPSED_COLUMNS_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as Partial<Record<'done' | 'failed', boolean>>;
+      collapsedColumns = {
+        done: parsed.done === true,
+        failed: parsed.failed === true
+      };
+    } catch {
+      collapsedColumns = { done: false, failed: false };
+    }
+  }
+
+  function persistCollapsedColumns() {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(COLLAPSED_COLUMNS_KEY, JSON.stringify(collapsedColumns));
+    }
+  }
+
+  function isCollapsibleStatus(status: TaskStatus): status is 'done' | 'failed' {
+    return status === 'done' || status === 'failed';
+  }
+
+  function isColumnCollapsed(status: TaskStatus): boolean {
+    return isCollapsibleStatus(status) ? collapsedColumns[status] : false;
+  }
+
+  function toggleColumnCollapse(status: 'done' | 'failed') {
+    collapsedColumns = { ...collapsedColumns, [status]: !collapsedColumns[status] };
+    persistCollapsedColumns();
+  }
 
   let selectedId = $derived(selected?.id);
   $effect(() => {
@@ -201,6 +243,8 @@
           <KanbanColumn
             {status}
             tasks={byStatus.get(status) ?? []}
+            collapsed={isColumnCollapsed(status)}
+            onToggleCollapse={isCollapsibleStatus(status) ? () => toggleColumnCollapse(status) : undefined}
             onOpen={(t) => (selected = t)}
           />
         {/each}

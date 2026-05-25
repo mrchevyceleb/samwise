@@ -22,6 +22,7 @@
 	const theme = getTheme();
 	let headerHovered = $state(false);
 	let isInProgress = $derived(status === 'in_progress');
+	let collapseTitle = $derived(`${collapsed ? 'Expand' : 'Collapse'} ${label}`);
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -41,6 +42,8 @@
 >
 	<!-- Column header -->
 	<button
+		title={onToggleCollapse ? collapseTitle : undefined}
+		aria-label={onToggleCollapse ? collapseTitle : label}
 		style="
 			display: flex; align-items: center; gap: 6px;
 			padding: {collapsed ? '8px 6px' : '8px 10px'};
@@ -85,6 +88,17 @@
 			">
 				{tasks.length}
 			</span>
+
+			{#if onToggleCollapse}
+				<svg
+					width="12" height="12" viewBox="0 0 12 12" fill="none"
+					stroke="{theme.c.textMuted}" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"
+					style="transition: transform 0.18s ease;"
+					aria-hidden="true"
+				>
+					<path d="M8 2L4 6l4 4"/>
+				</svg>
+			{/if}
 		{:else}
 			<span style="font-size: 11px; font-weight: 700; color: {theme.c.textMuted}; letter-spacing: 0.5px;">
 				{label} ({tasks.length})

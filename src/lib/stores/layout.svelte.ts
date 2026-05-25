@@ -7,7 +7,14 @@ let terminalVisible = $state(false);
 let leftPanelVisible = $state(true);
 let rightPanelVisible = $state(true);
 let sidebarCollapsed = $state(false);
-let doneColumnCollapsed = $state(false);
+const storedDoneColumnCollapsed = typeof localStorage !== 'undefined'
+	? localStorage.getItem('agent-one-done-column-collapsed') === 'true'
+	: false;
+const storedFailedColumnCollapsed = typeof localStorage !== 'undefined'
+	? localStorage.getItem('agent-one-failed-column-collapsed') === 'true'
+	: false;
+let doneColumnCollapsed = $state(storedDoneColumnCollapsed);
+let failedColumnCollapsed = $state(storedFailedColumnCollapsed);
 let focusedConversation = $state<{ id: string; type: 'agent' | 'claude-code' } | null>(null);
 
 // Theme: 'dark' | 'light', persisted to localStorage
@@ -21,6 +28,12 @@ function applyTheme(t: Theme) {
 	}
 	if (typeof localStorage !== 'undefined') {
 		localStorage.setItem('agent-one-theme', t);
+	}
+}
+
+function persistBool(key: string, value: boolean) {
+	if (typeof localStorage !== 'undefined') {
+		localStorage.setItem(key, String(value));
 	}
 }
 
@@ -62,8 +75,24 @@ export function getLayout() {
 		toggleSidebar() { sidebarCollapsed = !sidebarCollapsed; },
 
 		get doneColumnCollapsed() { return doneColumnCollapsed; },
-		set doneColumnCollapsed(v: boolean) { doneColumnCollapsed = v; },
-		toggleDoneColumn() { doneColumnCollapsed = !doneColumnCollapsed; },
+		set doneColumnCollapsed(v: boolean) {
+			doneColumnCollapsed = v;
+			persistBool('agent-one-done-column-collapsed', v);
+		},
+		toggleDoneColumn() {
+			doneColumnCollapsed = !doneColumnCollapsed;
+			persistBool('agent-one-done-column-collapsed', doneColumnCollapsed);
+		},
+
+		get failedColumnCollapsed() { return failedColumnCollapsed; },
+		set failedColumnCollapsed(v: boolean) {
+			failedColumnCollapsed = v;
+			persistBool('agent-one-failed-column-collapsed', v);
+		},
+		toggleFailedColumn() {
+			failedColumnCollapsed = !failedColumnCollapsed;
+			persistBool('agent-one-failed-column-collapsed', failedColumnCollapsed);
+		},
 
 		get focusedConversation() { return focusedConversation; },
 		set focusedConversation(v: { id: string; type: 'agent' | 'claude-code' } | null) { focusedConversation = v; },

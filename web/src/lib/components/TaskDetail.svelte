@@ -47,6 +47,7 @@
   let uiStamp = $derived(getUiStamp(task));
   let mergeDeployState = $derived(getMergeDeployState(task));
   let mergeConflictFixState = $derived(getMergeConflictFixState(task));
+  let statusOptions = $derived(STATUSES.includes(task.status) ? STATUSES : [task.status, ...STATUSES]);
   let mergeDeployRequestError = $state<string | null>(null);
   let mergeConflictFixRequestError = $state<string | null>(null);
   let visualQA = $derived(task.visual_qa_result);
@@ -152,7 +153,7 @@
             class="text-[10px] uppercase tracking-wide rounded-md border px-1.5 py-0.5 border-white/20 bg-slate-900 text-slate-200 focus:outline-none focus:border-white/40"
             aria-label="Move task"
           >
-            {#each STATUSES as s}
+            {#each statusOptions as s}
               <option value={s}>{STATUS_LABEL[s]}</option>
             {/each}
           </select>

@@ -22,8 +22,9 @@ function getTasksByColumn(): Record<TaskStatus, AeTask[]> {
     pending_confirmation: [],
   };
   for (const t of tasks) {
-    if (grouped[t.status]) {
-      grouped[t.status].push(t);
+    const columnStatus = t.status === 'testing' ? 'in_progress' : t.status;
+    if (grouped[columnStatus]) {
+      grouped[columnStatus].push(t);
     }
   }
   // Terminal columns (done, failed) are about "what just happened", so sort
@@ -57,7 +58,7 @@ export function getTaskStore() {
       return {
         total: tasks.length,
         queued: tasks.filter(t => t.status === 'queued').length,
-        inProgress: tasks.filter(t => t.status === 'in_progress').length,
+        inProgress: tasks.filter(t => t.status === 'in_progress' || t.status === 'testing').length,
         testing: tasks.filter(t => t.status === 'testing').length,
         review: tasks.filter(t => t.status === 'review').length,
         fixesNeeded: tasks.filter(t => t.status === 'fixes_needed').length,

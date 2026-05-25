@@ -4,7 +4,19 @@
   import { tasksStore } from '$lib/stores/tasks.svelte';
   import KanbanCard from './KanbanCard.svelte';
 
-  let { status, tasks, onOpen }: { status: TaskStatus; tasks: AeTask[]; onOpen: (t: AeTask) => void } = $props();
+  let {
+    status,
+    tasks,
+    onOpen,
+    collapsed = false,
+    onToggleCollapse
+  }: {
+    status: TaskStatus;
+    tasks: AeTask[];
+    onOpen: (t: AeTask) => void;
+    collapsed?: boolean;
+    onToggleCollapse?: () => void;
+  } = $props();
 
   let dragHover = $state(false);
 
@@ -38,10 +50,12 @@
     if (!taskId) return;
     tasksStore.setStatus(taskId, status);
   }
+
+  let collapseLabel = $derived(`${collapsed ? 'Expand' : 'Collapse'} ${STATUS_LABEL[status]}`);
 </script>
 
 <section
-  class="w-[85vw] sm:w-80 md:w-72 shrink-0 rounded-2xl bg-white/5 border backdrop-blur flex flex-col max-h-[calc(100dvh-7rem)] transition-colors {dragHover
+  class="{collapsed ? 'w-12' : 'w-[85vw] sm:w-80 md:w-72'} shrink-0 rounded-2xl bg-white/5 border backdrop-blur flex flex-col max-h-[calc(100dvh-7rem)] transition-all {dragHover
     ? 'border-emerald-400/60 bg-emerald-400/5'
     : 'border-white/10'}"
   ondragover={handleDragOver}
@@ -50,19 +64,35 @@
   role="list"
   aria-label={STATUS_LABEL[status]}
 >
-  <header class="flex items-center justify-between px-3 py-2 border-b border-white/10 sticky top-0 bg-white/5 backdrop-blur rounded-t-2xl">
-    <div class="flex items-center gap-2">
-      <span class="h-2 w-2 rounded-full bob {statusDot[status]}"></span>
-      <h2 class="text-sm font-semibold text-slate-100">{STATUS_LABEL[status]}</h2>
-    </div>
-    <span class="text-xs text-slate-400">{tasks.length}</span>
+  <header class="{collapsed ? 'h-full border-b-0 rounded-2xl' : 'border-b rounded-t-2xl'} border-white/10 sticky top-0 bg-white/5 backdrop-blur">
+    <button
+      type="button"
+      disabled={!onToggleCollapse}
+      onclick={() => onToggleCollapse?.()}
+      aria-label={onToggleCollapse ? collapseLabel : STATUS_LABEL[status]}
+      title={onToggleCollapse ? collapseLabel : undefined}
+      class="{collapsed ? 'h-full min-h-44 flex-col justify-start px-2 py-3' : 'px-3 py-2 justify-between'} flex w-full items-center gap-2 text-left transition-colors {onToggleCollapse ? 'cursor-pointer hover:bg-white/5' : 'cursor-default'} disabled:cursor-default"
+    >
+      <span class="flex items-center gap-2 {collapsed ? 'flex-col' : ''}">
+        <span class="h-2 w-2 shrink-0 rounded-full bob {statusDot[status]}"></span>
+        <h2 class="{collapsed ? '[writing-mode:vertical-rl] text-xs' : 'text-sm'} font-semibold text-slate-100">
+          {STATUS_LABEL[status]}
+        </h2>
+      </span>
+      <span class="{collapsed ? 'mt-2' : ''} text-xs text-slate-400">{tasks.length}</span>
+      {#if onToggleCollapse && !collapsed}
+        <span class="text-slate-500" aria-hidden="true">‹</span>
+      {/if}
+    </button>
   </header>
 
-  <div class="flex-1 overflow-y-auto p-2 space-y-2">
-    {#each tasks as t (t.id)}
-      <KanbanCard task={t} {onOpen} />
-    {:else}
-      <div class="text-center text-xs text-slate-500 py-6">nothing here</div>
-    {/each}
-  </div>
+  {#if !collapsed}
+    <div class="flex-1 overflow-y-auto p-2 space-y-2">
+      {#each tasks as t (t.id)}
+        <KanbanCard task={t} {onOpen} />
+      {:else}
+        <div class="text-center text-xs text-slate-500 py-6">nothing here</div>
+      {/each}
+    </div>
+  {/if}
 </section>

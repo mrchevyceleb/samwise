@@ -146,7 +146,6 @@ export const STATUSES: TaskStatus[] = [
   'queued',
   'pending_confirmation',
   'in_progress',
-  'testing',
   'review',
   'fixes_needed',
   'approved',

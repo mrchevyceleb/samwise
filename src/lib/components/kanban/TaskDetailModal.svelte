@@ -101,7 +101,7 @@
 	// Derived
 	let elapsed = $derived(formatTimeAgo(new Date(task.created_at).getTime()));
 	let priorityColor = $derived(PRIORITY_COLORS[task.priority]);
-	let statusColumn = $derived(KANBAN_COLUMNS.find(c => c.status === task.status));
+	let statusColumn = $derived(KANBAN_COLUMNS.find(c => c.status === (task.status === 'testing' ? 'in_progress' : task.status)));
 	let isFailed = $derived(task.status === 'failed');
 	let isInProgress = $derived(task.status === 'in_progress');
 	let isStoppable = $derived(task.status === 'in_progress' || task.status === 'testing');

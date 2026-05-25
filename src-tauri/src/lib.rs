@@ -243,9 +243,6 @@ pub fn run() {
             commands::worker::worker_status,
             commands::worker::stop_current_task,
             commands::worker::restart_task,
-            // Playwright
-            commands::playwright::playwright_screenshot,
-            commands::playwright::playwright_screenshot_mobile,
             // Health checks
             commands::health::check_claude_code,
             commands::health::check_gh_auth,

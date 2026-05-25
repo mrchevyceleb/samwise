@@ -9,6 +9,7 @@ use tokio::process::Child;
 /// Used for the --scope argument on the custom-command path where we're
 /// building a shell string. Paths with spaces or special characters stay
 /// intact.
+#[allow(dead_code)]
 fn shell_quote(s: &str) -> String {
     // Simple POSIX-style single-quote. Replace any embedded single quote
     // with the '\'' escape sequence. Works for both sh -c and cmd /C since
@@ -289,6 +290,7 @@ pub struct DevServerHandle {
 
 /// Detect the dev command and default port from package.json.
 /// Returns (script_name, default_port) where script_name is "dev" or "start".
+#[allow(dead_code)]
 async fn detect_dev_command(repo_path: &str) -> Result<(String, u16), String> {
     let pkg_path = std::path::Path::new(repo_path).join("package.json");
     let content = tokio::fs::read_to_string(&pkg_path)
@@ -317,6 +319,7 @@ async fn detect_dev_command(repo_path: &str) -> Result<(String, u16), String> {
 }
 
 /// Detect framework and default port from the script command string.
+#[allow(dead_code)]
 fn detect_port_from_script(script: &str) -> u16 {
     let s = script.to_lowercase();
     if s.contains("vite") || s.contains("svelte") || s.contains("sveltekit") {
@@ -335,6 +338,7 @@ fn detect_port_from_script(script: &str) -> u16 {
 }
 
 /// Detect the port CLI flag style for the framework.
+#[allow(dead_code)]
 enum PortStyle {
     /// --port {port} (vite, nuxt, sveltekit)
     DashDashPort,
@@ -344,6 +348,7 @@ enum PortStyle {
     EnvVar,
 }
 
+#[allow(dead_code)]
 fn detect_port_style(script: &str) -> PortStyle {
     let s = script.to_lowercase();
     if s.contains("next") {
@@ -363,6 +368,7 @@ fn detect_port_style(script: &str) -> PortStyle {
 /// listening on `[::1]:port` — so we have to check both. This was the cause of
 /// the "screenshots show a different app" bug: the open-port probe returned a
 /// port that was actually owned by another app on the IPv6 side.
+#[allow(dead_code)]
 fn port_is_free(port: u16) -> bool {
     let v4 = std::net::TcpListener::bind(format!("127.0.0.1:{}", port));
     let v6 = std::net::TcpListener::bind(format!("[::1]:{}", port));
@@ -371,10 +377,12 @@ fn port_is_free(port: u16) -> bool {
 
 static RESERVED_DEV_PORTS: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
 
+#[allow(dead_code)]
 fn reserved_dev_ports() -> &'static Mutex<HashSet<u16>> {
     RESERVED_DEV_PORTS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+#[allow(dead_code)]
 fn reserve_open_port(starting_from: u16) -> u16 {
     let mut reserved = reserved_dev_ports()
         .lock()
@@ -436,6 +444,7 @@ pub async fn ensure_deps_installed(repo_path: &str) -> Result<(), String> {
 /// Start a dev server in the given repo directory.
 /// If `dev_command` is provided (from ae_projects), use it directly. It may contain `{port}` placeholder.
 /// Otherwise auto-detect from package.json.
+#[allow(dead_code)]
 pub async fn start_dev_server(
     repo_path: &str,
     dev_command: Option<&str>,
@@ -616,6 +625,7 @@ pub async fn start_dev_server(
 }
 
 /// Read the actual script content from package.json for a given script name.
+#[allow(dead_code)]
 async fn read_script_content(repo_path: &str, script_name: &str) -> Result<String, String> {
     let pkg_path = std::path::Path::new(repo_path).join("package.json");
     let content = tokio::fs::read_to_string(&pkg_path)
@@ -641,6 +651,7 @@ async fn read_script_content(repo_path: &str, script_name: &str) -> Result<Strin
 /// 2xx/3xx = ready. 4xx/5xx keeps polling until timeout. A 404 is still "someone's
 /// answering, just not with our app yet" — if it persists the whole timeout window
 /// the caller will skip screenshots rather than capture the wrong thing.
+#[allow(dead_code)]
 pub async fn wait_for_ready(url: &str, timeout_secs: u64) -> Result<(), String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))

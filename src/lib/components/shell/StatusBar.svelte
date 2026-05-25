@@ -59,9 +59,6 @@
 				<span style="color: {theme.c.accentIndigo}; font-weight: 600;">{taskStore.taskCounts.inProgress}</span> in progress
 			</span>
 			<span style="color: {theme.c.textMuted};">
-				<span style="color: {theme.c.accentAmber}; font-weight: 600;">{taskStore.taskCounts.testing}</span> testing
-			</span>
-			<span style="color: {theme.c.textMuted};">
 				<span style="color: {theme.c.accentGreen}; font-weight: 600;">{taskStore.taskCounts.review}</span> review
 			</span>
 		</div>

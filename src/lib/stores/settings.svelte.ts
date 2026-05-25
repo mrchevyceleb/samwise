@@ -86,11 +86,6 @@ export interface AppSettings {
   // blockers, commit, and push. Max 3 cycles per card. Skipped when Codex
   // emits REQUIRES_HUMAN: yes (product/architecture calls).
   autoFixFromFixesNeededEnabled: boolean;
-  // Visual QA gate: when on, Sam spins up a dev server, moves the card into
-  // Testing after code work, and runs the `/browse` Browserbase gate before
-  // PR creation. The gate fails closed when browser-visible changes cannot be
-  // validated.
-  visualQaEnabled: boolean;
 }
 
 export interface MCPServerConfig {
@@ -196,7 +191,6 @@ export const DEFAULT_SETTINGS: AppSettings = {
   autoMergeMaxDiffLines: 400,
   autoPrReviewEnabled: true,
   autoFixFromFixesNeededEnabled: true,
-  visualQaEnabled: true,
 };
 
 // ---- Svelte 5 Runes State ----

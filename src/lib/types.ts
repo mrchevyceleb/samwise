@@ -201,7 +201,6 @@ export const KANBAN_COLUMNS: KanbanColumn[] = [
   { status: 'queued', label: 'Queued', color: '#6e7681', glowColor: 'rgba(110, 118, 129, 0.15)', icon: '()' },
   { status: 'pending_confirmation', label: 'Awaiting Confirmation', color: '#d29922', glowColor: 'rgba(210, 153, 34, 0.18)', icon: '?' },
   { status: 'in_progress', label: 'In Progress', color: '#6366f1', glowColor: 'rgba(99, 102, 241, 0.2)', icon: '>>' },
-  { status: 'testing', label: 'Testing', color: '#f59e0b', glowColor: 'rgba(245, 158, 11, 0.15)', icon: '??' },
   { status: 'review', label: 'Review', color: '#3fb950', glowColor: 'rgba(63, 185, 80, 0.15)', icon: 'PR' },
   { status: 'fixes_needed', label: 'Fixes Needed', color: '#f97316', glowColor: 'rgba(249, 115, 22, 0.18)', icon: '!!' },
   { status: 'approved', label: 'Ready to Merge', color: '#58a6ff', glowColor: 'rgba(88, 166, 255, 0.15)', icon: '++' },
