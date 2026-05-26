@@ -101,6 +101,56 @@ pub async fn fetch_tasks(
     handle_response(client.get(&url).send().await.map_err(|e| e.to_string())?).await
 }
 
+pub async fn fetch_board_tasks(config: &SupabaseConfig) -> Result<Value, String> {
+    let client = build_client(config)?;
+    let base_url = rest_url(config, "ae_tasks");
+    let active_url = format!(
+        "{}?status=in.(queued,in_progress,testing,review,fixes_needed,approved,qa,pending_confirmation)&order=priority.asc,created_at.asc&limit=1000",
+        base_url
+    );
+    let terminal_url = format!(
+        "{}?status=in.(done,failed)&order=updated_at.desc&limit=250",
+        base_url
+    );
+
+    let active: Value = handle_response(
+        client
+            .get(&active_url)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?,
+    )
+    .await?;
+    let terminal: Value = handle_response(
+        client
+            .get(&terminal_url)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?,
+    )
+    .await?;
+
+    let mut rows = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for row in active
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(terminal.as_array().into_iter().flatten())
+    {
+        let id = row
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if id.is_empty() || seen.insert(id) {
+            rows.push(row.clone());
+        }
+    }
+
+    Ok(Value::Array(rows))
+}
+
 pub async fn fetch_task(config: &SupabaseConfig, id: &str) -> Result<Option<Value>, String> {
     let client = build_client(config)?;
     let url = format!("{}?id=eq.{}&limit=1", rest_url(config, "ae_tasks"), id);
@@ -813,7 +863,10 @@ pub async fn supabase_fetch_tasks(
     state: tauri::State<'_, SupabaseState>,
 ) -> Result<Value, String> {
     let config = state.get_config().await;
-    fetch_tasks(&config, status_filter.as_deref()).await
+    match status_filter.as_deref() {
+        Some(status) => fetch_tasks(&config, Some(status)).await,
+        None => fetch_board_tasks(&config).await,
+    }
 }
 
 #[tauri::command]

@@ -104,12 +104,100 @@ fn task_repo_serial_keys(task: &Value) -> Vec<String> {
 }
 
 fn task_is_repo_active(task: &Value) -> bool {
-    matches!(
-        task.get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default(),
-        "in_progress" | "testing"
-    )
+    let status = task
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if matches!(status, "in_progress" | "testing") {
+        return true;
+    }
+    status == "review"
+        && pr_review_context_status(task) == Some("running")
+        && !pr_review_running_is_stale(task)
+}
+
+fn pr_review_last_review_at(task: &Value) -> Option<&str> {
+    task.get("last_pr_review_at").and_then(|v| v.as_str())
+}
+
+fn pr_review_should_run_now(task: &Value) -> bool {
+    if pr_review_context_status(task) == Some("running") && !pr_review_running_is_stale(task) {
+        return false;
+    }
+
+    let updated_at = task
+        .get("updated_at")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    match pr_review_last_review_at(task) {
+        None => true,
+        Some(last) if !last.is_empty() => {
+            match (
+                chrono::DateTime::parse_from_rfc3339(updated_at),
+                chrono::DateTime::parse_from_rfc3339(last),
+            ) {
+                (Ok(updated), Ok(reviewed)) => {
+                    updated > reviewed
+                        || chrono::Utc::now()
+                            .signed_duration_since(reviewed.with_timezone(&chrono::Utc))
+                            > chrono::Duration::minutes(30)
+                }
+                _ => true,
+            }
+        }
+        _ => true,
+    }
+}
+
+fn task_needs_pr_review_run(task: &Value) -> bool {
+    let status = task
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if status != "review" {
+        return false;
+    }
+    let has_pr_url = task
+        .get("pr_url")
+        .and_then(|v| v.as_str())
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    let has_repo_path = task
+        .get("repo_path")
+        .and_then(|v| v.as_str())
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    has_pr_url && has_repo_path && task_requires_pr_review(task) && pr_review_should_run_now(task)
+}
+
+fn pending_pr_review_conflict_for_keys(
+    tasks: &[Value],
+    repo_keys: &[String],
+    excluded_task_id: Option<&str>,
+) -> Option<String> {
+    if repo_keys.is_empty() {
+        return None;
+    }
+
+    let pending_keys: HashSet<String> = tasks
+        .iter()
+        .filter(|task| {
+            if let Some(excluded) = excluded_task_id {
+                let task_id = task.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                if task_id == excluded {
+                    return false;
+                }
+            }
+            task_needs_pr_review_run(task)
+        })
+        .flat_map(task_repo_serial_keys)
+        .collect();
+
+    repo_keys
+        .iter()
+        .find(|key| pending_keys.contains(*key))
+        .cloned()
 }
 
 fn collect_active_repo_keys(tasks: &[Value]) -> HashSet<String> {
@@ -203,6 +291,11 @@ const MERGE_CONFLICT_FIX_STARTED_AT_KEY: &str = "samwise_merge_conflict_fix_star
 const MERGE_CONFLICT_FIX_COMPLETED_AT_KEY: &str = "samwise_merge_conflict_fix_completed_at";
 const MERGE_CONFLICT_FIX_STATUS_KEY: &str = "samwise_merge_conflict_fix_status";
 const MERGE_CONFLICT_FIX_ERROR_KEY: &str = "samwise_merge_conflict_fix_error";
+const PR_REVIEW_STARTED_AT_KEY: &str = "samwise_pr_review_started_at";
+const PR_REVIEW_COMPLETED_AT_KEY: &str = "samwise_pr_review_completed_at";
+const PR_REVIEW_STATUS_KEY: &str = "samwise_pr_review_status";
+const PR_REVIEW_ERROR_KEY: &str = "samwise_pr_review_error";
+const PR_REVIEW_RUNNING_STALE_SECS: i64 = 25 * 60;
 const SAMWISE_DEPLOY_MANIFEST_PATH: &str = ".samwise/deploy.json";
 const SAMWISE_SUPABASE_AUTO_COMMAND: &str = "samwise:supabase:auto";
 const KIM_FULL_PR_REVIEW_SOURCE: &str = "github-kim-pr-review";
@@ -1449,12 +1542,12 @@ async fn worker_loop(
             if free_slots > 0 {
                 if let Ok(tasks) = supabase::fetch_tasks(&config, Some("queued")).await {
                     if let Some(arr) = tasks.as_array() {
-                        let mut active_repo_keys = supabase::fetch_tasks(&config, None)
+                        let known_task_rows = supabase::fetch_tasks(&config, None)
                             .await
                             .ok()
                             .and_then(|all| all.as_array().cloned())
-                            .map(|all| collect_active_repo_keys(&all))
                             .unwrap_or_default();
+                        let mut active_repo_keys = collect_active_repo_keys(&known_task_rows);
                         // Sort by priority: critical=0, high=1, medium=2, low=3, then created_at asc
                         let priority_order = |p: &str| match p {
                             "critical" => 0u8,
@@ -1517,6 +1610,18 @@ async fn worker_loop(
                             {
                                 log::info!(
                                     "[worker] delaying queued task {} because repo {} already has active work",
+                                    task_id,
+                                    key
+                                );
+                                continue;
+                            }
+                            if let Some(key) = pending_pr_review_conflict_for_keys(
+                                &known_task_rows,
+                                &repo_keys,
+                                Some(&task_id),
+                            ) {
+                                log::info!(
+                                    "[worker] delaying queued task {} because repo {} has a PR review ready to run",
                                     task_id,
                                     key
                                 );
@@ -3712,6 +3817,16 @@ async fn execute_task(
                 )
                 .await;
                 repo_path = worktree_path;
+                let _ = supabase::update_task(
+                    config,
+                    &task_id,
+                    &serde_json::json!({
+                        "branch": task_branch,
+                        "base_branch": base_branch,
+                        "updated_at": chrono::Utc::now().to_rfc3339(),
+                    }),
+                )
+                .await;
                 branch = Some(task_branch);
                 resolved_base_branch = Some(base_branch);
             }
@@ -8689,6 +8804,97 @@ async fn detect_base_branch(repo_path: &str) -> String {
     "master".to_string()
 }
 
+fn pr_review_context_status(task: &Value) -> Option<&str> {
+    task.get("context")
+        .and_then(|v| v.as_object())
+        .and_then(|context| context.get(PR_REVIEW_STATUS_KEY))
+        .and_then(|v| v.as_str())
+}
+
+fn pr_review_started_at(task: &Value) -> Option<&str> {
+    task.get("context")
+        .and_then(|v| v.as_object())
+        .and_then(|context| context.get(PR_REVIEW_STARTED_AT_KEY))
+        .and_then(|v| v.as_str())
+}
+
+fn pr_review_running_is_stale(task: &Value) -> bool {
+    let Some(started_at) =
+        pr_review_started_at(task).and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+    else {
+        return true;
+    };
+    chrono::Utc::now()
+        .signed_duration_since(started_at.with_timezone(&chrono::Utc))
+        .num_seconds()
+        > PR_REVIEW_RUNNING_STALE_SECS
+}
+
+async fn mark_pr_review_running(config: &SupabaseConfig, task_id: &str) {
+    let started_at = chrono::Utc::now().to_rfc3339();
+    let mut updates = serde_json::Map::new();
+    updates.insert(
+        "last_pr_review_at".to_string(),
+        Value::String(started_at.clone()),
+    );
+
+    if let Ok(Some(task)) = supabase::fetch_task(config, task_id).await {
+        let mut context = task_context_object(&task);
+        context.insert(
+            PR_REVIEW_STATUS_KEY.to_string(),
+            Value::String("running".to_string()),
+        );
+        context.insert(
+            PR_REVIEW_STARTED_AT_KEY.to_string(),
+            Value::String(started_at),
+        );
+        context.remove(PR_REVIEW_COMPLETED_AT_KEY);
+        context.remove(PR_REVIEW_ERROR_KEY);
+        updates.insert("context".to_string(), Value::Object(context));
+    }
+
+    let _ = supabase::update_task(config, task_id, &Value::Object(updates)).await;
+}
+
+async fn mark_pr_review_finished(config: &SupabaseConfig, task_id: &str, error: Option<&str>) {
+    let Ok(Some(task)) = supabase::fetch_task(config, task_id).await else {
+        return;
+    };
+    let mut context = task_context_object(&task);
+    context.insert(
+        PR_REVIEW_STATUS_KEY.to_string(),
+        Value::String(
+            if error.is_some() {
+                "failed"
+            } else {
+                "succeeded"
+            }
+            .to_string(),
+        ),
+    );
+    context.insert(
+        PR_REVIEW_COMPLETED_AT_KEY.to_string(),
+        Value::String(chrono::Utc::now().to_rfc3339()),
+    );
+    if let Some(error) = error {
+        context.insert(
+            PR_REVIEW_ERROR_KEY.to_string(),
+            Value::String(truncate(error, 900)),
+        );
+    } else {
+        context.remove(PR_REVIEW_ERROR_KEY);
+    }
+
+    let _ = supabase::update_task(
+        config,
+        task_id,
+        &serde_json::json!({
+            "context": Value::Object(context),
+        }),
+    )
+    .await;
+}
+
 /// Spawn a detached Codex `$samwise-pr-review` run for a task. On verdict,
 /// update the task status (approved / fixes_needed) or leave it in review
 /// (inconclusive) and post the markdown body as a Sam comment. Always
@@ -8703,14 +8909,7 @@ pub fn spawn_pr_review_task(
     tokio::spawn(async move {
         // Stamp first so the poll-loop watcher (which also triggers on fixes_needed
         // -> review) doesn't double-fire before the codex run finishes.
-        let _ = supabase::update_task(
-            &config,
-            &task_id,
-            &serde_json::json!({
-                "last_pr_review_at": chrono::Utc::now().to_rfc3339(),
-            }),
-        )
-        .await;
+        mark_pr_review_running(&config, &task_id).await;
 
         agent_comment(
             &config,
@@ -8723,6 +8922,7 @@ pub fn spawn_pr_review_task(
             Ok(r) => r,
             Err(e) => {
                 log::warn!("[pr-review] run failed for task {}: {}", task_id, e);
+                mark_pr_review_finished(&config, &task_id, Some(&e)).await;
                 agent_comment(
                     &config,
                     &task_id,
@@ -8749,6 +8949,7 @@ pub fn spawn_pr_review_task(
                 "[pr-review] task {} moved out of review before verdict; dropping stale verdict",
                 task_id
             );
+            mark_pr_review_finished(&config, &task_id, None).await;
             return;
         }
 
@@ -8773,6 +8974,7 @@ pub fn spawn_pr_review_task(
         if !result.markdown.trim().is_empty() {
             agent_comment(&config, &task_id, &result.markdown).await;
         }
+        mark_pr_review_finished(&config, &task_id, None).await;
 
         match result.verdict {
             review::PrReviewVerdict::MergeNow => {
@@ -12467,7 +12669,8 @@ mod merge_deploy_tests {
     }
 
     #[test]
-    fn active_repo_keys_only_include_running_or_testing_tasks() {
+    fn active_repo_keys_include_running_testing_and_live_pr_reviews() {
+        let now = chrono::Utc::now().to_rfc3339();
         let tasks = vec![
             serde_json::json!({
                 "status": "in_progress",
@@ -12482,6 +12685,21 @@ mod merge_deploy_tests {
                 "status": "queued",
                 "repo_path": "/repo/queued"
             }),
+            serde_json::json!({
+                "status": "review",
+                "repo_path": "/repo/reviewing",
+                "context": {
+                    "samwise_pr_review_status": "running",
+                    "samwise_pr_review_started_at": now,
+                }
+            }),
+            serde_json::json!({
+                "status": "review",
+                "repo_path": "/repo/review-complete",
+                "context": {
+                    "samwise_pr_review_status": "succeeded"
+                }
+            }),
         ];
 
         let keys = collect_active_repo_keys(&tasks);
@@ -12489,7 +12707,9 @@ mod merge_deploy_tests {
         assert!(keys.contains("repo_path:/repo/operly"));
         assert!(keys.contains("repo_url:https://github.com/r-link-llc/r-link-studio-rebuild"));
         assert!(keys.contains("project:r-link-studio"));
+        assert!(keys.contains("repo_path:/repo/reviewing"));
         assert!(!keys.contains("repo_path:/repo/queued"));
+        assert!(!keys.contains("repo_path:/repo/review-complete"));
     }
 
     #[test]
@@ -12519,6 +12739,74 @@ mod merge_deploy_tests {
         );
         assert_eq!(
             active_repo_conflict_for_keys(&tasks[..1], &keys, Some("full-review")),
+            None
+        );
+    }
+
+    #[test]
+    fn stale_pr_review_does_not_hold_repo_serial_lock_forever() {
+        let stale_started_at = (chrono::Utc::now()
+            - chrono::Duration::seconds(PR_REVIEW_RUNNING_STALE_SECS + 1))
+        .to_rfc3339();
+        let task = serde_json::json!({
+            "status": "review",
+            "repo_path": "/repo/operly",
+            "context": {
+                "samwise_pr_review_status": "running",
+                "samwise_pr_review_started_at": stale_started_at,
+            }
+        });
+
+        assert!(!task_is_repo_active(&task));
+        assert!(collect_active_repo_keys(&[task]).is_empty());
+    }
+
+    #[test]
+    fn pending_pr_review_blocks_new_queued_work_for_same_repo() {
+        let review_task = serde_json::json!({
+            "id": "review-task",
+            "status": "review",
+            "repo_path": "/repo/r-link",
+            "pr_url": "https://github.com/R-Link-LLC/r-link-studio-rebuild/pull/129",
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+            "last_pr_review_at": serde_json::Value::Null,
+        });
+        let queued_task = serde_json::json!({
+            "id": "queued-task",
+            "status": "queued",
+            "repo_path": "/repo/r-link",
+        });
+        let keys = task_repo_serial_keys(&queued_task);
+
+        assert_eq!(
+            pending_pr_review_conflict_for_keys(&[review_task], &keys, Some("queued-task")),
+            Some("repo_path:/repo/r-link".to_string())
+        );
+    }
+
+    #[test]
+    fn fresh_running_pr_review_does_not_count_as_pending_review_queue_work() {
+        let review_task = serde_json::json!({
+            "id": "review-task",
+            "status": "review",
+            "repo_path": "/repo/r-link",
+            "pr_url": "https://github.com/R-Link-LLC/r-link-studio-rebuild/pull/129",
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+            "last_pr_review_at": serde_json::Value::Null,
+            "context": {
+                "samwise_pr_review_status": "running",
+                "samwise_pr_review_started_at": chrono::Utc::now().to_rfc3339(),
+            }
+        });
+        let queued_task = serde_json::json!({
+            "id": "queued-task",
+            "status": "queued",
+            "repo_path": "/repo/r-link",
+        });
+        let keys = task_repo_serial_keys(&queued_task);
+
+        assert_eq!(
+            pending_pr_review_conflict_for_keys(&[review_task], &keys, Some("queued-task")),
             None
         );
     }
@@ -14984,15 +15272,30 @@ making any other changes.",
                 match push {
                     Ok(o) if o.status.success() => {
                         // Clear last_pr_review_at so the watcher re-runs $samwise-pr-review on the updated PR.
+                        let mut updates = serde_json::json!({
+                            "status": "review",
+                            "last_pr_review_at": serde_json::Value::Null,
+                            "updated_at": chrono::Utc::now().to_rfc3339(),
+                        });
+                        if let Ok(Some(latest_task)) = supabase::fetch_task(&config, &task_id).await
+                        {
+                            let mut context = task_context_object(&latest_task);
+                            context.insert(
+                                PR_REVIEW_STATUS_KEY.to_string(),
+                                Value::String("pending".to_string()),
+                            );
+                            context.remove(PR_REVIEW_STARTED_AT_KEY);
+                            context.remove(PR_REVIEW_COMPLETED_AT_KEY);
+                            context.remove(PR_REVIEW_ERROR_KEY);
+                            if let Some(obj) = updates.as_object_mut() {
+                                obj.insert("context".to_string(), Value::Object(context));
+                            }
+                        }
                         let updated = supabase::update_task_if_status(
                             &config,
                             &task_id,
                             "in_progress",
-                            &serde_json::json!({
-                                "status": "review",
-                                "last_pr_review_at": serde_json::Value::Null,
-                                "updated_at": chrono::Utc::now().to_rfc3339(),
-                            }),
+                            &updates,
                         )
                         .await
                         .ok()
@@ -15107,6 +15410,11 @@ pub async fn sweep_pr_review_queue(
         return;
     };
     let Some(arr) = tasks.as_array() else { return };
+    let mut known_task_rows = supabase::fetch_tasks(config, None)
+        .await
+        .ok()
+        .and_then(|tasks| tasks.as_array().cloned())
+        .unwrap_or_else(|| arr.clone());
 
     for task in arr {
         let task_id = task
@@ -15174,36 +15482,22 @@ pub async fn sweep_pr_review_queue(
         if main_repo_path.is_empty() || !task_requires_pr_review(task) {
             continue;
         }
-
-        let updated_at = task
-            .get("updated_at")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let last_review = task.get("last_pr_review_at").and_then(|v| v.as_str());
-
         // Fire if never reviewed, OR updated_at > last_pr_review_at (card moved back in),
         // OR the last review was long enough ago to retry an inconclusive Codex
         // decision. This keeps cards from sitting in Review forever when host
         // checks were merely pending during the first pass.
-        let should_run = match last_review {
-            None => true,
-            Some(last) if !last.is_empty() => {
-                match (
-                    chrono::DateTime::parse_from_rfc3339(updated_at),
-                    chrono::DateTime::parse_from_rfc3339(last),
-                ) {
-                    (Ok(u), Ok(l)) => {
-                        u > l
-                            || chrono::Utc::now()
-                                .signed_duration_since(l.with_timezone(&chrono::Utc))
-                                > chrono::Duration::minutes(30)
-                    }
-                    _ => true,
-                }
-            }
-            _ => true,
-        };
-        if !should_run {
+        if !pr_review_should_run_now(task) {
+            continue;
+        }
+        let repo_keys = task_repo_serial_keys(task);
+        if let Some(key) =
+            active_repo_conflict_for_keys(&known_task_rows, &repo_keys, Some(&task_id))
+        {
+            log::info!(
+                "[pr-review-sweep] delaying task {} because repo {} already has active work",
+                task_id,
+                key
+            );
             continue;
         }
 
@@ -15240,6 +15534,19 @@ pub async fn sweep_pr_review_queue(
                 continue;
             }
         };
+
+        let mut launched = task.clone();
+        let mut context = task_context_object(&launched);
+        context.insert(
+            PR_REVIEW_STATUS_KEY.to_string(),
+            Value::String("running".to_string()),
+        );
+        context.insert(
+            PR_REVIEW_STARTED_AT_KEY.to_string(),
+            Value::String(chrono::Utc::now().to_rfc3339()),
+        );
+        launched["context"] = Value::Object(context);
+        known_task_rows.push(launched);
 
         spawn_pr_review_task(config.clone(), task_id, pr_url, repo_path);
     }

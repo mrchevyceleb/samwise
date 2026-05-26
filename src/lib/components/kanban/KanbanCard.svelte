@@ -437,6 +437,21 @@
 			</span>
 		{/if}
 
+		{#if task.branch || task.base_branch}
+			<span
+				title={task.branch ? 'Work branch' : 'Base branch'}
+				style="
+					font-size: 10px; font-weight: 650; padding: 2px 7px; border-radius: 5px;
+					background: rgba(255, 255, 255, 0.05); color: var(--text-secondary);
+					border: 1px solid rgba(255, 255, 255, 0.10);
+					max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+					font-family: var(--font-mono);
+				"
+			>
+				{task.branch ? `branch ${task.branch}` : `base ${task.base_branch}`}
+			</span>
+		{/if}
+
 		<!-- Origin badge (Operly / Banana / Sentry) -->
 		{#if originBadge}
 			{#if task.origin_url}

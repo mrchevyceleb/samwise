@@ -434,6 +434,8 @@
     {/if}
     {#if task.branch}
       <span class="rounded bg-white/5 border border-white/10 px-1.5 py-0.5 truncate max-w-[140px]">⎇ {task.branch}</span>
+    {:else if task.base_branch}
+      <span title="Base branch" class="rounded bg-white/5 border border-white/10 px-1.5 py-0.5 truncate max-w-[140px]">base {task.base_branch}</span>
     {/if}
     <span class="ml-auto">{relTime(task.updated_at)}</span>
   </div>

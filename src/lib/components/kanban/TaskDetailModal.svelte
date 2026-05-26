@@ -995,6 +995,11 @@
 							<span style="color: var(--text-muted); width: 60px;">Branch</span>
 							<span style="color: var(--text-secondary); font-family: var(--font-mono); font-size: 10px;">{task.branch}</span>
 						</div>
+					{:else if task.base_branch}
+						<div style="display: flex; align-items: center; gap: 6px;">
+							<span style="color: var(--text-muted); width: 60px;">Base</span>
+							<span style="color: var(--text-secondary); font-family: var(--font-mono); font-size: 10px;">{task.base_branch}</span>
+						</div>
 					{/if}
 
 					<!-- Dates -->

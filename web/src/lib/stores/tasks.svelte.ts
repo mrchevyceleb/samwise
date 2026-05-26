@@ -1,6 +1,17 @@
 import { supabase } from '$lib/supabase';
 import type { AeTask, AeComment, TaskStatus } from '$lib/types';
 
+const ACTIVE_STATUSES: TaskStatus[] = [
+  'queued',
+  'pending_confirmation',
+  'in_progress',
+  'testing',
+  'review',
+  'fixes_needed',
+  'approved',
+  'qa'
+];
+
 class TasksStore {
   tasks = $state<AeTask[]>([]);
   comments = $state<Record<string, AeComment[]>>({});
@@ -12,13 +23,30 @@ class TasksStore {
 
   async refresh() {
     try {
-      const { data, error } = await supabase
+      const active = await supabase
         .from('ae_tasks')
         .select('*')
+        .in('status', ACTIVE_STATUSES)
+        .order('priority', { ascending: true })
+        .order('created_at', { ascending: true })
+        .limit(1000);
+      if (active.error) throw active.error;
+
+      const terminal = await supabase
+        .from('ae_tasks')
+        .select('*')
+        .in('status', ['done', 'failed'])
         .order('updated_at', { ascending: false })
-        .limit(500);
-      if (error) throw error;
-      this.tasks = (data ?? []) as AeTask[];
+        .limit(250);
+      if (terminal.error) throw terminal.error;
+
+      const seen = new Set<string>();
+      const rows = [...(active.data ?? []), ...(terminal.data ?? [])].filter((task) => {
+        if (seen.has(task.id)) return false;
+        seen.add(task.id);
+        return true;
+      });
+      this.tasks = rows as AeTask[];
       this.error = null;
       this.prefetchReviewComments();
       if (!this.channel) this.subscribeRealtime();

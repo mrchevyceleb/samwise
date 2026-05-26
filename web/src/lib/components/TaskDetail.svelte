@@ -345,6 +345,8 @@
         {/if}
         {#if task.branch}
           <div class="rounded-lg border border-white/10 bg-white/5 text-slate-300 px-3 py-2 truncate">⎇ {task.branch}</div>
+        {:else if task.base_branch}
+          <div class="rounded-lg border border-white/10 bg-white/5 text-slate-300 px-3 py-2 truncate">base {task.base_branch}</div>
         {/if}
       </section>
 
