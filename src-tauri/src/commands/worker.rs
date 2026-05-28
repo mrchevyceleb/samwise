@@ -8160,6 +8160,9 @@ pub async fn run_claude_code_opts(
         .arg("--model")
         .arg(super::claude_code::CLAUDE_MODEL);
 
+    // Max thinking on every run.
+    cmd.env("MAX_THINKING_TOKENS", super::claude_code::MAX_THINKING_TOKENS);
+
     if max_turns > 0 {
         cmd.arg("--max-turns").arg(max_turns.to_string());
     }
@@ -8367,6 +8370,9 @@ pub async fn run_claude_code_streaming(
         .arg("--dangerously-skip-permissions")
         .arg("--model")
         .arg(super::claude_code::CLAUDE_MODEL);
+
+    // Max thinking on every run.
+    cmd.env("MAX_THINKING_TOKENS", super::claude_code::MAX_THINKING_TOKENS);
 
     if max_turns > 0 {
         cmd.arg("--max-turns").arg(max_turns.to_string());

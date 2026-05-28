@@ -37,7 +37,12 @@ struct ClaudeCodeClosedPayload {
 
 /// The Claude model Sam always uses. Single source of truth so chat and worker
 /// stay aligned. Change this string when bumping models.
-pub const CLAUDE_MODEL: &str = "claude-opus-4-7";
+pub const CLAUDE_MODEL: &str = "claude-opus-4-8";
+
+/// Thinking-token budget Sam runs with on every Claude Code spawn. The CLI reads
+/// this via the `MAX_THINKING_TOKENS` env var (there is no flag); 31999 is the
+/// maximum ("ultrathink") tier. Single source of truth alongside CLAUDE_MODEL.
+pub const MAX_THINKING_TOKENS: &str = "31999";
 
 /// Returns (executable, prefix_args) for spawning the Claude CLI.
 ///
@@ -110,6 +115,9 @@ pub fn spawn_claude_code(
         .arg("--include-partial-messages")
         .arg("--dangerously-skip-permissions")
         .arg("--model").arg(CLAUDE_MODEL);
+
+    // Max thinking on every run.
+    command.env("MAX_THINKING_TOKENS", MAX_THINKING_TOKENS);
 
     // Add extra args from the frontend (e.g. --resume). Note: --model is already
     // pinned above to CLAUDE_MODEL; frontend args take precedence if they set it again.
@@ -243,6 +251,9 @@ pub fn claude_code_prompt(prompt: String, cwd: String) -> Result<String, String>
         .arg("--max-turns").arg("1")
         .arg("--no-input")
         .arg("--model").arg(CLAUDE_MODEL);
+
+    // Max thinking on every run.
+    command.env("MAX_THINKING_TOKENS", MAX_THINKING_TOKENS);
 
     let cwd_path = std::path::PathBuf::from(&cwd);
     if cwd_path.exists() && cwd_path.is_dir() {
