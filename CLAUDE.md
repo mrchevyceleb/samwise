@@ -1,6 +1,6 @@
 # AutoSam - AI Coding Coworker
 
-Matt's AI junior developer. Autonomous coding agent that lives on the Mac mini, reachable from anywhere. Tauri v2 + SvelteKit 5 + Rust.
+Matt's AI junior developer. Autonomous coding agent that lives on the DGX Spark ("Moria"), reachable from anywhere. Tauri v2 + SvelteKit 5 + Rust.
 
 Named after Samwise Gamgee (LOTR). Personality is Sam: loyal, proactive, "senior dev on Slack" tone. Takes tasks, ships PRs, answers questions.
 
@@ -18,9 +18,11 @@ The backend worker picks up tasks from the board, writes code via Claude Code CL
 
 ## Deployment
 
-**Primary host:** Mac mini (macOS), 24/7. Accessed via screen sharing or Tailscale from Trenzalore (Windows workstation) and phone.
+**Primary host:** DGX Spark "Moria" (Ubuntu 24.04, aarch64), 24/7. Worker id / hostname `spark-3065`. Accessed via screen sharing or Tailscale from Trenzalore (Windows workstation) and phone. Migrated here from the old Mac mini on 2026-05-29 (mini retired; its `ae_workers` row still lingers but stopped heartbeating at cutover).
 
 **Secondary host:** Trenzalore. The Tauri desktop app can run on either machine, both reading the same Supabase. The worker loop is single-active (enforced via `ae_workers` heartbeat).
+
+**Linux host requirement (Spark):** Codex's PR-review sandbox uses bubblewrap, which needs unprivileged user namespaces. Ubuntu 24.04 blocks these by default via AppArmor, which silently breaks `$samwise-pr-review` (every review returns INCONCLUSIVE and cards stick in Review). Fix is `kernel.apparmor_restrict_unprivileged_userns=0` (persisted in `/etc/sysctl.d/60-unprivileged-userns.conf`). The sandbox also needs network for `gh`, set via `[sandbox_workspace_write] network_access = true` in `~/.codex/config.toml` and the `-c sandbox_workspace_write.network_access=true` flag in `review.rs`.
 
 ## Commands
 
@@ -36,7 +38,9 @@ npm run check          # Svelte type check
 
 ## Build Rules
 
-- **Always rebuild AND deploy after pushing changes.** Run `bin/deploy.sh` after any commit/push. `npx tauri build` alone is NOT enough — the rebuilt bundle lands at `src-tauri/target/release/bundle/macos/SamWise.app`, but Matt runs `/Applications/SamWise.app` (launchd-managed). `bin/deploy.sh` handles the full cycle: `doppler run -- npx tauri build` → stop the running instance → replace `/Applications/SamWise.app` → `launchctl kickstart`. Anything less and the production binary stays stale while the source code moves on.
+- **Always rebuild AND deploy after pushing changes.** A `npx tauri build` (or `cargo build --release`) alone is NOT enough — the running production process must be replaced, or the binary stays stale while the source moves on.
+  - **Spark "Moria" (primary, Linux) — current reality:** prod runs as `/usr/bin/agent-one` (native Linux binary, built to `src-tauri/target/release/agent-one`). ⚠️ `bin/deploy.sh` is still macOS-only (targets `/Applications/SamWise.app`, `launchctl`, BSD `date -v`) and will NOT run here. A Linux deploy path is not yet scripted — do not run `bin/deploy.sh` on the Spark. Note: changes that only touch how AutoSam invokes the `codex`/`claude` CLIs or their config (e.g. `~/.codex/config.toml`) take effect on the next child-process spawn WITHOUT a rebuild, since those are read fresh each run.
+  - **Mac (legacy/`bin/deploy.sh`):** `doppler run -- npx tauri build` → stop the running instance → replace `/Applications/SamWise.app` → `launchctl kickstart`.
 - The frontend source of truth for board columns is `src/lib/types.ts` (Tauri app) AND `web/src/lib/types.ts` (separate SvelteKit viewer under `web/`). Changes to statuses or labels must be applied to BOTH. Same rule for any other shared-shaped data — treat `web/` as its own app with its own types.
 
 ## Architecture
@@ -87,7 +91,7 @@ Defined inline in `chat.rs::build_system_prompt()` (around line 427). Tone: proa
 - Task prompt is explicit about committing, not just exploring. `max_turns` bounded low to prevent runaway reads.
 
 ### Cross-platform notes
-- Supports both macOS (primary) and Windows (Trenzalore)
+- Runs on Linux (primary — the DGX Spark), macOS (legacy mini), and Windows (Trenzalore)
 - Platform-specific code is gated with `cfg!(target_os = ...)` blocks, not assumed
 - Screenshot directory resolves via `dirs::data_local_dir()`, not hardcoded
-- Claude Code CLI lookup checks platform-appropriate paths: `~/.local/bin/claude` on macOS, `%USERPROFILE%\.local\bin\claude.exe` on Windows, PATH fallback on both
+- Claude Code CLI lookup checks platform-appropriate paths: `~/.local/bin/claude` on macOS/Linux, `%USERPROFILE%\.local\bin\claude.exe` on Windows, PATH fallback on all

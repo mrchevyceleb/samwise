@@ -876,6 +876,12 @@ pub async fn run_samwise_pr_review(
     // readiness unconfirmed" as a blocker — which isn't a code issue and
     // leaves the card in Fixes Needed with nothing for Claude to fix.
     // The skill's own hard constraints forbid any mutating commands.
+    //
+    // network_access: on Linux the workspace-write sandbox blocks network by
+    // default (macOS Seatbelt allowed it). The skill fetches the PR diff with
+    // `gh` from inside the sandbox, so without net it returns INCONCLUSIVE and
+    // parks the card in Review forever. Pin it on here so we don't depend on
+    // machine-global ~/.codex/config.toml being set on whatever host we run on.
     let mut cmd = async_cmd("codex");
     cmd.args([
         "--search",
@@ -884,6 +890,7 @@ pub async fn run_samwise_pr_review(
         "-c", CODEX_REASONING_CONFIG,
         "-s", "workspace-write",
         "-c", "approval_policy=\"never\"",
+        "-c", "sandbox_workspace_write.network_access=true",
     ])
     .arg(&prompt)
     .current_dir(&cwd)
