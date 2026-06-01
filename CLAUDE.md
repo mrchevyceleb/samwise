@@ -39,7 +39,13 @@ npm run check          # Svelte type check
 ## Build Rules
 
 - **Always rebuild AND deploy after pushing changes.** A `npx tauri build` (or `cargo build --release`) alone is NOT enough — the running production process must be replaced, or the binary stays stale while the source moves on.
-  - **Spark "Moria" (primary, Linux) — current reality:** prod runs as `/usr/bin/agent-one` (native Linux binary, built to `src-tauri/target/release/agent-one`). ⚠️ `bin/deploy.sh` is still macOS-only (targets `/Applications/SamWise.app`, `launchctl`, BSD `date -v`) and will NOT run here. A Linux deploy path is not yet scripted — do not run `bin/deploy.sh` on the Spark. Note: changes that only touch how AutoSam invokes the `codex`/`claude` CLIs or their config (e.g. `~/.codex/config.toml`) take effect on the next child-process spawn WITHOUT a rebuild, since those are read fresh each run.
+  - **Spark "Moria" (primary, Linux) — current reality:** prod runs as `/usr/bin/agent-one` (native Linux binary, built to `src-tauri/target/release/agent-one`), managed by the systemd user service `samwise-agent-one.service`. Deploy steps:
+    1. `cd src-tauri && doppler run --project agent-one --config prd -- cargo build --release`
+    2. `systemctl --user stop samwise-agent-one.service`
+    3. `sudo cp src-tauri/target/release/agent-one /usr/bin/agent-one`
+    4. `systemctl --user start samwise-agent-one.service`
+    To restart without rebuilding: `systemctl --user restart samwise-agent-one.service`. ⚠️ Do NOT use `pkill` + manual launch — the WebView (Tauri UI) requires the systemd user session environment to initialize properly (WebKitWebProcess, WebKitNetworkProcess). A bare shell launch starts the worker but not the GUI, causing "connection refused" in the app.
+    Note: changes that only touch `~/.codex/config.toml` or other CLI configs take effect on the next child-process spawn WITHOUT a rebuild.
   - **Mac (legacy/`bin/deploy.sh`):** `doppler run -- npx tauri build` → stop the running instance → replace `/Applications/SamWise.app` → `launchctl kickstart`.
 - The frontend source of truth for board columns is `src/lib/types.ts` (Tauri app) AND `web/src/lib/types.ts` (separate SvelteKit viewer under `web/`). Changes to statuses or labels must be applied to BOTH. Same rule for any other shared-shaped data — treat `web/` as its own app with its own types.
 
