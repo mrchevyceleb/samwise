@@ -7535,6 +7535,107 @@ async fn process_telegram_message(config: &SupabaseConfig, user_message: &str, m
         }
     };
 
+    // 1d. Fast-path: "pr review <URL>" — bypass Claude Code entirely and create
+    // a plant full-PR-review task directly. This is fire-and-forget: no
+    // pending_confirmation gate, no execute_task path, no Supabase-error
+    // fallback into awaiting-confirmation. The sweep_plant_full_pr_review_queue
+    // loop owns the task from here.
+    {
+        let prompt_lower = routed_project.prompt.to_ascii_lowercase();
+        let is_pr_review_intent = prompt_lower.contains("pr review")
+            || prompt_lower.contains("pr-review")
+            || prompt_lower.contains("/pr-review");
+
+        // Pull the first https://github.com/.../pull/NNN URL from the message.
+        let pr_url_extracted = if is_pr_review_intent {
+            routed_project.prompt.split_whitespace().find(|token| {
+                token.starts_with("https://github.com/")
+                    && token.contains("/pull/")
+                    && review::is_safe_pr_url(token)
+            }).map(str::to_string)
+        } else {
+            None
+        };
+
+        if let Some(pr_url) = pr_url_extracted {
+            // Verify the repo is on the plant allowlist.
+            let allowed = github_pull_ref_from_url(&pr_url)
+                .map(|r| plant_repo_is_allowed(&r.owner, &r.repo))
+                .unwrap_or(false);
+
+            if allowed {
+                // Look up repo_path from the project registry.
+                let repo_path = projects_all
+                    .as_array()
+                    .and_then(|arr| {
+                        arr.iter().find(|p| {
+                            p.get("name").and_then(|v| v.as_str())
+                                == Some(routed_project.project.as_str())
+                        })
+                    })
+                    .and_then(|p| p.get("repo_path").and_then(|v| v.as_str()))
+                    .unwrap_or("")
+                    .to_string();
+
+                let pr_num = pr_number_from_url(&pr_url)
+                    .map(|n| format!("#{}", n))
+                    .unwrap_or_default();
+                let pr_ref = github_pull_ref_from_url(&pr_url)
+                    .map(|r| format!("{}/{}{}",  r.owner, r.repo, pr_num))
+                    .unwrap_or_else(|| pr_url.clone());
+                let title = format!("Full PR review: {}", pr_ref);
+
+                let task_row = serde_json::json!({
+                    "title": title,
+                    "description": routed_project.prompt,
+                    "status": "queued",
+                    "priority": "high",
+                    "task_type": "code",
+                    "source": "telegram",
+                    "pr_url": pr_url,
+                    "repo_path": repo_path,
+                    "project": routed_project.project,
+                    "context": {
+                        "plant_full_pr_review": true,
+                        "telegram_project_prefix": routed_project.prefix,
+                        "telegram_project_match_score": routed_project.score,
+                        "original_telegram_message": user_message,
+                    },
+                });
+
+                match supabase::create_task(config, &task_row).await {
+                    Ok(_) => {
+                        let reply = format!(
+                            "On it — queued full PR review for {} ({}). Fire and forget.",
+                            routed_project.project, pr_url
+                        );
+                        let _ = supabase::send_message(
+                            config,
+                            &serde_json::json!({
+                                "role": "agent",
+                                "content": &reply,
+                                "conversation_id": supabase::DEFAULT_CONVERSATION_ID,
+                            }),
+                        )
+                        .await;
+                        send_telegram_plain(config, &reply).await;
+                    }
+                    Err(e) => {
+                        log::warn!("[worker] Telegram pr-review fast-path task insert failed: {}", e);
+                        send_telegram_plain(
+                            config,
+                            &format!("Couldn't queue the PR review: {}. Try again.", e),
+                        )
+                        .await;
+                    }
+                }
+                return;
+            }
+            // Repo not on allowlist — fall through to Claude Code so Sam can
+            // handle it naturally (explain, redirect, etc.).
+        }
+    }
+
     // 2. Build context (reuse chat.rs functions)
     let recent_chat = chat::fetch_recent_chat(config).await;
     let project_registry = chat::build_project_registry(config).await;
