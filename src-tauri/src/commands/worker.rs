@@ -1860,6 +1860,24 @@ async fn worker_loop(
             sweep_pr_review_queue(&config, &settings).await;
         }
 
+        // Re-fire auto-fix on `fixes_needed` cards idle for 8+ min. Fills the
+        // gap where a 900s Claude Code timeout leaves a card in fixes_needed
+        // with no path back to the fix loop. Every ~90s (18 ticks), offset 6
+        // so it doesn't cluster with the PR-review sweep.
+        if tick % 18 == 6 {
+            let settings: Option<serde_json::Value> =
+                if let Ok(data_dir) = app.path().app_data_dir() {
+                    let settings_path = data_dir.join("settings.json");
+                    tokio::fs::read_to_string(&settings_path)
+                        .await
+                        .ok()
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                } else {
+                    None
+                };
+            sweep_stale_fixes_needed_cards(&config, &settings).await;
+        }
+
         // Pick up Merge + Deploy requests from either the desktop UI or the
         // web UI. The browser only writes a context flag; this local worker
         // owns GitHub/Railway/Supabase credentials and executes the workflow.
@@ -14897,13 +14915,26 @@ async fn maybe_spawn_auto_fix(
     }
 
     // Read the setting from disk so the detached path doesn't need cached_settings plumbed in.
-    let home = std::env::var("HOME").unwrap_or_default();
-    let settings_path = std::path::PathBuf::from(&home)
-        .join("Library/Application Support/com.mattjohnston.agent-one/settings.json");
-    let settings_val: Option<serde_json::Value> = tokio::fs::read_to_string(&settings_path)
-        .await
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok());
+    // Use XDG_DATA_HOME / platform data dir rather than a hardcoded macOS path
+    // so this works on both macOS and Linux (the DGX Spark).
+    let settings_val: Option<serde_json::Value> = {
+        let data_home = std::env::var("XDG_DATA_HOME")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                let home = std::env::var("HOME").unwrap_or_default();
+                // macOS: ~/Library/Application Support  |  Linux: ~/.local/share
+                #[cfg(target_os = "macos")]
+                { std::path::PathBuf::from(&home).join("Library/Application Support") }
+                #[cfg(not(target_os = "macos"))]
+                { std::path::PathBuf::from(&home).join(".local/share") }
+            });
+        let settings_path = data_home.join("com.mattjohnston.agent-one/settings.json");
+        tokio::fs::read_to_string(&settings_path)
+            .await
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+    };
     let auto_fix_on = settings_val
         .as_ref()
         .and_then(|s| s.get("autoFixFromFixesNeededEnabled"))
@@ -15386,6 +15417,89 @@ async fn fail_auto_fix(config: &SupabaseConfig, task_id: &str, pr_url: &str, rea
         &format!("Reason: {}", reason),
     )
     .await;
+}
+
+/// Re-fire the auto-fix loop for `fixes_needed` cards that have been idle
+/// long enough that their last attempt clearly finished (or timed out) but
+/// nothing re-spawned a new cycle.
+///
+/// This fills the gap where `maybe_spawn_auto_fix` is only called once from
+/// the PR-review verdict path. After a 900s Claude Code timeout the card
+/// returns to `fixes_needed` but there is no other path that re-tries it.
+///
+/// Guard rails:
+/// - Only fires when `autoFixFromFixesNeededEnabled` is on (default true).
+/// - Respects the 3-cycle cap (`review_cycle_count < 3`).
+/// - Skips cards that moved out of `fixes_needed` between the fetch and claim.
+/// - Idle threshold: 8 min. Shorter than the 15-min fix timeout so we never
+///   re-fire while a cycle is still running; long enough to avoid double-fires
+///   on cards that were just written to `fixes_needed`.
+async fn sweep_stale_fixes_needed_cards(
+    config: &SupabaseConfig,
+    cached_settings: &Option<serde_json::Value>,
+) {
+    let auto_fix_on = cached_settings
+        .as_ref()
+        .and_then(|s| s.get("autoFixFromFixesNeededEnabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    if !auto_fix_on {
+        return;
+    }
+
+    let Ok(tasks) = supabase::fetch_tasks(config, Some("fixes_needed")).await else {
+        return;
+    };
+    let Some(arr) = tasks.as_array() else { return };
+
+    let idle_cutoff = chrono::Utc::now() - chrono::Duration::minutes(8);
+
+    for task in arr {
+        let task_id = task.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let pr_url = task.get("pr_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let repo_path = task.get("repo_path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if task_id.is_empty() || pr_url.is_empty() || repo_path.is_empty() {
+            continue;
+        }
+        if !review::is_safe_pr_url(&pr_url) {
+            continue;
+        }
+        // Skip cards that are actively being worked (updated recently)
+        let updated_at = task.get("updated_at").and_then(|v| v.as_str()).unwrap_or("");
+        if let Ok(updated) = chrono::DateTime::parse_from_rfc3339(updated_at) {
+            if updated.with_timezone(&chrono::Utc) > idle_cutoff {
+                continue;
+            }
+        }
+        // Respect the 3-cycle cap
+        let cycle_count = task
+            .get("review_cycle_count")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        if cycle_count >= 3 {
+            continue;
+        }
+        // Recover the review blockers markdown from the most recent Codex
+        // review comment on this card so we can feed it to the fix prompt.
+        let review_markdown = supabase::fetch_latest_codex_review_markdown(config, &task_id)
+            .await
+            .unwrap_or_default();
+
+        let expected_branch = task_branch_name(&short_task_id(&task_id));
+        log::info!(
+            "[auto-fix-sweep] re-firing auto-fix for stale fixes_needed task {} (cycle {}/3)",
+            task_id, cycle_count + 1
+        );
+        spawn_auto_fix_task(
+            config.clone(),
+            task_id,
+            pr_url,
+            repo_path,
+            review_markdown,
+            cycle_count as u32,
+            expected_branch,
+        );
+    }
 }
 
 /// Scan tasks in `review` status and fire `spawn_pr_review_task` for any

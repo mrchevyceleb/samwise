@@ -159,6 +159,40 @@ pub async fn fetch_task(config: &SupabaseConfig, id: &str) -> Result<Option<Valu
     Ok(val.as_array().and_then(|a| a.first().cloned()))
 }
 
+/// Fetch the most recent Codex review markdown body posted as a comment on
+/// a task. Used by `sweep_stale_fixes_needed_cards` to recover the blockers
+/// text so it can be fed back into the auto-fix prompt without re-running
+/// the full review.
+///
+/// Looks for the last comment whose content starts with "## Summary" (the
+/// structure emitted by `$samwise-pr-review`). Falls back to an empty string
+/// so callers can still spawn the fix with a generic prompt.
+pub async fn fetch_latest_codex_review_markdown(
+    config: &SupabaseConfig,
+    task_id: &str,
+) -> Result<String, String> {
+    let client = build_client(config)?;
+    let url = format!(
+        "{}?task_id=eq.{}&order=created_at.desc&limit=20&select=content",
+        rest_url(config, "ae_comments"),
+        task_id,
+    );
+    let val: Value =
+        handle_response(client.get(&url).send().await.map_err(|e| e.to_string())?).await?;
+    let markdown = val
+        .as_array()
+        .and_then(|rows| {
+            rows.iter()
+                .filter_map(|r| r.get("content").and_then(|v| v.as_str()))
+                .find(|content| {
+                    content.contains("## Blockers") || content.contains("## Summary")
+                })
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    Ok(markdown)
+}
+
 pub async fn create_task(config: &SupabaseConfig, task: &Value) -> Result<Value, String> {
     let client = build_client(config)?;
     handle_response(
