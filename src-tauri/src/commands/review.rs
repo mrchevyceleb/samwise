@@ -633,13 +633,12 @@ fn min_across_dimensions(scores: &Value) -> Option<i64> {
     min_val
 }
 
-/// Poll `gh pr checks --json` until all checks conclude. Returns Ok(true) if all
-/// pass, Ok(false) if any fail or if we time out. Require at least 2 polls before
-/// trusting an "empty / all pass" result, so checks that haven't registered yet
-/// don't short-circuit the gate.
-/// Keep the JSON field list compatible with older GitHub CLI builds; `bucket`
-/// already normalizes pass/fail/pending and `conclusion` is not universally
-/// available.
+/// Poll CI checks until all conclude. Returns Ok(true) if all non-Vercel checks
+/// pass, Ok(false) if any fail or if we time out.
+///
+/// Uses `gh pr view --json statusCheckRollup` rather than `gh pr checks --json`
+/// because the latter's `--json` flag is not available in gh ≤ 2.45.x (Ubuntu
+/// package). `gh pr view --json` has been stable across all gh versions.
 pub async fn wait_for_ci(pr_url: &str, repo_path: &str) -> Result<bool, String> {
     let start = std::time::Instant::now();
     let max = Duration::from_secs(CI_POLL_MAX_SECS);
@@ -648,70 +647,100 @@ pub async fn wait_for_ci(pr_url: &str, repo_path: &str) -> Result<bool, String> 
 
     loop {
         let output = async_cmd("gh")
-            .args(["pr", "checks", pr_url, "--json", "name,state,bucket"])
+            .args(["pr", "view", pr_url, "--json", "statusCheckRollup"])
             .current_dir(repo_path)
             .output()
             .await
-            .map_err(|e| format!("spawn gh checks: {}", e))?;
+            .map_err(|e| format!("spawn gh pr view: {}", e))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let parsed: Result<Value, _> = serde_json::from_str(&stdout);
         observations += 1;
 
-        if let Ok(Value::Array(checks)) = parsed {
-            if checks.is_empty() {
-                // Don't trust first empty reading. GitHub may register checks lazily.
-                if observations >= CI_MIN_OBSERVATIONS && start.elapsed() >= Duration::from_secs(60) {
-                    log::info!("[review] no CI checks on PR {} after {} observations; treating as pass",
-                        pr_url, observations);
-                    return Ok(true);
-                }
-            } else {
-                let mut all_done = true;
-                let mut any_fail = false;
-                let mut any_pass = false;
-                let mut considered_checks = 0usize;
-                for c in &checks {
-                    let name = c.get("name")
-                        .or_else(|| c.get("context"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    if is_ignored_vercel_check(name) {
-                        continue;
+        if output.status.success() {
+            let parsed: Result<Value, _> = serde_json::from_str(&stdout);
+            if let Ok(obj) = parsed {
+                let checks = obj
+                    .get("statusCheckRollup")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+
+                if checks.is_empty() {
+                    if observations >= CI_MIN_OBSERVATIONS && start.elapsed() >= Duration::from_secs(60) {
+                        log::info!("[review] no CI checks on PR {} after {} observations; treating as pass",
+                            pr_url, observations);
+                        return Ok(true);
                     }
-                    considered_checks += 1;
-                    let bucket = c.get("bucket").and_then(|v| v.as_str()).unwrap_or("");
-                    match bucket {
-                        "pass" => { any_pass = true; }
-                        "skipping" => {}
-                        "fail" | "cancel" => { any_fail = true; }
-                        _ => { all_done = false; }
+                } else {
+                    let mut all_done = true;
+                    let mut any_fail = false;
+                    let mut any_pass = false;
+                    let mut considered_checks = 0usize;
+
+                    for c in &checks {
+                        let name = c.get("name")
+                            .or_else(|| c.get("context"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if is_ignored_vercel_check(name) {
+                            continue;
+                        }
+                        considered_checks += 1;
+
+                        // `statusCheckRollup` items use `conclusion` (COMPLETED checks)
+                        // and `status` (in-flight). Normalise to the same pass/fail/pending
+                        // buckets the old `gh pr checks --json bucket` field used.
+                        let conclusion = c.get("conclusion").and_then(|v| v.as_str()).unwrap_or("");
+                        let status = c.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                        let state = c.get("state").and_then(|v| v.as_str()).unwrap_or("");
+
+                        let bucket = match conclusion.to_uppercase().as_str() {
+                            "SUCCESS" => "pass",
+                            "SKIPPED" | "NEUTRAL" => "skipping",
+                            "FAILURE" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED" | "ERROR" => "fail",
+                            _ => {
+                                // Conclusion absent or empty → check state / status
+                                match state.to_uppercase().as_str() {
+                                    "SUCCESS" => "pass",
+                                    "FAILURE" | "ERROR" => "fail",
+                                    _ => match status.to_uppercase().as_str() {
+                                        "COMPLETED" => "pass",
+                                        "EXPECTED" | "SKIPPED" => "skipping",
+                                        _ => "pending",
+                                    },
+                                }
+                            }
+                        };
+
+                        match bucket {
+                            "pass" => { any_pass = true; }
+                            "skipping" => {}
+                            "fail" => { any_fail = true; }
+                            _ => { all_done = false; }
+                        }
                     }
-                }
-                if considered_checks == 0 {
-                    log::info!("[review] only ignored Vercel checks on PR {}; treating CI as pass", pr_url);
-                    return Ok(true);
-                }
-                if any_fail { return Ok(false); }
-                if all_done && any_pass { return Ok(true); }
-                if all_done && !any_pass {
-                    // All skipping, nothing passed. Treat as not-green.
-                    return Ok(false);
+
+                    if considered_checks == 0 {
+                        log::info!("[review] only ignored Vercel checks on PR {}; treating CI as pass", pr_url);
+                        return Ok(true);
+                    }
+                    if any_fail { return Ok(false); }
+                    if all_done && any_pass { return Ok(true); }
+                    if all_done && !any_pass {
+                        return Ok(false);
+                    }
                 }
             }
-        } else if !output.status.success() && stdout.trim().is_empty() {
+        } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
             if gh_checks_no_checks_reported(&stderr) {
-                // GitHub CLI exits non-zero for a brand-new PR head before
-                // checks have attached. Treat it like an empty checks array
-                // and keep polling instead of failing the merge immediately.
                 if observations >= CI_MIN_OBSERVATIONS && start.elapsed() >= Duration::from_secs(60) {
                     log::info!("[review] no CI checks reported on PR {} after {} observations; treating as pass",
                         pr_url, observations);
                     return Ok(true);
                 }
             } else {
-                return Err(format!("gh pr checks: {}", stderr.trim()));
+                return Err(format!("gh pr view checks: {}", stderr.trim()));
             }
         }
 
