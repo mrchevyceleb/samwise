@@ -9115,6 +9115,32 @@ pub fn spawn_pr_review_task(
                 .and_then(|v| v.as_array().map(|arr| !arr.is_empty()))
                 .unwrap_or(false);
                 if updated {
+                    // Stamp merge-deploy request flags so sweep_merge_deploy_requests
+                    // picks this up automatically. Without these flags the cron's
+                    // merge_deploy_request_is_pending gate never fires and approved
+                    // cards sit idle indefinitely (the guard requires context keys
+                    // samwise_merge_deploy_status=="requested" + requested_at set).
+                    if let Ok(Some(t)) = supabase::fetch_task(&config, &task_id).await {
+                        let mut ctx = task_context_object(&t);
+                        ctx.insert(
+                            MERGE_DEPLOY_STATUS_KEY.to_string(),
+                            Value::String("requested".to_string()),
+                        );
+                        ctx.insert(
+                            MERGE_DEPLOY_REQUESTED_AT_KEY.to_string(),
+                            Value::String(chrono::Utc::now().to_rfc3339()),
+                        );
+                        ctx.remove(MERGE_DEPLOY_ERROR_KEY);
+                        let _ = supabase::update_task(
+                            &config,
+                            &task_id,
+                            &serde_json::json!({
+                                "context": Value::Object(ctx),
+                                "updated_at": chrono::Utc::now().to_rfc3339(),
+                            }),
+                        )
+                        .await;
+                    }
                     notify_callback(&config, &task_id, "approved", Some(&pr_url), None);
                     send_terminal_telegram(
                         &config,
