@@ -52,6 +52,38 @@ fn normalize_path_env() {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     normalize_path_env();
+
+    // ── Crash-loop guard ──────────────────────────────────────────────
+    // When systemd restarts this process after a SIGKILL (force close),
+    // WebKit's child processes (WebKitWebProcess, WebKitNetworkProcess)
+    // may not have fully cleaned up their compositor / D-Bus / Wayland
+    // state. Creating a new WebView too soon produces a blank window.
+    //
+    // Guard: if the previous startup timestamp is less than 30 seconds
+    // old, pause until 30 seconds have elapsed since that start so the
+    // old WebKit processes have time to be reaped.
+    let startup_path = std::path::PathBuf::from("/tmp/samwise-startup");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let last_start = std::fs::read_to_string(&startup_path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    std::fs::write(&startup_path, now.to_string()).ok();
+    if last_start > 0 {
+        let elapsed = now.saturating_sub(last_start);
+        if elapsed < 30 {
+            let pause = 30 - elapsed;
+            eprintln!(
+                "[startup] crash-loop guard: last start was {}s ago, pausing {}s for WebKit cleanup",
+                elapsed, pause
+            );
+            std::thread::sleep(std::time::Duration::from_secs(pause));
+        }
+    }
+
     tauri::Builder::default()
         .manage(AppState::new())
         .manage(ClaudeCodeState::default())

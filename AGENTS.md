@@ -28,24 +28,31 @@ The backend worker picks up tasks from the board, writes code via Claude Code CL
 
 ```bash
 npx tauri dev          # Full app (Vite + Rust) - dev server
-npx tauri build        # Production build (.app + .dmg on macOS, .exe + installers on Windows)
+npx tauri build        # Production build (embeds frontend assets + bundles .deb/.rpm/AppImage). ALWAYS use this for prod, never cargo build --release alone.
 cd src-tauri && cargo check  # Rust only
 npm run check          # Svelte type check
 ```
 
+**Production binary (Linux/aarch64):** `src-tauri/target/aarch64-unknown-linux-gnu/release/agent-one` (use this path for deploy, NOT `target/release/agent-one`)
 **Production binary (macOS):** `src-tauri/target/release/bundle/macos/Samwise.app`
 **Production binary (Windows):** `src-tauri/target/release/agent-one.exe`
 
 ## Build Rules
 
-- **Always rebuild AND deploy after pushing changes.** A `npx tauri build` (or `cargo build --release`) alone is NOT enough — the running production process must be replaced, or the binary stays stale while the source moves on.
-  - **Spark "Moria" (primary, Linux) — current reality:** prod runs as `/usr/bin/agent-one` (native Linux binary, built to `src-tauri/target/release/agent-one`), managed by the systemd user service `samwise-agent-one.service`. Deploy steps:
-    1. `cd src-tauri && doppler run --project agent-one --config prd -- cargo build --release`
-    2. `systemctl --user stop samwise-agent-one.service`
-    3. `sudo cp src-tauri/target/release/agent-one /usr/bin/agent-one`
-    4. `systemctl --user start samwise-agent-one.service`
-    To restart without rebuilding: `systemctl --user restart samwise-agent-one.service`. ⚠️ Do NOT use `pkill` + manual launch — the WebView (Tauri UI) requires the systemd user session environment to initialize properly (WebKitWebProcess, WebKitNetworkProcess). A bare shell launch starts the worker but not the GUI, causing "connection refused" in the app.
-    Note: changes that only touch `~/.codex/config.toml` or other CLI configs take effect on the next child-process spawn WITHOUT a rebuild.
+- **Always rebuild AND deploy after pushing changes.** A build alone is NOT enough — the running production process must be replaced, or the binary stays stale while the source moves on.
+  - **Spark "Moria" (primary, Linux) — current reality:** prod runs as `/usr/bin/agent-one` (native Linux binary, built to `src-tauri/target/aarch64-unknown-linux-gnu/release/agent-one`), managed by the systemd user service `samwise-agent-one.service`. Deployment:
+    1. **Build:** `npx tauri build` from the project root. This runs `beforeBuildCommand` (npm run build) and properly embeds frontend assets via Tauri's protocol handler. **Do NOT use `cargo build --release` alone** — it skips the Tauri asset embedding step, which causes the WebView to show "could not connect to local host" (blank window) because the custom protocol handler isn't registered. The binary ends up at `src-tauri/target/aarch64-unknown-linux-gnu/release/agent-one` (NOT `src-tauri/target/release/agent-one`).
+    2. **Deploy:**
+       ```bash
+       systemctl --user stop samwise-agent-one.service
+       sudo cp src-tauri/target/aarch64-unknown-linux-gnu/release/agent-one /usr/bin/agent-one
+       systemctl --user start samwise-agent-one.service
+       ```
+    To restart without rebuilding: `systemctl --user restart samwise-agent-one.service`. To stop completely (prevents auto-restart): `systemctl --user stop samwise-agent-one.service` (the `Restart=on-failure` policy only restarts on crashes, not clean stops).
+    - **Systemd restart policy:** The service uses `Restart=on-failure` with `RestartSec=15` and `TimeoutStopSec=30`. This means crashes auto-recover, but clean `systemctl --user stop` or tray "Quit" exits stay stopped. The 15-second restart delay gives WebKit compositor processes time to clean up before a new WebView is created.
+    - **Crash-loop guard:** `src-tauri/src/lib.rs` writes a timestamp to `/tmp/samwise-startup` on launch. If the previous start was <30s ago, it pauses to let WebKit processes fully die. This prevents the blank/error window from rapid force-kill-then-restart cycles.
+    - ⚠️ Do NOT use `pkill agent-one` + manual launch — the WebView (Tauri UI) requires the systemd user session environment to initialize properly (WebKitWebProcess, WebKitNetworkProcess). A bare shell launch starts the worker but not the GUI, causing "connection refused" in the app.
+    - Note: changes that only touch `~/.codex/config.toml` or other CLI configs take effect on the next child-process spawn WITHOUT a rebuild.
   - **Mac (legacy/`bin/deploy.sh`):** `doppler run -- npx tauri build` → stop the running instance → replace `/Applications/SamWise.app` → `launchctl kickstart`.
 - **When updating Tauri UI, also update and deploy the web UI.** The desktop app under `src/` and the separate web app under `web/` must stay visually/functionally in sync for shared board workflows. Any UI affordance, label, status action, stamp, review/deploy panel, or task interaction added to the Tauri UI needs the equivalent web UI change in the same task unless explicitly impossible. After pushing, deploy both surfaces: the desktop binary (see deploy note above — `bin/deploy.sh` only on Mac) and the web UI via the repo's Vercel workflow/CLI.
 - **Merge-to-Done must include post-merge deployments.** Do not add a UI path that marks PR-backed cards Done immediately after merge. The worker must check the PR file list, run any required Railway server deploys, Supabase migrations, and Supabase Edge Function deploys, then mark Done only after those steps succeed. If any deployment is needed or skipped, make that explicit in Sam comments, PR/commit text, and UI copy.
