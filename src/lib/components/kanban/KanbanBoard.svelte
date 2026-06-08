@@ -27,7 +27,14 @@
 
 	let columnsContainer = $state<HTMLDivElement | null>(null);
 
-	/** Auto-poll comments for active/reviewed tasks so card summaries update live */
+	/**
+	 * Card summaries are kept live by the realtime `ae_comments` subscription
+	 * (see AppShell.initRealtime). We only need a one-time initial load so
+	 * previews are populated at launch, plus an infrequent fallback poll in
+	 * case the realtime channel drops. The old 8s poll fired a burst of N
+	 * parallel Supabase requests for every active card and was the main source
+	 * of UI lag.
+	 */
 	let commentPollInterval: ReturnType<typeof setInterval> | null = null;
 
 	function pollActiveComments() {
@@ -45,10 +52,10 @@
 
 	onMount(() => {
 		taskStore.fetchTasks();
-		// Poll comments for active tasks every 8 seconds
-		commentPollInterval = setInterval(pollActiveComments, 8000);
-		// Initial fetch
+		// One-time initial load of comment previews shortly after mount
 		setTimeout(pollActiveComments, 1000);
+		// Slow safety fallback (realtime handles live updates)
+		commentPollInterval = setInterval(pollActiveComments, 60000);
 	});
 
 	onDestroy(() => {

@@ -33,19 +33,20 @@ cd src-tauri && cargo check  # Rust only
 npm run check          # Svelte type check
 ```
 
-**Production binary (Linux/aarch64):** `src-tauri/target/aarch64-unknown-linux-gnu/release/agent-one` (use this path for deploy, NOT `target/release/agent-one`)
+**Production binary (Linux/aarch64):** `src-tauri/target/release/agent-one` (the host target triple is the default, so `npx tauri build` writes here — there is NO separate `target/aarch64-unknown-linux-gnu/` output on this host; that dir holds only stale binaries). Verify a build embedded the frontend with `strings <binary> | grep -c _app/immutable` (must be > 0).
 **Production binary (macOS):** `src-tauri/target/release/bundle/macos/Samwise.app`
 **Production binary (Windows):** `src-tauri/target/release/agent-one.exe`
 
 ## Build Rules
 
 - **Always rebuild AND deploy after pushing changes.** A build alone is NOT enough — the running production process must be replaced, or the binary stays stale while the source moves on.
-  - **Spark "Moria" (primary, Linux) — current reality:** prod runs as `/usr/bin/agent-one` (native Linux binary, built to `src-tauri/target/aarch64-unknown-linux-gnu/release/agent-one`), managed by the systemd user service `samwise-agent-one.service`. Deployment:
-    1. **Build:** `npx tauri build` from the project root. This runs `beforeBuildCommand` (npm run build) and properly embeds frontend assets via Tauri's protocol handler. **Do NOT use `cargo build --release` alone** — it skips the Tauri asset embedding step, which causes the WebView to show "could not connect to local host" (blank window) because the custom protocol handler isn't registered. The binary ends up at `src-tauri/target/aarch64-unknown-linux-gnu/release/agent-one` (NOT `src-tauri/target/release/agent-one`).
+  - **Spark "Moria" (primary, Linux) — current reality:** prod runs as `/usr/bin/agent-one` (native Linux binary, built to `src-tauri/target/release/agent-one`), managed by the systemd user service `samwise-agent-one.service`. Deployment:
+    1. **Build:** `npx tauri build --no-bundle` from the project root (`--no-bundle` skips the slow .deb/.rpm/AppImage step; assets still embed). This runs `beforeBuildCommand` (npm run build) and properly embeds frontend assets via Tauri's protocol handler. **Do NOT use `cargo build --release` alone** — it skips the asset-embedding step, so the binary has NO frontend and the WebView falls back to `devUrl` (`http://localhost:5890`), showing a blank "Could not connect to localhost: Connection refused" page. The binary is written to `src-tauri/target/release/agent-one`.
     2. **Deploy:**
        ```bash
        systemctl --user stop samwise-agent-one.service
-       sudo cp src-tauri/target/aarch64-unknown-linux-gnu/release/agent-one /usr/bin/agent-one
+       sudo cp src-tauri/target/release/agent-one /usr/bin/agent-one
+       strings /usr/bin/agent-one | grep -c _app/immutable   # must be > 0 before starting
        systemctl --user start samwise-agent-one.service
        ```
     To restart without rebuilding: `systemctl --user restart samwise-agent-one.service`. To stop completely (prevents auto-restart): `systemctl --user stop samwise-agent-one.service` (the `Restart=on-failure` policy only restarts on crashes, not clean stops).

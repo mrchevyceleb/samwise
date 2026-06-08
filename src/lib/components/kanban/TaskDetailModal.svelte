@@ -71,20 +71,23 @@
 	let artifacts = $state<Artifact[]>([]);
 	let loadingArtifacts = $state(false);
 
-	onMount(async () => {
-		commentStore.fetchComments(task.id);
-		// Fetch artifacts for this task
+	onMount(() => {
+		// Fire both fetches in parallel and let the modal paint immediately —
+		// neither blocks the initial render of the card details.
 		loadingArtifacts = true;
-		try {
-			const result = await safeInvoke<Artifact[]>('supabase_fetch_artifacts', { task_id: task.id });
-			if (result && result.length > 0) {
-				artifacts = result;
-			}
-		} catch (e) {
-			console.warn('[task-detail] Failed to fetch artifacts:', e);
-		} finally {
-			loadingArtifacts = false;
-		}
+		commentStore.fetchComments(task.id);
+		safeInvoke<Artifact[]>('supabase_fetch_artifacts', { task_id: task.id })
+			.then((result) => {
+				if (result && result.length > 0) {
+					artifacts = result;
+				}
+			})
+			.catch((e) => {
+				console.warn('[task-detail] Failed to fetch artifacts:', e);
+			})
+			.finally(() => {
+				loadingArtifacts = false;
+			});
 	});
 
 	let hasReport = $derived(artifacts.some(a => a.artifact_type === 'report'));

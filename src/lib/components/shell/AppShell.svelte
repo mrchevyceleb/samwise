@@ -31,6 +31,21 @@
 	let showMasterPrompt = $state(false);
 	let realtimeChannels: any[] = [];
 	let taskRefreshInterval: ReturnType<typeof setInterval> | null = null;
+	let taskRefreshDebounce: ReturnType<typeof setTimeout> | null = null;
+
+	/**
+	 * The worker flips many task rows in quick succession (status transitions,
+	 * claims, etc). Refetching the whole board on every raw realtime event
+	 * caused back-to-back full reloads and froze the UI. Collapse a burst of
+	 * events into a single refetch.
+	 */
+	function scheduleTaskRefresh() {
+		if (taskRefreshDebounce) clearTimeout(taskRefreshDebounce);
+		taskRefreshDebounce = setTimeout(() => {
+			taskRefreshDebounce = null;
+			taskStore.fetchTasks({ silent: true });
+		}, 250);
+	}
 
 	let workerUnlisten: (() => void) | null = null;
 
@@ -117,6 +132,10 @@
 			clearInterval(taskRefreshInterval);
 			taskRefreshInterval = null;
 		}
+		if (taskRefreshDebounce) {
+			clearTimeout(taskRefreshDebounce);
+			taskRefreshDebounce = null;
+		}
 		workerUnlisten?.();
 		chatStore.destroySession();
 	});
@@ -128,7 +147,7 @@
 		const taskChannel = subscribeToTable(config.url, config.anon_key, 'ae_tasks', (payload) => {
 			const { eventType } = payload;
 			if (eventType === 'INSERT' || eventType === 'UPDATE' || eventType === 'DELETE') {
-				taskStore.fetchTasks({ silent: true });
+				scheduleTaskRefresh();
 			}
 		});
 		realtimeChannels.push(taskChannel);
@@ -150,9 +169,10 @@
 
 	function startTaskRefreshFallback() {
 		if (taskRefreshInterval) return;
+		// Safety fallback only — realtime is the primary update path.
 		taskRefreshInterval = setInterval(() => {
 			taskStore.fetchTasks({ silent: true });
-		}, 10_000);
+		}, 30_000);
 	}
 
 	function handleFocus() {

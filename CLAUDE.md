@@ -28,7 +28,7 @@ The backend worker picks up tasks from the board, writes code via Claude Code CL
 
 ```bash
 npx tauri dev          # Full app (Vite + Rust) - dev server
-npx tauri build        # Production build (.app + .dmg on macOS, .exe + installers on Windows)
+npx tauri build        # Production build — ALWAYS use this for prod, never `cargo build --release` alone (see Build Rules)
 cd src-tauri && cargo check  # Rust only
 npm run check          # Svelte type check
 ```
@@ -38,13 +38,16 @@ npm run check          # Svelte type check
 
 ## Build Rules
 
-- **Always rebuild AND deploy after pushing changes.** A `npx tauri build` (or `cargo build --release`) alone is NOT enough — the running production process must be replaced, or the binary stays stale while the source moves on.
-  - **Spark "Moria" (primary, Linux) — current reality:** prod runs as `/usr/bin/agent-one` (native Linux binary, built to `src-tauri/target/release/agent-one`), managed by the systemd user service `samwise-agent-one.service`. Deploy steps:
-    1. `cd src-tauri && doppler run --project agent-one --config prd -- cargo build --release`
+- ⚠️ **NEVER build prod with `cargo build --release` — the resulting binary has NO embedded frontend, so the WebView falls back to the dev server URL.** `tauri.conf.json` sets `devUrl: http://localhost:5890` and `frontendDist: ../build`. Only the Tauri CLI (`npx tauri build`) actually compiles+embeds the built `../build` assets into the binary and registers the WebView custom protocol. A plain `cargo build --release` skips that embedding step entirely, so at runtime the WebView has nothing to serve and tries to load `http://localhost:5890` (the non-running Vite dev server), showing a blank page with **"Could not connect to localhost: Connection refused."** This is the #1 recurring AutoSam deploy bug.
+  - **How to verify a binary is a correct prod build:** `strings <binary> | grep -c _app/immutable` must return a number **> 0** (≈20). That counts the embedded SvelteKit asset refs. A broken (cargo-only) binary returns **0**. Do NOT use `grep localhost:5890` to test — that string is present in BOTH good and bad binaries (it's just the embedded config blob) and proves nothing. A correct binary is also visibly larger (~27.4MB vs ~26.7MB) because of the embedded assets.
+  - (This was first fixed in commit `6d5c6a2`, but only in AGENTS.md — the AGENTS.md note's `target/aarch64-unknown-linux-gnu/release/` path is WRONG for this host; see step 3.)
+- **Always rebuild AND deploy after pushing changes.** Building alone is NOT enough — the running production process must be replaced, or the binary stays stale while the source moves on.
+  - **Spark "Moria" (primary, Linux) — current reality:** prod runs as `/usr/bin/agent-one`, managed by the systemd user service `samwise-agent-one.service`. Deploy steps:
+    1. **Build (from project root):** `doppler run --project agent-one --config prd -- npx tauri build --no-bundle` (`--no-bundle` skips the slow .deb/.rpm/AppImage step; assets still embed correctly). This also runs `beforeBuildCommand` (`npm run build`), so the frontend is rebuilt for you. On this host the binary is written to `src-tauri/target/release/agent-one` (the host target triple IS the default, so there is NO separate `target/aarch64-unknown-linux-gnu/` output — that dir holds only stale binaries; ignore it).
     2. `systemctl --user stop samwise-agent-one.service`
-    3. `sudo cp src-tauri/target/release/agent-one /usr/bin/agent-one`
+    3. `sudo cp src-tauri/target/release/agent-one /usr/bin/agent-one` — then confirm before starting: `strings /usr/bin/agent-one | grep -c _app/immutable` (must be > 0).
     4. `systemctl --user start samwise-agent-one.service`
-    To restart without rebuilding: `systemctl --user restart samwise-agent-one.service`. ⚠️ Do NOT use `pkill` + manual launch — the WebView (Tauri UI) requires the systemd user session environment to initialize properly (WebKitWebProcess, WebKitNetworkProcess). A bare shell launch starts the worker but not the GUI, causing "connection refused" in the app.
+    To restart without rebuilding: `systemctl --user restart samwise-agent-one.service`. ⚠️ Do NOT use `pkill` + manual launch — the WebView (Tauri UI) requires the systemd user session environment to initialize properly (WebKitWebProcess, WebKitNetworkProcess). A bare shell launch starts the worker but not the GUI.
     Note: changes that only touch `~/.codex/config.toml` or other CLI configs take effect on the next child-process spawn WITHOUT a rebuild.
   - **Mac (legacy/`bin/deploy.sh`):** `doppler run -- npx tauri build` → stop the running instance → replace `/Applications/SamWise.app` → `launchctl kickstart`.
 - The frontend source of truth for board columns is `src/lib/types.ts` (Tauri app) AND `web/src/lib/types.ts` (separate SvelteKit viewer under `web/`). Changes to statuses or labels must be applied to BOTH. Same rule for any other shared-shaped data — treat `web/` as its own app with its own types.
