@@ -208,32 +208,66 @@ fn collect_active_repo_keys(tasks: &[Value]) -> HashSet<String> {
         .collect()
 }
 
+/// Like collect_active_repo_keys but COUNTS active tasks per repo key, so the
+/// main claim loop can allow up to `max_tasks_per_repo()` per repo instead of a
+/// hard one-at-a-time lock.
+fn collect_active_repo_counts(tasks: &[Value]) -> HashMap<String, usize> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for task in tasks.iter().filter(|t| task_is_repo_active(t)) {
+        for key in task_repo_serial_keys(task) {
+            *counts.entry(key).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+/// Max simultaneously-active tasks allowed per repo (coding/testing/running-review).
+/// Default 2 lets two cards in the same repo run at once (separate worktrees +
+/// branches + dynamically-reserved dev-server ports keep them isolated). Tunable
+/// at runtime via AUTOSAM_MAX_TASKS_PER_REPO (clamped 1..=4) so it can change
+/// without a rebuild; set 1 to restore strict one-at-a-time serialization.
+const MAX_TASKS_PER_REPO_DEFAULT: usize = 2;
+
+fn max_tasks_per_repo() -> usize {
+    std::env::var("AUTOSAM_MAX_TASKS_PER_REPO")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&v| (1..=4).contains(&v))
+        .unwrap_or(MAX_TASKS_PER_REPO_DEFAULT)
+}
+
+/// Returns the first of `repo_keys` that is already at/over `max_per_repo`
+/// active tasks (so the candidate must wait). Counts active tasks per repo key
+/// rather than treating any active task as a hard lock, which is what allows
+/// >1 concurrent task per repo.
 fn active_repo_conflict_for_keys(
     tasks: &[Value],
     repo_keys: &[String],
     excluded_task_id: Option<&str>,
+    max_per_repo: usize,
 ) -> Option<String> {
-    if repo_keys.is_empty() {
+    if repo_keys.is_empty() || max_per_repo == 0 {
         return None;
     }
 
-    let active_keys: HashSet<String> = tasks
-        .iter()
-        .filter(|task| {
-            if let Some(excluded) = excluded_task_id {
-                let task_id = task.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                if task_id == excluded {
-                    return false;
-                }
+    let mut active_counts: HashMap<String, usize> = HashMap::new();
+    for task in tasks.iter() {
+        if let Some(excluded) = excluded_task_id {
+            let task_id = task.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            if task_id == excluded {
+                continue;
             }
-            task_is_repo_active(task)
-        })
-        .flat_map(task_repo_serial_keys)
-        .collect();
+        }
+        if task_is_repo_active(task) {
+            for key in task_repo_serial_keys(task) {
+                *active_counts.entry(key).or_insert(0) += 1;
+            }
+        }
+    }
 
     repo_keys
         .iter()
-        .find(|key| active_keys.contains(*key))
+        .find(|key| active_counts.get(*key).copied().unwrap_or(0) >= max_per_repo)
         .cloned()
 }
 
@@ -324,6 +358,41 @@ const CLOSE_ORIGIN_TICKET_URL: &str =
 const POST_MERGE_DEPLOY_GREEN_TIMEOUT_SECS: u64 = 60 * 60;
 const POST_MERGE_DEPLOY_GREEN_POLL_SECS: u64 = 20;
 const MERGE_DEPLOY_RUNNING_STALE_SECS: i64 = 90 * 60;
+
+/// Wall-clock budget for a single auto-fix Claude Code run (the pass that
+/// addresses Codex blockers on a PR). The old hardcoded 900s was too tight
+/// for larger repos like operly: the fixer was getting cut off mid-edit and
+/// bouncing the card to fixes_needed on a *timeout*, not on a real blocker,
+/// then the 8-min sweep re-fired it straight into the same wall. The card
+/// stays `in_progress` for the whole run, so a longer budget never collides
+/// with the fixes_needed sweep. Tunable at runtime via AUTOSAM_FIX_TIMEOUT_SECS
+/// (set in the systemd unit) so it can be raised without rebuilding the binary.
+const AUTO_FIX_CLAUDE_TIMEOUT_SECS_DEFAULT: u64 = 1800;
+
+fn auto_fix_claude_timeout_secs() -> u64 {
+    std::env::var("AUTOSAM_FIX_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&v| v >= 60)
+        .unwrap_or(AUTO_FIX_CLAUDE_TIMEOUT_SECS_DEFAULT)
+}
+
+/// Wall-clock budget for a single coding Claude Code run (the first pass that
+/// implements a card before PR open). The old hardcoded 3600s (1h) cut complex
+/// cards off mid-fix and lost the whole run: the card hit the wall with no
+/// commit and no PR, landing in `failed` with nothing to show. A longer budget
+/// lets those genuine long fixes finish. Tunable at runtime via
+/// AUTOSAM_TASK_TIMEOUT_SECS (set in the systemd unit) so it can be changed
+/// without rebuilding the binary.
+const TASK_CLAUDE_TIMEOUT_SECS_DEFAULT: u64 = 7200;
+
+fn task_claude_timeout_secs() -> u64 {
+    std::env::var("AUTOSAM_TASK_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&v| v >= 60)
+        .unwrap_or(TASK_CLAUDE_TIMEOUT_SECS_DEFAULT)
+}
 
 /// Per-repo serialization for Merge + Deploy. Multiple cards on the same
 /// repo would otherwise race over the shared deploy worktree, `gh pr merge`,
@@ -1547,7 +1616,7 @@ async fn worker_loop(
                             .ok()
                             .and_then(|all| all.as_array().cloned())
                             .unwrap_or_default();
-                        let mut active_repo_keys = collect_active_repo_keys(&known_task_rows);
+                        let mut active_repo_counts = collect_active_repo_counts(&known_task_rows);
                         // Sort by priority: critical=0, high=1, medium=2, low=3, then created_at asc
                         let priority_order = |p: &str| match p {
                             "critical" => 0u8,
@@ -1606,7 +1675,9 @@ async fn worker_loop(
                                 .to_string();
                             let repo_keys = task_repo_serial_keys(task);
                             if let Some(key) =
-                                repo_keys.iter().find(|key| active_repo_keys.contains(*key))
+                                repo_keys
+                                    .iter()
+                                    .find(|key| active_repo_counts.get(*key).copied().unwrap_or(0) >= max_tasks_per_repo())
                             {
                                 log::info!(
                                     "[worker] delaying queued task {} because repo {} already has active work",
@@ -1660,7 +1731,7 @@ async fn worker_loop(
                                         }
                                         claimed_this_tick += 1;
                                         for key in repo_keys {
-                                            active_repo_keys.insert(key);
+                                            *active_repo_counts.entry(key).or_insert(0) += 1;
                                         }
                                         emit_worker_event(
                                             &app,
@@ -4093,14 +4164,15 @@ from Matt, stop without making changes and explain specifically what you need cl
 
     let prompt = prompt_parts.join("\n");
 
-    // 60-minute timeout, UNLIMITED turns. A hard cap just surfaces as
-    // error_max_turns mid-run on complex tasks — the timeout is the real
-    // guard. Pass 0 so `--max-turns` is omitted entirely.
+    // Coding-pass timeout (default 2h, tunable via AUTOSAM_TASK_TIMEOUT_SECS),
+    // UNLIMITED turns. A hard cap just surfaces as error_max_turns mid-run on
+    // complex tasks; the timeout is the real guard. Pass 0 so `--max-turns` is
+    // omitted entirely.
     let claude_result = run_claude_code_streaming(
         &repo_path,
         &prompt,
         0,
-        3600,
+        task_claude_timeout_secs(),
         config,
         &task_id,
         process_id_slot.clone(),
@@ -6258,21 +6330,27 @@ async fn run_build_check(repo_path: &str) -> Result<Option<String>, (String, Str
 /// assume children exist (fail-closed: do not recover when we cannot tell).
 fn worker_has_alive_descendants() -> bool {
     let pid = std::process::id();
+    // `pgrep -aP` lists "<pid> <command>" for each DIRECT child. On the Linux
+    // (Tauri / webkit2gtk) build the worker ALWAYS has WebKit GUI helper
+    // children (WebKitNetworkProcess, WebKitWebProcess, WebKitGPUProcess).
+    // Those are not orphaned task work and must never block recovery —
+    // otherwise recover_stuck_tasks defers on every boot and a crash-orphaned
+    // card stays wedged in `in_progress` forever, holding its repo's serialize
+    // lock. Only real execute_task subprocesses (claude/codex/git/node/sh/...)
+    // should count, so filter the WebKit helpers out before deciding.
     match std::process::Command::new("pgrep")
-        .args(["-P", &pid.to_string()])
+        .args(["-aP", &pid.to_string()])
         .output()
     {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| line.splitn(2, ' ').nth(1))
+            .any(|cmd| !cmd.contains("WebKit") && !cmd.contains("webkit")),
         Ok(out) => {
-            if out.status.success() {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                !stdout.trim().is_empty()
-            } else {
-                // pgrep exits 1 when no matches are found and that is the
-                // success-but-empty case; any other failure code is treated
-                // as "unknown" and we fail closed.
-                let code = out.status.code().unwrap_or(-1);
-                code != 1
-            }
+            // pgrep exits 1 when no matches are found and that is the
+            // success-but-empty case; any other failure code is treated
+            // as "unknown" and we fail closed.
+            out.status.code().unwrap_or(-1) != 1
         }
         Err(_) => true,
     }
@@ -12864,11 +12942,11 @@ mod merge_deploy_tests {
         let keys = task_repo_serial_keys(&tasks[0]);
 
         assert_eq!(
-            active_repo_conflict_for_keys(&tasks, &keys, Some("full-review")),
+            active_repo_conflict_for_keys(&tasks, &keys, Some("full-review"), 1),
             Some("repo_path:/repo/r-link".to_string())
         );
         assert_eq!(
-            active_repo_conflict_for_keys(&tasks[..1], &keys, Some("full-review")),
+            active_repo_conflict_for_keys(&tasks[..1], &keys, Some("full-review"), 1),
             None
         );
     }
@@ -14227,7 +14305,7 @@ pub async fn sweep_plant_full_pr_review_queue(config: &SupabaseConfig) {
             continue;
         }
 
-        if let Some(key) = active_repo_conflict_for_keys(arr, &repo_keys, Some(&task_id)) {
+        if let Some(key) = active_repo_conflict_for_keys(arr, &repo_keys, Some(&task_id), max_tasks_per_repo()) {
             log::info!(
                 "[plant-pr-review] delaying task {} because repo {} already has active work",
                 task_id,
@@ -14413,6 +14491,7 @@ pub async fn sweep_kim_full_pr_review_queue(config: &SupabaseConfig) {
                     &known_task_rows,
                     &existing_repo_keys,
                     Some(existing_task_id),
+                    max_tasks_per_repo(),
                 ) {
                     log::info!(
                         "[kim-pr-review] delaying queued task {} because repo {} already has active work",
@@ -14459,6 +14538,7 @@ pub async fn sweep_kim_full_pr_review_queue(config: &SupabaseConfig) {
                         &known_task_rows,
                         &existing_repo_keys,
                         Some(task_id),
+                        max_tasks_per_repo(),
                     ) {
                         log::info!(
                             "[kim-pr-review] delaying stale restart for task {} because repo {} already has active work",
@@ -14582,7 +14662,7 @@ pub async fn sweep_kim_full_pr_review_queue(config: &SupabaseConfig) {
             "repo_path": repo_path,
         });
         let repo_keys = task_repo_serial_keys(&repo_probe);
-        if let Some(key) = active_repo_conflict_for_keys(&known_task_rows, &repo_keys, None) {
+        if let Some(key) = active_repo_conflict_for_keys(&known_task_rows, &repo_keys, None, max_tasks_per_repo()) {
             log::info!(
                 "[kim-pr-review] delaying PR #{} because repo {} already has active work",
                 pr_number,
@@ -15264,7 +15344,7 @@ making any other changes.",
             &repo_path,
             &prompt,
             0,
-            900,
+            auto_fix_claude_timeout_secs(),
             &config,
             &task_id,
             process_id_slot,
@@ -15594,15 +15674,27 @@ async fn sweep_stale_fixes_needed_cards(
             .unwrap_or_default();
 
         let expected_branch = task_branch_name(&short_task_id(&task_id));
+        // Run the fix in the card's own worktree, not the main checkout.
+        // spawn_auto_fix_task's pre-flight does `git checkout <expected_branch>`
+        // in whatever dir we hand it, and the PR head branch is checked out in
+        // the worktree — so passing the main checkout makes git refuse with
+        // "'<branch>' is already used by worktree ...", silently burning a cycle
+        // (this is exactly how PR #378 cycle 3 died). Mirror the review->fix
+        // path, which always operates in the worktree. Fall back to the main
+        // checkout only when no worktree exists (older cards already cleaned up).
+        let fix_repo_path = task_worktree_path(&repo_path, &task_id)
+            .filter(|p| p.is_dir())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| repo_path.clone());
         log::info!(
-            "[auto-fix-sweep] re-firing auto-fix for stale fixes_needed task {} (cycle {}/3)",
-            task_id, cycle_count + 1
+            "[auto-fix-sweep] re-firing auto-fix for stale fixes_needed task {} (cycle {}/3) in {}",
+            task_id, cycle_count + 1, fix_repo_path
         );
         spawn_auto_fix_task(
             config.clone(),
             task_id,
             pr_url,
-            repo_path,
+            fix_repo_path,
             review_markdown,
             cycle_count as u32,
             expected_branch,
@@ -15717,7 +15809,7 @@ pub async fn sweep_pr_review_queue(
         }
         let repo_keys = task_repo_serial_keys(task);
         if let Some(key) =
-            active_repo_conflict_for_keys(&known_task_rows, &repo_keys, Some(&task_id))
+            active_repo_conflict_for_keys(&known_task_rows, &repo_keys, Some(&task_id), max_tasks_per_repo())
         {
             log::info!(
                 "[pr-review-sweep] delaying task {} because repo {} already has active work",
