@@ -2,8 +2,14 @@
 
 import type { AeComment, CommentAuthor } from '$lib/types';
 import { safeInvoke } from '$lib/utils/tauri';
+import { SvelteMap } from 'svelte/reactivity';
 
-let commentsByTask = $state<Map<string, AeComment[]>>(new Map());
+// SvelteMap gives per-KEY reactivity: setting comments for one task only
+// invalidates readers of THAT task's comments. The previous plain-Map +
+// `commentsByTask = new Map(...)` reassignment invalidated every card on
+// every comment event, which (under the software-rendered WebView) pinned
+// the CPU at 100% whenever the worker was posting progress comments.
+const commentsByTask = new SvelteMap<string, AeComment[]>();
 let loading = $state(false);
 let error = $state<string | null>(null);
 
@@ -47,9 +53,7 @@ export function getCommentStore() {
           taskId,
         });
         if (result) {
-          const next = new Map(commentsByTask);
-          next.set(taskId, result);
-          commentsByTask = next;
+          commentsByTask.set(taskId, result);
         }
       } catch (e) {
         error = String(e);
@@ -73,9 +77,7 @@ export function getCommentStore() {
           const newComment = result[0] as AeComment;
           // Add to local state
           const existing = commentsByTask.get(taskId) || [];
-          const next = new Map(commentsByTask);
-          next.set(taskId, [...existing, newComment]);
-          commentsByTask = next;
+          commentsByTask.set(taskId, [...existing, newComment]);
           return newComment;
         }
       } catch (e) {
@@ -88,9 +90,7 @@ export function getCommentStore() {
       try {
         await safeInvoke('supabase_delete_comment', { commentId });
         const existing = commentsByTask.get(taskId) || [];
-        const next = new Map(commentsByTask);
-        next.set(taskId, existing.filter((c) => c.id !== commentId));
-        commentsByTask = next;
+        commentsByTask.set(taskId, existing.filter((c) => c.id !== commentId));
         return true;
       } catch (e) {
         error = String(e);
@@ -103,9 +103,7 @@ export function getCommentStore() {
       const taskId = comment.task_id;
       const existing = commentsByTask.get(taskId) || [];
       if (!existing.find((c) => c.id === comment.id)) {
-        const next = new Map(commentsByTask);
-        next.set(taskId, [...existing, comment]);
-        commentsByTask = next;
+        commentsByTask.set(taskId, [...existing, comment]);
       }
     },
 

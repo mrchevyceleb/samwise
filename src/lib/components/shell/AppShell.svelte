@@ -16,7 +16,7 @@
 	import { getTheme } from '$lib/stores/theme.svelte';
 	import { safeInvoke } from '$lib/utils/tauri';
 	import { subscribeToTable } from '$lib/supabase';
-	import type { AeMessage, AeComment } from '$lib/types';
+	import type { AeMessage, AeComment, AeTask } from '$lib/types';
 
 	const layout = getLayout();
 	const settingsStore = getSettingsStore();
@@ -31,20 +31,41 @@
 	let showMasterPrompt = $state(false);
 	let realtimeChannels: any[] = [];
 	let taskRefreshInterval: ReturnType<typeof setInterval> | null = null;
-	let taskRefreshDebounce: ReturnType<typeof setTimeout> | null = null;
 
 	/**
-	 * The worker flips many task rows in quick succession (status transitions,
-	 * claims, etc). Refetching the whole board on every raw realtime event
-	 * caused back-to-back full reloads and froze the UI. Collapse a burst of
-	 * events into a single refetch.
+	 * Realtime coalescing. The WebView runs WITHOUT GPU compositing
+	 * (WEBKIT_DISABLE_COMPOSITING_MODE — GPU path black-screens on this NVIDIA
+	 * box), so there are no compositor layers and ANY DOM change forces the web
+	 * process to software-repaint a large region and ship the buffer over a
+	 * socket. When the worker churns the DB it emits many realtime events/sec;
+	 * applying each one immediately meant a full repaint per event and pinned
+	 * the CPU at 100%. So we BUFFER incoming task/comment events and flush them
+	 * in a single batch at most ~1x/sec → at most one repaint per second
+	 * regardless of how hard the worker is churning.
 	 */
-	function scheduleTaskRefresh() {
-		if (taskRefreshDebounce) clearTimeout(taskRefreshDebounce);
-		taskRefreshDebounce = setTimeout(() => {
-			taskRefreshDebounce = null;
-			taskStore.fetchTasks({ silent: true });
-		}, 250);
+	const FLUSH_INTERVAL = 1000;
+	let pendingTaskUpdates = new Map<string, { type: string; row: AeTask }>();
+	let pendingComments: AeComment[] = [];
+	let flushTimer: ReturnType<typeof setTimeout> | null = null;
+
+	function scheduleFlush() {
+		if (flushTimer) return;
+		flushTimer = setTimeout(flushRealtime, FLUSH_INTERVAL);
+	}
+
+	function flushRealtime() {
+		flushTimer = null;
+		// Svelte batches these synchronous state writes into a single re-render.
+		if (pendingTaskUpdates.size > 0) {
+			for (const { type, row } of pendingTaskUpdates.values()) {
+				taskStore.applyRealtimeUpdate(type, row);
+			}
+			pendingTaskUpdates = new Map();
+		}
+		if (pendingComments.length > 0) {
+			for (const c of pendingComments) commentStore.applyRealtimeComment(c);
+			pendingComments = [];
+		}
 	}
 
 	let workerUnlisten: (() => void) | null = null;
@@ -132,9 +153,9 @@
 			clearInterval(taskRefreshInterval);
 			taskRefreshInterval = null;
 		}
-		if (taskRefreshDebounce) {
-			clearTimeout(taskRefreshDebounce);
-			taskRefreshDebounce = null;
+		if (flushTimer) {
+			clearTimeout(flushTimer);
+			flushTimer = null;
 		}
 		workerUnlisten?.();
 		chatStore.destroySession();
@@ -146,8 +167,15 @@
 
 		const taskChannel = subscribeToTable(config.url, config.anon_key, 'ae_tasks', (payload) => {
 			const { eventType } = payload;
-			if (eventType === 'INSERT' || eventType === 'UPDATE' || eventType === 'DELETE') {
-				scheduleTaskRefresh();
+			// Buffer the latest state per row id; flushed in one batch ~1x/sec.
+			if ((eventType === 'INSERT' || eventType === 'UPDATE') && payload.new) {
+				const row = payload.new as AeTask;
+				pendingTaskUpdates.set(row.id, { type: eventType, row });
+				scheduleFlush();
+			} else if (eventType === 'DELETE' && payload.old) {
+				const row = payload.old as AeTask;
+				pendingTaskUpdates.set(row.id, { type: 'DELETE', row });
+				scheduleFlush();
 			}
 		});
 		realtimeChannels.push(taskChannel);
@@ -161,7 +189,8 @@
 
 		const commentChannel = subscribeToTable(config.url, config.anon_key, 'ae_comments', (payload) => {
 			if (payload.eventType === 'INSERT') {
-				commentStore.applyRealtimeComment(payload.new as AeComment);
+				pendingComments.push(payload.new as AeComment);
+				scheduleFlush();
 			}
 		});
 		realtimeChannels.push(commentChannel);
@@ -268,7 +297,6 @@
 				box-shadow: 0 4px 20px {theme.c.accentGlow}, 0 0 40px {theme.c.accentGlow};
 				transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 				transform: {chatToggleHovered ? 'scale(1.1) rotate(-5deg)' : 'scale(1)'};
-				animation: breathe-glow 3s ease-in-out infinite;
 			"
 			onclick={() => layout.toggleRightPanel()}
 			onmouseenter={() => chatToggleHovered = true}

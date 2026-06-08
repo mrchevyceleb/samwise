@@ -281,7 +281,7 @@
 		padding: 12px 14px;
 		border-radius: 10px;
 		background: {hovered ? (theme.isDark ? 'rgba(99, 102, 241, 0.06)' : 'rgba(79, 70, 229, 0.04)') : theme.c.glassBg};
-		backdrop-filter: blur(12px);
+		/* backdrop blur removed: software-rendered blur per-card repainted every frame and pinned the CPU */
 		border: {isWorking ? '1.5px solid rgba(99, 102, 241, 0.5)' : hovered ? '1px solid ' + theme.c.borderGlow : '1px solid ' + theme.c.glassBorder};
 		{isWorking ? 'animation: working-card-pulse 2s ease-in-out infinite;' : ''}
 		cursor: grab;
@@ -289,7 +289,6 @@
 		transform: {isBeingDragged ? 'scale(0.95)' : hovered ? 'translateY(-2px)' : 'translateY(0)'};
 		box-shadow: {hovered ? theme.c.shadowCardHover : theme.c.shadowCard};
 		opacity: {isBeingDragged ? '0.4' : '1'};
-		{!isWorking ? `animation: ${task.status !== 'done' && !isBeingDragged ? 'card-idle-bob 4s ease-in-out infinite' : 'none'}; animation-delay: ${Math.random() * 2}s;` : ''}
 		user-select: none;
 	"
 	onmouseenter={() => hovered = true}

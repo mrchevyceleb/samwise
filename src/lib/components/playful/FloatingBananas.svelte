@@ -26,8 +26,8 @@
 				--float-opacity: {s.opacity};
 				--drift-x: {s.driftX}px;
 				--drift-y: {s.driftY}px;
-				animation: float-drift {s.duration}s ease-in-out infinite;
-				animation-delay: {s.delay}s;
+				/* float-drift animation removed: 10 full-viewport elements animating
+				   continuously forced large software repaints every frame on the GPU-less WebView */
 				pointer-events: none;
 				user-select: none;
 				font-family: var(--font-mono);
