@@ -101,7 +101,7 @@ The full lifecycle is:
    - **`pr-review-batch` cron** at 12 past the hour — runs via Rivendell's Codex forge, does the full review → merge → deploy
    - **"Merge and Deploy" button** in the AutoSam UI — Matt clicks it, which stamps `samwise_merge_deploy_status: "requested"` in context, and `sweep_merge_deploy_requests` in the worker executes it
 
-Post-merge deploy (when triggered): Railway server deploy, Supabase migrations (`supabase db push`), Supabase Edge Functions (`supabase functions deploy` — requires `SUPABASE_ACCESS_TOKEN` in Doppler). **Vercel is NOT triggered by Sam** — Vercel auto-deploys when main is pushed to GitHub.
+Post-merge deploy (when triggered): Railway server deploy, Supabase migrations (`supabase db push`), Supabase Edge Functions (`supabase functions deploy` — requires `SUPABASE_ACCESS_TOKEN` in Doppler). **Vercel is NOT triggered by Sam** — Vercel auto-deploys from the repo's configured GitHub branch. Do not assume that branch is `main`; for protected Operly work, ordinary PRs target `dev`.
 
 ⚠️ **Critical**: Do NOT auto-stamp `samwise_merge_deploy_status: "requested"` at the `approved` transition in `spawn_pr_review_task`. Doing so bypasses the intended human/cron control point and causes Sam to merge PRs he shouldn't. The `sweep_merge_deploy_requests` gate is intentional and correct — it only fires when the button or cron explicitly requests it.
 

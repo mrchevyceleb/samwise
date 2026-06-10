@@ -11069,8 +11069,24 @@ async fn run_merge_deploy_workflow(
         .await;
     }
 
-    let default_branch = detect_default_branch(repo_path).await;
-    let deploy_path = prepare_deploy_checkout(repo_path, task_id, &default_branch)
+    let (_, deploy_branch) = fetch_pr_branch_info(pr_url, repo_path)
+        .await
+        .map_err(|e| {
+            MergeDeployError::new(
+                format!(
+                    "failed to read PR base branch before deploy; refusing to deploy from repo default branch: {}",
+                    e
+                ),
+                pr_merged,
+            )
+        })?;
+    if deploy_branch.trim().is_empty() {
+        return Err(MergeDeployError::new(
+            "PR base branch was empty before deploy; refusing to deploy from repo default branch",
+            pr_merged,
+        ));
+    }
+    let deploy_path = prepare_deploy_checkout(repo_path, task_id, &deploy_branch)
         .await
         .map_err(|e| MergeDeployError::new(e, pr_merged))?;
     ensure_supabase_link_state(repo_path, &deploy_path, &files)
@@ -11165,7 +11181,7 @@ async fn gh_pr_is_merged(pr_url: &str, repo_path: &str) -> Result<bool, String> 
 async fn prepare_deploy_checkout(
     repo_path: &str,
     task_id: &str,
-    default_branch: &str,
+    base_branch: &str,
 ) -> Result<String, String> {
     run_git(&["fetch", "origin", "--prune"], repo_path).await?;
 
@@ -11173,7 +11189,7 @@ async fn prepare_deploy_checkout(
         if let Some(path) = task_worktree_path(repo_path, task_id).filter(|p| p.is_dir()) {
             path.to_string_lossy().into_owned()
         } else {
-            ensure_temp_deploy_worktree(repo_path, task_id, default_branch).await?
+            ensure_temp_deploy_worktree(repo_path, task_id, base_branch).await?
         };
 
     let dirty = run_git(&["status", "--porcelain"], &deploy_path).await?;
@@ -11185,7 +11201,7 @@ async fn prepare_deploy_checkout(
     }
 
     run_git(&["fetch", "origin", "--prune"], &deploy_path).await?;
-    let origin_ref = format!("origin/{}", default_branch);
+    let origin_ref = format!("origin/{}", base_branch);
     run_git(&["checkout", "--detach", &origin_ref], &deploy_path).await?;
     Ok(deploy_path)
 }
