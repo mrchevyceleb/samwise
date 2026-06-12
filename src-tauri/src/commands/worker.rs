@@ -14073,6 +14073,12 @@ async fn list_kim_ready_prs(repo_path: &str) -> Result<Vec<Value>, String> {
 /// are owned exclusively by `sweep_plant_full_pr_review_queue`; the normal
 /// coding queue skips them.
 fn is_plant_full_pr_review_task(task: &Value) -> bool {
+    // Skip terminal tasks — they only waste sweep cycles and spam
+    // "delaying task" logs for rows that are already done/cancelled/failed.
+    let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    if matches!(status, "done" | "cancelled" | "failed") {
+        return false;
+    }
     task.get("context")
         .and_then(|c| c.get("plant_full_pr_review"))
         .and_then(|v| v.as_bool())
