@@ -249,6 +249,24 @@ pub fn is_safe_pr_url(pr_url: &str) -> bool {
     re.is_match(pr_url)
 }
 
+/// True for GitHub compare URLs used by promotion tasks
+/// (e.g. `https://github.com/Owner/Repo/compare/prod...main`).
+/// These are not PRs but are legitimate automation targets.
+pub fn is_safe_compare_url(url: &str) -> bool {
+    let re = match regex::Regex::new(
+        r"^https://github\.com/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+/compare/[A-Za-z0-9_.\-]+\.{2,3}[A-Za-z0-9_.\-]+$",
+    ) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    re.is_match(url)
+}
+
+/// Convenience: accepts either a PR URL or a compare URL.
+pub fn is_safe_pr_or_compare_url(url: &str) -> bool {
+    is_safe_pr_url(url) || is_safe_compare_url(url)
+}
+
 pub async fn fetch_pr_head_sha(pr_url: &str, repo_path: &str) -> Result<String, String> {
     let output = async_cmd("gh")
         .args(["pr", "view", pr_url, "--json", "headRefOid"])

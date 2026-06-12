@@ -15671,7 +15671,7 @@ async fn sweep_stale_fixes_needed_cards(
         if task_id.is_empty() || pr_url.is_empty() || repo_path.is_empty() {
             continue;
         }
-        if !review::is_safe_pr_url(&pr_url) {
+        if !review::is_safe_pr_or_compare_url(&pr_url) {
             continue;
         }
         // Skip cards that are actively being worked (updated recently)
