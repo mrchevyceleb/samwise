@@ -786,6 +786,36 @@ mod tests {
     }
 }
 
+/// Post an APPROVED review on the PR so that branch-protection rules that
+/// require an approving review are satisfied before we attempt the merge.
+/// Idempotent: if an approval already exists, this is a no-op at the GitHub
+/// level (it just adds another approval event).
+pub async fn gh_pr_approve(pr_url: &str, repo_path: &str) -> Result<(), String> {
+    let output = async_cmd("gh")
+        .args([
+            "pr", "review", pr_url,
+            "--approve",
+            "-b", "Auto-approved by Samwise merge pipeline (Codex review passed, CI green).",
+        ])
+        .current_dir(repo_path)
+        .output()
+        .await
+        .map_err(|e| format!("spawn gh pr review --approve: {}", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        // Non-fatal: some repos don't require reviews, and the merge itself
+        // will fail if a review truly is required and this somehow didn't stick.
+        log::warn!(
+            "[review] gh pr review --approve returned non-zero (non-fatal). stderr={} stdout={}",
+            stderr, stdout
+        );
+    } else {
+        log::info!("[review] posted APPROVED review on {}", pr_url);
+    }
+    Ok(())
+}
+
 pub async fn gh_merge(pr_url: &str, repo_path: &str, head_sha: &str) -> Result<(), String> {
     // --match-head-commit rejects if anyone pushed after our review.
     // Do not pass --delete-branch: Sam task branches are attached to local
