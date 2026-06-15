@@ -42,6 +42,10 @@ type Body = {
   environment?: "staging" | "production";
   preview_url?: string;
   base_branch?: string;
+  // Run mode for the worker. "direct"/"command" skip the PR pipeline (no
+  // worktree/branch/PR); "full" (default) runs the single-repo code pipeline.
+  // `$admin-review` promotion handoffs default to "direct" (see below).
+  cron_execution_mode?: string;
   attachments?: AttachmentInput[];
   callback_url?: string;
   callback_secret?: string;
@@ -435,6 +439,26 @@ Deno.serve(async (req) => {
     ...(task.context && typeof task.context === "object" ? task.context : {}),
     qa_environment: environment,
   };
+
+  // `$admin-review` promotion handoffs (the guard-supabase job in a repo's
+  // deploy.yml hands the staging->prod promotion to Sam when the delta touches
+  // supabase/) are administrative actions: review the prod..main delta, run the
+  // Supabase migration/edge-function work, dispatch the deploy workflow. They
+  // change no code, so they must NOT run through the single-repo PR pipeline -
+  // that opens an empty `sam/<id>` PR which auto-merges and trips a Slack
+  // notice. "direct" mode runs Sam against the repo checkout and skips the
+  // worktree/branch/PR. An explicit body.cron_execution_mode still wins.
+  const explicitMode = typeof body.cron_execution_mode === "string"
+    ? body.cron_execution_mode.trim().toLowerCase()
+    : "";
+  const cronExecutionMode = explicitMode ||
+    (title.startsWith("$admin-review") ? "direct" : "");
+  if (cronExecutionMode) {
+    task.context = {
+      ...(task.context && typeof task.context === "object" ? task.context : {}),
+      cron_execution_mode: cronExecutionMode,
+    };
+  }
 
   const baseBranch = cleanBaseBranch(body.base_branch);
   if (baseBranch) task.base_branch = baseBranch;
