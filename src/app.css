@@ -327,3 +327,27 @@ button, input, textarea, select, a, [role="button"] {
   from { opacity: 0; transform: translateY(-8px); }
   to { opacity: 1; transform: translateY(0); }
 }
+
+/* ── Perf-lite: software-rendered WebView (the Spark) ──────────────
+   On the Spark the WebView runs with WEBKIT_DISABLE_COMPOSITING_MODE=1
+   (the GPU path black-screens on this NVIDIA box), so there are no GPU
+   compositor layers and EVERY animation frame forces a full software
+   repaint on the WebKit main thread. A handful of always-on `infinite`
+   animations (breathing titlebar logo, pulsing status dots that run 24/7,
+   working-card glows) was enough to pin that thread at ~100% CPU and starve
+   input, so clicks took 3-5s to register.
+
+   `perf-lite` is added to <html> at runtime ONLY on those hosts (see
+   AppShell + the `perf_lite_mode` Tauri command); GPU-composited hosts keep
+   the full animation set. Forcing every animation to a single iteration is a
+   no-op for one-shot entrance/interaction animations (so fade-ins still
+   reveal their elements and the toy feel survives) but stops the `infinite`
+   ones after one cycle, so nothing repaints forever and idle CPU drops to ~0.
+   Backdrop blur is dropped too — it is expensive to recompute per repaint. */
+html.perf-lite *,
+html.perf-lite *::before,
+html.perf-lite *::after {
+  animation-iteration-count: 1 !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}

@@ -206,6 +206,7 @@ pub fn run() {
             // Settings
             commands::settings::save_settings,
             commands::settings::load_settings,
+            commands::settings::perf_lite_mode,
             // Git
             commands::git::git_status,
             commands::git::git_diff,

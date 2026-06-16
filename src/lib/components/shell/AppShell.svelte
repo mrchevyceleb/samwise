@@ -74,6 +74,25 @@
 		// Apply theme CSS variables to DOM immediately
 		theme.applyNow();
 
+		// Perf-lite: on software-rendered WebViews (the Spark, where GPU
+		// compositing is disabled) every animation frame is a full repaint on
+		// the WebKit main thread, so always-on `infinite` animations pin the CPU
+		// and make clicks lag for seconds. Detect that host and stop the
+		// continuous animations (see app.css `.perf-lite`). localStorage
+		// 'samwise:perf-lite' = '1' forces it on, '0' forces it off (for testing).
+		try {
+			const override = localStorage.getItem('samwise:perf-lite');
+			const perfLite =
+				override === '1'
+					? true
+					: override === '0'
+						? false
+						: (await safeInvoke<boolean>('perf_lite_mode')) === true;
+			if (perfLite) document.documentElement.classList.add('perf-lite');
+		} catch {
+			// Non-Tauri / detection failed — leave full animations on.
+		}
+
 		await initSettings();
 
 		const config = await safeInvoke<{ url: string; anon_key: string; service_role_key: string | null }>('supabase_load_doppler');
