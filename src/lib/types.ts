@@ -8,7 +8,7 @@ export type MessageRole = 'user' | 'agent' | 'system';
 export type CommentAuthor = 'matt' | 'agent' | 'system';
 export type WorkerStatus = 'online' | 'offline' | 'busy';
 export type TriggerSourceType = 'supabase' | 'webhook' | 'github' | 'triage';
-export type OriginSystem = 'operly_triage' | 'banana_triage' | 'sentry' | 'manual';
+export type OriginSystem = 'operly_triage' | 'banana_triage' | 'dev_pr_tracker' | 'sentry' | 'manual';
 export type CronExecutionMode = 'full' | 'direct' | 'command';
 export type CronRunStatus = 'running' | 'succeeded' | 'failed' | 'skipped';
 
@@ -81,7 +81,9 @@ export interface OriginBadgeMeta {
   border: string;
 }
 
-export const ORIGIN_BADGES: Record<Exclude<OriginSystem, 'manual'>, OriginBadgeMeta> = {
+export type OriginBadgeKey = Exclude<OriginSystem, 'manual'>;
+
+export const ORIGIN_BADGES: Record<OriginBadgeKey, OriginBadgeMeta> = {
   operly_triage: {
     label: 'Operly',
     color: '#a78bfa',
@@ -94,6 +96,12 @@ export const ORIGIN_BADGES: Record<Exclude<OriginSystem, 'manual'>, OriginBadgeM
     bg: 'rgba(250, 204, 21, 0.10)',
     border: 'rgba(250, 204, 21, 0.30)',
   },
+  dev_pr_tracker: {
+    label: 'Dev PR',
+    color: '#38bdf8',
+    bg: 'rgba(56, 189, 248, 0.10)',
+    border: 'rgba(56, 189, 248, 0.30)',
+  },
   sentry: {
     label: 'Sentry',
     color: '#fb7185',
@@ -101,6 +109,14 @@ export const ORIGIN_BADGES: Record<Exclude<OriginSystem, 'manual'>, OriginBadgeM
     border: 'rgba(251, 113, 133, 0.30)',
   },
 };
+
+export function getOriginBadge(origin: string | null | undefined): OriginBadgeMeta | null {
+  const key = origin?.trim();
+  if (!key || key === 'manual') return null;
+  return Object.prototype.hasOwnProperty.call(ORIGIN_BADGES, key)
+    ? ORIGIN_BADGES[key as OriginBadgeKey]
+    : null;
+}
 
 export interface AeComment {
   id: string;

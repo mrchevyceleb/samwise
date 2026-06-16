@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import type { AeTask, TaskStatus, TaskPriority } from '$lib/types';
-	import { PRIORITY_COLORS, KANBAN_COLUMNS, ORIGIN_BADGES } from '$lib/types';
+	import { PRIORITY_COLORS, KANBAN_COLUMNS, getOriginBadge } from '$lib/types';
 	import { getTaskStore } from '$lib/stores/tasks.svelte';
 	import { getCommentStore } from '$lib/stores/comments.svelte';
 	import { getTheme } from '$lib/stores/theme.svelte';
@@ -164,11 +164,7 @@
 		isMergeConflictError(mergeDeployState.error) &&
 		!isMergeConflictFixBusy(mergeConflictFixState)
 	);
-	let originBadge = $derived(
-		task.origin_system && task.origin_system !== 'manual'
-			? ORIGIN_BADGES[task.origin_system]
-			: null
-	);
+	let originBadge = $derived(getOriginBadge(task.origin_system));
 
 	async function saveTitle() {
 		if (editTitle.trim() && editTitle !== task.title) {

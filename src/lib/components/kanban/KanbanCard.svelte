@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import type { AeTask, Subtask } from '$lib/types';
-	import { PRIORITY_COLORS, ORIGIN_BADGES } from '$lib/types';
+	import { PRIORITY_COLORS, getOriginBadge } from '$lib/types';
 	import { getCommentStore } from '$lib/stores/comments.svelte';
 	import { getDragStore } from '$lib/stores/drag.svelte';
 	import { getTheme } from '$lib/stores/theme.svelte';
@@ -92,11 +92,7 @@
 		qaIsSkip ? 'rgba(245, 158, 11, 0.24)' :
 		'rgba(248, 81, 73, 0.2)'
 	);
-	let originBadge = $derived(
-		task.origin_system && task.origin_system !== 'manual'
-			? ORIGIN_BADGES[task.origin_system]
-			: null
-	);
+	let originBadge = $derived(getOriginBadge(task.origin_system));
 	let subtasks = $derived(task.subtasks || []);
 	let subtaskTotal = $derived(subtasks.length);
 	let subtaskDone = $derived(subtasks.filter((s: Subtask) => s.done).length);

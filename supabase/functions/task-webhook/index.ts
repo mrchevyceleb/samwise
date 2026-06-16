@@ -26,7 +26,12 @@ type AttachmentInput =
   | string
   | { url?: string; data?: string; name?: string; mime?: string };
 
-type OriginSystem = "operly_triage" | "banana_triage" | "sentry" | "manual";
+type OriginSystem =
+  | "operly_triage"
+  | "banana_triage"
+  | "dev_pr_tracker"
+  | "sentry"
+  | "manual";
 
 type Body = {
   title?: string;
@@ -57,11 +62,23 @@ type Body = {
 const ORIGIN_SYSTEMS: ReadonlySet<OriginSystem> = new Set([
   "operly_triage",
   "banana_triage",
+  "dev_pr_tracker",
   "sentry",
   "manual",
 ]);
 
 type StoredAttachment = { url: string; name: string; mime: string };
+type StorageUploadClient = {
+  storage: {
+    from: (bucketId: string) => {
+      upload: (
+        path: string,
+        fileBody: Uint8Array,
+        fileOptions?: { contentType?: string; upsert?: boolean },
+      ) => Promise<{ error: { message: string } | null }>;
+    };
+  };
+};
 type ProjectRow = {
   name: string;
   repo_url?: string | null;
@@ -278,7 +295,7 @@ function decodeBase64(raw: string): Uint8Array {
 }
 
 async function ingestAttachment(
-  sb: ReturnType<typeof createClient>,
+  sb: StorageUploadClient,
   supabaseUrl: string,
   entry: AttachmentInput,
 ): Promise<StoredAttachment | null> {
@@ -320,7 +337,7 @@ async function ingestAttachment(
 }
 
 async function uploadBytes(
-  sb: ReturnType<typeof createClient>,
+  sb: StorageUploadClient,
   supabaseUrl: string,
   bytes: Uint8Array,
   mime: string,
@@ -485,6 +502,11 @@ Deno.serve(async (req) => {
       if (!ORIGIN_SYSTEMS.has(os)) {
         return json(400, {
           error: `origin_system must be one of: ${[...ORIGIN_SYSTEMS].join(", ")}`,
+        });
+      }
+      if (os === "dev_pr_tracker" && !task.callback_url) {
+        return json(400, {
+          error: "callback_url is required when origin_system is dev_pr_tracker",
         });
       }
       task.origin_system = os;

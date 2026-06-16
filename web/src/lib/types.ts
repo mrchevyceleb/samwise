@@ -11,7 +11,7 @@ export type TaskStatus =
   | 'pending_confirmation';
 export type TaskPriority = 'critical' | 'high' | 'medium' | 'low';
 export type TaskType = 'code' | 'research' | 'qa-verify';
-export type OriginSystem = 'operly_triage' | 'banana_triage' | 'sentry' | 'manual';
+export type OriginSystem = 'operly_triage' | 'banana_triage' | 'dev_pr_tracker' | 'sentry' | 'manual';
 export type CronExecutionMode = 'full' | 'direct' | 'command';
 export type CronRunStatus = 'running' | 'succeeded' | 'failed' | 'skipped';
 
@@ -84,17 +84,27 @@ export interface AeTask {
   commit_message?: string | null;
 }
 
-export const ORIGIN_LABEL: Record<Exclude<OriginSystem, 'manual'>, string> = {
+export type OriginBadgeKey = Exclude<OriginSystem, 'manual'>;
+
+export const ORIGIN_LABEL: Record<OriginBadgeKey, string> = {
   operly_triage: 'Operly',
   banana_triage: 'Banana',
+  dev_pr_tracker: 'Dev PR',
   sentry: 'Sentry'
 };
 
-export const ORIGIN_BADGE_CLASS: Record<Exclude<OriginSystem, 'manual'>, string> = {
+export const ORIGIN_BADGE_CLASS: Record<OriginBadgeKey, string> = {
   operly_triage: 'bg-violet-500/10 text-violet-200 border-violet-400/30',
   banana_triage: 'bg-amber-400/10 text-amber-200 border-amber-300/30',
+  dev_pr_tracker: 'bg-sky-500/10 text-sky-200 border-sky-400/30',
   sentry: 'bg-rose-500/10 text-rose-200 border-rose-400/30'
 };
+
+export function getOriginKey(origin: string | null | undefined): OriginBadgeKey | null {
+  const key = origin?.trim();
+  if (!key || key === 'manual') return null;
+  return Object.prototype.hasOwnProperty.call(ORIGIN_LABEL, key) ? (key as OriginBadgeKey) : null;
+}
 
 export interface AeComment {
   id: string;

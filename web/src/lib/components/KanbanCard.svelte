@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { AeTask } from '$lib/types';
-  import { PRIORITY_COLOR, ORIGIN_LABEL, ORIGIN_BADGE_CLASS } from '$lib/types';
+  import { PRIORITY_COLOR, ORIGIN_LABEL, ORIGIN_BADGE_CLASS, getOriginKey } from '$lib/types';
   import { tasksStore } from '$lib/stores/tasks.svelte';
   import {
     extractReviewActionPanel,
@@ -39,11 +39,7 @@
     isMergeConflictError(mergeDeployState.error) &&
     !isMergeConflictFixBusy(mergeConflictFixState)
   );
-  let originKey = $derived(
-    task.origin_system && task.origin_system !== 'manual'
-      ? (task.origin_system as 'operly_triage' | 'banana_triage' | 'sentry')
-      : null
-  );
+  let originKey = $derived(getOriginKey(task.origin_system));
 
   function relTime(iso: string) {
     const d = Date.now() - new Date(iso).getTime();
