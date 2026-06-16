@@ -35,11 +35,12 @@ struct ClaudeCodeClosedPayload {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-/// The Claude model Sam always uses. Single source of truth so chat and worker
-/// stay aligned. Change this string when bumping models.
-pub const CLAUDE_MODEL: &str = "claude-fable-5";
+/// The Claude model Sam uses for coding tasks. Opus 4.8 is the primary.
+/// The worker auto-detects model unavailability and retries with the fallback.
+pub const CLAUDE_MODEL: &str = "claude-opus-4-8";
+pub const CLAUDE_MODEL_FALLBACK: &str = "claude-opus-4-20250514";
 
-/// Reasoning effort Sam runs with on every Claude Code spawn. Fable 5 / Opus 4.7+
+/// Reasoning effort Sam runs with on every Claude Code spawn. Opus 4.8+
 /// use adaptive thinking and ignore the legacy MAX_THINKING_TOKENS budget; the live
 /// lever is the CLI `--effort` flag (low|medium|high|xhigh|max). "xhigh" is the
 /// recommended tier for coding/agentic work. Single source of truth alongside CLAUDE_MODEL.

@@ -461,7 +461,10 @@ Deno.serve(async (req) => {
   }
 
   const baseBranch = cleanBaseBranch(body.base_branch);
-  if (baseBranch) task.base_branch = baseBranch;
+  // All projects now use `main` as the base branch. External callers may
+  // still send `dev` from stale config. Normalize here so the worker never
+  // tries to branch off a nonexistent origin/dev.
+  if (baseBranch) task.base_branch = baseBranch.toLowerCase() === "dev" || baseBranch.toLowerCase() === "development" ? "main" : baseBranch;
 
   if (typeof body.callback_url === "string") {
     const cb = body.callback_url.trim();

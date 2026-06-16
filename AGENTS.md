@@ -97,20 +97,18 @@ Secrets in Doppler project `agent-one`, config `prd`
 ### Sam's Persona
 Defined inline in `chat.rs::build_system_prompt()` (around line 427). Tone: proactive, competent, casual Slack. Asks clarifying questions, flags assumptions, pushes back when something seems wrong. Not a yes-machine. Eventually this will load from a Markdown character file under `~/samwise/` but for now it's a Rust string.
 
-### Task Lifecycle — Where Sam Stops
-**Sam's job ends at `approved` (Ready to Merge). Sam never merges or deploys himself.**
+### Task Lifecycle — Sam Merges to Main
+
+**Sam now auto-merges approved PRs to `main`.** Main isn't production (Matt manually promotes), so the merge gate is just a formality. No separate cron review needed.
 
 The full lifecycle is:
 1. Task picked up → Sam codes → opens PR (GitHub)
 2. `$samwise-pr-review` (Codex skill) runs automatically via `sweep_pr_review_queue`
-3. Verdict: `MergeNow` → card moves to **`approved`** (Ready to Merge) — **SAM STOPS HERE**
-4. Merge + deploy is handled externally by one of:
-   - **`pr-review-batch` cron** at 12 past the hour — runs via Rivendell's Codex forge, does the full review → merge → deploy
-   - **"Merge and Deploy" button** in the AutoSam UI — Matt clicks it, which stamps `samwise_merge_deploy_status: "requested"` in context, and `sweep_merge_deploy_requests` in the worker executes it
+3. Verdict: `MergeNow` → card moves to **`approved`** and auto-stamps merge request
+4. `sweep_merge_deploy_requests` picks it up on the next worker cycle → merges PR to `main`
+5. Matt manually promotes `main` to production when ready
 
-Post-merge deploy (when triggered): Railway server deploy, Supabase migrations (`supabase db push`), Supabase Edge Functions (`supabase functions deploy` — requires `SUPABASE_ACCESS_TOKEN` in Doppler). **Vercel is NOT triggered by Sam** — Vercel auto-deploys from the repo's configured GitHub branch. Do not assume that branch is `main`; for protected Operly work, ordinary PRs target `dev`.
-
-⚠️ **Critical**: Do NOT auto-stamp `samwise_merge_deploy_status: "requested"` at the `approved` transition in `spawn_pr_review_task`. Doing so bypasses the intended human/cron control point and causes Sam to merge PRs he shouldn't. The `sweep_merge_deploy_requests` gate is intentional and correct — it only fires when the button or cron explicitly requests it.
+Post-merge deploy (when triggered): Railway server deploy, Supabase migrations (`supabase db push`), Supabase Edge Functions (`supabase functions deploy` — requires `SUPABASE_ACCESS_TOKEN` in Doppler). **Vercel is NOT triggered by Sam** — Vercel auto-deploys from the repo's configured GitHub branch.
 
 ### Key Patterns
 - Stores use Svelte 5 runes and `safeInvoke` for Tauri IPC
