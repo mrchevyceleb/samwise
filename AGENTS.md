@@ -16,6 +16,12 @@ Planned additional surface: **Telegram bot** for reaching Sam from a phone. Inbo
 
 The backend worker picks up tasks from the board, writes code via Claude Code CLI, takes Playwright screenshots for visual QA, and opens PRs with before/after screenshots.
 
+## LLM Backend
+
+**Claude Code is now driven by the Z.ai coding plan, not Anthropic Claude models.** The worker still runs the Claude Code CLI (same agent loop: tool use, streaming, file ops), but the underlying model is **GLM 5.2 Max (thinking mode)** served through the Z.ai coding plan. Do NOT assume Anthropic-model identity, defaults, pricing, context limits, or behavior. Any `claude-*` model name that appears in configs (e.g. `claude-opus-4-8`) is just the label Claude Code sends upstream — it resolves to GLM 5.2 Max on the Z.ai plan.
+
+This supersedes the earlier Fireworks GLM 5.1 LiteLLM proxy approach documented in `LLM-PROXY-SWAP.md`. Routing is now the Z.ai coding plan, GLM 5.2 Max thinking.
+
 ## Deployment
 
 **Primary host:** DGX Spark "Moria" (Ubuntu 24.04, aarch64), 24/7. Worker id / hostname `spark-3065`. Accessed via screen sharing or Tailscale from Trenzalore (Windows workstation) and phone. Migrated here from the old Mac mini on 2026-05-29 (mini retired; its `ae_workers` row still lingers but stopped heartbeating at cutover).
