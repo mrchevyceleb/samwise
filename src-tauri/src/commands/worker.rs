@@ -9,7 +9,63 @@ use tauri::{Emitter, Manager};
 use super::dev_server;
 use super::review;
 use super::supabase::{self, SupabaseConfig, SupabaseState};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use crate::process::async_cmd;
+
+// ── LLM Proxy ────────────────────────────────────────────────────────
+
+/// Load LLM proxy config from settings.json. Returns None if not configured.
+/// Reads the app data dir from the same env var / location the Tauri app uses.
+/// This is a best-effort loader for use inside the worker loop where we
+/// don't have an AppHandle handy. The proxy config is also loaded directly
+/// in claude_code.rs when an AppHandle IS available.
+fn load_llm_proxy() -> Option<super::claude_code::LlmProxyConfig> {
+    // Try the Tauri app data dir convention first
+    let data_dir = if cfg!(target_os = "macos") {
+        std::env::var("HOME").ok().map(|h| PathBuf::from(format!("{}/Library/Application Support/com.mattjohnston.agent-one", h)))
+    } else if cfg!(target_os = "windows") {
+        std::env::var("LOCALAPPDATA").ok().map(|h| PathBuf::from(format!("{}\\mattjohnston\\agent-one", h)))
+    } else {
+        // Linux / DGX Spark: try XDG_DATA_HOME, then ~/.local/share
+        std::env::var("XDG_DATA_HOME").ok()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::var("HOME").ok()
+                    .map(|h| PathBuf::from(format!("{}/.local/share", h)))
+                    .unwrap_or_default()
+            })
+            .join("com.mattjohnston.agent-one")
+            .into()
+    };
+
+    if let Some(dir) = data_dir {
+        let path = dir.join("settings.json");
+        if path.exists() {
+            if let Ok(raw) = std::fs::read_to_string(&path) {
+                if let Some(config) = super::claude_code::LlmProxyConfig::from_json(&raw) {
+                    return Some(config);
+                }
+                // No proxy keys in settings.json — fall through to env var check.
+            }
+        }
+    }
+
+    // Fallback: AUTOSAM_LLM_PROXY_URL env var. This is scoped to AutoSam only
+    // (not the generic ANTHROPIC_BASE_URL which would affect ALL Claude Code
+    // usage on the machine, including Matt's personal sessions). Set this in the systemd service file.
+    if let Ok(url) = std::env::var("AUTOSAM_LLM_PROXY_URL") {
+        if !url.is_empty() {
+            log::info!("[worker] load_llm_proxy: found AUTOSAM_LLM_PROXY_URL={}", url);
+        return Some(super::claude_code::LlmProxyConfig {
+                base_url: url,
+                api_key: std::env::var("AUTOSAM_LLM_PROXY_API_KEY").unwrap_or_default(),
+            });
+        }
+    }
+
+    None
+}
 
 // ── State ────────────────────────────────────────────────────────────
 
@@ -120,9 +176,24 @@ fn pr_review_last_review_at(task: &Value) -> Option<&str> {
     task.get("last_pr_review_at").and_then(|v| v.as_str())
 }
 
+/// A review marked `running` whose worker has gone stale is a zombie: the
+/// process died (panic, OOM, host restart), and nothing will move it on its own.
+/// Detect it so the sweep re-fires instead of waiting out the 30-min last-review
+/// timer. Scoped to `running` (the only status carrying a real `started_at`);
+/// other states fall through to the normal throttle so we never poll-spam.
+fn pr_review_is_stale_inflight(task: &Value) -> bool {
+    pr_review_context_status(task) == Some("running") && pr_review_running_is_stale(task)
+}
+
 fn pr_review_should_run_now(task: &Value) -> bool {
     if pr_review_context_status(task) == Some("running") && !pr_review_running_is_stale(task) {
         return false;
+    }
+
+    // Zombie in-flight review (dead worker / wedged prep): re-fire immediately
+    // rather than letting the last-review timer hold it for up to 30 min.
+    if pr_review_is_stale_inflight(task) {
+        return true;
     }
 
     // If the last review ended inconclusive, retry sooner (5 min instead of
@@ -233,7 +304,7 @@ fn collect_active_repo_counts(tasks: &[Value]) -> HashMap<String, usize> {
 /// Max simultaneously-active tasks allowed per repo (coding/testing/running-review).
 /// Default 2 lets two cards in the same repo run at once (separate worktrees +
 /// branches + dynamically-reserved dev-server ports keep them isolated). Tunable
-/// at runtime via AUTOSAM_MAX_TASKS_PER_REPO (clamped 1..=4) so it can change
+/// at runtime via AUTOSAM_MAX_TASKS_PER_REPO (clamped 1..=8) so it can change
 /// without a rebuild; set 1 to restore strict one-at-a-time serialization.
 const MAX_TASKS_PER_REPO_DEFAULT: usize = 2;
 
@@ -241,7 +312,7 @@ fn max_tasks_per_repo() -> usize {
     std::env::var("AUTOSAM_MAX_TASKS_PER_REPO")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|&v| (1..=4).contains(&v))
+        .filter(|&v| (1..=8).contains(&v))
         .unwrap_or(MAX_TASKS_PER_REPO_DEFAULT)
 }
 
@@ -340,6 +411,16 @@ const PR_REVIEW_STARTED_AT_KEY: &str = "samwise_pr_review_started_at";
 const PR_REVIEW_COMPLETED_AT_KEY: &str = "samwise_pr_review_completed_at";
 const PR_REVIEW_STATUS_KEY: &str = "samwise_pr_review_status";
 const PR_REVIEW_ERROR_KEY: &str = "samwise_pr_review_error";
+
+// Button-driven "Review & Merge" flow: Sam runs a comprehensive pre-merge
+// review (correctness, regressions, UI, UX, blind spots, security), FIXES
+// everything broken, then merges to main with --admin. Stamped by the
+// frontend button on `approved` cards; picked up by sweep_review_merge_requests.
+const REVIEW_MERGE_STATUS_KEY: &str = "samwise_review_merge_status";
+// `samwise_review_merge_requested_at` is stamped by the frontend button; the
+// worker only reads STATUS, so the requested-at key isn't needed here.
+const REVIEW_MERGE_STARTED_AT_KEY: &str = "samwise_review_merge_started_at";
+const REVIEW_MERGE_ERROR_KEY: &str = "samwise_review_merge_error";
 const PR_REVIEW_RUNNING_STALE_SECS: i64 = 25 * 60;
 const SAMWISE_DEPLOY_MANIFEST_PATH: &str = ".samwise/deploy.json";
 const SAMWISE_SUPABASE_AUTO_COMMAND: &str = "samwise:supabase:auto";
@@ -368,7 +449,37 @@ const CLOSE_ORIGIN_TICKET_URL: &str =
     "https://iycloielqcjnjqddeuet.supabase.co/functions/v1/close-origin-ticket";
 const POST_MERGE_DEPLOY_GREEN_TIMEOUT_SECS: u64 = 60 * 60;
 const POST_MERGE_DEPLOY_GREEN_POLL_SECS: u64 = 20;
-const MERGE_DEPLOY_RUNNING_STALE_SECS: i64 = 90 * 60;
+// A Merge + Deploy "running" longer than this is treated as dead (stale). It
+// MUST exceed the maximum legitimate run so the stale handler never races a
+// still-live task: pre-merge is capped at MERGE_DEPLOY_PREMERGE_TIMEOUT_SECS
+// (70 min) and the un-wrapped post-merge deploy green-poll can add up to
+// POST_MERGE_DEPLOY_GREEN_TIMEOUT_SECS (60 min), so the real ceiling is ~130
+// min. 140 min sits just above that: a row still "running" at 140 min is
+// provably dead, so the handler can safely close it (done if the PR merged,
+// reset otherwise). Pre-merge HANGS recover far faster via the 70-min internal
+// timeout + auto-retry; this is only the post-merge / cross-host backstop.
+const MERGE_DEPLOY_RUNNING_STALE_SECS: i64 = 140 * 60;
+/// Wall-clock budget for the PRE-MERGE phase of a Merge + Deploy (everything up
+/// to and including the GitHub merge: PR-file listing, deploy preflights, the
+/// reviewed-head guard, `wait_for_ci` BEFORE merge-in, the base-branch merge-in
+/// (which may run a Claude conflict-resolution pass), then `wait_for_ci` AGAIN
+/// after merge-in). CI is polled twice (each up to CI_POLL_MAX_SECS = 15 min) and
+/// the conflict-resolution pass is bounded near 20 min, so a legitimate pre-merge
+/// phase can run ~55 min worst case. 70 min sits above that with margin and still
+/// under the 90-min RUNNING_STALE backstop, so it only fires on a genuine hang (a
+/// git/gh subprocess that never returns). When it fires, the spawned merge task
+/// ends and its per-repo MERGE_DEPLOY_LOCKS guard is released (and any in-flight
+/// git/gh child is SIGKILLed via kill_on_drop), so the auto re-request (see
+/// start_merge_deploy_task's Err handler) can re-fire without racing a live task.
+const MERGE_DEPLOY_PREMERGE_TIMEOUT_SECS: u64 = 70 * 60;
+/// Max automatic re-fires of a pre-merge-timed-out run before parking it for a
+/// human, so a genuinely wedged merge cannot retry forever.
+const MERGE_DEPLOY_MAX_RETRIES: i64 = 2;
+/// Context key holding the reviewed head SHA for a queued/retried Merge + Deploy,
+/// so the reviewed-head guard survives re-fires through the queue picker (which
+/// would otherwise pass `None` and merge whatever the PR head is at merge time).
+const MERGE_DEPLOY_EXPECTED_HEAD_SHA_KEY: &str = "samwise_merge_deploy_expected_head_sha";
+const MERGE_DEPLOY_RETRIES_KEY: &str = "samwise_merge_deploy_retries";
 
 /// Wall-clock budget for a single auto-fix Claude Code run (the pass that
 /// addresses Codex blockers on a PR). The old hardcoded 900s was too tight
@@ -435,14 +546,92 @@ async fn run_git(args: &[&str], repo_path: &str) -> Result<String, String> {
     let output = async_cmd("git")
         .args(args)
         .current_dir(repo_path)
+        // If a wrapping timeout (e.g. the merge-deploy pre-merge budget) drops
+        // this future, SIGKILL the git child so it can't keep mutating the
+        // worktree and race the retry. Safe for all callers: every one awaits
+        // .output() here, none detach the child.
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|e| format!("git {:?}: {}", args, e))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("git {:?}: {}", args, stderr.trim()));
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    // Self-heal a stale-lock wedge ONCE. A leftover `*.lock` under .git (from a
+    // killed git child or a crashed `fetch --prune`) makes every later ref update
+    // fail with "cannot lock ref", which is exactly how a PR-review worktree prep
+    // wedges a card in Review for 30 min (the #596 zombie). Clear the stale locks
+    // and retry the same command once.
+    if git_error_is_stale_lock(&stderr) {
+        let cleared = clear_named_stale_git_locks(&stderr);
+        if cleared > 0 {
+            log::warn!(
+                "[git] cleared {} stale lock(s) in {} after \"{}\"; retrying {:?}",
+                cleared, repo_path, stderr, args
+            );
+            let retry = async_cmd("git")
+                .args(args)
+                .current_dir(repo_path)
+                .kill_on_drop(true)
+                .output()
+                .await
+                .map_err(|e| format!("git {:?} (lock-retry): {}", args, e))?;
+            if retry.status.success() {
+                return Ok(String::from_utf8_lossy(&retry.stdout).trim().to_string());
+            }
+            return Err(format!(
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&retry.stderr).trim()
+            ));
+        }
+    }
+    Err(format!("git {:?}: {}", args, stderr))
+}
+
+/// True when a git failure is a stale `.lock` collision we can safely self-heal
+/// by removing the leftover lock and retrying (not a genuine logic error).
+fn git_error_is_stale_lock(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains(".lock")
+        && (s.contains("cannot lock")
+            || s.contains("could not lock")
+            || s.contains("unable to create")
+            || s.contains("file exists"))
+}
+
+/// Remove ONLY the specific `*.lock` file(s) git named in its "cannot lock"
+/// error (the absolute paths printed inside quotes, e.g. `Unable to create
+/// '/abs/.git/refs/.../x.lock'`). We never sweep the ref store broadly: a sibling
+/// worktree sharing the common dir could legitimately hold packed-refs.lock /
+/// index.lock during a long op, and yanking those would corrupt it. We also only
+/// remove a file older than 30s, so an in-flight lock a live process just created
+/// is left alone (the retry simply fails and the next sweep tries again).
+/// Returns how many were cleared.
+fn clear_named_stale_git_locks(stderr: &str) -> usize {
+    let mut removed = 0usize;
+    let mut seen = std::collections::HashSet::new();
+    for segment in stderr.split(['\'', '"']) {
+        if !segment.ends_with(".lock") {
+            continue;
+        }
+        let path = std::path::Path::new(segment);
+        // Only absolute paths git actually printed; a bare ref name can't match.
+        if !path.is_absolute() || !seen.insert(segment.to_string()) {
+            continue;
+        }
+        let stale = std::fs::metadata(path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|m| m.elapsed().ok())
+            .map(|age| age.as_secs() >= 30)
+            .unwrap_or(false);
+        if stale && std::fs::remove_file(path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 async fn detect_default_branch(repo_path: &str) -> String {
@@ -1715,6 +1904,10 @@ async fn worker_loop(
                                 continue;
                             }
 
+
+
+
+
                             if !task_id.is_empty() {
                                 // Defensive: never double-claim a task already in
                                 // our pool (claim_task is the cross-worker guard).
@@ -1971,6 +2164,9 @@ async fn worker_loop(
         if tick % 2 == 0 {
             sweep_merge_conflict_fix_requests(&config).await;
             sweep_merge_deploy_requests(&config).await;
+            // Button-driven "Review & Merge": Sam comprehensively reviews + fixes
+            // the PR, then chains into the merge+deploy path with admin rights.
+            sweep_review_merge_requests(&config).await;
         }
 
         // Sweep approved/review/fixes_needed cards whose GitHub PRs got merged
@@ -3085,6 +3281,24 @@ followed immediately by a fenced json block:
                 MERGE_DEPLOY_REQUESTED_AT_KEY.to_string(),
                 Value::String(chrono::Utc::now().to_rfc3339()),
             );
+            // Persist the just-passed head SHA so the merge picker keeps the
+            // reviewed-head guard (gh_merge --match-head-commit) on this
+            // automated QA-pass auto-merge.
+            {
+                let pr = task_row.get("pr_url").and_then(|v| v.as_str()).unwrap_or("");
+                let rp = task_row
+                    .get("repo_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if !pr.is_empty() && !rp.is_empty() {
+                    if let Ok(sha) = review::fetch_pr_head_sha(pr, rp).await {
+                        context.insert(
+                            MERGE_DEPLOY_EXPECTED_HEAD_SHA_KEY.to_string(),
+                            Value::String(sha),
+                        );
+                    }
+                }
+            }
             context.insert(MERGE_DEPLOY_ERROR_KEY.to_string(), Value::Null);
             let result = supabase::update_task(
                 config,
@@ -4097,24 +4311,53 @@ async fn execute_task(
     // to consult them (images carry info text can't).
     let attachment_paths = materialize_task_attachments(&task_id, &task).await;
     if !attachment_paths.is_empty() {
-        let lines: Vec<String> = attachment_paths
-            .iter()
-            .map(|p| format!("- {}", p.display()))
-            .collect();
+        // When proxy is active (non-vision model like GLM), image attachments
+        // can't be sent directly. Run them through a local vision model first.
+        let proxy = load_llm_proxy();
+        let image_descriptions = describe_image_attachments(&attachment_paths, &proxy).await;
+
+        let mut lines: Vec<String> = Vec::new();
+        for p in &attachment_paths {
+            if let Some(desc) = image_descriptions.get(p) {
+                // Image was described by local vision model. Include the text
+                // description instead of the raw image file.
+                lines.push(format!(
+                    "- {} (IMAGE — described by vision adapter):\n  {}",
+                    p.display(),
+                    desc.lines().map(|l| format!("    {}", l)).collect::<Vec<_>>().join("\n")
+                ));
+            } else {
+                // Non-image file, or image that couldn't be described. Pass as-is.
+                lines.push(format!("- {}", p.display()));
+            }
+        }
         prompt_parts.push(format!(
             "## Attached files\nMatt attached {} file(s) to this task. Read them before doing anything else — they almost always contain the bug repro, design reference, or error screenshot that the description alone does not convey:\n{}\n",
             attachment_paths.len(),
             lines.join("\n")
         ));
-        agent_comment(
-            config,
-            &task_id,
-            &format!(
-                "Downloaded {} attachment(s) for this task.",
-                attachment_paths.len()
-            ),
-        )
-        .await;
+        if !image_descriptions.is_empty() {
+            agent_comment(
+                config,
+                &task_id,
+                &format!(
+                    "Downloaded {} attachment(s). {} image(s) described via local vision model (backend can't handle images).",
+                    attachment_paths.len(),
+                    image_descriptions.len()
+                ),
+            )
+            .await;
+        } else {
+            agent_comment(
+                config,
+                &task_id,
+                &format!(
+                    "Downloaded {} attachment(s) for this task.",
+                    attachment_paths.len()
+                ),
+            )
+            .await;
+        }
     }
 
     // The actual task
@@ -4168,6 +4411,17 @@ async fn execute_task(
         } else {
             String::new()
         };
+
+        // When routing through the LLM proxy (GLM), explicitly request tests.
+        // GLM tends to skip test coverage, which blocks auto-merge (min score 7).
+        let proxy = load_llm_proxy();
+        let test_instruction_section = if proxy.is_some() {
+            String::from(
+                "## Test Coverage\nWrite tests for your changes. Even a basic smoke test or rendering test is better than none. The code review will score test_coverage, and a score below 7 blocks auto-merge. If the project has no test framework, add a comment in the commit explaining why tests are not feasible.\n\n"
+            )
+        } else {
+            String::new()
+        };
         prompt_parts.push(format!(
             "## Task\n**{title}**\n\n{description}\n\n\
 ## Instructions\n\
@@ -4175,7 +4429,7 @@ Make the code changes required by this task. You have approval to edit \
 any file in this repo \u{2014} do not ask for confirmation before writing.\n\n\
 Explore only what the task needs. Do not read the whole codebase or add \
 unrelated cleanup \u{2014} those will bloat the diff and slow review.\n\n\
-{visual_verification_section}\
+{visual_verification_section}{test_instruction_section}\
 When you are done making changes (and visual verification, if applicable), stage everything and write a structured commit. \
 Use a HEREDOC so the body is multi-line:\n\
 ```\n\
@@ -5500,6 +5754,46 @@ from Matt, stop without making changes and explain specifically what you need cl
                                 &format!("Auto-merge blocked: {}", reason),
                             )
                             .await;
+                            // If the blocker is a review-flagged code issue (not just a
+                            // guard rule like diff size or package.json), move to fixes_needed
+                            // so the auto-fix loop can fire. Without this, tasks with real
+                            // code blockers sit in "approved" forever — the merge retry can't
+                            // fix code issues, and no fix cycle fires from approved status.
+                            let reason_str = reason.as_str();
+                            let is_code_blocker = reason_str.contains("review flagged blockers")
+                                || reason_str.contains("lowest review score");
+                            if is_code_blocker {
+                                // Task is in "review" status when try_auto_merge blocks.
+                                let moved = supabase::update_task_if_status(
+                                    config,
+                                    &task_id,
+                                    "review",
+                                    &serde_json::json!({
+                                        "status": "fixes_needed",
+                                        "updated_at": chrono::Utc::now().to_rfc3339(),
+                                    }),
+                                )
+                                .await
+                                .ok()
+                                .and_then(|v| v.as_array().map(|arr| !arr.is_empty()))
+                                .unwrap_or(false);
+                                if moved {
+                                    log::info!(
+                                        "[worker] auto-merge blocked with code issues; moving task {} to fixes_needed for auto-fix cycle",
+                                        task_id
+                                    );
+                                    notify_callback(config, &task_id, "fixes_needed", Some(&pr_url), None);
+                                    // Kick the auto-fix loop so the fix cycle fires immediately
+                                    maybe_spawn_auto_fix(
+                                        config.clone(),
+                                        task_id.clone(),
+                                        pr_url.clone(),
+                                        repo_path.clone(),
+                                        String::new(),
+                                        false,
+                                    ).await;
+                                }
+                            }
                             if notify_task_completed_code {
                                 send_telegram(
                                     config,
@@ -6779,6 +7073,7 @@ async fn download_attachment_for_task(
 /// paths. Errors are logged but never fatal — a broken URL shouldn't kill
 /// the whole task.
 async fn materialize_task_attachments(
+
     task_id: &str,
     task: &serde_json::Value,
 ) -> Vec<std::path::PathBuf> {
@@ -6798,6 +7093,133 @@ async fn materialize_task_attachments(
         }
     }
     out
+}
+/// When the LLM proxy is active (routing through a non-vision model like GLM),
+/// image attachments can't be sent directly. This function detects image files
+/// among the attachments, calls a local vision model (LM Studio) to describe
+/// each one, and returns text descriptions that replace the raw image references
+/// in the prompt. This mirrors Pi's "Vision Adapter Context" pattern.
+///
+/// Returns a map of image file path -> text description. The caller replaces
+/// image references in the prompt with these descriptions.
+async fn describe_image_attachments(
+    attachment_paths: &[std::path::PathBuf],
+    proxy: &Option<super::claude_code::LlmProxyConfig>,
+) -> HashMap<std::path::PathBuf, String> {
+    // Only run when proxy is active (non-vision model backend)
+    if proxy.is_none() {
+        return HashMap::new();
+    }
+
+    let image_exts = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"];
+    let image_files: Vec<&std::path::PathBuf> = attachment_paths
+        .iter()
+        .filter(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| image_exts.contains(&e.to_lowercase().as_str()))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    if image_files.is_empty() {
+        return HashMap::new();
+    }
+
+    log::info!(
+        "[worker] Vision adapter: {} image attachment(s) to describe via local model",
+        image_files.len()
+    );
+
+    let mut descriptions = HashMap::new();
+
+    // Check if LM Studio is available locally
+    let lm_studio_url = std::env::var("AUTOSAM_VISION_MODEL_URL")
+        .unwrap_or_else(|_| "http://localhost:1234/v1".to_string());
+    let vision_model = std::env::var("AUTOSAM_VISION_MODEL")
+        .unwrap_or_else(|_| "qwen3-vl-4b-instruct".to_string());
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build();
+
+    let Ok(client) = client else {
+        log::warn!("[worker] Vision adapter: failed to build HTTP client");
+        return HashMap::new();
+    };
+
+    for img_path in &image_files {
+        match tokio::fs::read(img_path).await {
+            Ok(bytes) => {
+                let b64 = STANDARD.encode(&bytes);
+                let ext = img_path.extension().and_then(|e| e.to_str()).unwrap_or("png");
+                let mime = match ext {
+                    "jpg" | "jpeg" => "image/jpeg",
+                    "gif" => "image/gif",
+                    "webp" => "image/webp",
+                    "svg" => "image/svg+xml",
+                    _ => "image/png",
+                };
+
+                let body = serde_json::json!({
+                    "model": vision_model,
+                    "max_tokens": 500,
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe this screenshot in detail. What does it show? What bug, error, or design reference is visible? Be specific about text, UI elements, and colors."},
+                            {"type": "image_url", "image_url": {"url": format!("data:{};base64,{}", mime, b64)}}
+                        ]
+                    }]
+                });
+
+                match client
+                    .post(format!("{}/chat/completions", lm_studio_url.trim_end_matches("/v1").trim_end_matches('/')))
+                    .json(&body)
+                    .send()
+                    .await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        if let Ok(json) = resp.json::<serde_json::Value>().await {
+                            if let Some(desc) = json
+                                .get("choices")
+                                .and_then(|c| c.get(0))
+                                .and_then(|c| c.get("message"))
+                                .and_then(|m| m.get("content"))
+                                .and_then(|c| c.as_str())
+                            {
+                                log::info!(
+                                    "[worker] Vision adapter: described {} ({} chars)",
+                                    img_path.display(),
+                                    desc.len()
+                                );
+                                descriptions.insert((*img_path).clone(), desc.to_string());
+                            }
+                        }
+                    }
+                    Ok(resp) => {
+                        log::warn!(
+                            "[worker] Vision adapter: vision model returned status {} for {}",
+                            resp.status(),
+                            img_path.display()
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "[worker] Vision adapter: failed to call vision model for {}: {}",
+                            img_path.display(),
+                            e
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("[worker] Vision adapter: failed to read {}: {}", img_path.display(), e);
+            }
+        }
+    }
+
+    descriptions
 }
 
 /// Fetch a Telegram-hosted file by its `file_id` and return the raw bytes
@@ -8316,6 +8738,10 @@ pub async fn run_claude_code_opts(
         cmd.arg("--max-turns").arg(max_turns.to_string());
     }
 
+    // Inject LLM proxy env vars if configured.
+    let proxy = load_llm_proxy();
+    super::claude_code::inject_proxy_env_async(&mut cmd, &proxy);
+
     // Resolve cwd. Callers pass "." for "no particular repo" chat calls, but
     // when Samwise.app is launched from Finder the inherited cwd is "/". Any
     // filesystem walk the CLI does from there hits /Volumes and triggers the
@@ -8531,6 +8957,10 @@ pub async fn run_claude_code_streaming(
     if max_turns > 0 {
         cmd.arg("--max-turns").arg(max_turns.to_string());
     }
+
+    // Inject LLM proxy env vars if configured.
+    let proxy = load_llm_proxy();
+    super::claude_code::inject_proxy_env_async(&mut cmd, &proxy);
 
     let resolved_cwd = resolve_chat_cwd(cwd);
     cmd.current_dir(&resolved_cwd)
@@ -9215,11 +9645,13 @@ pub fn spawn_pr_review_task(
                 .and_then(|v| v.as_array().map(|arr| !arr.is_empty()))
                 .unwrap_or(false);
                 if updated {
-                    // Card moves to approved (Ready to Merge). Since main
-                    // isn't production (Matt manually promotes), auto-stamp
-                    // the merge request so sweep_merge_deploy_requests merges
-                    // it on the next worker cycle. Gated by autoMergeOnApproved
-                    // setting (default true) so projects can opt out.
+                    // Card moves to approved (Ready to Merge) and STOPS there.
+                    // Auto-merge is intentionally OFF (2026-06-19): green cards
+                    // wait in Ready to Merge for the "Review & Merge" button,
+                    // which runs Sam's comprehensive review + fix + admin merge.
+                    // The legacy auto-stamp path stays behind autoMergeOnApproved
+                    // (now default FALSE) so nothing merges to main without the
+                    // button unless a project explicitly re-enables it.
                     let settings_val: Option<serde_json::Value> = {
                         let data_home = std::env::var("XDG_DATA_HOME")
                             .ok()
@@ -9240,7 +9672,7 @@ pub fn spawn_pr_review_task(
                         .as_ref()
                         .and_then(|s| s.get("autoMergeOnApproved"))
                         .and_then(|v| v.as_bool())
-                        .unwrap_or(true);
+                        .unwrap_or(false);
                     if merge_on_approved {
                         if let Some(task_row) = supabase::fetch_task(&config, &task_id).await.ok().flatten() {
                             let mut context = task_context_object(&task_row);
@@ -9252,6 +9684,25 @@ pub fn spawn_pr_review_task(
                             MERGE_DEPLOY_REQUESTED_AT_KEY.to_string(),
                             Value::String(chrono::Utc::now().to_rfc3339()),
                         );
+                        // Persist the just-reviewed head SHA so the merge picker
+                        // re-fires this auto-approved request WITH the reviewed-head
+                        // guard (gh_merge --match-head-commit). Without it the merge
+                        // would accept whatever the head happens to be at merge time.
+                        {
+                            let pr = task_row.get("pr_url").and_then(|v| v.as_str()).unwrap_or("");
+                            let rp = task_row
+                                .get("repo_path")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            if !pr.is_empty() && !rp.is_empty() {
+                                if let Ok(sha) = review::fetch_pr_head_sha(pr, rp).await {
+                                    context.insert(
+                                        MERGE_DEPLOY_EXPECTED_HEAD_SHA_KEY.to_string(),
+                                        Value::String(sha),
+                                    );
+                                }
+                            }
+                        }
                         context.insert(MERGE_DEPLOY_ERROR_KEY.to_string(), Value::Null);
                         let stamp_result = supabase::update_task(
                             &config,
@@ -9799,6 +10250,33 @@ async fn start_merge_conflict_fix_task(config: &SupabaseConfig, task: Value) {
                     MERGE_DEPLOY_STATUS_KEY.to_string(),
                     Value::String("requested".to_string()),
                 );
+                // Fetch the freshly-resolved head SHA ONCE and reuse it for both
+                // the context stamp and the start call below. Two separate reads
+                // could diverge if the head changed between them, letting the
+                // direct start path merge a newer, unreviewed head while the
+                // stored guard held the older one. The conflict-fix just produced
+                // this head; gh_merge's --match-head-commit enforces it.
+                let resolved_head: Option<String> = {
+                    let pr = latest_task.get("pr_url").and_then(|v| v.as_str()).unwrap_or("");
+                    let rp = latest_task
+                        .get("repo_path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if pr.is_empty() || rp.is_empty() {
+                        None
+                    } else {
+                        review::fetch_pr_head_sha(pr, rp).await.ok()
+                    }
+                };
+                // Persist it in the SAME write that sets `requested`, so even if
+                // the picker fires before the start_merge_deploy_task call below
+                // it carries the reviewed-head guard (no None-SHA race window).
+                if let Some(sha) = &resolved_head {
+                    context.insert(
+                        MERGE_DEPLOY_EXPECTED_HEAD_SHA_KEY.to_string(),
+                        Value::String(sha.clone()),
+                    );
+                }
                 context.insert(MERGE_DEPLOY_ERROR_KEY.to_string(), Value::Null);
 
                 let _ = supabase::update_task(
@@ -9825,7 +10303,7 @@ async fn start_merge_conflict_fix_task(config: &SupabaseConfig, task: Value) {
                     latest_task,
                     true,
                     "Merge conflicts were resolved and pushed. Retrying Merge + Deploy.",
-                    None,
+                    resolved_head,
                 )
                 .await;
             }
@@ -10160,6 +10638,25 @@ async fn ensure_clean_review_worktree(repo_path: &str) -> Result<(), String> {
     }
 }
 
+/// Re-fetch the latest PR head into an existing review worktree and hard-reset
+/// it to `origin/<branch>`, discarding any local commits/changes from a
+/// previous review pass. Used by the Review & Merge re-review loop when an
+/// external push lands on the PR head mid-review: Sam re-fetches the new code
+/// and reviews it fresh rather than bailing. `clean -fdx` removes stray
+/// untracked files the prior pass may have left behind.
+async fn refetch_pr_head_to_worktree(repo_path: &str, branch: &str) -> Result<(), String> {
+    run_git(&["fetch", "origin", "--prune"], repo_path).await?;
+    let origin_ref = format!("origin/{}", branch);
+    run_git(&["rev-parse", "--verify", &origin_ref], repo_path)
+        .await
+        .map_err(|e| format!("PR head ref {} unavailable after fetch: {}", origin_ref, e))?;
+    run_git(&["reset", "--hard", &origin_ref], repo_path).await?;
+    run_git(&["clean", "-fdx"], repo_path)
+        .await
+        .map_err(|e| format!("clean -fdx of review worktree failed: {}", e))?;
+    Ok(())
+}
+
 async fn ensure_pr_review_worktree(
     main_repo_path: &str,
     task_id: &str,
@@ -10291,6 +10788,11 @@ async fn run_git_capture(args: &[&str], repo_path: &str) -> Result<(bool, String
     let output = async_cmd("git")
         .args(args)
         .current_dir(repo_path)
+        // If a wrapping timeout (e.g. the merge-deploy pre-merge budget) drops
+        // this future, SIGKILL the git child so it can't keep mutating the
+        // worktree and race the retry. Safe for all callers: every one awaits
+        // .output() here, none detach the child.
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|e| format!("git {:?}: {}", args, e))?;
@@ -10501,6 +11003,19 @@ impl MergeDeployError {
             kind: MergeDeployErrorKind::DeployTimedOut,
         }
     }
+
+    /// The pre-merge phase exceeded MERGE_DEPLOY_PREMERGE_TIMEOUT_SECS (a hung
+    /// git/gh subprocess). pr_merged is always false here by construction. This
+    /// is the only error kind the Err handler auto-re-fires, because it is the
+    /// one signal that means "stuck, not refused". Every other failure (CI hard
+    /// fail, head-changed bail, preflight reject) should park for a human.
+    fn premerge_timeout(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            pr_merged: false,
+            kind: MergeDeployErrorKind::PremergeTimeout,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10508,6 +11023,7 @@ enum MergeDeployErrorKind {
     Standard,
     DeployFailed,
     DeployTimedOut,
+    PremergeTimeout,
 }
 
 /// Pick up merge/deploy requests written by the desktop or web UI. The UI only
@@ -10566,7 +11082,9 @@ pub async fn sweep_merge_deploy_requests(config: &SupabaseConfig) {
         }
         if merge_deploy_running_is_stale(task) {
             stale_running.push(task);
-        } else if let Some(repo_key) = merge_deploy_repo_key(task) {
+            continue;
+        }
+        if let Some(repo_key) = merge_deploy_repo_key(task) {
             running_repos.insert(repo_key);
         }
     }
@@ -10579,35 +11097,120 @@ pub async fn sweep_merge_deploy_requests(config: &SupabaseConfig) {
         if task_id.is_empty() {
             continue;
         }
-        let mut context = task_context_object(task);
-        context.insert(
-            MERGE_DEPLOY_STATUS_KEY.to_string(),
-            Value::String("failed".to_string()),
-        );
-        context.insert(
-            MERGE_DEPLOY_COMPLETED_AT_KEY.to_string(),
-            Value::String(chrono::Utc::now().to_rfc3339()),
-        );
-        context.insert(
-            MERGE_DEPLOY_ERROR_KEY.to_string(),
-            Value::String("Worker restarted before this Merge + Deploy could finish; resetting so the queue can advance.".to_string()),
-        );
+        let base_context = task_context_object(task);
+        let pr_url = task
+            .get("pr_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let repo_path = task
+            .get("repo_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        // Captured for the merged-done branch so it runs the same upstream
+        // closeout the normal success path does (notify_callback + ticket close).
+        let origin_system = task
+            .get("origin_system")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let origin_id = task
+            .get("origin_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let task_source = task
+            .get("source")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let callback_url = task
+            .get("callback_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let config_clone = config.clone();
         tokio::spawn(async move {
-            let _ = supabase::update_task(
-                &config_clone,
-                &task_id,
-                &serde_json::json!({
-                    "context": Value::Object(context),
-                    "updated_at": chrono::Utc::now().to_rfc3339(),
-                }),
-            )
-            .await;
-            agent_comment(
-                &config_clone,
-                &task_id,
-                "Detected a stale Merge + Deploy run from a previous worker session. Marked it failed so the queue can keep moving. Re-request Merge + Deploy if this PR still needs to ship.",
-            ).await;
+            // If the PR is ALREADY merged, the run only died during the
+            // post-merge finalize (deploy is automatic via the Vercel GitHub
+            // Action), so the work actually shipped. Close it Done instead of
+            // mislabeling a shipped PR "failed". Otherwise reset it so the queue
+            // can advance. Either way this releases the wedged per-repo slot.
+            let merged = if !pr_url.is_empty()
+                && !repo_path.is_empty()
+                && review::is_safe_pr_url(&pr_url)
+            {
+                gh_pr_is_merged(&pr_url, &repo_path).await.unwrap_or(false)
+            } else {
+                false
+            };
+            let mut context = base_context;
+            context.insert(
+                MERGE_DEPLOY_COMPLETED_AT_KEY.to_string(),
+                Value::String(chrono::Utc::now().to_rfc3339()),
+            );
+            if merged {
+                context.insert(
+                    MERGE_DEPLOY_STATUS_KEY.to_string(),
+                    Value::String("succeeded".to_string()),
+                );
+                context.insert(MERGE_DEPLOY_ERROR_KEY.to_string(), Value::Null);
+                let _ = supabase::update_task(
+                    &config_clone,
+                    &task_id,
+                    &serde_json::json!({
+                        "status": "done",
+                        "completed_at": chrono::Utc::now().to_rfc3339(),
+                        "updated_at": chrono::Utc::now().to_rfc3339(),
+                        "context": Value::Object(context),
+                        "failure_reason": Value::Null,
+                    }),
+                )
+                .await;
+                // Run the same upstream closeout as the normal success path, so
+                // callback consumers and the origin ticket don't go stale just
+                // because the finalize died and the sweep closed the card.
+                notify_callback(&config_clone, &task_id, "done", Some(&pr_url), None);
+                close_origin_ticket(
+                    &config_clone,
+                    &task_id,
+                    &origin_system,
+                    &origin_id,
+                    &pr_url,
+                    &task_source,
+                    &callback_url,
+                );
+                agent_comment(
+                    &config_clone,
+                    &task_id,
+                    "Detected a stale Merge + Deploy whose PR is already merged (the run died during post-merge finalize; deploy is automatic). Closing as Done and releasing the merge slot.",
+                )
+                .await;
+            } else {
+                context.insert(
+                    MERGE_DEPLOY_STATUS_KEY.to_string(),
+                    Value::String("failed".to_string()),
+                );
+                context.insert(
+                    MERGE_DEPLOY_ERROR_KEY.to_string(),
+                    Value::String("Worker restarted before this Merge + Deploy could finish; resetting so the queue can advance.".to_string()),
+                );
+                let _ = supabase::update_task(
+                    &config_clone,
+                    &task_id,
+                    &serde_json::json!({
+                        "context": Value::Object(context),
+                        "updated_at": chrono::Utc::now().to_rfc3339(),
+                    }),
+                )
+                .await;
+                agent_comment(
+                    &config_clone,
+                    &task_id,
+                    "Detected a stale Merge + Deploy run from a previous worker session. Marked it failed so the queue can keep moving. Re-request Merge + Deploy if this PR still needs to ship.",
+                ).await;
+            }
         });
     }
 
@@ -10635,12 +11238,19 @@ pub async fn sweep_merge_deploy_requests(config: &SupabaseConfig) {
             continue;
         };
         let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        // Carry the reviewed head SHA (persisted when the request was queued)
+        // through so the reviewed-head guard survives the re-fire.
+        let expected_head_sha = task
+            .get("context")
+            .and_then(|c| c.get(MERGE_DEPLOY_EXPECTED_HEAD_SHA_KEY))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         start_merge_deploy_task(
             config,
             (*task).clone(),
             status == "approved",
             "Merge + Deploy is at the front of the queue. Starting now.",
-            None,
+            expected_head_sha,
         )
         .await;
     }
@@ -10835,6 +11445,15 @@ async fn start_merge_deploy_task(
                         MERGE_DEPLOY_REQUESTED_AT_KEY.to_string(),
                         Value::String(chrono::Utc::now().to_rfc3339()),
                     );
+                    // Preserve the reviewed head SHA so the queue picker re-fires
+                    // this card WITH the reviewed-head guard intact (it would
+                    // otherwise pass None and merge whatever the head is later).
+                    if let Some(sha) = expected_head_sha.as_deref() {
+                        context.insert(
+                            MERGE_DEPLOY_EXPECTED_HEAD_SHA_KEY.to_string(),
+                            Value::String(sha.to_string()),
+                        );
+                    }
                     context.insert(MERGE_DEPLOY_ERROR_KEY.to_string(), Value::Null);
                     let _ = supabase::update_task(
                         config,
@@ -10870,6 +11489,14 @@ async fn start_merge_deploy_task(
             MERGE_DEPLOY_STARTED_AT_KEY.to_string(),
             Value::String(chrono::Utc::now().to_rfc3339()),
         );
+        // Keep the reviewed head SHA in context for the life of the run so an
+        // auto re-fire (pre-merge timeout) inherits the reviewed-head guard.
+        if let Some(sha) = expected_head_sha.as_deref() {
+            context.insert(
+                MERGE_DEPLOY_EXPECTED_HEAD_SHA_KEY.to_string(),
+                Value::String(sha.to_string()),
+            );
+        }
         context.insert(MERGE_DEPLOY_ERROR_KEY.to_string(), Value::Null);
         let _ = supabase::update_task(
             &config_clone,
@@ -10962,6 +11589,91 @@ async fn start_merge_deploy_task(
                     .ok()
                     .flatten()
                     .unwrap_or_else(|| task.clone());
+
+                // A pre-merge timeout means the merge step HUNG, not that the PR
+                // was refused (pr_merged is false by construction). This Err arm
+                // only runs after run_merge_deploy_workflow returned, so the
+                // per-repo lock guard has dropped and the slot is free. Auto
+                // re-fire the merge (capped) by writing a fresh pending request
+                // for the queue picker. The reviewed head SHA persisted in
+                // context carries the reviewed-head guard across the re-fire.
+                // Every OTHER failure kind falls through and parks for a human.
+                if err.kind == MergeDeployErrorKind::PremergeTimeout {
+                    let retries = latest_task
+                        .get("context")
+                        .and_then(|c| c.get(MERGE_DEPLOY_RETRIES_KEY))
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    let current_status = latest_task
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    // Only re-fire statuses the queue picker accepts, and PRESERVE
+                    // the status (never force "approved") so a deploy-only request
+                    // on a review/fixes_needed card cannot be upgraded into a
+                    // merge-allowed one (should_merge_if_open is recomputed by the
+                    // picker from the unchanged status).
+                    let refireable =
+                        matches!(current_status, "approved" | "fixes_needed" | "review");
+                    if retries < MERGE_DEPLOY_MAX_RETRIES && refireable {
+                        let mut context = task_context_object(&latest_task);
+                        context.insert(
+                            MERGE_DEPLOY_STATUS_KEY.to_string(),
+                            Value::String("requested".to_string()),
+                        );
+                        context.insert(
+                            MERGE_DEPLOY_REQUESTED_AT_KEY.to_string(),
+                            Value::String(chrono::Utc::now().to_rfc3339()),
+                        );
+                        context.insert(MERGE_DEPLOY_STARTED_AT_KEY.to_string(), Value::Null);
+                        context.insert(MERGE_DEPLOY_ERROR_KEY.to_string(), Value::Null);
+                        context.insert(
+                            MERGE_DEPLOY_RETRIES_KEY.to_string(),
+                            Value::Number((retries + 1).into()),
+                        );
+                        // No "status" field: preserve the row status. The reviewed
+                        // head SHA already lives in context (carried by
+                        // task_context_object) so the re-fire keeps the guard.
+                        match supabase::update_task(
+                            &config_clone,
+                            &task_id,
+                            &serde_json::json!({
+                                "updated_at": chrono::Utc::now().to_rfc3339(),
+                                "context": Value::Object(context),
+                            }),
+                        )
+                        .await
+                        {
+                            Ok(_) => {
+                                agent_comment(
+                                    &config_clone,
+                                    &task_id,
+                                    &format!(
+                                        "Merge + Deploy went silent before merging (pre-merge step hung past {} minutes). The merge slot is free again, so auto-retrying: attempt {} of {}.",
+                                        MERGE_DEPLOY_PREMERGE_TIMEOUT_SECS / 60,
+                                        retries + 1,
+                                        MERGE_DEPLOY_MAX_RETRIES
+                                    ),
+                                )
+                                .await;
+                                return;
+                            }
+                            Err(e) => {
+                                // The re-stamp write failed. Do NOT claim a retry
+                                // that did not persist (that would silently leave
+                                // the card running until the 90-min backstop).
+                                // Fall through to the normal failed-handling so it
+                                // parks visibly.
+                                log::error!(
+                                    "[merge-deploy] failed to persist pre-merge-timeout retry for {}: {}",
+                                    task_id,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+
                 let mut context = task_context_object(&latest_task);
                 context.insert(
                     MERGE_DEPLOY_STATUS_KEY.to_string(),
@@ -11065,6 +11777,13 @@ async fn run_merge_deploy_workflow(
         ));
     }
 
+    // The pre-merge phase (everything up to and including the GitHub merge) runs
+    // under a hard timeout. A hung git/gh subprocess here would otherwise hold
+    // the per-repo MERGE_DEPLOY_LOCKS guard forever; the timeout guarantees the
+    // spawned task ends and releases the lock, so start_merge_deploy_task's Err
+    // handler can safely re-fire without racing a live task. The post-merge
+    // deploy phase (which has its own 60-min green-poll budget) is NOT wrapped.
+    let premerge_fut = async {
     let mut files = review::fetch_pr_files(pr_url, repo_path)
         .await
         .map_err(|e| MergeDeployError::new(format!("failed to list PR files: {}", e), false))?;
@@ -11200,6 +11919,20 @@ async fn run_merge_deploy_workflow(
         )
         .await;
     }
+
+        Ok::<_, MergeDeployError>((files, wait_for_deploy_green, pr_merged))
+    };
+    let (files, wait_for_deploy_green, pr_merged) = tokio::time::timeout(
+        std::time::Duration::from_secs(MERGE_DEPLOY_PREMERGE_TIMEOUT_SECS),
+        premerge_fut,
+    )
+    .await
+    .map_err(|_| {
+        MergeDeployError::premerge_timeout(format!(
+            "Pre-merge phase exceeded {} minutes (a git or gh step hung before the PR could merge).",
+            MERGE_DEPLOY_PREMERGE_TIMEOUT_SECS / 60
+        ))
+    })??;
 
     let (_, deploy_branch) = fetch_pr_branch_info(pr_url, repo_path)
         .await
@@ -15330,14 +16063,210 @@ async fn maybe_spawn_auto_fix(
         })
         .unwrap_or_else(|| task_branch_name(&short_task_id(&task_id)));
     if cycle_count >= 3 {
-        agent_comment(&config, &task_id, "Hit the 3-cycle auto-fix cap on this PR. Stopping so I don't thrash — take a look when you get a sec.").await;
-        send_terminal_telegram(
+        // Cap reached. Before parking this PR for a human, attempt ONE final
+        // merge at a relaxed score floor. The 3-cycle cap most often fires on
+        // CI-green, no-blocker PRs whose only problem is a sub-threshold Codex
+        // score (5 to 6) the auto-fix cannot raise (nothing concrete to fix), so
+        // the card cycles to the cap and then sits forever waiting for a human.
+        // Re-running the full gate with ONLY the score bar lowered (every other
+        // gate, blockers, blocker-paths, diff size, deletions, CI, stays at full
+        // strength) ships those to staging instead. main is staging, so prod
+        // stays gated behind the manual /ship promotion.
+        let cap_ctx = latest_task.as_ref().and_then(|t| t.get("context"));
+        let already_tried = cap_ctx
+            .and_then(|c| c.get("cap_merge_attempted"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if already_tried {
+            // Self-heal the #1 manual babysitter tax: a capped card whose cap-floor
+            // merge already failed gets parked forever, even after a human or fixer
+            // agent pushes a NEW commit to the PR. Detect a fresh push by comparing
+            // the current PR head against the SHA we stamped when the cap-merge was
+            // attempted; if it moved, the parked verdict is stale, so re-open for a
+            // clean review cycle on the updated code instead of leaving it for Matt.
+            let attempted_sha = cap_ctx
+                .and_then(|c| c.get("cap_merge_attempted_sha"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let current_sha = review::fetch_pr_head_sha(&pr_url, &repo_path).await.ok();
+            let new_commit = matches!(
+                (attempted_sha.as_deref(), current_sha.as_deref()),
+                (Some(prev), Some(cur)) if !prev.is_empty() && !cur.is_empty() && prev != cur
+            );
+            if new_commit {
+                let mut reset_ctx = cap_ctx
+                    .cloned()
+                    .filter(|c| c.is_object())
+                    .unwrap_or_else(|| serde_json::json!({}));
+                if let Some(obj) = reset_ctx.as_object_mut() {
+                    obj.remove("cap_merge_attempted");
+                    obj.remove("cap_merge_attempted_sha");
+                    obj.remove(PR_REVIEW_STATUS_KEY);
+                    obj.remove(PR_REVIEW_STARTED_AT_KEY);
+                    obj.remove("auto_merge_blocked_reason");
+                }
+                // Only flip if still in fixes_needed so a concurrent human move wins.
+                let _ = supabase::update_task_if_status(
+                    &config,
+                    &task_id,
+                    "fixes_needed",
+                    &serde_json::json!({
+                        "status": "review",
+                        "review_cycle_count": 1,
+                        "auto_merge_blocked_reason": serde_json::Value::Null,
+                        "context": reset_ctx,
+                    }),
+                )
+                .await;
+                agent_comment(&config, &task_id, "A new commit was pushed after the cap-floor merge attempt. Re-opening for a fresh review on the updated code instead of leaving it parked.").await;
+                return;
+            }
+            agent_comment(&config, &task_id, "Hit the 3-cycle cap and the relaxed cap-floor merge was already attempted without success. Leaving in Fixes Needed for you.").await;
+            return;
+        }
+
+        // Respect the master auto-merge switch. If auto-merge is off, the cap
+        // path must not merge either; park for a human exactly as before.
+        let auto_merge_on = settings_val
+            .as_ref()
+            .and_then(|s| s.get("autoMergeEnabled"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !auto_merge_on {
+            agent_comment(&config, &task_id, "Hit the 3-cycle auto-fix cap and auto-merge is off, so leaving this in Fixes Needed for you.").await;
+            send_terminal_telegram(
+                &config,
+                &task_id,
+                &format!("Auto-fix capped: {}", pr_url),
+                "3 cycles and auto-merge is off. Your call.",
+            )
+            .await;
+            return;
+        }
+
+        let cap_floor = settings_val
+            .as_ref()
+            .and_then(|s| s.get("autoMergeCapFloorScore"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(5)
+            .clamp(1, 10);
+        // Override ONLY the score bar. The feature flag is already verified above,
+        // and every other gate inside try_auto_merge stays untouched, so the
+        // relaxed pass still enforces blockers, paths, diff size, and CI in full.
+        let mut relaxed = settings_val.clone().unwrap_or_else(|| serde_json::json!({}));
+        relaxed["autoMergeMinScore"] = serde_json::json!(cap_floor);
+        let title = latest_task
+            .as_ref()
+            .and_then(|t| t.get("title"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let description = latest_task
+            .as_ref()
+            .and_then(|t| t.get("description"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        // Mark attempted BEFORE running so a crash or re-fire cannot re-trigger
+        // the expensive review plus up-to-15min CI poll. Preserve existing context
+        // (force an object so the flag always lands even if context was null).
+        let mut new_ctx = latest_task
+            .as_ref()
+            .and_then(|t| t.get("context"))
+            .cloned()
+            .filter(|c| c.is_object())
+            .unwrap_or_else(|| serde_json::json!({}));
+        new_ctx["cap_merge_attempted"] = serde_json::json!(true);
+        // Stamp the head SHA the cap-merge ran against so the self-heal above can
+        // tell a later genuine new-commit push apart from the same parked state.
+        if let Ok(sha) = review::fetch_pr_head_sha(&pr_url, &repo_path).await {
+            if !sha.is_empty() {
+                new_ctx["cap_merge_attempted_sha"] = serde_json::json!(sha);
+            }
+        }
+        let _ = supabase::update_task(&config, &task_id, &serde_json::json!({ "context": new_ctx })).await;
+
+        agent_comment(
             &config,
             &task_id,
-            &format!("Auto-fix capped: {}", pr_url),
-            "3 auto-fix cycles and Codex still sees blockers. Your call.",
+            &format!(
+                "Hit the 3-cycle auto-fix cap. Attempting a final merge at the relaxed cap floor (min score {}). Every other gate (blockers, CI, diff size, blocker paths) still applies at full strength.",
+                cap_floor
+            ),
         )
         .await;
+
+        let outcome = review::try_auto_merge(
+            &config,
+            &repo_path,
+            &pr_url,
+            &task_id,
+            &title,
+            &description,
+            &Some(relaxed),
+        )
+        .await;
+        match outcome {
+            review::AutoMergeOutcome::ReadyForMergeDeploy { head_sha } => {
+                // Status-race guard: the review + CI poll can take up to 15 min,
+                // during which a human may have moved the card. Only flip to
+                // approved if it is still in fixes_needed; otherwise respect the
+                // manual change and do NOT merge.
+                let claimed = supabase::update_task_if_status(
+                    &config,
+                    &task_id,
+                    "fixes_needed",
+                    &serde_json::json!({
+                        "status": "approved",
+                        "updated_at": chrono::Utc::now().to_rfc3339(),
+                    }),
+                )
+                .await
+                .ok()
+                .and_then(|v| v.as_array().map(|arr| !arr.is_empty()))
+                .unwrap_or(false);
+                if !claimed {
+                    agent_comment(&config, &task_id, "Cap-floor merge gates passed, but the card was moved out of Fixes Needed during the review window, so I am not merging. Respecting the manual change.").await;
+                    return;
+                }
+                let merge_task = supabase::fetch_task(&config, &task_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| {
+                        serde_json::json!({
+                            "id": &task_id,
+                            "pr_url": &pr_url,
+                            "repo_path": &repo_path,
+                        })
+                    });
+                notify_callback(&config, &task_id, "approved", Some(&pr_url), None);
+                start_merge_deploy_task(
+                    &config,
+                    merge_task,
+                    true,
+                    "Cap-floor merge gates passed (relaxed score bar after 3 fix cycles; all other gates intact). Running Merge + Deploy.",
+                    Some(head_sha),
+                )
+                .await;
+            }
+            _ => {
+                agent_comment(
+                    &config,
+                    &task_id,
+                    "3-cycle cap reached and the relaxed cap-floor merge still did not pass (real blockers, CI not green, or score below the floor). Leaving in Fixes Needed for you.",
+                )
+                .await;
+                send_terminal_telegram(
+                    &config,
+                    &task_id,
+                    &format!("Auto-fix capped: {}", pr_url),
+                    "3 cycles plus a relaxed cap-floor merge both failed. Your call.",
+                )
+                .await;
+            }
+        }
         return;
     }
 
@@ -15816,12 +16745,30 @@ async fn sweep_stale_fixes_needed_cards(
                 continue;
             }
         }
-        // Respect the 3-cycle cap
         let cycle_count = task
             .get("review_cycle_count")
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
+        // Capped cards (3 cycles) do NOT just get skipped. Re-enter
+        // maybe_spawn_auto_fix, whose cap branch attempts the relaxed cap-floor
+        // merge (guarded by context.cap_merge_attempted so it runs at most once).
+        // This is what catches cards that parked at the cap via the "no new
+        // commit" path, where the verdict path never re-calls maybe_spawn_auto_fix
+        // and the cap-floor merge would otherwise never fire. Spawn it detached so
+        // the up-to-15min CI poll never stalls the sweep loop.
         if cycle_count >= 3 {
+            let cap_repo_path = task_worktree_path(&repo_path, &task_id)
+                .filter(|p| p.is_dir())
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| repo_path.clone());
+            tokio::spawn(maybe_spawn_auto_fix(
+                config.clone(),
+                task_id.clone(),
+                pr_url.clone(),
+                cap_repo_path,
+                String::new(),
+                false,
+            ));
             continue;
         }
         // Recover the review blockers markdown from the most recent Codex
@@ -16025,6 +16972,734 @@ pub async fn sweep_pr_review_queue(
 
         spawn_pr_review_task(config.clone(), task_id, pr_url, repo_path);
     }
+}
+
+// ── Button-driven comprehensive Review & Merge ───────────────────────────
+
+/// Claude Code budget for the comprehensive Review & Merge pass. Kept under
+/// WEDGE_IN_PROGRESS_MIN (60 min) so the card (which sits `in_progress` for the
+/// whole run) is never reaped by sweep_wedged_cards mid-review. Tunable via
+/// AUTOSAM_REVIEW_MERGE_TIMEOUT_SECS, but keep it below 3600s unless the wedge
+/// threshold is also raised.
+const REVIEW_MERGE_CLAUDE_TIMEOUT_SECS_DEFAULT: u64 = 2700;
+
+fn review_merge_claude_timeout_secs() -> u64 {
+    std::env::var("AUTOSAM_REVIEW_MERGE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(REVIEW_MERGE_CLAUDE_TIMEOUT_SECS_DEFAULT)
+}
+
+/// Parse Sam's verdict line. Returns true ONLY on an explicit
+/// `REVIEW_MERGE_VERDICT: ready`. Anything else (blocked, missing, truncated)
+/// returns false, so the worker never merges to main on ambiguous output.
+fn parse_review_merge_verdict(output: &str) -> bool {
+    for line in output.lines().rev() {
+        let upper = line.trim().to_ascii_uppercase();
+        if let Some(rest) = upper.strip_prefix("REVIEW_MERGE_VERDICT:") {
+            return rest.trim().to_ascii_lowercase().starts_with("ready");
+        }
+    }
+    false
+}
+
+/// The comprehensive pre-merge review + fix prompt handed to Claude Code
+/// (Opus 4.8). Sam reviews the whole PR deeply, fixes everything broken, and
+/// declares a ready/blocked verdict. This is the "not a rubber stamp" pass.
+fn build_review_merge_prompt(pr_url: &str, title: &str, description: &str) -> String {
+    format!(
+        "You are Sam doing the FINAL pre-merge review of this pull request before it merges to \
+main with admin rights. The repo is already checked out at this worktree, on the PR's head \
+branch. This is the last gate before code lands, so be thorough and adversarial. Do NOT rubber-stamp it.\n\n\
+PR: {pr_url}\n\
+Task: {title}\n\
+{description}\n\n\
+## Review comprehensively (look well beyond the diff)\n\
+Inspect the changed code AND the surrounding code it touches:\n\
+1. Correctness: does it actually do what the task asked? Trace the logic. Check edge cases, \
+error handling, null/empty/boundary inputs, async/await correctness, and race conditions.\n\
+2. Regressions: could this break existing behavior, callers, or adjacent features? Check \
+everything that imports or uses the changed code.\n\
+3. UI / UX: if there is any user-facing change, is the UI correct, accessible, responsive, and \
+consistent with the rest of the app? Are loading, empty, and error states handled? Does it feel \
+polished and match the intended design?\n\
+4. Blind spots: the things the author likely did not consider. Security (authn/authz, injection, \
+secret handling), data integrity, migrations, performance, and anything that smells off. This is \
+the most valuable part.\n\
+5. Build and tests: the change must build and the relevant tests must pass.\n\n\
+## Fix everything that is broken\n\
+You are not only reviewing. FIX every real problem you find. Make the code changes directly in \
+this worktree, add or correct tests where it matters, and run the project's build and test \
+commands to confirm it is green. Do not add unrelated features, refactor unrelated code, or bump \
+dependencies beyond what a real fix requires.\n\n\
+## Commit (do not push)\n\
+When you are done fixing, stage and commit everything with a structured message:\n\
+```\n\
+git add -A && git commit -m \"$(cat <<'EOF'\n\
+samwise: pre-merge comprehensive review fixes\n\n\
+Found:\n\
+- <bullet per real issue, or \"nothing blocking\">\n\n\
+Fixed:\n\
+- <bullet per change, or \"no code changes needed\">\n\n\
+Deployment required:\n\
+- Railway server: <yes/no/unknown> - <reason, include service name if yes>\n\
+- Supabase migrations: <yes/no/unknown> - <reason, include filenames if yes>\n\
+- Supabase Edge Functions: <yes/no/unknown> - <reason, include function names if yes>\n\
+EOF\n\
+)\"\n\
+```\n\
+If the PR is already solid and you changed nothing, do NOT create an empty commit. Do not run \
+`git push` and do not open another PR. The worker handles the push and the merge.\n\n\
+## Verdict (REQUIRED final line)\n\
+Decide whether this is safe to merge to main now:\n\
+- If everything is correct after your fixes and it builds and tests green, end your message with \
+exactly this on its own line: REVIEW_MERGE_VERDICT: ready\n\
+- If there is a real blocker you cannot safely fix yourself (it needs a product or design \
+decision from Matt, a schema or data decision, or the build/tests still fail after your best \
+effort), do NOT fabricate a fix. Explain precisely what is blocking, then end your message with \
+exactly this on its own line: REVIEW_MERGE_VERDICT: blocked\n\
+The very last line of your final message MUST be the REVIEW_MERGE_VERDICT line. When unsure, choose blocked.",
+        pr_url = pr_url,
+        title = title,
+        description = if description.trim().is_empty() { "(no description)" } else { description }
+    )
+}
+
+/// Pick up button-stamped Review & Merge requests on `approved` cards and run
+/// Sam's comprehensive review + fix + merge for each. Mirrors the PR-review
+/// sweep's worktree prep and per-repo concurrency cap; the actual merge reuses
+/// start_merge_deploy_task (gh pr merge --admin + deploy) untouched.
+pub async fn sweep_review_merge_requests(config: &SupabaseConfig) {
+    let Ok(tasks) = supabase::fetch_tasks(config, Some("approved")).await else {
+        return;
+    };
+    let Some(arr) = tasks.as_array() else {
+        return;
+    };
+    let known_task_rows = supabase::fetch_tasks(config, None)
+        .await
+        .ok()
+        .and_then(|tasks| tasks.as_array().cloned())
+        .unwrap_or_else(|| arr.clone());
+
+    for task in arr {
+        let task_id = task
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if task_id.is_empty() {
+            continue;
+        }
+        // Only cards explicitly requested via the Review & Merge button.
+        if task_context_string(task, REVIEW_MERGE_STATUS_KEY).as_deref() != Some("requested") {
+            continue;
+        }
+        let pr_url = task
+            .get("pr_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let main_repo_path = task
+            .get("repo_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if pr_url.is_empty() || main_repo_path.is_empty() {
+            clear_review_merge_request(
+                config,
+                &task_id,
+                task,
+                "Review & Merge needs both a PR URL and a repo checkout, and this card is missing one. Leaving it in Ready to Merge.",
+            )
+            .await;
+            continue;
+        }
+        // One active task per repo, same cap as the PR-review sweep.
+        let repo_keys = task_repo_serial_keys(task);
+        if let Some(key) = active_repo_conflict_for_keys(
+            &known_task_rows,
+            &repo_keys,
+            Some(&task_id),
+            max_tasks_per_repo(),
+        ) {
+            log::info!(
+                "[review-merge] delaying task {} because repo {} already has active work",
+                task_id,
+                key
+            );
+            continue;
+        }
+
+        // Prepare the PR worktree (checked out on the PR head branch).
+        let repo_path = match ensure_pr_review_worktree(&main_repo_path, &task_id, &pr_url, task).await
+        {
+            Ok(path) => path,
+            Err(e) => {
+                log::warn!(
+                    "[review-merge] cannot prepare worktree for task {}: {}",
+                    task_id,
+                    e
+                );
+                agent_comment(
+                    config,
+                    &task_id,
+                    &format!(
+                        "Could not prepare the PR worktree for Review & Merge yet. I'll retry shortly. Reason: {}",
+                        truncate(&e, 700)
+                    ),
+                )
+                .await;
+                continue;
+            }
+        };
+
+        spawn_review_merge_task(config.clone(), task_id, pr_url, repo_path, task.clone());
+    }
+}
+
+/// Run the comprehensive review + fix pass, then chain into merge + deploy.
+/// Atomically claims the card (approved -> in_progress) so a second sweep tick
+/// cannot double-spawn. On a clean/fixed verdict it merges with admin; on a
+/// blocker it parks in Fixes Needed; on failure it returns the card to Ready
+/// to Merge so the button can be retried.
+fn spawn_review_merge_task(
+    config: SupabaseConfig,
+    task_id: String,
+    pr_url: String,
+    repo_path: String,
+    task_row: Value,
+) {
+    tokio::spawn(async move {
+        // Atomic claim: approved -> in_progress, stamp running. If the card
+        // already moved (another tick or a manual move), bail.
+        let mut claim_ctx = task_context_object(&task_row);
+        claim_ctx.insert(
+            REVIEW_MERGE_STATUS_KEY.to_string(),
+            Value::String("running".to_string()),
+        );
+        claim_ctx.insert(
+            REVIEW_MERGE_STARTED_AT_KEY.to_string(),
+            Value::String(chrono::Utc::now().to_rfc3339()),
+        );
+        claim_ctx.insert(REVIEW_MERGE_ERROR_KEY.to_string(), Value::Null);
+        let claimed = supabase::update_task_if_status(
+            &config,
+            &task_id,
+            "approved",
+            &serde_json::json!({
+                "status": "in_progress",
+                "context": Value::Object(claim_ctx),
+                "updated_at": chrono::Utc::now().to_rfc3339(),
+            }),
+        )
+        .await
+        .ok()
+        .and_then(|v| v.as_array().map(|arr| !arr.is_empty()))
+        .unwrap_or(false);
+        if !claimed {
+            log::info!(
+                "[review-merge] task {} not in approved at claim time; skipping",
+                task_id
+            );
+            return;
+        }
+        notify_callback(&config, &task_id, "in_progress", Some(&pr_url), None);
+        agent_comment(
+            &config,
+            &task_id,
+            "Running a full pre-merge review through Sam (Opus 4.8): correctness, regressions, UI/UX, blind spots, security. I'll fix what's broken, then merge to main with admin rights if it's clean.",
+        )
+        .await;
+
+        // Resolve the PR head branch and refuse to operate on main/master.
+        let branch = async_cmd("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&repo_path)
+            .output()
+            .await
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    String::from_utf8(o.stdout).ok()
+                } else {
+                    None
+                }
+            })
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        if branch.is_empty() || branch == "HEAD" || branch == "main" || branch == "master" {
+            fail_review_merge(
+                &config,
+                &task_id,
+                &pr_url,
+                &format!(
+                    "worktree is on '{}', not a PR branch; refusing to run",
+                    if branch.is_empty() { "(detached)" } else { &branch }
+                ),
+            )
+            .await;
+            return;
+        }
+
+        let title = task_row
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let description = task_row
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let prompt = build_review_merge_prompt(&pr_url, &title, &description);
+
+        // Bounded re-review loop. If an external push lands on the PR head
+        // while Sam is reviewing (or between the review and the merge), re-fetch
+        // the latest code and review it AGAIN instead of bailing and requiring
+        // a manual button click. A real agent doesn't abandon the task just
+        // because the PR moved. Bounded so a PR that keeps churning can't loop
+        // forever; after the retries are exhausted the card is parked for a
+        // human rather than merged against an unreviewed commit.
+        const REVIEW_MERGE_MAX_HEAD_RETRIES: i32 = 3;
+        let mut head_change_attempt: i32 = 0;
+        // Encode the "loop always produces a reviewed head SHA" invariant in
+        // the type: the loop body yields the SHA via `break`, so there is no
+        // post-loop Option to unwrap/expect. A future edit that forgets to set
+        // it becomes a compile error, not a runtime panic.
+        let head_sha: String = loop {
+            let slot: Arc<tokio::sync::Mutex<Option<u32>>> =
+                Arc::new(tokio::sync::Mutex::new(None));
+            let output = match run_claude_code_streaming(
+                &repo_path,
+                &prompt,
+                0,
+                review_merge_claude_timeout_secs(),
+                &config,
+                &task_id,
+                slot,
+                None,
+            )
+            .await
+            {
+                Ok(out) => out,
+                Err(e) => {
+                    fail_review_merge(&config, &task_id, &pr_url, &format!("Claude Code errored: {}", e))
+                        .await;
+                    return;
+                }
+            };
+
+            // Push any commits Sam made (hard branch guard; no-op if nothing changed).
+            if !push_review_merge_commits(&config, &task_id, &pr_url, &repo_path, &branch).await {
+                // push helper already failed the card.
+                return;
+            }
+
+            if !parse_review_merge_verdict(&output) {
+                // Blocker (or no clean verdict). Never merge; park in Fixes Needed.
+                let mut ctx = supabase::fetch_task(&config, &task_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .as_ref()
+                    .map(task_context_object)
+                    .unwrap_or_default();
+                ctx.insert(
+                    REVIEW_MERGE_STATUS_KEY.to_string(),
+                    Value::String("blocked".to_string()),
+                );
+                let updated = supabase::update_task_if_status(
+                    &config,
+                    &task_id,
+                    "in_progress",
+                    &serde_json::json!({
+                        "status": "fixes_needed",
+                        "context": Value::Object(ctx),
+                        "updated_at": chrono::Utc::now().to_rfc3339(),
+                    }),
+                )
+                .await
+                .ok()
+                .and_then(|v| v.as_array().map(|arr| !arr.is_empty()))
+                .unwrap_or(false);
+                if updated {
+                    notify_callback(
+                        &config,
+                        &task_id,
+                        "fixes_needed",
+                        Some(&pr_url),
+                        Some("review found a blocker"),
+                    );
+                    agent_comment(
+                        &config,
+                        &task_id,
+                        "My comprehensive review found a blocker I shouldn't merge past without your call. I pushed any safe fixes I made and moved this to Fixes Needed. Details are in the review above.",
+                    )
+                    .await;
+                    send_terminal_telegram(
+                        &config,
+                        &task_id,
+                        &format!("Needs your call: {}", pr_url),
+                        "Review & Merge found a blocker it couldn't safely fix.",
+                    )
+                    .await;
+                }
+                return;
+            }
+
+            // Clean / fixed. Reviewed-head guard: the ONLY commit we may admin-merge
+            // is the exact one Sam just reviewed (the local worktree HEAD, including
+            // any fixes Sam committed + pushed). If the live GitHub PR head doesn't
+            // match it, an external push landed during the review (or our push
+            // didn't make local == remote). Instead of giving up, re-fetch the
+            // latest code and re-review it (bounded by REVIEW_MERGE_MAX_HEAD_RETRIES).
+            let reviewed_sha = async_cmd("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&repo_path)
+                .output()
+                .await
+                .ok()
+                .and_then(|o| {
+                    if o.status.success() {
+                        String::from_utf8(o.stdout).ok()
+                    } else {
+                        None
+                    }
+                })
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            if reviewed_sha.is_empty() {
+                fail_review_merge(
+                    &config,
+                    &task_id,
+                    &pr_url,
+                    "couldn't resolve the local reviewed HEAD; refusing to merge a commit I can't identify.",
+                )
+                .await;
+                return;
+            }
+            // Distinguish a remote-head FETCH FAILURE from a real head mismatch.
+            // Collapsing a transient GitHub/network error into "head changed"
+            // would misdiagnose outages and waste up to 4 full Opus reviews
+            // re-reviewing the same code. On a fetch error, fail closed now.
+            let remote_head = match review::fetch_pr_head_sha(&pr_url, &repo_path).await {
+                Ok(sha) => sha.trim().to_string(),
+                Err(e) => {
+                    fail_review_merge(
+                        &config,
+                        &task_id,
+                        &pr_url,
+                        &format!(
+                            "couldn't fetch the live PR head to verify it matches what I reviewed ({}). I won't admin-merge without confirming the commit. Click Review & Merge again.",
+                            truncate(&e, 300)
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            if remote_head != reviewed_sha {
+                head_change_attempt += 1;
+                let short = |s: &str| s.chars().take(8).collect::<String>();
+                let reviewed_short = short(&reviewed_sha);
+                let current_short = short(&remote_head);
+                if head_change_attempt > REVIEW_MERGE_MAX_HEAD_RETRIES {
+                    fail_review_merge(
+                        &config,
+                        &task_id,
+                        &pr_url,
+                        &format!(
+                            "the PR head kept changing while I tried to review it (re-reviewed {} time(s), reviewed {} last, current {}). I won't admin-merge an unreviewed commit. Click Review & Merge again when the PR settles.",
+                            REVIEW_MERGE_MAX_HEAD_RETRIES, reviewed_short, current_short
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+                log::info!(
+                    "[review-merge] task {} PR head changed (attempt {}/{}): reviewed {} -> current {}; re-fetching and re-reviewing",
+                    task_id, head_change_attempt, REVIEW_MERGE_MAX_HEAD_RETRIES, reviewed_short, current_short
+                );
+                agent_comment(
+                    &config,
+                    &task_id,
+                    &format!(
+                        "The PR head changed while I was reviewing it (I reviewed {}, the live PR is now {}). I'm not going to merge a commit I haven't reviewed. Re-fetching the latest code and starting review pass {}/{}. Any fixes I made last pass were against the old commit and will be dropped; I'll re-check the new code and re-fix what's still broken.",
+                        reviewed_short, current_short, head_change_attempt + 1, REVIEW_MERGE_MAX_HEAD_RETRIES + 1
+                    ),
+                )
+                .await;
+                if let Err(e) =
+                    refetch_pr_head_to_worktree(&repo_path, &branch).await
+                {
+                    fail_review_merge(
+                        &config,
+                        &task_id,
+                        &pr_url,
+                        &format!(
+                            "PR head changed but I couldn't re-fetch the latest code to re-review: {}. Leaving it in Ready to Merge.",
+                            truncate(&e, 400)
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+                // Loop back: re-run the review on the freshly fetched head.
+                continue;
+            }
+            // Head matches: the reviewed commit IS the live PR head. Merge it.
+            break reviewed_sha;
+        };
+        let pre_merge = supabase::fetch_task(&config, &task_id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| task_row.clone());
+        let mut done_ctx = task_context_object(&pre_merge);
+        done_ctx.insert(
+            REVIEW_MERGE_STATUS_KEY.to_string(),
+            Value::String("succeeded".to_string()),
+        );
+        done_ctx.insert(REVIEW_MERGE_ERROR_KEY.to_string(), Value::Null);
+        let claimed_back = supabase::update_task_if_status(
+            &config,
+            &task_id,
+            "in_progress",
+            &serde_json::json!({
+                "status": "approved",
+                "context": Value::Object(done_ctx),
+                "updated_at": chrono::Utc::now().to_rfc3339(),
+            }),
+        )
+        .await
+        .ok()
+        .and_then(|v| v.as_array().map(|arr| !arr.is_empty()))
+        .unwrap_or(false);
+        if !claimed_back {
+            log::info!(
+                "[review-merge] task {} moved out of in_progress before merge; respecting manual state",
+                task_id
+            );
+            return;
+        }
+        let merge_task = supabase::fetch_task(&config, &task_id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(pre_merge);
+        notify_callback(&config, &task_id, "approved", Some(&pr_url), None);
+        agent_comment(
+            &config,
+            &task_id,
+            "Review passed and any fixes are in. Merging to main with admin rights, then running the deploy plan.",
+        )
+        .await;
+        start_merge_deploy_task(
+            &config,
+            merge_task,
+            true,
+            "Comprehensive Review & Merge passed. Running merge (admin) + deploy.",
+            Some(head_sha),
+        )
+        .await;
+    });
+}
+
+/// Push whatever Sam committed to the PR head branch. Hard-guards that the
+/// worktree is on the expected PR branch (never main). A no-op (nothing new to
+/// push) is success: it means the PR was already clean. Returns false only on a
+/// real failure (and fails the card itself).
+async fn push_review_merge_commits(
+    config: &SupabaseConfig,
+    task_id: &str,
+    pr_url: &str,
+    repo_path: &str,
+    expected_branch: &str,
+) -> bool {
+    let branch = async_cmd("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(repo_path)
+        .output()
+        .await
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                String::from_utf8(o.stdout).ok()
+            } else {
+                None
+            }
+        })
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if branch.is_empty() || branch == "HEAD" {
+        fail_review_merge(config, task_id, pr_url, "couldn't resolve PR branch for push").await;
+        return false;
+    }
+    if branch != expected_branch {
+        fail_review_merge(
+            config,
+            task_id,
+            pr_url,
+            &format!(
+                "refusing to push: worktree on '{}' but Review & Merge may only push to '{}'",
+                branch, expected_branch
+            ),
+        )
+        .await;
+        return false;
+    }
+
+    let head_before = async_cmd("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo_path)
+        .output()
+        .await
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                String::from_utf8(o.stdout).ok()
+            } else {
+                None
+            }
+        })
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let upstream = async_cmd("git")
+        .args(["rev-parse", &format!("origin/{}", branch)])
+        .current_dir(repo_path)
+        .output()
+        .await
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                String::from_utf8(o.stdout).ok()
+            } else {
+                None
+            }
+        })
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if !head_before.is_empty() && !upstream.is_empty() && head_before == upstream {
+        agent_comment(
+            config,
+            task_id,
+            "No code changes were needed from the review. Proceeding to merge.",
+        )
+        .await;
+        return true;
+    }
+
+    match async_cmd("git")
+        .args(["push", "origin", &branch])
+        .current_dir(repo_path)
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => {
+            agent_comment(config, task_id, "Pushed review fixes to the PR branch.").await;
+            true
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            fail_review_merge(config, task_id, pr_url, &format!("git push failed: {}", stderr.trim()))
+                .await;
+            false
+        }
+        Err(e) => {
+            fail_review_merge(config, task_id, pr_url, &format!("git push spawn failed: {}", e)).await;
+            false
+        }
+    }
+}
+
+/// Return a Review & Merge card to Ready to Merge (approved) with a failure
+/// stamp so the button can be retried. Used for transient/operational failures
+/// (not review blockers, which route to Fixes Needed).
+async fn fail_review_merge(config: &SupabaseConfig, task_id: &str, pr_url: &str, reason: &str) {
+    let mut ctx = supabase::fetch_task(config, task_id)
+        .await
+        .ok()
+        .flatten()
+        .as_ref()
+        .map(task_context_object)
+        .unwrap_or_default();
+    ctx.insert(
+        REVIEW_MERGE_STATUS_KEY.to_string(),
+        Value::String("failed".to_string()),
+    );
+    ctx.insert(
+        REVIEW_MERGE_ERROR_KEY.to_string(),
+        Value::String(truncate(reason, 500)),
+    );
+    let updated = supabase::update_task_if_status(
+        config,
+        task_id,
+        "in_progress",
+        &serde_json::json!({
+            "status": "approved",
+            "context": Value::Object(ctx),
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+        }),
+    )
+    .await
+    .ok()
+    .and_then(|v| v.as_array().map(|arr| !arr.is_empty()))
+    .unwrap_or(false);
+    if !updated {
+        log::info!(
+            "[review-merge] task {} moved out of in_progress before failure update; respecting manual state",
+            task_id
+        );
+        return;
+    }
+    notify_callback(config, task_id, "approved", Some(pr_url), Some(reason));
+    agent_comment(
+        config,
+        task_id,
+        &format!(
+            "Review & Merge attempt failed: {}. Left in Ready to Merge so you can retry.",
+            reason
+        ),
+    )
+    .await;
+    send_terminal_telegram(
+        config,
+        task_id,
+        &format!("Review & Merge failed: {}", pr_url),
+        &format!("Reason: {}", reason),
+    )
+    .await;
+}
+
+/// Clear a Review & Merge request that can't be acted on (e.g. missing PR URL),
+/// leaving the card in Ready to Merge with an explanatory stamp + comment.
+async fn clear_review_merge_request(
+    config: &SupabaseConfig,
+    task_id: &str,
+    task_row: &Value,
+    msg: &str,
+) {
+    let mut ctx = task_context_object(task_row);
+    ctx.insert(
+        REVIEW_MERGE_STATUS_KEY.to_string(),
+        Value::String("failed".to_string()),
+    );
+    ctx.insert(
+        REVIEW_MERGE_ERROR_KEY.to_string(),
+        Value::String(truncate(msg, 300)),
+    );
+    let _ = supabase::update_task(
+        config,
+        task_id,
+        &serde_json::json!({
+            "context": Value::Object(ctx),
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+        }),
+    )
+    .await;
+    agent_comment(config, task_id, msg).await;
 }
 
 /// Fire a signed HTTP callback for a task status transition, if the task
