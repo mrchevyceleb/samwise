@@ -186,6 +186,24 @@ export function isReviewMergeBusy(review: ReviewMergeState, deploy: MergeDeployS
 	);
 }
 
+/**
+ * True when a card is in any merge-pipeline phase (Review & Merge, Merge +
+ * Deploy, or merge-conflict fix) — whether queued ("requested") or actively
+ * running. The board uses this to route these cards into the dedicated
+ * Merging column instead of leaving them hidden in Approved / In Progress.
+ */
+export function isMergeInFlight(task: Pick<AeTask, 'context'>): boolean {
+	const context = task.context ?? {};
+	const rm = context[REVIEW_MERGE_STATUS_KEY];
+	const md = context[MERGE_DEPLOY_STATUS_KEY];
+	const mcf = context[MERGE_CONFLICT_FIX_STATUS_KEY];
+	return (
+		rm === 'requested' || rm === 'running' ||
+		md === 'requested' || md === 'running' ||
+		mcf === 'requested' || mcf === 'running'
+	);
+}
+
 export function isReviewActionStatus(status: AeTask['status']): boolean {
 	return status === 'review' || status === 'fixes_needed' || status === 'approved' || status === 'done';
 }

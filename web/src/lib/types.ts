@@ -171,7 +171,7 @@ export const STATUS_LABEL: Record<TaskStatus, string> = {
   review: 'Review',
   fixes_needed: 'Fixes Needed',
   approved: 'Ready to Merge',
-  qa: 'In QA',
+  qa: 'Merging',
   done: 'Done',
   failed: 'Failed',
   pending_confirmation: 'Awaiting Confirmation'

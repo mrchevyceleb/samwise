@@ -11,6 +11,10 @@ export const MERGE_CONFLICT_FIX_REQUESTED_AT_KEY = 'samwise_merge_conflict_fix_r
 export const MERGE_CONFLICT_FIX_STARTED_AT_KEY = 'samwise_merge_conflict_fix_started_at';
 export const MERGE_CONFLICT_FIX_STATUS_KEY = 'samwise_merge_conflict_fix_status';
 export const MERGE_CONFLICT_FIX_ERROR_KEY = 'samwise_merge_conflict_fix_error';
+export const REVIEW_MERGE_REQUESTED_AT_KEY = 'samwise_review_merge_requested_at';
+export const REVIEW_MERGE_STARTED_AT_KEY = 'samwise_review_merge_started_at';
+export const REVIEW_MERGE_STATUS_KEY = 'samwise_review_merge_status';
+export const REVIEW_MERGE_ERROR_KEY = 'samwise_review_merge_error';
 
 export type ReviewVerdict = 'merge' | 'fix' | 'inconclusive' | 'errored' | 'blocked';
 
@@ -25,6 +29,7 @@ export interface ReviewActionPanel {
 
 export type MergeDeployStatus = 'requested' | 'running' | 'succeeded' | 'failed';
 export type MergeConflictFixStatus = 'requested' | 'running' | 'succeeded' | 'failed';
+export type ReviewMergeStatus = 'requested' | 'running' | 'succeeded' | 'failed' | 'blocked';
 
 export interface MergeDeployState {
 	status: MergeDeployStatus | null;
@@ -35,6 +40,13 @@ export interface MergeDeployState {
 
 export interface MergeConflictFixState {
 	status: MergeConflictFixStatus | null;
+	requestedAt: string | null;
+	startedAt: string | null;
+	error: string | null;
+}
+
+export interface ReviewMergeState {
+	status: ReviewMergeStatus | null;
 	requestedAt: string | null;
 	startedAt: string | null;
 	error: string | null;
@@ -129,6 +141,70 @@ export function mergeDeployButtonLabel(state: MergeDeployState): string {
 
 export function isMergeDeployBusy(state: MergeDeployState): boolean {
 	return state.status === 'requested' || state.status === 'running';
+}
+
+export function getReviewMergeState(task: Pick<AeTask, 'context'>): ReviewMergeState {
+	const context = task.context ?? {};
+	const rawStatus = context[REVIEW_MERGE_STATUS_KEY];
+	const status: ReviewMergeStatus | null =
+		rawStatus === 'requested' || rawStatus === 'running' || rawStatus === 'succeeded' || rawStatus === 'failed' || rawStatus === 'blocked'
+			? rawStatus
+			: null;
+	return {
+		status,
+		requestedAt: stringValue(context[REVIEW_MERGE_REQUESTED_AT_KEY]),
+		startedAt: stringValue(context[REVIEW_MERGE_STARTED_AT_KEY]),
+		error: stringValue(context[REVIEW_MERGE_ERROR_KEY]),
+	};
+}
+
+export function requestReviewMergeContext(task: Pick<AeTask, 'context'>): Record<string, unknown> {
+	return {
+		...(task.context ?? {}),
+		[REVIEW_MERGE_REQUESTED_AT_KEY]: new Date().toISOString(),
+		[REVIEW_MERGE_STARTED_AT_KEY]: null,
+		[REVIEW_MERGE_STATUS_KEY]: 'requested',
+		[REVIEW_MERGE_ERROR_KEY]: null,
+	};
+}
+
+// The Review & Merge button drives the whole path to main: Sam comprehensively
+// reviews + fixes the PR, then chains into merge + deploy. The label reflects
+// the review phase first, then the merge/deploy phase it hands off to.
+export function reviewMergeButtonLabel(review: ReviewMergeState, deploy: MergeDeployState): string {
+	if (review.status === 'running') return 'Sam Reviewing...';
+	if (review.status === 'requested') return 'Sam Queued';
+	if (deploy.status === 'running') return 'Deploying...';
+	if (deploy.status === 'requested') return 'Merge Queued';
+	if (review.status === 'failed' || deploy.status === 'failed') return 'Retry Review & Merge';
+	return 'Review & Merge';
+}
+
+export function isReviewMergeBusy(review: ReviewMergeState, deploy: MergeDeployState): boolean {
+	return (
+		review.status === 'requested' ||
+		review.status === 'running' ||
+		deploy.status === 'requested' ||
+		deploy.status === 'running'
+	);
+}
+
+/**
+ * True when a card is in any merge-pipeline phase (Review & Merge, Merge +
+ * Deploy, or merge-conflict fix) — whether queued ("requested") or actively
+ * running. The board uses this to route these cards into the dedicated
+ * Merging column instead of leaving them hidden in Approved / In Progress.
+ */
+export function isMergeInFlight(task: Pick<AeTask, 'context'>): boolean {
+	const context = task.context ?? {};
+	const rm = context[REVIEW_MERGE_STATUS_KEY];
+	const md = context[MERGE_DEPLOY_STATUS_KEY];
+	const mcf = context[MERGE_CONFLICT_FIX_STATUS_KEY];
+	return (
+		rm === 'requested' || rm === 'running' ||
+		md === 'requested' || md === 'running' ||
+		mcf === 'requested' || mcf === 'running'
+	);
 }
 
 export function isReviewActionStatus(status: AeTask['status']): boolean {

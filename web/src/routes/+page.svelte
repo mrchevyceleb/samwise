@@ -3,6 +3,7 @@
   import { tasksStore } from '$lib/stores/tasks.svelte';
   import { supabase } from '$lib/supabase';
   import { STATUSES, type AeTask, type AeProject, type TaskStatus } from '$lib/types';
+  import { isMergeInFlight } from '$lib/utils/review-actions';
   import KanbanColumn from '$lib/components/KanbanColumn.svelte';
   import TaskDetail from '$lib/components/TaskDetail.svelte';
   import NewTaskModal from '$lib/components/NewTaskModal.svelte';
@@ -94,15 +95,16 @@
     const map = new Map<string, AeTask[]>();
     for (const s of STATUSES) map.set(s, []);
     for (const t of filtered) {
-      const status = displayStatus(t.status);
+      const status = displayStatus(t);
       if (!map.has(status)) map.set(status, []);
       map.get(status)!.push(t);
     }
     return map;
   });
 
-  function displayStatus(status: TaskStatus): TaskStatus {
-    return status === 'testing' ? 'in_progress' : status;
+  function displayStatus(task: AeTask): TaskStatus {
+    if (isMergeInFlight(task)) return 'qa';
+    return task.status === 'testing' ? 'in_progress' : task.status;
   }
 
   function loadCollapsedColumns() {

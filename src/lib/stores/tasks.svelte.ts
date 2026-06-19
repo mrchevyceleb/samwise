@@ -2,6 +2,7 @@
 
 import type { AeTask, TaskStatus, TaskPriority, TaskType, TaskSource } from '$lib/types';
 import { safeInvoke } from '$lib/utils/tauri';
+import { isMergeInFlight } from '$lib/utils/review-actions';
 
 let tasks = $state<AeTask[]>([]);
 let loading = $state(false);
@@ -22,7 +23,11 @@ function getTasksByColumn(): Record<TaskStatus, AeTask[]> {
     pending_confirmation: [],
   };
   for (const t of tasks) {
-    const columnStatus = t.status === 'testing' ? 'in_progress' : t.status;
+    let columnStatus: TaskStatus = t.status === 'testing' ? 'in_progress' : t.status;
+    // Route merge-pipeline cards (Review & Merge, Merge + Deploy, conflict
+    // fix) into the Merging column so they're visible instead of hidden in
+    // Approved / In Progress.
+    if (isMergeInFlight(t)) columnStatus = 'qa';
     if (grouped[columnStatus]) {
       grouped[columnStatus].push(t);
     }
@@ -58,12 +63,12 @@ export function getTaskStore() {
       return {
         total: tasks.length,
         queued: tasks.filter(t => t.status === 'queued').length,
-        inProgress: tasks.filter(t => t.status === 'in_progress' || t.status === 'testing').length,
+        inProgress: tasks.filter(t => (t.status === 'in_progress' || t.status === 'testing') && !isMergeInFlight(t)).length,
         testing: tasks.filter(t => t.status === 'testing').length,
         review: tasks.filter(t => t.status === 'review').length,
         fixesNeeded: tasks.filter(t => t.status === 'fixes_needed').length,
-        approved: tasks.filter(t => t.status === 'approved').length,
-        qa: tasks.filter(t => t.status === 'qa').length,
+        approved: tasks.filter(t => t.status === 'approved' && !isMergeInFlight(t)).length,
+        qa: tasks.filter(t => t.status === 'qa' || isMergeInFlight(t)).length,
         done: tasks.filter(t => t.status === 'done').length,
         failed: tasks.filter(t => t.status === 'failed').length,
         pendingConfirmation: tasks.filter(t => t.status === 'pending_confirmation').length,
