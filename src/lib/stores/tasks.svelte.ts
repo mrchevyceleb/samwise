@@ -2,7 +2,7 @@
 
 import type { AeTask, TaskStatus, TaskPriority, TaskType, TaskSource } from '$lib/types';
 import { safeInvoke } from '$lib/utils/tauri';
-import { isMergeInFlight } from '$lib/utils/review-actions';
+import { displayColumnStatus } from '$lib/utils/review-actions';
 
 let tasks = $state<AeTask[]>([]);
 let loading = $state(false);
@@ -23,11 +23,10 @@ function getTasksByColumn(): Record<TaskStatus, AeTask[]> {
     pending_confirmation: [],
   };
   for (const t of tasks) {
-    let columnStatus: TaskStatus = t.status === 'testing' ? 'in_progress' : t.status;
-    // Route merge-pipeline cards (Review & Merge, Merge + Deploy, conflict
-    // fix) into the Merging column so they're visible instead of hidden in
-    // Approved / In Progress.
-    if (isMergeInFlight(t)) columnStatus = 'qa';
+    // Single source of truth for which column a card shows in: merge-pipeline
+    // cards route to the Merging (qa) column; testing collapses into
+    // in_progress. Counts below derive from the same helper so they agree.
+    const columnStatus = displayColumnStatus(t);
     if (grouped[columnStatus]) {
       grouped[columnStatus].push(t);
     }
@@ -60,18 +59,29 @@ export function getTaskStore() {
     get tasksByColumn() { return getTasksByColumn(); },
 
     get taskCounts() {
+      // Derive counts from the SAME display-status mapping used for columns
+      // so a card is never counted in a column it isn't shown in (and vice
+      // versa). `testing` is kept as a raw sub-count of in_progress.
+      const byCol: Record<TaskStatus, number> = {
+        queued: 0, in_progress: 0, testing: 0, review: 0, fixes_needed: 0,
+        approved: 0, qa: 0, done: 0, failed: 0, pending_confirmation: 0,
+      };
+      for (const t of tasks) {
+        const col = displayColumnStatus(t);
+        byCol[col] = (byCol[col] ?? 0) + 1;
+      }
       return {
         total: tasks.length,
-        queued: tasks.filter(t => t.status === 'queued').length,
-        inProgress: tasks.filter(t => (t.status === 'in_progress' || t.status === 'testing') && !isMergeInFlight(t)).length,
+        queued: byCol.queued,
+        inProgress: byCol.in_progress,
         testing: tasks.filter(t => t.status === 'testing').length,
-        review: tasks.filter(t => t.status === 'review').length,
-        fixesNeeded: tasks.filter(t => t.status === 'fixes_needed').length,
-        approved: tasks.filter(t => t.status === 'approved' && !isMergeInFlight(t)).length,
-        qa: tasks.filter(t => t.status === 'qa' || isMergeInFlight(t)).length,
-        done: tasks.filter(t => t.status === 'done').length,
-        failed: tasks.filter(t => t.status === 'failed').length,
-        pendingConfirmation: tasks.filter(t => t.status === 'pending_confirmation').length,
+        review: byCol.review,
+        fixesNeeded: byCol.fixes_needed,
+        approved: byCol.approved,
+        qa: byCol.qa,
+        done: byCol.done,
+        failed: byCol.failed,
+        pendingConfirmation: byCol.pending_confirmation,
       };
     },
 

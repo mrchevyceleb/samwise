@@ -3,7 +3,7 @@
   import { tasksStore } from '$lib/stores/tasks.svelte';
   import { supabase } from '$lib/supabase';
   import { STATUSES, type AeTask, type AeProject, type TaskStatus } from '$lib/types';
-  import { isMergeInFlight } from '$lib/utils/review-actions';
+  import { displayColumnStatus } from '$lib/utils/review-actions';
   import KanbanColumn from '$lib/components/KanbanColumn.svelte';
   import TaskDetail from '$lib/components/TaskDetail.svelte';
   import NewTaskModal from '$lib/components/NewTaskModal.svelte';
@@ -95,17 +95,15 @@
     const map = new Map<string, AeTask[]>();
     for (const s of STATUSES) map.set(s, []);
     for (const t of filtered) {
-      const status = displayStatus(t);
+      const status = displayColumnStatus(t);
       if (!map.has(status)) map.set(status, []);
       map.get(status)!.push(t);
     }
     return map;
   });
 
-  function displayStatus(task: AeTask): TaskStatus {
-    if (isMergeInFlight(task)) return 'qa';
-    return task.status === 'testing' ? 'in_progress' : task.status;
-  }
+  // displayColumnStatus (shared with the desktop app) routes merge-pipeline
+  // cards to the Merging column and collapses testing into in_progress.
 
   function loadCollapsedColumns() {
     if (typeof localStorage === 'undefined') return;

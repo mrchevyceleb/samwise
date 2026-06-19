@@ -1,4 +1,4 @@
-import type { AeComment, AeTask } from '$lib/types';
+import type { AeComment, AeTask, TaskStatus } from '$lib/types';
 
 export const UI_STAMP_KEY = 'samwise_ui_stamp';
 export const MANUAL_IN_PROGRESS_STAMP = 'manual_in_progress';
@@ -186,13 +186,23 @@ export function isReviewMergeBusy(review: ReviewMergeState, deploy: MergeDeployS
 	);
 }
 
+/** Statuses where a merge-pipeline context flag is meaningful. Stale
+ *  `requested`/`running` flags left on a `done`/`failed`/`queued` card must NOT
+ *  pull that card back into the Merging column, so this guard is required. */
+const MERGE_IN_FLIGHT_STATUSES = new Set<TaskStatus>([
+	'approved', 'in_progress', 'testing', 'review', 'fixes_needed',
+]);
+
 /**
  * True when a card is in any merge-pipeline phase (Review & Merge, Merge +
  * Deploy, or merge-conflict fix) — whether queued ("requested") or actively
- * running. The board uses this to route these cards into the dedicated
- * Merging column instead of leaving them hidden in Approved / In Progress.
+ * running. Scoped to merge-eligible statuses so a stale context flag on a
+ * finished/failed/queued card can't yank it into the Merging column. The board
+ * uses this to route these cards into the dedicated Merging column instead of
+ * leaving them hidden in Approved / In Progress.
  */
-export function isMergeInFlight(task: Pick<AeTask, 'context'>): boolean {
+export function isMergeInFlight(task: Pick<AeTask, 'status' | 'context'>): boolean {
+	if (!MERGE_IN_FLIGHT_STATUSES.has(task.status)) return false;
 	const context = task.context ?? {};
 	const rm = context[REVIEW_MERGE_STATUS_KEY];
 	const md = context[MERGE_DEPLOY_STATUS_KEY];
@@ -202,6 +212,15 @@ export function isMergeInFlight(task: Pick<AeTask, 'context'>): boolean {
 		md === 'requested' || md === 'running' ||
 		mcf === 'requested' || mcf === 'running'
 	);
+}
+
+/** The board column a task should display in. Routes merge-pipeline cards to
+ *  the Merging (qa) column and collapses `testing` into `in_progress`. This is
+ *  the single source of truth for display routing — both column grouping and
+ *  status counts derive from it so they can never disagree. */
+export function displayColumnStatus(task: Pick<AeTask, 'status' | 'context'>): TaskStatus {
+	if (isMergeInFlight(task)) return 'qa';
+	return task.status === 'testing' ? 'in_progress' : task.status;
 }
 
 export function isReviewActionStatus(status: AeTask['status']): boolean {
