@@ -7,15 +7,17 @@
     getUiStamp,
     getMergeDeployState,
     getMergeConflictFixState,
+    getReviewMergeState,
     isMergeConflictError,
     isMergeConflictFixBusy,
     isReviewActionStatus,
     isMergeDeployBusy,
+    isReviewMergeBusy,
     mergeConflictFixButtonLabel,
-    mergeDeployButtonLabel,
+    reviewMergeButtonLabel,
     nextManualInProgressStampContext,
     requestMergeConflictFixContext,
-    requestMergeDeployContext
+    requestReviewMergeContext
   } from '$lib/utils/review-actions';
   let { task, onOpen }: { task: AeTask; onOpen: (t: AeTask) => void } = $props();
 
@@ -26,6 +28,8 @@
   let mergeConflictFixState = $derived(getMergeConflictFixState(task));
   let mergeDeployRequestError = $state<string | null>(null);
   let mergeConflictFixRequestError = $state<string | null>(null);
+  let reviewMergeRequestError = $state<string | null>(null);
+  let reviewMergeState = $derived(getReviewMergeState(task));
   let showTesterPicker = $state(false);
   let testers = $state<{ name: string; role: string }[]>([]);
   let selectedTester = $state('');
@@ -69,14 +73,14 @@
     await tasksStore.updateTask(task.id, { context: nextManualInProgressStampContext(task) });
   }
 
-  async function requestMergeDeploy(e: MouseEvent) {
+  async function requestReviewMerge(e: MouseEvent) {
     e.preventDefault();
     e.stopPropagation();
-    if (!canMergeDeploy || isMergeDeployBusy(mergeDeployState)) return;
-    mergeDeployRequestError = null;
-    const ok = await tasksStore.updateTask(task.id, { context: requestMergeDeployContext(task) });
+    if (!canMergeDeploy || isReviewMergeBusy(reviewMergeState, mergeDeployState)) return;
+    reviewMergeRequestError = null;
+    const ok = await tasksStore.updateTask(task.id, { context: requestReviewMergeContext(task) });
     if (!ok) {
-      mergeDeployRequestError = tasksStore.error || 'Could not queue Merge + Deploy.';
+      reviewMergeRequestError = tasksStore.error || 'Could not queue Review & Merge.';
     }
   }
 
@@ -310,16 +314,16 @@
       </button>
       <button
         type="button"
-        onclick={canMergeDeploy ? requestMergeDeploy : markDone}
-        disabled={isMergeDeployBusy(mergeDeployState)}
-        class="rounded-lg border px-2 py-1.5 text-[10px] font-black transition {canMergeDeploy ? 'border-cyan-300/35 bg-cyan-400/10 text-cyan-100 hover:bg-cyan-400/15' : 'border-emerald-300/30 bg-emerald-400/10 text-emerald-100 hover:bg-emerald-400/15'} {isMergeDeployBusy(mergeDeployState) ? 'opacity-70 cursor-wait' : ''}"
+        onclick={canMergeDeploy ? requestReviewMerge : markDone}
+        disabled={isReviewMergeBusy(reviewMergeState, mergeDeployState)}
+        class="rounded-lg border px-2 py-1.5 text-[10px] font-black transition {canMergeDeploy ? 'border-cyan-300/35 bg-cyan-400/10 text-cyan-100 hover:bg-cyan-400/15' : 'border-emerald-300/30 bg-emerald-400/10 text-emerald-100 hover:bg-emerald-400/15'} {isReviewMergeBusy(reviewMergeState, mergeDeployState) ? 'opacity-70 cursor-wait' : ''}"
       >
-        {canMergeDeploy ? mergeDeployButtonLabel(mergeDeployState) : 'Mark Done'}
+        {canMergeDeploy ? reviewMergeButtonLabel(reviewMergeState, mergeDeployState) : 'Mark Done'}
       </button>
     </div>
-    {#if mergeDeployRequestError || mergeDeployState.error}
+    {#if reviewMergeRequestError || reviewMergeState.error}
       <div class="mt-2 line-clamp-3 rounded-lg border border-rose-400/35 bg-rose-500/10 px-2 py-1.5 text-[10px] font-bold leading-snug text-rose-100">
-        Merge + Deploy failed: {mergeDeployRequestError || mergeDeployState.error}
+        Review &amp; Merge: {reviewMergeRequestError || reviewMergeState.error}
       </div>
     {/if}
     {#if canRequestMergeConflictFix || isMergeConflictFixBusy(mergeConflictFixState) || mergeConflictFixRequestError || mergeConflictFixState.error}

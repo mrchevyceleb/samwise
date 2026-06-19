@@ -7,15 +7,17 @@
     getUiStamp,
     getMergeDeployState,
     getMergeConflictFixState,
+    getReviewMergeState,
     isMergeConflictError,
     isMergeConflictFixBusy,
     isReviewActionStatus,
     isMergeDeployBusy,
+    isReviewMergeBusy,
     mergeConflictFixButtonLabel,
-    mergeDeployButtonLabel,
+    reviewMergeButtonLabel,
     nextManualInProgressStampContext,
     requestMergeConflictFixContext,
-    requestMergeDeployContext
+    requestReviewMergeContext
   } from '$lib/utils/review-actions';
   import LinkRow from './LinkRow.svelte';
 
@@ -47,9 +49,15 @@
   let uiStamp = $derived(getUiStamp(task));
   let mergeDeployState = $derived(getMergeDeployState(task));
   let mergeConflictFixState = $derived(getMergeConflictFixState(task));
+  let reviewMergeState = $derived(getReviewMergeState(task));
   let displayStatus = $derived(task.status === 'testing' ? 'in_progress' : task.status);
   let mergeDeployRequestError = $state<string | null>(null);
   let mergeConflictFixRequestError = $state<string | null>(null);
+  let reviewMergeRequestError = $state<string | null>(null);
+  let stopping = $state(false);
+  let confirmDelete = $state(false);
+  let deleting = $state(false);
+  let isStoppable = $derived(task.status === 'in_progress' || task.status === 'testing');
   let visualQA = $derived(task.visual_qa_result);
   let visualQaVerdict = $derived((visualQA?.verdict || (visualQA?.pass ? 'PASS' : 'FAIL')).toUpperCase());
   let canMergeDeploy = $derived(!!task.pr_url && (task.status === 'approved' || mergeDeployState.status === 'failed'));
@@ -92,12 +100,37 @@
     await tasksStore.updateTask(task.id, { context: nextManualInProgressStampContext(task) });
   }
 
-  async function requestMergeDeploy() {
-    if (!canMergeDeploy || isMergeDeployBusy(mergeDeployState)) return;
-    mergeDeployRequestError = null;
-    const ok = await tasksStore.updateTask(task.id, { context: requestMergeDeployContext(task) });
+  async function requestReviewMerge() {
+    if (!canMergeDeploy || isReviewMergeBusy(reviewMergeState, mergeDeployState)) return;
+    reviewMergeRequestError = null;
+    const ok = await tasksStore.updateTask(task.id, { context: requestReviewMergeContext(task) });
     if (!ok) {
-      mergeDeployRequestError = tasksStore.error || 'Could not queue Merge + Deploy.';
+      reviewMergeRequestError = tasksStore.error || 'Could not queue Review & Merge.';
+    }
+  }
+
+  async function handleStop() {
+    if (stopping) return;
+    stopping = true;
+    try {
+      await tasksStore.stopTask(task.id);
+    } finally {
+      stopping = false;
+    }
+  }
+
+  async function handleDelete() {
+    if (!confirmDelete) {
+      confirmDelete = true;
+      setTimeout(() => { confirmDelete = false; }, 3000);
+      return;
+    }
+    deleting = true;
+    try {
+      await tasksStore.deleteTask(task.id);
+      onClose();
+    } finally {
+      deleting = false;
     }
   }
 
@@ -222,11 +255,11 @@
               </button>
               <button
                 type="button"
-                onclick={canMergeDeploy ? requestMergeDeploy : markDone}
-                disabled={isMergeDeployBusy(mergeDeployState)}
-                class="rounded-lg border px-3 py-2 text-xs font-black {canMergeDeploy ? 'border-cyan-300/35 bg-cyan-400/10 text-cyan-100 hover:bg-cyan-400/15' : 'border-emerald-300/30 bg-emerald-400/10 text-emerald-100 hover:bg-emerald-400/15'} {isMergeDeployBusy(mergeDeployState) ? 'opacity-70 cursor-wait' : ''}"
+                onclick={canMergeDeploy ? requestReviewMerge : markDone}
+                disabled={isReviewMergeBusy(reviewMergeState, mergeDeployState)}
+                class="rounded-lg border px-3 py-2 text-xs font-black {canMergeDeploy ? 'border-cyan-300/35 bg-cyan-400/10 text-cyan-100 hover:bg-cyan-400/15' : 'border-emerald-300/30 bg-emerald-400/10 text-emerald-100 hover:bg-emerald-400/15'} {isReviewMergeBusy(reviewMergeState, mergeDeployState) ? 'opacity-70 cursor-wait' : ''}"
               >
-                {canMergeDeploy ? mergeDeployButtonLabel(mergeDeployState) : 'Mark Done'}
+                {canMergeDeploy ? reviewMergeButtonLabel(reviewMergeState, mergeDeployState) : 'Mark Done'}
               </button>
               {#if canRequestMergeConflictFix || isMergeConflictFixBusy(mergeConflictFixState) || mergeConflictFixRequestError || mergeConflictFixState.error}
                 <button
@@ -250,9 +283,9 @@
               </button>
             {/if}
           </div>
-          {#if mergeDeployRequestError || mergeDeployState.error}
+          {#if reviewMergeRequestError || reviewMergeState.error}
             <div class="mt-3 whitespace-pre-wrap rounded-xl border border-rose-400/35 bg-rose-500/10 px-3 py-2 text-xs font-bold leading-snug text-rose-100">
-              Merge + Deploy failed: {mergeDeployRequestError || mergeDeployState.error}
+              Review &amp; Merge: {reviewMergeRequestError || reviewMergeState.error}
             </div>
           {/if}
           {#if mergeConflictFixRequestError || mergeConflictFixState.error}
@@ -403,6 +436,27 @@
             {/each}
           </ul>
         {/if}
+      </section>
+
+      <section class="flex flex-wrap gap-2 pt-2 border-t border-white/10">
+        {#if isStoppable}
+          <button
+            type="button"
+            onclick={handleStop}
+            disabled={stopping}
+            class="rounded-lg border border-amber-400/40 bg-amber-500/10 px-3 py-2 text-xs font-black text-amber-100 hover:bg-amber-500/15 {stopping ? 'opacity-70 cursor-wait' : ''}"
+          >
+            {stopping ? 'Stopping...' : 'Stop Task'}
+          </button>
+        {/if}
+        <button
+          type="button"
+          onclick={handleDelete}
+          disabled={deleting}
+          class="rounded-lg border px-3 py-2 text-xs font-black transition {confirmDelete ? 'border-rose-400/60 bg-rose-500/20 text-rose-100' : 'border-rose-400/20 bg-rose-500/5 text-rose-300 hover:bg-rose-500/10'} {deleting ? 'opacity-70 cursor-wait' : ''}"
+        >
+          {deleting ? 'Deleting...' : confirmDelete ? 'Click again to confirm' : 'Delete Task'}
+        </button>
       </section>
 
       <footer class="text-[10px] text-slate-500 pt-2">

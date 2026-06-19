@@ -185,6 +185,26 @@ class TasksStore {
     } as Partial<AeTask>);
   }
 
+  async stopTask(taskId: string) {
+    return this.updateTask(taskId, {
+      status: 'failed',
+      failure_reason: 'Stopped by user.',
+      worker_id: null,
+      claimed_at: null,
+    } as Partial<AeTask>);
+  }
+
+  async deleteTask(taskId: string) {
+    const { error } = await supabase.from('ae_tasks').delete().eq('id', taskId);
+    if (error) {
+      this.error = error.message;
+      return false;
+    }
+    this.tasks = this.tasks.filter((t) => t.id !== taskId);
+    this.error = null;
+    return true;
+  }
+
   private async closeOriginTicket(task: AeTask) {
     if (task.origin_system === 'manual' || task.source === 'manual') return;
     if (!task.origin_system && !task.callback_url) return;
