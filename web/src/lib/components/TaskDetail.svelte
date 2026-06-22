@@ -78,6 +78,10 @@
     task.status === 'approved'
   );
   let requeueing = $state(false);
+  let closingPr = $state(false);
+  let closePrError = $state<string | null>(null);
+  let copiedPr = $state(false);
+  let canClosePr = $derived(!!task.pr_url && task.status !== 'done');
 
   function verdictColor(verdict: string | undefined) {
     if (verdict === 'merge') return '#34d399';
@@ -146,6 +150,33 @@
   async function markDone() {
     await tasksStore.setStatus(task.id, 'done');
     onClose();
+  }
+
+  async function closePrAndDone() {
+    if (!canClosePr || closingPr) return;
+    closingPr = true;
+    closePrError = null;
+    const result = await tasksStore.closePr(task.id);
+    if (!result.ok) {
+      closePrError = result.error || 'Could not close the PR.';
+      closingPr = false;
+      return;
+    }
+    // PR closed (or already closed) — now mark the task done. setStatus also
+    // fires the origin-ticket closeout for Operly/Banana/etc. cards.
+    await tasksStore.setStatus(task.id, 'done');
+    onClose();
+  }
+
+  async function copyPrLink() {
+    if (!task.pr_url) return;
+    try {
+      await navigator.clipboard.writeText(task.pr_url);
+      copiedPr = true;
+      setTimeout(() => { copiedPr = false; }, 2000);
+    } catch (e) {
+      console.warn('[task-detail] copy PR link failed:', e);
+    }
   }
 
   async function handleRequeue() {
@@ -439,6 +470,32 @@
       </section>
 
       <section class="flex flex-wrap gap-2 pt-2 border-t border-white/10">
+        {#if task.pr_url}
+          <button
+            type="button"
+            onclick={copyPrLink}
+            class="rounded-lg border border-indigo-300/30 bg-indigo-400/10 px-3 py-2 text-xs font-black text-indigo-100 hover:bg-indigo-400/15"
+            title="Copy PR link to clipboard"
+          >
+            {copiedPr ? '✓ Copied!' : '⧉ Copy PR link'}
+          </button>
+        {/if}
+        {#if canClosePr}
+          <button
+            type="button"
+            onclick={closePrAndDone}
+            disabled={closingPr}
+            class="rounded-lg border border-rose-400/40 bg-rose-500/10 px-3 py-2 text-xs font-black text-rose-100 hover:bg-rose-500/15 {closingPr ? 'opacity-70 cursor-wait' : ''}"
+            title="Close this PR without merging and mark the task Done"
+          >
+            {closingPr ? 'Closing...' : '✕ Close PR & Mark Done'}
+          </button>
+        {/if}
+        {#if closePrError}
+          <div class="w-full whitespace-pre-wrap rounded-lg border border-rose-400/35 bg-rose-500/10 px-3 py-2 text-xs font-bold leading-snug text-rose-100">
+            {closePrError}
+          </div>
+        {/if}
         {#if isStoppable}
           <button
             type="button"

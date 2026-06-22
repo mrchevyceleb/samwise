@@ -17,5 +17,8 @@ verify_jwt = false
 [functions.agent-api]
 verify_jwt = false
 
+[functions.close-pr]
+verify_jwt = false
+
 [functions.worker-heartbeat-alarm]
 verify_jwt = false

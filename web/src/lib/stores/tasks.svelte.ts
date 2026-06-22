@@ -222,6 +222,30 @@ class TasksStore {
     }
   }
 
+  /**
+   * Close a task's GitHub PR without merging, via the close-pr edge function.
+   * Returns true if the PR was closed (or was already closed/merged). Does NOT
+   * touch the task status — the caller decides whether to then setStatus done.
+   */
+  async closePr(taskId: string): Promise<{ ok: boolean; error?: string }> {
+    const task = this.tasks.find((t) => t.id === taskId);
+    if (!task?.pr_url) return { ok: false, error: 'This task has no PR.' };
+    try {
+      const res = await fetch('/api/close-pr', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ task_id: taskId })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data?.ok === false) {
+        return { ok: false, error: data?.error || `close-pr failed (${res.status})` };
+      }
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+
   async loadCommentsFor(taskId: string) {
     if (this.comments[taskId]) return;
     const { data } = await supabase
