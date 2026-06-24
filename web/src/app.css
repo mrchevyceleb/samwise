@@ -40,5 +40,12 @@ select option:disabled {
   50%  { transform: scale(1.3) rotate(10deg); opacity: 1; }
   100% { transform: scale(0) rotate(40deg); opacity: 0; }
 }
-.drift { animation: drift 14s ease-in-out infinite; }
-.bob   { animation: bob 2.8s ease-in-out infinite; }
+/* 2026-06-24: The Spark (Moria) has no working browser GPU path on its NVIDIA
+   GB10, so Firefox and the Tauri WebView both software-render. Each perpetual
+   decorative animation then repaints every frame on the CPU. With 10 drifting
+   circles + 11 bobbing icons always running, that pinned a full core (~98% in
+   Firefox) and made the board lag. Disabled so the CPU can idle when nothing is
+   happening; the elements remain (just static). One-shot animations (pop-in)
+   are unaffected. Revert this block to restore the motion on GPU-capable hosts. */
+.drift { animation: none; }
+.bob   { animation: none; }
