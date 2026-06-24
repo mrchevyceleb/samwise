@@ -538,6 +538,80 @@ Deno.serve(async (req) => {
     if (stored.length > 0) task.attachments = stored;
   }
 
+  // Dedup: one upstream ticket (or a button mashed a few times) must not fan
+  // out into several Sam cards. If an OPEN card already exists for this origin
+  // (precise key) or with identical title+description (content fallback for
+  // reports that carry no/varying origin_id), return that card instead of
+  // inserting a duplicate. Terminal cards (done/failed/cancelled) do NOT block a
+  // fresh report, because a new report after the last was resolved is real work.
+  const OPEN_STATUSES = [
+    "queued",
+    "in_progress",
+    "review",
+    "fixes_needed",
+    "approved",
+    "on_hold",
+    "testing",
+    "pending_confirmation",
+  ];
+
+  async function findOpenDuplicate(): Promise<
+    { id: string; status: string } | null
+  > {
+    if (
+      typeof task.origin_system === "string" &&
+      typeof task.origin_id === "string" &&
+      task.origin_id
+    ) {
+      const { data, error } = await sb
+        .from("ae_tasks")
+        .select("id, status")
+        .eq("origin_system", task.origin_system)
+        .eq("origin_id", task.origin_id)
+        .in("status", OPEN_STATUSES)
+        .limit(1);
+      if (error) throw new Error(`origin lookup: ${error.message}`);
+      if (data && data.length > 0) return data[0];
+    }
+    // Content fallback for reports that carry no/varying origin_id. Scope it by
+    // source (and project when resolved) so identical wording from a DIFFERENT
+    // source or project is not wrongly suppressed as a duplicate.
+    let q = sb
+      .from("ae_tasks")
+      .select("id, status")
+      .eq("title", title)
+      .eq("description", description)
+      .eq("source", source)
+      .in("status", OPEN_STATUSES);
+    if (project) q = q.eq("project", project);
+    const { data, error } = await q.limit(1);
+    if (error) throw new Error(`content lookup: ${error.message}`);
+    if (data && data.length > 0) return data[0];
+    return null;
+  }
+
+  let duplicate: { id: string; status: string } | null = null;
+  try {
+    duplicate = await findOpenDuplicate();
+  } catch (e) {
+    // Fail OPEN: dropping a real inbound report (fail-closed) is worse than a
+    // rare duplicate on a transient query error. Proceed with the insert.
+    console.error(
+      `[task-webhook] dedup check failed, inserting anyway: ${
+        e instanceof Error ? e.message : String(e)
+      }`,
+    );
+  }
+  if (duplicate) {
+    return json(200, {
+      ok: true,
+      deduped: true,
+      task: { id: duplicate.id, status: duplicate.status },
+      note:
+        "An open Sam card already exists for this report; returning it instead of creating a duplicate.",
+    });
+  }
+
   const { data: inserted, error: insErr } = await sb
     .from("ae_tasks")
     .insert(task)
@@ -545,6 +619,32 @@ Deno.serve(async (req) => {
     .single();
 
   if (insErr) {
+    // Lost a race to a concurrent duplicate POST: the partial unique index on
+    // open (origin_system, origin_id) rejected this insert. Return the card that
+    // won instead of erroring, so the intake stays idempotent under button-mash.
+    if (
+      insErr.code === "23505" &&
+      typeof task.origin_system === "string" &&
+      typeof task.origin_id === "string" &&
+      task.origin_id
+    ) {
+      const { data: existing } = await sb
+        .from("ae_tasks")
+        .select("id, status")
+        .eq("origin_system", task.origin_system)
+        .eq("origin_id", task.origin_id)
+        .in("status", OPEN_STATUSES)
+        .limit(1);
+      if (existing && existing.length > 0) {
+        return json(200, {
+          ok: true,
+          deduped: true,
+          task: { id: existing[0].id, status: existing[0].status },
+          note:
+            "An open Sam card already exists for this report (won an insert race); returning it.",
+        });
+      }
+    }
     return json(500, { error: `Insert failed: ${insErr.message}` });
   }
 
