@@ -194,6 +194,41 @@ class TasksStore {
     } as Partial<AeTask>);
   }
 
+  /**
+   * Restart a failed task: kick it back to queued and clear the stale claim
+   * so the worker re-picks it up. Semantically the same write as requeueTask
+   * but expressed as a distinct action for the failed-card "Restart" button.
+   */
+  async restartTask(taskId: string) {
+    const task = this.tasks.find((t) => t.id === taskId);
+    if (!task) return false;
+    return this.updateTask(taskId, {
+      status: 'queued',
+      worker_id: null,
+      claimed_at: null,
+      failure_reason: null,
+    } as Partial<AeTask>);
+  }
+
+  /**
+   * Post a comment as the given author. The realtime channel (ae_comments)
+   * pushes the new row back into this.comments, so the caller does not need
+   * to insert it locally.
+   */
+  async postComment(taskId: string, author: string, content: string): Promise<boolean> {
+    try {
+      const { error } = await supabase
+        .from('ae_comments')
+        .insert({ task_id: taskId, author, content });
+      if (error) throw error;
+      this.error = null;
+      return true;
+    } catch (e: unknown) {
+      this.error = e instanceof Error ? e.message : String(e);
+      return false;
+    }
+  }
+
   async deleteTask(taskId: string) {
     const { error } = await supabase.from('ae_tasks').delete().eq('id', taskId);
     if (error) {
@@ -257,7 +292,8 @@ class TasksStore {
   }
 
   private shouldPrefetchComments(task: AeTask) {
-    return !!task.pr_url && (task.status === 'review' || task.status === 'fixes_needed' || task.status === 'approved');
+    return task.status === 'in_progress' || task.status === 'testing' ||
+      (!!task.pr_url && (task.status === 'review' || task.status === 'fixes_needed' || task.status === 'approved'));
   }
 
   private prefetchReviewComments() {

@@ -13,6 +13,7 @@ name = "agent-one"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "chrono",
  "cron",
  "dirs 5.0.1",

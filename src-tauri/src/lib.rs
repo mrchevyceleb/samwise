@@ -226,6 +226,8 @@ pub fn run() {
             commands::git::git_stash_pop,
             commands::git::git_push,
             commands::git::git_pull,
+            // GitHub PR
+            commands::git::close_pr,
             // Claude Code
             commands::claude_code::spawn_claude_code,
             commands::claude_code::write_claude_code,
@@ -280,6 +282,7 @@ pub fn run() {
             commands::health::check_claude_code,
             commands::health::check_gh_auth,
             commands::health::check_doppler,
+            commands::health::check_llm_proxy,
             // Hello
             commands::hello::hello,
             // Chat (direct - no worker dependency)

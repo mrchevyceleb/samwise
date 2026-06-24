@@ -844,6 +844,9 @@ pub async fn gh_merge(pr_url: &str, repo_path: &str, head_sha: &str) -> Result<(
                 "--match-head-commit", &current_sha,
             ])
             .current_dir(repo_path)
+            // If a wrapping timeout drops this future, kill the gh child so a
+            // lingering merge can't complete behind the back of the retry.
+            .kill_on_drop(true)
             .output()
             .await
             .map_err(|e| format!("spawn gh merge: {}", e))?;

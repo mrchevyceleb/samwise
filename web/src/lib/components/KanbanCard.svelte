@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount, onDestroy } from 'svelte';
   import type { AeTask } from '$lib/types';
   import { PRIORITY_COLOR, ORIGIN_LABEL, ORIGIN_BADGE_CLASS, getOriginKey } from '$lib/types';
   import { tasksStore } from '$lib/stores/tasks.svelte';
@@ -36,7 +37,7 @@
   let sendingToQa = $state(false);
   let sendToQaError = $state<string | null>(null);
   let showReviewActions = $derived(isReviewActionStatus(task.status) && !!(reviewPanel || task.pr_url));
-  let canMergeDeploy = $derived(!!task.pr_url && (task.status === 'approved' || mergeDeployState.status === 'failed'));
+  let canMergeDeploy = $derived(!!task.pr_url && (task.status === 'approved' || mergeDeployState.status === 'failed' || reviewMergeState.status === 'failed'));
   let canRequestMergeConflictFix = $derived(
     !!task.pr_url &&
     mergeDeployState.status === 'failed' &&
@@ -44,6 +45,65 @@
     !isMergeConflictFixBusy(mergeConflictFixState)
   );
   let originKey = $derived(getOriginKey(task.origin_system));
+
+  // Status-derived flags
+  let isWorking = $derived(task.status === 'in_progress' || task.status === 'testing');
+  let isAgent = $derived(task.assignee === 'agent');
+  let hasScreenshots = $derived(
+    (task.screenshots_before && task.screenshots_before.length > 0) ||
+    (task.screenshots_after && task.screenshots_after.length > 0)
+  );
+  let commentCount = $derived(comments.length);
+
+  // Latest agent/system comment for activity preview on working/review cards
+  let latestComment = $derived((() => {
+    if (comments.length === 0) return null;
+    if (!isWorking && task.status !== 'review') return null;
+    const agentComments = comments.filter((c) => c.author === 'agent' || c.author === 'system');
+    const src = agentComments.length > 0 ? agentComments[agentComments.length - 1] : comments[comments.length - 1];
+    return src.content;
+  })());
+
+  // Visual QA
+  let qaResult = $derived(task.visual_qa_result);
+  let qaVerdict = $derived(qaResult ? (qaResult.verdict || (qaResult.pass ? 'PASS' : 'FAIL')).toUpperCase() : '');
+  let qaIsPass = $derived(qaVerdict === 'PASS');
+  let qaIsSkip = $derived(qaVerdict === 'SKIP');
+  let qaBadgeLabel = $derived(qaIsSkip ? 'QA Skipped' : qaIsPass ? 'QA Passed' : 'QA Failed');
+
+  // Live working timer
+  let nowTick = $state(Date.now());
+  let timerInterval: ReturnType<typeof setInterval> | null = null;
+  let workingElapsed = $derived((() => {
+    if (!isWorking || !task.claimed_at) return '';
+    const start = new Date(task.claimed_at).getTime();
+    const diff = Math.max(0, nowTick - start);
+    const secs = Math.floor(diff / 1000);
+    if (secs < 60) return `${secs}s`;
+    const mins = Math.floor(secs / 60);
+    const remSecs = secs % 60;
+    if (mins < 60) return `${mins}m ${remSecs}s`;
+    const hrs = Math.floor(mins / 60);
+    const remMins = mins % 60;
+    return `${hrs}h ${remMins}m`;
+  })());
+
+  onMount(() => {
+    if (isWorking) timerInterval = setInterval(() => { nowTick = Date.now(); }, 1000);
+  });
+
+  onDestroy(() => {
+    if (timerInterval) clearInterval(timerInterval);
+  });
+
+  $effect(() => {
+    if (isWorking && !timerInterval) {
+      timerInterval = setInterval(() => { nowTick = Date.now(); }, 1000);
+    } else if (!isWorking && timerInterval) {
+      clearInterval(timerInterval);
+      timerInterval = null;
+    }
+  });
 
   function relTime(iso: string) {
     const d = Date.now() - new Date(iso).getTime();
@@ -174,22 +234,17 @@
     if (!e.dataTransfer) return;
     e.dataTransfer.effectAllowed = 'move';
     e.dataTransfer.setData('application/x-samwise-task', task.id);
-    // Plain text fallback for browsers that ignore custom MIME types.
     e.dataTransfer.setData('text/plain', task.id);
   }}
   onclick={() => onOpen(task)}
   onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') onOpen(task); }}
-  class="group w-full text-left rounded-xl border border-white/10 bg-white/5 p-3 backdrop-blur hover:bg-white/10 hover:scale-[1.01] hover:-translate-y-0.5 active:scale-[0.99] transition-all shadow-sm cursor-grab active:cursor-grabbing"
+  class="group w-full text-left rounded-xl border p-3 backdrop-blur transition-all shadow-sm cursor-grab active:cursor-grabbing hover:scale-[1.01] hover:-translate-y-0.5 active:scale-[0.99] hover:bg-white/10 {isWorking ? 'border-indigo-500/50 bg-indigo-500/5' : 'border-white/10 bg-white/5'}"
 >
   {#if uiStamp}
     <div class="mb-2 rounded-xl border border-orange-300/70 bg-gradient-to-r from-orange-400/30 via-amber-300/15 to-rose-300/20 px-2.5 py-2 shadow-lg shadow-orange-950/30">
       <div class="flex items-center justify-between gap-2">
-        <span class="text-[11px] font-black uppercase tracking-[0.16em] text-orange-50">
-          Manual In Progress
-        </span>
-        <span class="rounded-full border border-orange-200/40 bg-black/25 px-1.5 py-0.5 text-[9px] font-black uppercase tracking-wide text-orange-100">
-          Mine
-        </span>
+        <span class="text-[11px] font-black uppercase tracking-[0.16em] text-orange-50">Manual In Progress</span>
+        <span class="rounded-full border border-orange-200/40 bg-black/25 px-1.5 py-0.5 text-[9px] font-black uppercase tracking-wide text-orange-100">Mine</span>
       </div>
     </div>
   {/if}
@@ -203,13 +258,12 @@
           </svg>
           On Hold
         </span>
-        <span class="rounded-full border border-slate-200/40 bg-black/25 px-1.5 py-0.5 text-[9px] font-black uppercase tracking-wide text-slate-100">
-          Sam Skips
-        </span>
+        <span class="rounded-full border border-slate-200/40 bg-black/25 px-1.5 py-0.5 text-[9px] font-black uppercase tracking-wide text-slate-100">Sam Skips</span>
       </div>
     </div>
   {/if}
 
+  <!-- Title + priority -->
   <div class="flex items-start justify-between gap-2">
     <div class="text-sm font-medium text-slate-100 line-clamp-2">{task.title}</div>
     <span class="shrink-0 text-[10px] uppercase tracking-wide rounded-md border px-1.5 py-0.5 {PRIORITY_COLOR[task.priority]}">
@@ -247,7 +301,7 @@
   {#if task.project || originKey}
     <div class="mt-2 flex flex-wrap items-center gap-1.5 text-xs text-slate-400">
       {#if task.project}
-        <span>📦 {task.project}</span>
+        <span class="text-[10px] font-semibold px-1.5 py-0.5 rounded-md bg-indigo-500/10 text-indigo-300">📦 {task.project}</span>
       {/if}
       {#if originKey}
         {#if task.origin_url}
@@ -273,6 +327,26 @@
     </div>
   {/if}
 
+  <!-- Latest agent comment preview -->
+  {#if latestComment}
+    <div class="mt-2 flex items-start gap-1.5 rounded-md border-l-2 border-indigo-400/35 bg-indigo-500/5 px-2 py-1.5 text-[11px] leading-snug text-slate-400">
+      {#if isWorking}
+        <span class="mt-px h-1.5 w-1.5 shrink-0 rounded-full bg-indigo-400 animate-pulse"></span>
+      {/if}
+      <span class="line-clamp-2">{latestComment}</span>
+    </div>
+  {/if}
+
+  <!-- Visual QA badge -->
+  {#if qaResult}
+    <div class="mt-2">
+      <span class="inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-md border
+        {qaIsPass ? 'border-emerald-400/40 bg-emerald-500/10 text-emerald-300' : qaIsSkip ? 'border-amber-400/40 bg-amber-500/10 text-amber-300' : 'border-rose-400/40 bg-rose-500/10 text-rose-300'}">
+        {qaBadgeLabel}
+      </span>
+    </div>
+  {/if}
+
   {#if task.subtasks && task.subtasks.length > 0}
     {@const done = task.subtasks.filter((s) => s.done).length}
     <div class="mt-2 flex items-center gap-1.5">
@@ -281,14 +355,6 @@
       </div>
       <span class="text-[10px] text-slate-400">{done}/{task.subtasks.length}</span>
     </div>
-  {/if}
-
-  {#if task.commit_message && task.commit_message.trim()}
-    <pre
-      onmousedown={(e) => e.stopPropagation()}
-      onclick={(e) => e.stopPropagation()}
-      class="mt-2 max-h-52 overflow-y-auto whitespace-pre-wrap break-words rounded-md border-l-2 border-indigo-400/45 bg-indigo-500/5 px-2.5 py-2 font-mono text-[10px] leading-snug text-slate-300"
-    >{task.commit_message}</pre>
   {/if}
 
   {#if task.status === 'queued'}
@@ -343,10 +409,6 @@
     {/if}
   {/if}
 
-  <!-- Re-queue: kick a stuck non-terminal card back into the queue. Clears
-       worker_id/claimed_at/failure_reason so the worker can re-claim cleanly.
-       in_progress/testing intentionally excluded (live subprocess needs to be
-       killed first). -->
   {#if task.status === 'failed' || task.status === 'fixes_needed' || task.status === 'pending_confirmation' || task.status === 'review' || task.status === 'approved'}
     <button
       type="button"
@@ -395,17 +457,13 @@
             onclick={cancelSendToQa}
             disabled={sendingToQa}
             class="rounded-md border border-white/15 bg-white/5 px-2 py-1 text-[10px] font-black uppercase tracking-wide text-slate-200 hover:bg-white/10 disabled:opacity-50"
-          >
-            Cancel
-          </button>
+          >Cancel</button>
           <button
             type="button"
             onclick={confirmSendToQa}
             disabled={sendingToQa || !selectedTester}
             class="rounded-md border border-teal-300/45 bg-teal-500/25 px-2 py-1 text-[10px] font-black uppercase tracking-wide text-teal-50 hover:bg-teal-500/35 disabled:opacity-60 disabled:cursor-wait"
-          >
-            {sendingToQa ? 'Sending...' : 'Send'}
-          </button>
+          >{sendingToQa ? 'Sending...' : 'Send'}</button>
         </div>
       </div>
     {/if}
@@ -428,15 +486,74 @@
     {/if}
   {/if}
 
-  <div class="mt-2 flex flex-wrap items-center gap-1.5 text-[10px] text-slate-400">
+  <!-- Bottom row: assignee, pr/branch, icons, timer/timestamp -->
+  <div class="mt-2 flex items-center gap-1.5 text-[10px] text-slate-400">
+    <!-- Assignee indicator -->
+    <span
+      title="{isAgent ? 'Assigned to Agent' : 'Assigned to Matt'}"
+      class="flex items-center justify-center w-5 h-5 shrink-0 rounded-full {isAgent ? 'bg-indigo-500/15 text-indigo-400' : 'bg-emerald-500/15 text-emerald-400'}"
+    >
+      {#if isAgent}
+        <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor">
+          <path d="M8 0a1 1 0 011 1v1.07A6.002 6.002 0 0114 8v3a2 2 0 01-2 2H4a2 2 0 01-2-2V8a6.002 6.002 0 015-5.93V1a1 1 0 011-1zM6 9a1 1 0 100 2 1 1 0 000-2zm4 0a1 1 0 100 2 1 1 0 000-2z"/>
+        </svg>
+      {:else}
+        <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor">
+          <path d="M8 8a3 3 0 100-6 3 3 0 000 6zm-5 6s-1 0-1-1 1-4 6-4 6 3 6 4-1 1-1 1H3z"/>
+        </svg>
+      {/if}
+    </span>
+
     {#if task.pr_number}
       <span class="rounded bg-violet-500/15 border border-violet-500/30 text-violet-200 px-1.5 py-0.5">PR #{task.pr_number}</span>
     {/if}
     {#if task.branch}
-      <span class="rounded bg-white/5 border border-white/10 px-1.5 py-0.5 truncate max-w-[140px]">⎇ {task.branch}</span>
+      <span class="rounded bg-white/5 border border-white/10 px-1.5 py-0.5 truncate max-w-[100px]">⎇ {task.branch}</span>
     {:else if task.base_branch}
-      <span title="Base branch" class="rounded bg-white/5 border border-white/10 px-1.5 py-0.5 truncate max-w-[140px]">base {task.base_branch}</span>
+      <span title="Base branch" class="rounded bg-white/5 border border-white/10 px-1.5 py-0.5 truncate max-w-[100px]">base {task.base_branch}</span>
     {/if}
-    <span class="ml-auto">{relTime(task.updated_at)}</span>
+
+    <div class="ml-auto flex items-center gap-1.5 shrink-0">
+      {#if commentCount > 0}
+        <span class="flex items-center gap-0.5 text-slate-500">
+          <svg width="9" height="9" viewBox="0 0 16 16" fill="currentColor">
+            <path d="M2.678 11.894a1 1 0 01.287.801 10.97 10.97 0 01-.398 2c1.395-.323 2.247-.697 2.634-.893a1 1 0 01.71-.074A8.06 8.06 0 008 14c3.996 0 7-2.807 7-6s-3.004-6-7-6-7 2.808-7 6c0 1.468.617 2.83 1.678 3.894z"/>
+          </svg>
+          {commentCount}
+        </span>
+      {/if}
+
+      {#if task.report_url}
+        <button
+          type="button"
+          title="View report"
+          onclick={(e) => { e.stopPropagation(); window.open(task.report_url!, '_blank', 'noopener'); }}
+          class="flex items-center justify-center w-5 h-5 rounded bg-indigo-500/10 text-indigo-400 hover:bg-indigo-500/20 transition"
+        >
+          <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+            <polyline points="14 2 14 8 20 8"/>
+          </svg>
+        </button>
+      {/if}
+
+      {#if hasScreenshots}
+        <span title="Has screenshots" class="flex items-center justify-center w-5 h-5 rounded bg-purple-500/10 text-purple-400">
+          <svg width="9" height="9" viewBox="0 0 16 16" fill="currentColor">
+            <path d="M4.502 9a1.5 1.5 0 100-3 1.5 1.5 0 000 3z"/>
+            <path d="M14.002 13a2 2 0 01-2 2h-10a2 2 0 01-2-2V5A2 2 0 012 3h2.5l.83-1.36A1 1 0 016.18 1h3.64a1 1 0 01.86.49L11.5 3h2.5a2 2 0 012 2v8z"/>
+          </svg>
+        </span>
+      {/if}
+
+      {#if isWorking && workingElapsed}
+        <span class="flex items-center gap-1 text-indigo-400 font-mono font-semibold">
+          <span class="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-pulse"></span>
+          {workingElapsed}
+        </span>
+      {:else}
+        <span>{relTime(task.updated_at)}</span>
+      {/if}
+    </div>
   </div>
 </div>

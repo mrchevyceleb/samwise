@@ -91,6 +91,11 @@
       );
     });
   });
+  // Sort within each column to match the desktop app exactly: active work
+  // columns are priority-first (critical>high>medium>low) then newest-created
+  // first; terminal columns (done/failed) are most-recently-updated first.
+  const PRIORITY_ORDER: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 };
+  const RECENCY_COLUMNS = new Set(['done', 'failed']);
   let byStatus = $derived.by(() => {
     const map = new Map<string, AeTask[]>();
     for (const s of STATUSES) map.set(s, []);
@@ -98,6 +103,17 @@
       const status = displayColumnStatus(t);
       if (!map.has(status)) map.set(status, []);
       map.get(status)!.push(t);
+    }
+    for (const [status, list] of map) {
+      if (RECENCY_COLUMNS.has(status)) {
+        list.sort((a, b) => new Date(b.updated_at ?? b.created_at).getTime() - new Date(a.updated_at ?? a.created_at).getTime());
+      } else {
+        list.sort((a, b) => {
+          const pd = (PRIORITY_ORDER[a.priority] ?? 9) - (PRIORITY_ORDER[b.priority] ?? 9);
+          if (pd !== 0) return pd;
+          return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+        });
+      }
     }
     return map;
   });

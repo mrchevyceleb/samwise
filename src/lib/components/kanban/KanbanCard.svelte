@@ -10,16 +10,17 @@
 		extractReviewActionPanel,
 		getUiStamp,
 		getMergeDeployState,
+		getReviewMergeState,
 		getMergeConflictFixState,
 		isMergeConflictError,
 		isMergeConflictFixBusy,
 		isReviewActionStatus,
-		isMergeDeployBusy,
+		isReviewMergeBusy,
 		mergeConflictFixButtonLabel,
-		mergeDeployButtonLabel,
+		reviewMergeButtonLabel,
 		nextManualInProgressStampContext,
 		requestMergeConflictFixContext,
-		requestMergeDeployContext,
+		requestReviewMergeContext,
 	} from '$lib/utils/review-actions';
 	import { formatTimeAgo } from '$lib/utils/relative-time';
 	import { openExternal } from '$lib/utils/tauri';
@@ -55,6 +56,7 @@
 	let reviewPanel = $derived(extractReviewActionPanel(task, comments));
 	let uiStamp = $derived(getUiStamp(task));
 	let mergeDeployState = $derived(getMergeDeployState(task));
+	let reviewMergeState = $derived(getReviewMergeState(task));
 	let mergeConflictFixState = $derived(getMergeConflictFixState(task));
 	let mergeDeployRequestError = $state<string | null>(null);
 	let mergeConflictFixRequestError = $state<string | null>(null);
@@ -65,7 +67,7 @@
 	let sendToQaError = $state<string | null>(null);
 	const SAMWISE_API_BASE = 'https://samwise-board.vercel.app';
 	let showReviewActions = $derived(isReviewActionStatus(task.status) && !!(reviewPanel || task.pr_url));
-	let canMergeDeploy = $derived(!!task.pr_url && (task.status === 'approved' || mergeDeployState.status === 'failed'));
+	let canMergeDeploy = $derived(!!task.pr_url && (task.status === 'approved' || mergeDeployState.status === 'failed' || reviewMergeState.status === 'failed'));
 	let canRequestMergeConflictFix = $derived(
 		!!task.pr_url &&
 		mergeDeployState.status === 'failed' &&
@@ -180,14 +182,14 @@
 		await taskStore.updateTask(task.id, { context: nextManualInProgressStampContext(task) });
 	}
 
-	async function requestMergeDeploy(e: MouseEvent) {
+	async function requestReviewMerge(e: MouseEvent) {
 		e.preventDefault();
 		e.stopPropagation();
-		if (!canMergeDeploy || isMergeDeployBusy(mergeDeployState)) return;
+		if (!canMergeDeploy || isReviewMergeBusy(reviewMergeState, mergeDeployState)) return;
 		mergeDeployRequestError = null;
-		const ok = await taskStore.updateTask(task.id, { context: requestMergeDeployContext(task) });
+		const ok = await taskStore.updateTask(task.id, { context: requestReviewMergeContext(task) });
 		if (!ok) {
-			mergeDeployRequestError = taskStore.error || 'Could not queue Merge + Deploy.';
+			mergeDeployRequestError = taskStore.error || 'Could not queue Review & Merge.';
 		}
 	}
 
@@ -563,17 +565,17 @@
 					border: 1px solid {canMergeDeploy ? 'rgba(103, 232, 249, 0.32)' : 'rgba(63, 185, 80, 0.24)'};
 					color: {canMergeDeploy ? '#67e8f9' : 'var(--accent-green)'};
 					font-size: 10px; font-weight: 900; font-family: var(--font-ui);
-					cursor: {isMergeDeployBusy(mergeDeployState) ? 'wait' : 'pointer'}; transition: all 0.15s ease;
-					opacity: {isMergeDeployBusy(mergeDeployState) ? '0.72' : '1'};
+					cursor: {isReviewMergeBusy(reviewMergeState, mergeDeployState) ? 'wait' : 'pointer'}; transition: all 0.15s ease;
+					opacity: {isReviewMergeBusy(reviewMergeState, mergeDeployState) ? '0.72' : '1'};
 				"
 				onmousedown={(e) => e.stopPropagation()}
-				onclick={canMergeDeploy ? requestMergeDeploy : markDone}
-				disabled={isMergeDeployBusy(mergeDeployState)}
+				onclick={canMergeDeploy ? requestReviewMerge : markDone}
+				disabled={isReviewMergeBusy(reviewMergeState, mergeDeployState)}
 			>
-				{canMergeDeploy ? mergeDeployButtonLabel(mergeDeployState) : 'Mark Done'}
+				{canMergeDeploy ? reviewMergeButtonLabel(reviewMergeState, mergeDeployState) : 'Mark Done'}
 			</button>
 		</div>
-		{#if mergeDeployRequestError || mergeDeployState.error}
+		{#if mergeDeployRequestError || reviewMergeState.error || mergeDeployState.error}
 			<div style="
 				margin-top: 7px; padding: 7px 8px; border-radius: 8px;
 				background: rgba(248, 81, 73, 0.12);
@@ -582,7 +584,7 @@
 				display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
 				overflow: hidden;
 			">
-				Merge + Deploy failed: {mergeDeployRequestError || mergeDeployState.error}
+				Review &amp; Merge: {mergeDeployRequestError || reviewMergeState.error || mergeDeployState.error}
 			</div>
 		{/if}
 		{#if canRequestMergeConflictFix || isMergeConflictFixBusy(mergeConflictFixState) || mergeConflictFixRequestError || mergeConflictFixState.error}

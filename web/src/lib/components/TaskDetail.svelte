@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { AeTask, TaskStatus } from '$lib/types';
+  import type { AeTask, TaskStatus, TaskPriority, Subtask } from '$lib/types';
   import { PRIORITY_COLOR, STATUS_LABEL, STATUSES } from '$lib/types';
   import { tasksStore } from '$lib/stores/tasks.svelte';
   import {
@@ -30,20 +30,6 @@
   let comments = $derived(tasksStore.comments[task.id] ?? []);
   let before = $derived(task.screenshots_before ?? []);
   let after = $derived(task.screenshots_after ?? []);
-
-  /** Escape HTML then auto-link http(s) URLs so they're clickable in comments. */
-  function renderCommentHtml(content: string): string {
-    const escaped = content
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#39;');
-    return escaped.replace(
-      /(https?:\/\/[^\s<]+)/g,
-      '<a href="$1" target="_blank" rel="noopener noreferrer" class="text-indigo-300 underline hover:text-indigo-200">$1</a>'
-    );
-  }
   let attachments = $derived(task.attachments ?? []);
   let reviewPanel = $derived(extractReviewActionPanel(task, comments));
   let uiStamp = $derived(getUiStamp(task));
@@ -55,12 +41,13 @@
   let mergeConflictFixRequestError = $state<string | null>(null);
   let reviewMergeRequestError = $state<string | null>(null);
   let stopping = $state(false);
+  let restarting = $state(false);
   let confirmDelete = $state(false);
   let deleting = $state(false);
   let isStoppable = $derived(task.status === 'in_progress' || task.status === 'testing');
   let visualQA = $derived(task.visual_qa_result);
   let visualQaVerdict = $derived((visualQA?.verdict || (visualQA?.pass ? 'PASS' : 'FAIL')).toUpperCase());
-  let canMergeDeploy = $derived(!!task.pr_url && (task.status === 'approved' || mergeDeployState.status === 'failed'));
+  let canMergeDeploy = $derived(!!task.pr_url && (task.status === 'approved' || mergeDeployState.status === 'failed' || reviewMergeState.status === 'failed'));
   let canRequestMergeConflictFix = $derived(
     !!task.pr_url &&
     mergeDeployState.status === 'failed' &&
@@ -83,6 +70,78 @@
   let copiedPr = $state(false);
   let canClosePr = $derived(!!task.pr_url && task.status !== 'done');
 
+  // --- Inline editing: title + description ---
+  let editingTitle = $state(false);
+  let editTitle = $state('');
+  let editingDesc = $state(false);
+  let editDesc = $state('');
+
+  // --- Comment composer ---
+  let commentInput = $state('');
+  let postingComment = $state(false);
+  let commentsEl = $state<HTMLUListElement | null>(null);
+
+  // --- Interactive subtasks ---
+  let newSubtaskTitle = $state('');
+  let editingSubtaskId = $state<string | null>(null);
+  let editSubtaskText = $state('');
+  let subtaskDragId = $state<string | null>(null);
+  let dropTargetId = $state<string | null>(null);
+  let dropPosition = $state<'above' | 'below'>('below');
+
+  let subtasks = $derived<Subtask[]>((task.subtasks || []).slice().sort((a, b) => a.order - b.order));
+  let subtasksDone = $derived(subtasks.filter((s) => s.done).length);
+
+  const priorities: TaskPriority[] = ['critical', 'high', 'medium', 'low'];
+
+  /** Focus + select-all action for inline edit inputs. */
+  function autofocus(node: HTMLElement) {
+    node.focus();
+    if (node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement) node.select();
+  }
+
+  /** Escape HTML then render markdown-ish markup (code/bold/links/mentions).
+   *  HTML is escaped first for XSS safety, then code spans are stashed so the
+   *  bold/URL/mention regexes never run inside them. Mirrors the desktop app. */
+  function renderCommentHtml(content: string): string {
+    let safe = content
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+
+    // Stash code blocks + inline code so other regexes skip them.
+    const codeSlots: string[] = [];
+    const stash = (html: string): string => {
+      codeSlots.push(html);
+      return `\x00CODE${codeSlots.length - 1}\x00`;
+    };
+
+    // Code blocks (triple backticks) — keep internal newlines via pre-wrap.
+    safe = safe.replace(/```([\s\S]*?)```/g, (_m, inner: string) =>
+      stash(`<code class="block bg-black/40 rounded-md px-2.5 py-2 font-mono text-[11px] my-1 whitespace-pre-wrap overflow-x-auto break-words">${inner}</code>`)
+    );
+    // Inline code (single backticks)
+    safe = safe.replace(/`([^`]+)`/g, (_m, inner: string) =>
+      stash(`<code class="bg-black/30 rounded px-1 py-0.5 font-mono text-[11px]">${inner}</code>`)
+    );
+    // Bold (**text**)
+    safe = safe.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    // Auto-link URLs
+    safe = safe.replace(
+      /(https?:\/\/[^\s<]+)/g,
+      '<a href="$1" target="_blank" rel="noopener noreferrer" class="text-indigo-300 underline hover:text-indigo-200">$1</a>'
+    );
+    // @mentions
+    safe = safe.replace(/(^|\s)@(\w+)/g, '$1<span class="text-indigo-300 font-semibold">@$2</span>');
+    // Newlines to <br>
+    safe = safe.replace(/\n/g, '<br>');
+    // Restore code
+    safe = safe.replace(/\x00CODE(\d+)\x00/g, (_m, idx: string) => codeSlots[parseInt(idx, 10)]);
+    return safe;
+  }
+
   function verdictColor(verdict: string | undefined) {
     if (verdict === 'merge') return '#34d399';
     if (verdict === 'fix' || verdict === 'blocked') return '#fb923c';
@@ -100,10 +159,149 @@
     if (task.pr_url) window.open(task.pr_url, '_blank', 'noopener');
   }
 
+  // --- Inline title / description editing ---
+  function startEditTitle() {
+    editingTitle = true;
+    editTitle = task.title;
+  }
+  async function saveTitle() {
+    const trimmed = editTitle.trim();
+    if (trimmed && trimmed !== task.title) {
+      await tasksStore.updateTask(task.id, { title: trimmed });
+    }
+    editingTitle = false;
+  }
+  function startEditDesc() {
+    editingDesc = true;
+    editDesc = task.description || '';
+  }
+  async function saveDescription() {
+    if (editDesc !== (task.description || '')) {
+      await tasksStore.updateTask(task.id, { description: editDesc || null });
+    }
+    editingDesc = false;
+  }
+
+  function changePriority(p: TaskPriority) {
+    void tasksStore.updateTask(task.id, { priority: p });
+  }
+
+  // --- Comments ---
+  async function handlePostComment() {
+    const content = commentInput.trim();
+    if (!content || postingComment) return;
+    postingComment = true;
+    try {
+      const ok = await tasksStore.postComment(task.id, 'matt', content);
+      if (ok) {
+        commentInput = '';
+        // The realtime channel re-inserts the row; scroll to bottom after it lands.
+        requestAnimationFrame(() => {
+          if (commentsEl) commentsEl.scrollTop = commentsEl.scrollHeight;
+        });
+      }
+    } finally {
+      postingComment = false;
+    }
+  }
+  function handleCommentKeydown(e: KeyboardEvent) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      void handlePostComment();
+    }
+  }
+
+  // --- Subtasks ---
+  async function persistSubtasks(updated: Subtask[]) {
+    await tasksStore.updateTask(task.id, { subtasks: updated });
+  }
+  function toggleSubtask(id: string) {
+    void persistSubtasks(subtasks.map((s) => (s.id === id ? { ...s, done: !s.done } : s)));
+  }
+  function deleteSubtask(id: string) {
+    void persistSubtasks(subtasks.filter((s) => s.id !== id));
+  }
+  function addSubtask() {
+    const title = newSubtaskTitle.trim();
+    if (!title) return;
+    void persistSubtasks([...subtasks, { id: crypto.randomUUID(), title, done: false, order: subtasks.length }]);
+    newSubtaskTitle = '';
+  }
+  function handleAddSubtaskKeydown(e: KeyboardEvent) {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      addSubtask();
+    }
+  }
+  function startEditSubtask(s: Subtask) {
+    editingSubtaskId = s.id;
+    editSubtaskText = s.title;
+  }
+  function saveEditSubtask() {
+    if (editingSubtaskId && editSubtaskText.trim()) {
+      void persistSubtasks(subtasks.map((s) => (s.id === editingSubtaskId ? { ...s, title: editSubtaskText.trim() } : s)));
+    }
+    editingSubtaskId = null;
+    editSubtaskText = '';
+  }
+  function handleEditSubtaskKeydown(e: KeyboardEvent) {
+    if (e.key === 'Enter') { e.preventDefault(); saveEditSubtask(); }
+    if (e.key === 'Escape') { editingSubtaskId = null; editSubtaskText = ''; }
+  }
+  // Drag-to-reorder via data-subtask-id + mousemove, matching the desktop app.
+  function onSubtaskDragStart(e: MouseEvent, id: string) {
+    e.preventDefault();
+    e.stopPropagation();
+    subtaskDragId = id;
+    const onMove = (ev: MouseEvent) => {
+      const els = document.querySelectorAll('[data-subtask-id]');
+      let closestId: string | null = null;
+      let closestPos: 'above' | 'below' = 'below';
+      let minDist = Infinity;
+      for (const el of els) {
+        const rect = (el as HTMLElement).getBoundingClientRect();
+        const mid = rect.top + rect.height / 2;
+        const dist = Math.abs(ev.clientY - mid);
+        if (dist < minDist) {
+          minDist = dist;
+          closestId = (el as HTMLElement).dataset.subtaskId!;
+          closestPos = ev.clientY < mid ? 'above' : 'below';
+        }
+      }
+      if (closestId && closestId !== subtaskDragId) {
+        dropTargetId = closestId;
+        dropPosition = closestPos;
+      } else {
+        dropTargetId = null;
+      }
+    };
+    const onUp = () => {
+      if (subtaskDragId && dropTargetId) {
+        reorderSubtasks(subtaskDragId, dropTargetId, dropPosition);
+      }
+      subtaskDragId = null;
+      dropTargetId = null;
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  }
+  function reorderSubtasks(fromId: string, toId: string, pos: 'above' | 'below') {
+    const arr = [...subtasks];
+    const fromIdx = arr.findIndex((s) => s.id === fromId);
+    if (fromIdx < 0) return;
+    const item = arr.splice(fromIdx, 1)[0];
+    let toIdx = arr.findIndex((s) => s.id === toId);
+    if (pos === 'below') toIdx += 1;
+    arr.splice(toIdx, 0, item);
+    void persistSubtasks(arr.map((s, i) => ({ ...s, order: i })));
+  }
+
+  // --- Review panel / merge actions ---
   async function toggleManualInProgressStamp() {
     await tasksStore.updateTask(task.id, { context: nextManualInProgressStampContext(task) });
   }
-
   async function requestReviewMerge() {
     if (!canMergeDeploy || isReviewMergeBusy(reviewMergeState, mergeDeployState)) return;
     reviewMergeRequestError = null;
@@ -112,7 +310,6 @@
       reviewMergeRequestError = tasksStore.error || 'Could not queue Review & Merge.';
     }
   }
-
   async function handleStop() {
     if (stopping) return;
     stopping = true;
@@ -122,7 +319,15 @@
       stopping = false;
     }
   }
-
+  async function handleRestart() {
+    if (restarting) return;
+    restarting = true;
+    try {
+      await tasksStore.restartTask(task.id);
+    } finally {
+      restarting = false;
+    }
+  }
   async function handleDelete() {
     if (!confirmDelete) {
       confirmDelete = true;
@@ -137,7 +342,6 @@
       deleting = false;
     }
   }
-
   async function requestMergeConflictFix() {
     if (!canRequestMergeConflictFix) return;
     mergeConflictFixRequestError = null;
@@ -146,12 +350,10 @@
       mergeConflictFixRequestError = tasksStore.error || 'Could not queue Sam conflict recovery.';
     }
   }
-
   async function markDone() {
     await tasksStore.setStatus(task.id, 'done');
     onClose();
   }
-
   async function closePrAndDone() {
     if (!canClosePr || closingPr) return;
     closingPr = true;
@@ -167,7 +369,6 @@
     await tasksStore.setStatus(task.id, 'done');
     onClose();
   }
-
   async function copyPrLink() {
     if (!task.pr_url) return;
     try {
@@ -178,7 +379,6 @@
       console.warn('[task-detail] copy PR link failed:', e);
     }
   }
-
   async function handleRequeue() {
     if (requeueing) return;
     requeueing = true;
@@ -221,14 +421,40 @@
               <option value={s}>{STATUS_LABEL[s]}</option>
             {/each}
           </select>
-          <span class="text-[10px] uppercase tracking-wide rounded-md border px-1.5 py-0.5 {PRIORITY_COLOR[task.priority]}">
-            {task.priority}
-          </span>
+          <select
+            value={task.priority}
+            onchange={(e) => changePriority((e.currentTarget as HTMLSelectElement).value as TaskPriority)}
+            class="text-[10px] uppercase tracking-wide rounded-md border px-1.5 py-0.5 cursor-pointer focus:outline-none focus:border-white/40 {PRIORITY_COLOR[task.priority]}"
+            aria-label="Set priority"
+            title="Change priority"
+          >
+            {#each priorities as p}
+              <option value={p}>{p}</option>
+            {/each}
+          </select>
           {#if task.project}
             <span class="text-xs text-slate-400">📦 {task.project}</span>
           {/if}
         </div>
-        <h2 class="mt-1 text-lg font-semibold text-slate-100">{task.title}</h2>
+        {#if editingTitle}
+          <input
+            type="text"
+            bind:value={editTitle}
+            use:autofocus
+            class="mt-1 w-full rounded-lg border border-indigo-400/40 bg-slate-950 px-3 py-1.5 text-lg font-semibold text-slate-100 focus:outline-none focus:border-indigo-400/70"
+            onblur={saveTitle}
+            onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); saveTitle(); } if (e.key === 'Escape') editingTitle = false; }}
+          />
+        {:else}
+          <h2 class="mt-1 text-lg font-semibold text-slate-100">
+            <button
+              type="button"
+              class="block w-full text-left cursor-text rounded-md -mx-1 px-1 py-0 hover:bg-white/5 transition-colors"
+              title="Click to edit"
+              onclick={startEditTitle}
+            >{task.title}</button>
+          </h2>
+        {/if}
       </div>
       <button
         type="button"
@@ -342,12 +568,27 @@
         </section>
       {/if}
 
-      {#if task.description}
-        <section>
-          <h3 class="text-xs uppercase tracking-wide text-slate-400 mb-1">Description</h3>
-          <p class="text-sm text-slate-200 whitespace-pre-wrap">{task.description}</p>
-        </section>
-      {/if}
+      <section>
+        <h3 class="text-xs uppercase tracking-wide text-slate-400 mb-1">Description</h3>
+        {#if editingDesc}
+          <textarea
+            bind:value={editDesc}
+            use:autofocus
+            rows={4}
+            class="w-full rounded-xl border border-indigo-400/40 bg-slate-950 px-3 py-2 text-sm text-slate-200 resize-y focus:outline-none focus:border-indigo-400/70"
+            onblur={saveDescription}
+            onkeydown={(e) => { if (e.key === 'Escape') { e.preventDefault(); editingDesc = false; editDesc = task.description || ''; } }}
+          ></textarea>
+          <p class="mt-1 text-[10px] text-slate-500">Click outside to save · Escape to cancel</p>
+        {:else}
+          <button
+            type="button"
+            class="min-h-[44px] w-full text-left rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm whitespace-pre-wrap cursor-text hover:bg-white/10 transition-colors {task.description ? 'text-slate-200' : 'text-slate-500 italic'}"
+            title="Click to edit"
+            onclick={startEditDesc}
+          >{task.description || 'Add a description...'}</button>
+        {/if}
+      </section>
 
       {#if task.failure_reason}
         <section class="rounded-lg border border-rose-500/40 bg-rose-500/10 p-3">
@@ -356,19 +597,85 @@
         </section>
       {/if}
 
-      {#if task.subtasks && task.subtasks.length > 0}
-        <section>
-          <h3 class="text-xs uppercase tracking-wide text-slate-400 mb-2">Subtasks</h3>
-          <ul class="space-y-1">
-            {#each task.subtasks as s}
-              <li class="flex items-start gap-2 text-sm">
-                <span class="mt-0.5">{s.done ? '✅' : '⬜'}</span>
-                <span class={s.done ? 'line-through text-slate-500' : 'text-slate-200'}>{s.title}</span>
+      <section>
+        <div class="flex items-center gap-2 mb-2">
+          <h3 class="text-xs uppercase tracking-wide text-slate-400">Subtasks</h3>
+          {#if subtasks.length > 0}
+            <span class="text-xs font-bold text-slate-400">{subtasksDone}/{subtasks.length}</span>
+            {#if subtasks.length > 0}
+              <div class="flex-1 h-1 rounded-full bg-white/10 overflow-hidden">
+                <div class="h-full bg-indigo-400/70 transition-all" style="width:{Math.round((subtasksDone / subtasks.length) * 100)}%"></div>
+              </div>
+            {/if}
+          {/if}
+        </div>
+        {#if subtasks.length > 0}
+          <ul class="space-y-0.5">
+            {#each subtasks as st (st.id)}
+              <li
+                data-subtask-id={st.id}
+                class="group flex items-center gap-2 rounded-lg px-1.5 py-1 text-sm transition-colors
+                  {subtaskDragId === st.id ? 'opacity-40' : ''}
+                  {dropTargetId === st.id && dropPosition === 'above' ? 'border-t-2 border-indigo-400/70' : ''}
+                  {dropTargetId === st.id && dropPosition === 'below' ? 'border-b-2 border-indigo-400/70' : ''}
+                  hover:bg-white/5"
+              >
+                <!-- svelte-ignore a11y_no_static_element_interactions -->
+                <span
+                  class="cursor-grab active:cursor-grabbing text-slate-600 hover:text-slate-300 opacity-0 group-hover:opacity-100 transition-opacity select-none"
+                  title="Drag to reorder"
+                  onmousedown={(e) => onSubtaskDragStart(e, st.id)}
+                >⠿</span>
+                <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+                <button
+                  type="button"
+                  role="checkbox"
+                  aria-checked={st.done}
+                  onclick={() => toggleSubtask(st.id)}
+                  class="h-[18px] w-[18px] shrink-0 rounded border flex items-center justify-center transition-colors {st.done ? 'border-indigo-400 bg-indigo-500/80' : 'border-white/30 hover:border-white/50'}"
+                >
+                  {#if st.done}
+                    <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 5.5l2 2 4-4" /></svg>
+                  {/if}
+                </button>
+                {#if editingSubtaskId === st.id}
+                  <input
+                    type="text"
+                    bind:value={editSubtaskText}
+                    use:autofocus
+                    class="flex-1 rounded-md border border-indigo-400/40 bg-slate-950 px-2 py-1 text-sm text-slate-200 focus:outline-none focus:border-indigo-400/70"
+                    onblur={saveEditSubtask}
+                    onkeydown={handleEditSubtaskKeydown}
+                  />
+                {:else}
+                  <span
+                    class="flex-1 cursor-text {st.done ? 'line-through text-slate-500' : 'text-slate-200'}"
+                    role="button"
+                    tabindex="0"
+                    onclick={() => startEditSubtask(st)}
+                    onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); startEditSubtask(st); } }}
+                  >{st.title}</span>
+                {/if}
+                <button
+                  type="button"
+                  onclick={() => deleteSubtask(st.id)}
+                  class="shrink-0 text-slate-600 hover:text-rose-400 opacity-0 group-hover:opacity-100 transition-opacity"
+                  aria-label="Delete subtask"
+                >✕</button>
               </li>
             {/each}
           </ul>
-        </section>
-      {/if}
+        {/if}
+        <div class="mt-2">
+          <input
+            type="text"
+            bind:value={newSubtaskTitle}
+            placeholder="Add a subtask..."
+            class="w-full rounded-lg border border-white/10 bg-slate-950 px-2.5 py-1.5 text-sm text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-indigo-400/50"
+            onkeydown={handleAddSubtaskKeydown}
+          />
+        </div>
+      </section>
 
       <section class="flex flex-col gap-2 text-xs">
         {#if task.report_url}
@@ -455,18 +762,37 @@
 
       <section>
         <h3 class="text-xs uppercase tracking-wide text-slate-400 mb-2">Activity</h3>
-        {#if comments.length === 0}
-          <p class="text-xs text-slate-500">No comments yet.</p>
-        {:else}
-          <ul class="space-y-2">
-            {#each comments as c}
+        {#if comments.length > 0}
+          <ul bind:this={commentsEl} class="space-y-2 max-h-[40vh] overflow-y-auto pr-1">
+            {#each comments as c (c.id)}
               <li class="rounded-lg border border-white/10 bg-white/5 p-2">
                 <div class="text-[10px] uppercase tracking-wide text-slate-400">{c.author} · {new Date(c.created_at).toLocaleString()}</div>
-                <p class="text-sm text-slate-200 whitespace-pre-wrap">{@html renderCommentHtml(c.content)}</p>
+                <p class="mt-0.5 text-sm leading-snug text-slate-200">{@html renderCommentHtml(c.content)}</p>
               </li>
             {/each}
           </ul>
+        {:else}
+          <p class="text-xs text-slate-500 mb-2">No comments yet.</p>
         {/if}
+        <div class="mt-2 flex items-end gap-2">
+          <textarea
+            bind:value={commentInput}
+            placeholder="Add a comment... (use @agent or @matt for mentions)"
+            rows={2}
+            class="flex-1 rounded-lg border border-white/10 bg-slate-950 px-3 py-2 text-sm text-slate-200 placeholder:text-slate-500 resize-none focus:outline-none focus:border-indigo-400/50 disabled:opacity-60"
+            onkeydown={handleCommentKeydown}
+            disabled={postingComment}
+          ></textarea>
+          <button
+            type="button"
+            onclick={handlePostComment}
+            disabled={!commentInput.trim() || postingComment}
+            class="shrink-0 rounded-lg border border-emerald-300/30 bg-emerald-400/10 px-4 py-2 text-xs font-black text-emerald-100 hover:bg-emerald-400/15 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          >
+            {postingComment ? '...' : 'Post'}
+          </button>
+        </div>
+        <p class="mt-1 text-[10px] text-slate-500">Enter to post · Shift+Enter for new line</p>
       </section>
 
       <section class="flex flex-wrap gap-2 pt-2 border-t border-white/10">
@@ -495,6 +821,16 @@
           <div class="w-full whitespace-pre-wrap rounded-lg border border-rose-400/35 bg-rose-500/10 px-3 py-2 text-xs font-bold leading-snug text-rose-100">
             {closePrError}
           </div>
+        {/if}
+        {#if task.status === 'failed'}
+          <button
+            type="button"
+            onclick={handleRestart}
+            disabled={restarting}
+            class="rounded-lg border border-emerald-400/40 bg-emerald-500/10 px-3 py-2 text-xs font-black text-emerald-100 hover:bg-emerald-500/15 {restarting ? 'opacity-70 cursor-wait' : ''}"
+          >
+            {restarting ? 'Restarting...' : '↻ Restart Task'}
+          </button>
         {/if}
         {#if isStoppable}
           <button

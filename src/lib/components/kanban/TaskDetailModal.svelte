@@ -9,16 +9,17 @@
 		extractReviewActionPanel,
 		getUiStamp,
 		getMergeDeployState,
+		getReviewMergeState,
 		getMergeConflictFixState,
 		isMergeConflictError,
 		isMergeConflictFixBusy,
 		isReviewActionStatus,
-		isMergeDeployBusy,
+		isReviewMergeBusy,
 		mergeConflictFixButtonLabel,
-		mergeDeployButtonLabel,
+		reviewMergeButtonLabel,
 		nextManualInProgressStampContext,
 		requestMergeConflictFixContext,
-		requestMergeDeployContext,
+		requestReviewMergeContext,
 	} from '$lib/utils/review-actions';
 	import { formatTimeAgo } from '$lib/utils/relative-time';
 	import { renderMarkdown } from '$lib/utils/markdown';
@@ -65,6 +66,9 @@
 	let requestingMergeConflictFix = $state(false);
 	let mergeConflictFixRequestError = $state<string | null>(null);
 	let prBtnHovered = $state(false);
+	let closingPr = $state(false);
+	let closePrError = $state<string | null>(null);
+	let copiedPr = $state(false);
 
 	// Tabs: "details" or "report"
 	let activeTab = $state<'details' | 'report'>('details');
@@ -155,9 +159,11 @@
 	let reviewPanel = $derived(extractReviewActionPanel(task, comments));
 	let uiStamp = $derived(getUiStamp(task));
 	let mergeDeployState = $derived(getMergeDeployState(task));
+	let reviewMergeState = $derived(getReviewMergeState(task));
 	let mergeConflictFixState = $derived(getMergeConflictFixState(task));
 	let showReviewActions = $derived(isReviewActionStatus(task.status) && !!(reviewPanel || task.pr_url));
-	let canMergeDeploy = $derived(!!task.pr_url && (task.status === 'approved' || mergeDeployState.status === 'failed'));
+	let canClosePr = $derived(!!task.pr_url && task.status !== 'done');
+	let canMergeDeploy = $derived(!!task.pr_url && (task.status === 'approved' || mergeDeployState.status === 'failed' || reviewMergeState.status === 'failed'));
 	let canRequestMergeConflictFix = $derived(
 		!!task.pr_url &&
 		mergeDeployState.status === 'failed' &&
@@ -202,18 +208,54 @@
 		}
 	}
 
+	async function handleClosePrAndDone() {
+		if (!canClosePr || closingPr) return;
+		closingPr = true;
+		closePrError = null;
+		try {
+			const ok = await safeInvoke('close_pr', {
+				prUrl: task.pr_url,
+				repoPath: task.repo_path ?? null,
+			});
+			if (ok === null) {
+				// safeInvoke swallows the error and returns null when the Tauri
+				// command isn't available (e.g. running in a browser). Surface a
+				// clear message instead of silently marking done.
+				closePrError = 'Could not reach the app backend to close the PR.';
+				return;
+			}
+			await taskStore.moveTask(task.id, 'done');
+			onClose();
+		} catch (e) {
+			closePrError = e instanceof Error ? e.message : String(e);
+		} finally {
+			closingPr = false;
+		}
+	}
+
+	async function handleCopyPrLink() {
+		if (!task.pr_url) return;
+		try {
+			await navigator.clipboard.writeText(task.pr_url);
+			copiedPr = true;
+			setTimeout(() => (copiedPr = false), 2000);
+		} catch (e) {
+			console.warn('[task-detail] copy PR link failed:', e);
+		}
+	}
+
 	async function handleToggleManualInProgressStamp() {
 		await taskStore.updateTask(task.id, { context: nextManualInProgressStampContext(task) });
 	}
 
-	async function handleRequestMergeDeploy() {
-		if (!canMergeDeploy || requestingMergeDeploy || isMergeDeployBusy(mergeDeployState)) return;
+	async function handleRequestReviewMerge() {
+		if (!canMergeDeploy || requestingMergeDeploy || isReviewMergeBusy(reviewMergeState, mergeDeployState)) return;
 		requestingMergeDeploy = true;
 		mergeDeployRequestError = null;
 		try {
-			const ok = await taskStore.updateTask(task.id, { context: requestMergeDeployContext(task) });
+			const ok = await taskStore.updateTask(task.id, { context: requestReviewMergeContext(task) });
 			if (!ok) {
-				mergeDeployRequestError = taskStore.error || 'Could not queue Merge + Deploy.';
+				mergeDeployRequestError = taskStore.error || 'Could not queue Review & Merge.';
 			}
 		} finally {
 			requestingMergeDeploy = false;
@@ -644,8 +686,8 @@
 								{#if canMergeDeploy}
 									<button
 										type="button"
-										onclick={handleRequestMergeDeploy}
-										disabled={requestingMergeDeploy || isMergeDeployBusy(mergeDeployState)}
+										onclick={handleRequestReviewMerge}
+										disabled={requestingMergeDeploy || isReviewMergeBusy(reviewMergeState, mergeDeployState)}
 										style="
 											display: inline-flex; align-items: center; gap: 7px;
 											padding: 8px 12px; border-radius: 9px;
@@ -653,11 +695,11 @@
 											border: 1px solid rgba(103, 232, 249, 0.32);
 											color: #67e8f9;
 											font-size: 12px; font-weight: 900;
-											cursor: {requestingMergeDeploy || isMergeDeployBusy(mergeDeployState) ? 'wait' : 'pointer'}; font-family: var(--font-ui);
-											opacity: {requestingMergeDeploy || isMergeDeployBusy(mergeDeployState) ? '0.68' : '1'};
+											cursor: {requestingMergeDeploy || isReviewMergeBusy(reviewMergeState, mergeDeployState) ? 'wait' : 'pointer'}; font-family: var(--font-ui);
+											opacity: {requestingMergeDeploy || isReviewMergeBusy(reviewMergeState, mergeDeployState) ? '0.68' : '1'};
 										"
 									>
-								{requestingMergeDeploy ? 'Queueing...' : mergeDeployButtonLabel(mergeDeployState)}
+								{requestingMergeDeploy ? 'Queueing...' : reviewMergeButtonLabel(reviewMergeState, mergeDeployState)}
 							</button>
 							{#if canRequestMergeConflictFix || isMergeConflictFixBusy(mergeConflictFixState) || mergeConflictFixRequestError || mergeConflictFixState.error}
 								<button
@@ -699,7 +741,7 @@
 								{/if}
 							{/if}
 						</div>
-						{#if mergeDeployRequestError || mergeDeployState.error}
+						{#if mergeDeployRequestError || reviewMergeState.error || mergeDeployState.error}
 							<div style="
 								margin-top: 10px; padding: 10px 12px; border-radius: 10px;
 								background: rgba(248, 81, 73, 0.12);
@@ -707,7 +749,7 @@
 								color: #ffb4ae; font-size: 12px; font-weight: 750; line-height: 1.4;
 								white-space: pre-wrap;
 							">
-								Merge + Deploy failed: {mergeDeployRequestError || mergeDeployState.error}
+								Review &amp; Merge: {mergeDeployRequestError || reviewMergeState.error || mergeDeployState.error}
 							</div>
 						{/if}
 						{#if mergeConflictFixRequestError || mergeConflictFixState.error}
@@ -839,29 +881,101 @@
 				<!-- PR Link -->
 				{#if task.pr_url}
 					<div style="margin-bottom: 20px;">
-						<button
-							type="button"
-							onclick={() => openExternal(task.pr_url!)}
-							style="
-								display: inline-flex; align-items: center; gap: 8px;
-								padding: 8px 16px; border-radius: 8px;
-								background: {prBtnHovered ? 'rgba(63, 185, 80, 0.12)' : 'rgba(63, 185, 80, 0.06)'};
-								border: 1px solid rgba(63, 185, 80, 0.2);
-								color: var(--accent-green); text-decoration: none;
-								font-size: 12px; font-weight: 600;
-								cursor: pointer;
-								transition: all 0.15s ease;
-								transform: {prBtnHovered ? 'translateY(-1px)' : 'none'};
-								box-shadow: {prBtnHovered ? '0 4px 12px rgba(63, 185, 80, 0.15)' : 'none'};
-							"
-							onmouseenter={() => prBtnHovered = true}
-							onmouseleave={() => prBtnHovered = false}
-						>
-							<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
-								<path d="M7.177 3.073L9.573.677A.25.25 0 0110 .854v4.792a.25.25 0 01-.427.177L7.177 3.427a.25.25 0 010-.354zM3.75 2.5a.75.75 0 100 1.5.75.75 0 000-1.5zm-2.25.75a2.25 2.25 0 113 2.122v5.256a2.251 2.251 0 11-1.5 0V5.372A2.25 2.25 0 011.5 3.25zM11 2.5h-1V4h1a1 1 0 011 1v5.628a2.251 2.251 0 101.5 0V5A2.5 2.5 0 0011 2.5zm1 10.25a.75.75 0 111.5 0 .75.75 0 01-1.5 0zM3.75 12a.75.75 0 100 1.5.75.75 0 000-1.5z"/>
-							</svg>
-							View Pull Request
-						</button>
+						<div style="display: flex; flex-wrap: wrap; gap: 8px; align-items: center;">
+							<button
+								type="button"
+								onclick={() => openExternal(task.pr_url!)}
+								style="
+									display: inline-flex; align-items: center; gap: 8px;
+									padding: 8px 16px; border-radius: 8px;
+									background: {prBtnHovered ? 'rgba(63, 185, 80, 0.12)' : 'rgba(63, 185, 80, 0.06)'};
+									border: 1px solid rgba(63, 185, 80, 0.2);
+									color: var(--accent-green); text-decoration: none;
+									font-size: 12px; font-weight: 600;
+									cursor: pointer;
+									transition: all 0.15s ease;
+									transform: {prBtnHovered ? 'translateY(-1px)' : 'none'};
+									box-shadow: {prBtnHovered ? '0 4px 12px rgba(63, 185, 80, 0.15)' : 'none'};
+								"
+								onmouseenter={() => prBtnHovered = true}
+								onmouseleave={() => prBtnHovered = false}
+							>
+								<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+									<path d="M7.177 3.073L9.573.677A.25.25 0 0110 .854v4.792a.25.25 0 01-.427.177L7.177 3.427a.25.25 0 010-.354zM3.75 2.5a.75.75 0 100 1.5.75.75 0 000-1.5zm-2.25.75a2.25 2.25 0 113 2.122v5.256a2.251 2.251 0 11-1.5 0V5.372A2.25 2.25 0 011.5 3.25zM11 2.5h-1V4h1a1 1 0 011 1v5.628a2.251 2.251 0 101.5 0V5A2.5 2.5 0 0011 2.5zm1 10.25a.75.75 0 111.5 0 .75.75 0 01-1.5 0zM3.75 12a.75.75 0 100 1.5.75.75 0 000-1.5z"/>
+								</svg>
+								View Pull Request
+							</button>
+
+							<button
+								type="button"
+								onclick={handleCopyPrLink}
+								style="
+									display: inline-flex; align-items: center; gap: 7px;
+									padding: 8px 12px; border-radius: 8px;
+									background: rgba(99, 102, 241, 0.06);
+									border: 1px solid rgba(99, 102, 241, 0.2);
+									color: var(--accent-indigo);
+									font-size: 12px; font-weight: 600;
+									cursor: pointer; font-family: var(--font-ui);
+									transition: all 0.15s ease;
+								"
+								onmouseenter={(e) => { const el = e.currentTarget as HTMLElement; el.style.background = 'rgba(99, 102, 241, 0.12)'; }}
+								onmouseleave={(e) => { const el = e.currentTarget as HTMLElement; el.style.background = 'rgba(99, 102, 241, 0.06)'; }}
+								title="Copy PR link to clipboard"
+							>
+								{#if copiedPr}
+									<svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 8 7 12 13 4"/></svg>
+									Copied!
+								{:else}
+									<svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+										<rect x="5" y="5" width="9" height="9" rx="2"/>
+										<path d="M11 5V3.5A1.5 1.5 0 009.5 2h-6A1.5 1.5 0 002 3.5v6A1.5 1.5 0 003.5 11H5"/>
+									</svg>
+									Copy link
+								{/if}
+							</button>
+
+							{#if canClosePr}
+								<button
+									type="button"
+									onclick={handleClosePrAndDone}
+									disabled={closingPr}
+									style="
+										display: inline-flex; align-items: center; gap: 7px;
+										padding: 8px 12px; border-radius: 8px;
+										background: rgba(248, 81, 73, 0.08);
+										border: 1px solid rgba(248, 81, 73, 0.28);
+										color: var(--accent-red);
+										font-size: 12px; font-weight: 800;
+										cursor: {closingPr ? 'wait' : 'pointer'}; font-family: var(--font-ui);
+										transition: all 0.15s ease;
+										opacity: {closingPr ? '0.65' : '1'};
+									"
+									onmouseenter={(e) => { if (!closingPr) { const el = e.currentTarget as HTMLElement; el.style.background = 'rgba(248, 81, 73, 0.14)'; el.style.transform = 'translateY(-1px)'; } }}
+									onmouseleave={(e) => { const el = e.currentTarget as HTMLElement; el.style.background = 'rgba(248, 81, 73, 0.08)'; el.style.transform = 'none'; }}
+									title="Close this PR without merging and mark the task Done"
+								>
+									<svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+										<circle cx="8" cy="8" r="6"/>
+										<line x1="5.5" y1="5.5" x2="10.5" y2="10.5"/>
+										<line x1="10.5" y1="5.5" x2="5.5" y2="10.5"/>
+									</svg>
+									{closingPr ? 'Closing...' : 'Close PR & Mark Done'}
+								</button>
+							{/if}
+						</div>
+
+						{#if closePrError}
+							<div style="
+								margin-top: 10px; padding: 10px 12px; border-radius: 10px;
+								background: rgba(248, 81, 73, 0.12);
+								border: 1px solid rgba(248, 81, 73, 0.34);
+								color: #ffb4ae; font-size: 12px; font-weight: 750; line-height: 1.4;
+								white-space: pre-wrap;
+							">
+								{closePrError}
+							</div>
+						{/if}
 					</div>
 				{/if}
 			</div>
@@ -1031,17 +1145,17 @@
 								background: {canMergeDeploy ? (mergeDeployHovered ? 'rgba(34, 211, 238, 0.16)' : 'rgba(34, 211, 238, 0.09)') : (markDoneHovered ? 'rgba(63, 185, 80, 0.14)' : 'rgba(63, 185, 80, 0.08)')};
 								border: 1px solid {canMergeDeploy ? 'rgba(103, 232, 249, 0.32)' : 'rgba(63, 185, 80, 0.25)'};
 								color: {canMergeDeploy ? '#67e8f9' : 'var(--accent-green)'}; font-size: 11px; font-weight: 800;
-								font-family: var(--font-ui); cursor: {markingDone || requestingMergeDeploy || isMergeDeployBusy(mergeDeployState) ? 'wait' : 'pointer'};
+								font-family: var(--font-ui); cursor: {markingDone || requestingMergeDeploy || isReviewMergeBusy(reviewMergeState, mergeDeployState) ? 'wait' : 'pointer'};
 								transition: all 0.15s ease;
-								transform: {(canMergeDeploy ? mergeDeployHovered : markDoneHovered) && !markingDone && !requestingMergeDeploy && !isMergeDeployBusy(mergeDeployState) ? 'translateY(-1px)' : 'none'};
-								opacity: {markingDone || requestingMergeDeploy || isMergeDeployBusy(mergeDeployState) ? '0.6' : '1'};
+								transform: {(canMergeDeploy ? mergeDeployHovered : markDoneHovered) && !markingDone && !requestingMergeDeploy && !isReviewMergeBusy(reviewMergeState, mergeDeployState) ? 'translateY(-1px)' : 'none'};
+								opacity: {markingDone || requestingMergeDeploy || isReviewMergeBusy(reviewMergeState, mergeDeployState) ? '0.6' : '1'};
 							"
 							onmouseenter={() => { markDoneHovered = true; mergeDeployHovered = true; }}
 							onmouseleave={() => { markDoneHovered = false; mergeDeployHovered = false; }}
-							onclick={canMergeDeploy ? handleRequestMergeDeploy : handleMarkDone}
-							disabled={markingDone || requestingMergeDeploy || isMergeDeployBusy(mergeDeployState)}
+							onclick={canMergeDeploy ? handleRequestReviewMerge : handleMarkDone}
+							disabled={markingDone || requestingMergeDeploy || isReviewMergeBusy(reviewMergeState, mergeDeployState)}
 						>
-							{canMergeDeploy ? (requestingMergeDeploy ? 'Queueing...' : mergeDeployButtonLabel(mergeDeployState)) : (markingDone ? 'Marking Done...' : 'Mark Done')}
+							{canMergeDeploy ? (requestingMergeDeploy ? 'Queueing...' : reviewMergeButtonLabel(reviewMergeState, mergeDeployState)) : (markingDone ? 'Marking Done...' : 'Mark Done')}
 						</button>
 						{#if canRequestMergeConflictFix || isMergeConflictFixBusy(mergeConflictFixState) || mergeConflictFixRequestError || mergeConflictFixState.error}
 							<button
@@ -1060,7 +1174,7 @@
 								{requestingMergeConflictFix ? 'Queueing Sam...' : mergeConflictFixButtonLabel(mergeConflictFixState)}
 							</button>
 						{/if}
-						{#if mergeDeployRequestError || mergeDeployState.error}
+						{#if mergeDeployRequestError || reviewMergeState.error || mergeDeployState.error}
 							<div style="
 								padding: 8px 10px; border-radius: 8px;
 								background: rgba(248, 81, 73, 0.12);
@@ -1068,7 +1182,7 @@
 								color: #ffb4ae; font-size: 11px; font-weight: 750; line-height: 1.35;
 								white-space: pre-wrap;
 							">
-								Merge + Deploy failed: {mergeDeployRequestError || mergeDeployState.error}
+								Review &amp; Merge: {mergeDeployRequestError || reviewMergeState.error || mergeDeployState.error}
 							</div>
 						{/if}
 						{#if mergeConflictFixRequestError || mergeConflictFixState.error}

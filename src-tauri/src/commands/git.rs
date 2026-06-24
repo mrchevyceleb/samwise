@@ -267,3 +267,60 @@ pub fn git_push(project_dir: String) -> Result<(), String> {
 pub fn git_pull(project_dir: String) -> Result<(), String> {
     run_git_simple(&["pull"], &project_dir, "Pull")
 }
+
+/// Close a GitHub pull request without merging it.
+///
+/// Uses the authenticated `gh` CLI (same account the worker uses for reviews
+/// and merges). `gh pr close <full-pr-url>` resolves the owner/repo/number
+/// from the URL itself, so no working directory is required — but when the
+/// task carries a `repo_path` we run from there too so any repo-scoped `gh`
+/// config is picked up.
+///
+/// Closing an already-closed PR or a merged PR is treated as success so the
+/// "Close PR & Mark Done" button still completes the task in those cases.
+#[tauri::command]
+pub fn close_pr(pr_url: String, repo_path: Option<String>) -> Result<(), String> {
+    let url = pr_url.trim();
+    if url.is_empty() {
+        return Err("No PR URL to close.".to_string());
+    }
+
+    let mut gh = crate::process::cmd("gh");
+    gh.args(["pr", "close", url]);
+    if let Some(dir) = repo_path.as_deref() {
+        if !dir.is_empty() {
+            gh.current_dir(dir);
+        }
+    }
+
+    let output = gh
+        .output()
+        .map_err(|e| format!("spawn gh pr close: {}. Is the GitHub CLI installed and logged in?", e))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    // gh prints a human message on stdout for "already closed/merged" cases.
+    let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    let combined = format!("{} {}", stdout, stderr);
+
+    // Already closed / already merged → the PR is not open, so the goal of the
+    // button (PR is no longer open + mark task done) is already satisfied.
+    if combined.contains("already closed") || combined.contains("already merged") {
+        log::info!("[close_pr] PR already closed/merged, treating as success: {}", url);
+        return Ok(());
+    }
+
+    let msg = if stderr.trim().is_empty() {
+        stdout.trim().to_string()
+    } else {
+        stderr.trim().to_string()
+    };
+    Err(if msg.is_empty() {
+        format!("gh pr close failed for {}", url)
+    } else {
+        format!("gh pr close failed: {}", msg)
+    })
+}

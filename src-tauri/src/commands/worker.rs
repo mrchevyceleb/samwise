@@ -400,6 +400,7 @@ const MERGE_DEPLOY_COMPLETED_AT_KEY: &str = "samwise_merge_deploy_completed_at";
 const MERGE_DEPLOY_STATUS_KEY: &str = "samwise_merge_deploy_status";
 const MERGE_DEPLOY_ERROR_KEY: &str = "samwise_merge_deploy_error";
 const MERGE_DEPLOY_PLAN_KEY: &str = "samwise_merge_deploy_plan";
+const MERGE_DEPLOY_COMMAND_STATUS_KEY: &str = "samwise_merge_deploy_command_statuses";
 const TRANSIENT_RETRY_COUNT_KEY: &str = "samwise_transient_retry_count";
 const MAX_TRANSIENT_RETRIES: u32 = 3;
 const MERGE_CONFLICT_FIX_REQUESTED_AT_KEY: &str = "samwise_merge_conflict_fix_requested_at";
@@ -466,7 +467,7 @@ const MERGE_DEPLOY_RUNNING_STALE_SECS: i64 = 140 * 60;
 /// after merge-in). CI is polled twice (each up to CI_POLL_MAX_SECS = 15 min) and
 /// the conflict-resolution pass is bounded near 20 min, so a legitimate pre-merge
 /// phase can run ~55 min worst case. 70 min sits above that with margin and still
-/// under the 90-min RUNNING_STALE backstop, so it only fires on a genuine hang (a
+/// under the 140-min RUNNING_STALE backstop, so it only fires on a genuine hang (a
 /// git/gh subprocess that never returns). When it fires, the spawned merge task
 /// ends and its per-repo MERGE_DEPLOY_LOCKS guard is released (and any in-flight
 /// git/gh child is SIGKILLed via kill_on_drop), so the auto re-request (see
@@ -3262,6 +3263,8 @@ followed immediately by a fenced json block:
         agent_comment(config, task_id, &body).await;
         let mut updates = serde_json::json!({
             "status": "approved",
+            "worker_id": Value::Null,
+            "claimed_at": Value::Null,
             "updated_at": chrono::Utc::now().to_rfc3339(),
         });
         if let Some(u) = &session_url {
@@ -5715,6 +5718,8 @@ from Matt, stop without making changes and explain specifically what you need cl
                                 &task_id,
                                 &serde_json::json!({
                                     "status": "approved",
+                                    "worker_id": Value::Null,
+                                    "claimed_at": Value::Null,
                                     "updated_at": chrono::Utc::now().to_rfc3339(),
                                 }),
                             )
@@ -8738,8 +8743,17 @@ pub async fn run_claude_code_opts(
         cmd.arg("--max-turns").arg(max_turns.to_string());
     }
 
-    // Inject LLM proxy env vars if configured.
+    // Inject LLM proxy env vars if configured. In direct OAuth mode, refresh
+    // AutoSam's isolated Claude credentials before every spawn so stale copied
+    // credentials cannot silently 401 the worker.
     let proxy = load_llm_proxy();
+    if proxy.is_none() {
+        match super::claude_code::sync_claude_oauth_credentials_if_needed_async(false).await {
+            Ok(true) => log::info!("[worker] refreshed Claude OAuth credentials before one-shot spawn"),
+            Ok(false) => {}
+            Err(e) => log::warn!("[worker] could not refresh Claude OAuth credentials: {}", e),
+        }
+    }
     super::claude_code::inject_proxy_env_async(&mut cmd, &proxy);
 
     // Resolve cwd. Callers pass "." for "no particular repo" chat calls, but
@@ -8958,8 +8972,17 @@ pub async fn run_claude_code_streaming(
         cmd.arg("--max-turns").arg(max_turns.to_string());
     }
 
-    // Inject LLM proxy env vars if configured.
+    // Inject LLM proxy env vars if configured. In direct OAuth mode, refresh
+    // AutoSam's isolated Claude credentials before every spawn so stale copied
+    // credentials cannot silently 401 the worker.
     let proxy = load_llm_proxy();
+    if proxy.is_none() {
+        match super::claude_code::sync_claude_oauth_credentials_if_needed_async(false).await {
+            Ok(true) => log::info!("[worker] refreshed Claude OAuth credentials before streaming spawn"),
+            Ok(false) => {}
+            Err(e) => log::warn!("[worker] could not refresh Claude OAuth credentials: {}", e),
+        }
+    }
     super::claude_code::inject_proxy_env_async(&mut cmd, &proxy);
 
     let resolved_cwd = resolve_chat_cwd(cwd);
@@ -9637,6 +9660,8 @@ pub fn spawn_pr_review_task(
                     "review",
                     &serde_json::json!({
                         "status": "approved",
+                        "worker_id": Value::Null,
+                        "claimed_at": Value::Null,
                         "updated_at": chrono::Utc::now().to_rfc3339(),
                     }),
                 )
@@ -9757,6 +9782,8 @@ pub fn spawn_pr_review_task(
                     "review",
                     &serde_json::json!({
                         "status": "fixes_needed",
+                        "worker_id": Value::Null,
+                        "claimed_at": Value::Null,
                         "updated_at": chrono::Utc::now().to_rfc3339(),
                     }),
                 )
@@ -11077,15 +11104,24 @@ pub async fn sweep_merge_deploy_requests(config: &SupabaseConfig) {
     let mut running_repos: HashSet<String> = HashSet::new();
     let mut stale_running: Vec<&Value> = Vec::new();
     for task in arr {
-        if merge_deploy_context_status(task) != Some("running") {
-            continue;
-        }
-        if merge_deploy_running_is_stale(task) {
-            stale_running.push(task);
-            continue;
+        match merge_deploy_context_status(task) {
+            Some("recovering") => {
+                if let Some(repo_key) = merge_deploy_repo_key(task) {
+                    running_repos.insert(repo_key);
+                }
+                if merge_deploy_running_is_stale(task) {
+                    stale_running.push(task);
+                }
+                continue;
+            }
+            Some("running") => {}
+            _ => continue,
         }
         if let Some(repo_key) = merge_deploy_repo_key(task) {
             running_repos.insert(repo_key);
+        }
+        if merge_deploy_running_is_stale(task) {
+            stale_running.push(task);
         }
     }
     for task in stale_running {
@@ -11097,7 +11133,7 @@ pub async fn sweep_merge_deploy_requests(config: &SupabaseConfig) {
         if task_id.is_empty() {
             continue;
         }
-        let base_context = task_context_object(task);
+        let mut base_context = task_context_object(task);
         let pr_url = task
             .get("pr_url")
             .and_then(|v| v.as_str())
@@ -11108,6 +11144,47 @@ pub async fn sweep_merge_deploy_requests(config: &SupabaseConfig) {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        let repo_lock_guard = if !repo_path.is_empty() {
+            let lock = merge_deploy_lock_for(&repo_path);
+            match lock.try_lock_owned() {
+                Ok(guard) => Some(guard),
+                Err(_) => {
+                    log::info!(
+                        "[merge-deploy] stale recovery for task {} skipped because repo lock is active",
+                        task_id
+                    );
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        base_context.insert(
+            MERGE_DEPLOY_STATUS_KEY.to_string(),
+            Value::String("recovering".to_string()),
+        );
+        base_context.insert(
+            MERGE_DEPLOY_STARTED_AT_KEY.to_string(),
+            Value::String(chrono::Utc::now().to_rfc3339()),
+        );
+        base_context.insert(MERGE_DEPLOY_ERROR_KEY.to_string(), Value::Null);
+        if let Err(e) = supabase::update_task(
+            config,
+            &task_id,
+            &serde_json::json!({
+                "context": Value::Object(base_context.clone()),
+                "updated_at": chrono::Utc::now().to_rfc3339(),
+            }),
+        )
+        .await
+        {
+            log::warn!(
+                "[merge-deploy] could not stamp stale recovery for task {}: {}",
+                task_id,
+                e
+            );
+            continue;
+        }
         // Captured for the merged-done branch so it runs the same upstream
         // closeout the normal success path does (notify_callback + ticket close).
         let origin_system = task
@@ -11132,6 +11209,7 @@ pub async fn sweep_merge_deploy_requests(config: &SupabaseConfig) {
             .to_string();
         let config_clone = config.clone();
         tokio::spawn(async move {
+            let _repo_lock = repo_lock_guard;
             // If the PR is ALREADY merged, the run only died during the
             // post-merge finalize (deploy is automatic via the Vercel GitHub
             // Action), so the work actually shipped. Close it Done instead of
@@ -11141,53 +11219,154 @@ pub async fn sweep_merge_deploy_requests(config: &SupabaseConfig) {
                 && !repo_path.is_empty()
                 && review::is_safe_pr_url(&pr_url)
             {
-                gh_pr_is_merged(&pr_url, &repo_path).await.unwrap_or(false)
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(45),
+                    gh_pr_is_merged(&pr_url, &repo_path),
+                )
+                .await
+                {
+                    Ok(Ok(value)) => value,
+                    Ok(Err(e)) => {
+                        log::warn!(
+                            "[merge-deploy] stale recovery could not check whether PR is merged for task {}: {}",
+                            task_id,
+                            e
+                        );
+                        false
+                    }
+                    Err(_) => {
+                        log::warn!(
+                            "[merge-deploy] stale recovery timed out checking whether PR is merged for task {}",
+                            task_id
+                        );
+                        false
+                    }
+                }
             } else {
                 false
             };
-            let mut context = base_context;
-            context.insert(
-                MERGE_DEPLOY_COMPLETED_AT_KEY.to_string(),
-                Value::String(chrono::Utc::now().to_rfc3339()),
-            );
             if merged {
-                context.insert(
-                    MERGE_DEPLOY_STATUS_KEY.to_string(),
-                    Value::String("succeeded".to_string()),
-                );
-                context.insert(MERGE_DEPLOY_ERROR_KEY.to_string(), Value::Null);
-                let _ = supabase::update_task(
-                    &config_clone,
-                    &task_id,
-                    &serde_json::json!({
-                        "status": "done",
-                        "completed_at": chrono::Utc::now().to_rfc3339(),
-                        "updated_at": chrono::Utc::now().to_rfc3339(),
-                        "context": Value::Object(context),
-                        "failure_reason": Value::Null,
-                    }),
+                let recovery_result = tokio::time::timeout(
+                    std::time::Duration::from_secs(MERGE_DEPLOY_RUNNING_STALE_SECS as u64),
+                    recover_stale_merged_pr_deploy(&config_clone, &task_id, &pr_url, &repo_path),
                 )
-                .await;
-                // Run the same upstream closeout as the normal success path, so
-                // callback consumers and the origin ticket don't go stale just
-                // because the finalize died and the sweep closed the card.
-                notify_callback(&config_clone, &task_id, "done", Some(&pr_url), None);
-                close_origin_ticket(
-                    &config_clone,
-                    &task_id,
-                    &origin_system,
-                    &origin_id,
-                    &pr_url,
-                    &task_source,
-                    &callback_url,
-                );
-                agent_comment(
-                    &config_clone,
-                    &task_id,
-                    "Detected a stale Merge + Deploy whose PR is already merged (the run died during post-merge finalize; deploy is automatic). Closing as Done and releasing the merge slot.",
-                )
-                .await;
+                .await
+                .map_err(|_| {
+                    format!(
+                        "stale merged deploy recovery exceeded {} minutes",
+                        MERGE_DEPLOY_RUNNING_STALE_SECS / 60
+                    )
+                })
+                .and_then(|result| result);
+                match recovery_result {
+                    Ok(closeout_note) => {
+                        let mut context = supabase::fetch_task(&config_clone, &task_id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|latest| task_context_object(&latest))
+                            .unwrap_or_else(|| base_context.clone());
+                        context.insert(
+                            MERGE_DEPLOY_COMPLETED_AT_KEY.to_string(),
+                            Value::String(chrono::Utc::now().to_rfc3339()),
+                        );
+                        context.insert(
+                            MERGE_DEPLOY_STATUS_KEY.to_string(),
+                            Value::String("succeeded".to_string()),
+                        );
+                        context.insert(MERGE_DEPLOY_ERROR_KEY.to_string(), Value::Null);
+                        let _ = supabase::update_task(
+                            &config_clone,
+                            &task_id,
+                            &serde_json::json!({
+                                "status": "done",
+                                "completed_at": chrono::Utc::now().to_rfc3339(),
+                                "updated_at": chrono::Utc::now().to_rfc3339(),
+                                "worker_id": Value::Null,
+                                "claimed_at": Value::Null,
+                                "context": Value::Object(context),
+                                "failure_reason": Value::Null,
+                            }),
+                        )
+                        .await;
+                        // Run the same upstream closeout as the normal success path, so
+                        // callback consumers and the origin ticket don't go stale just
+                        // because the finalize died and the sweep closed the card.
+                        notify_callback(&config_clone, &task_id, "done", Some(&pr_url), None);
+                        close_origin_ticket(
+                            &config_clone,
+                            &task_id,
+                            &origin_system,
+                            &origin_id,
+                            &pr_url,
+                            &task_source,
+                            &callback_url,
+                        );
+                        agent_comment(
+                            &config_clone,
+                            &task_id,
+                            &format!(
+                                "Detected a stale Merge + Deploy whose PR is already merged. {} Closing as Done and releasing the merge slot.",
+                                closeout_note
+                            ),
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        let mut context = supabase::fetch_task(&config_clone, &task_id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|latest| task_context_object(&latest))
+                            .unwrap_or_else(|| base_context.clone());
+                        context.insert(
+                            MERGE_DEPLOY_COMPLETED_AT_KEY.to_string(),
+                            Value::String(chrono::Utc::now().to_rfc3339()),
+                        );
+                        context.insert(
+                            MERGE_DEPLOY_STATUS_KEY.to_string(),
+                            Value::String("failed".to_string()),
+                        );
+                        context.insert(
+                            MERGE_DEPLOY_ERROR_KEY.to_string(),
+                            Value::String(format!(
+                                "Stale Merge + Deploy PR is merged, but post-merge deploy verification did not pass: {}",
+                                e
+                            )),
+                        );
+                        let _ = supabase::update_task(
+                            &config_clone,
+                            &task_id,
+                            &serde_json::json!({
+                                "status": "failed",
+                                "failure_reason": "Post-merge deploy verification failed during stale recovery",
+                                "context": Value::Object(context),
+                                "updated_at": chrono::Utc::now().to_rfc3339(),
+                            }),
+                        )
+                        .await;
+                        agent_comment(
+                            &config_clone,
+                            &task_id,
+                            &format!(
+                                "Detected a stale Merge + Deploy whose PR is already merged, but I could not prove the post-merge deploy is green: {}. Leaving this failed instead of closing a broken deploy as Done.",
+                                e
+                            ),
+                        )
+                        .await;
+                    }
+                }
             } else {
+                let mut context = supabase::fetch_task(&config_clone, &task_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|latest| task_context_object(&latest))
+                    .unwrap_or_else(|| base_context.clone());
+                context.insert(
+                    MERGE_DEPLOY_COMPLETED_AT_KEY.to_string(),
+                    Value::String(chrono::Utc::now().to_rfc3339()),
+                );
                 context.insert(
                     MERGE_DEPLOY_STATUS_KEY.to_string(),
                     Value::String("failed".to_string()),
@@ -11541,6 +11720,8 @@ async fn start_merge_deploy_task(
                         "status": "done",
                         "completed_at": chrono::Utc::now().to_rfc3339(),
                         "updated_at": chrono::Utc::now().to_rfc3339(),
+                        "worker_id": Value::Null,
+                        "claimed_at": Value::Null,
                         "review_cycle_count": 0,
                         "context": Value::Object(context),
                         "failure_reason": Value::Null,
@@ -11997,7 +12178,7 @@ async fn run_merge_deploy_workflow(
     }
 
     for command in &plan.commands {
-        run_deploy_command_with_escalation(command, config, task_id)
+        run_tracked_deploy_command(command, config, task_id)
             .await
             .map_err(|e| MergeDeployError::deploy_failed(e, pr_merged))?;
     }
@@ -12697,15 +12878,130 @@ async fn run_deploy_shell(
         c.args(["-lc", command]);
         c
     };
+
+    #[cfg(unix)]
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+
     cmd.current_dir(cwd)
         .env("CI", "true")
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
 
-    tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output())
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("spawn {}: {}", label, e))?;
+    let child_pid = child.id();
+
+    let stdout = child.stdout.take();
+    let mut stdout_handle = tokio::spawn(async move {
+        let mut output = Vec::new();
+        if let Some(mut reader) = stdout {
+            use tokio::io::AsyncReadExt;
+            let _ = reader.read_to_end(&mut output).await;
+        }
+        output
+    });
+
+    let stderr = child.stderr.take();
+    let mut stderr_handle = tokio::spawn(async move {
+        let mut output = Vec::new();
+        if let Some(mut reader) = stderr {
+            use tokio::io::AsyncReadExt;
+            let _ = reader.read_to_end(&mut output).await;
+        }
+        output
+    });
+
+    let status = match tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        child.wait(),
+    )
+    .await
+    {
+        Ok(Ok(status)) => status,
+        Ok(Err(e)) => return Err(format!("wait for {}: {}", label, e)),
+        Err(_) => {
+            #[cfg(unix)]
+            if let Some(pid) = child_pid {
+                unsafe {
+                    let _ = libc::kill(-(pid as i32), libc::SIGTERM);
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = child.kill().await;
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            #[cfg(unix)]
+            if let Some(pid) = child_pid {
+                unsafe {
+                    let _ = libc::kill(-(pid as i32), libc::SIGKILL);
+                }
+            }
+            let _ = child.kill().await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
+
+            if tokio::time::timeout(std::time::Duration::from_secs(5), &mut stdout_handle)
+                .await
+                .is_err()
+            {
+                stdout_handle.abort();
+            }
+            if tokio::time::timeout(std::time::Duration::from_secs(5), &mut stderr_handle)
+                .await
+                .is_err()
+            {
+                stderr_handle.abort();
+            }
+            return Err(format!("{} timed out after {} minutes", label, timeout_secs / 60));
+        }
+    };
+
+    let stdout = match tokio::time::timeout(std::time::Duration::from_secs(5), &mut stdout_handle)
         .await
-        .map_err(|_| format!("{} timed out after {} minutes", label, timeout_secs / 60))?
-        .map_err(|e| format!("spawn {}: {}", label, e))
+    {
+        Ok(Ok(output)) => output,
+        _ => {
+            #[cfg(unix)]
+            if let Some(pid) = child_pid {
+                unsafe {
+                    let _ = libc::kill(-(pid as i32), libc::SIGKILL);
+                }
+            }
+            stdout_handle.abort();
+            Vec::new()
+        }
+    };
+    let stderr = match tokio::time::timeout(std::time::Duration::from_secs(5), &mut stderr_handle)
+        .await
+    {
+        Ok(Ok(output)) => output,
+        _ => {
+            #[cfg(unix)]
+            if let Some(pid) = child_pid {
+                unsafe {
+                    let _ = libc::kill(-(pid as i32), libc::SIGKILL);
+                }
+            }
+            stderr_handle.abort();
+            Vec::new()
+        }
+    };
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 async fn persist_deploy_plan(config: &SupabaseConfig, task_id: &str, plan: &DeployPlan) {
@@ -12741,6 +13037,86 @@ async fn persist_deploy_plan(config: &SupabaseConfig, task_id: &str, plan: &Depl
             }),
         )
         .await;
+    }
+}
+
+fn deploy_command_key(command: &DeployCommand) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        command.category, command.label, command.cwd, command.command
+    )
+}
+
+fn deploy_command_status_from_context(context: &serde_json::Map<String, Value>, command: &DeployCommand) -> Option<String> {
+    context
+        .get(MERGE_DEPLOY_COMMAND_STATUS_KEY)
+        .and_then(|v| v.as_object())
+        .and_then(|statuses| statuses.get(&deploy_command_key(command)))
+        .and_then(|entry| entry.get("status"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+async fn mark_deploy_command_status(
+    config: &SupabaseConfig,
+    task_id: &str,
+    command: &DeployCommand,
+    status: &str,
+    error: Option<&str>,
+) -> Result<(), String> {
+    let task = supabase::fetch_task(config, task_id)
+        .await
+        .map_err(|e| format!("fetch task before marking deploy command: {}", e))?
+        .ok_or_else(|| format!("task {} disappeared before marking deploy command", task_id))?;
+    let mut context = task_context_object(&task);
+    let mut statuses = context
+        .get(MERGE_DEPLOY_COMMAND_STATUS_KEY)
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let mut entry = serde_json::Map::new();
+    entry.insert("status".to_string(), Value::String(status.to_string()));
+    entry.insert("label".to_string(), Value::String(command.label.clone()));
+    entry.insert("category".to_string(), Value::String(command.category.to_string()));
+    entry.insert("cwd".to_string(), Value::String(command.cwd.clone()));
+    entry.insert("command".to_string(), Value::String(command.command.clone()));
+    entry.insert("updated_at".to_string(), Value::String(chrono::Utc::now().to_rfc3339()));
+    if let Some(error) = error {
+        entry.insert("error".to_string(), Value::String(truncate(error, 900)));
+    }
+    statuses.insert(deploy_command_key(command), Value::Object(entry));
+    context.insert(
+        MERGE_DEPLOY_COMMAND_STATUS_KEY.to_string(),
+        Value::Object(statuses),
+    );
+    supabase::update_task(
+        config,
+        task_id,
+        &serde_json::json!({
+            "context": Value::Object(context),
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+        }),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| format!("persist deploy command status `{}` for {}: {}", status, command.label, e))
+}
+
+async fn run_tracked_deploy_command(
+    command: &DeployCommand,
+    config: &SupabaseConfig,
+    task_id: &str,
+) -> Result<(), String> {
+    mark_deploy_command_status(config, task_id, command, "running", None).await?;
+    match run_deploy_command_with_escalation(command, config, task_id).await {
+        Ok(()) => {
+            mark_deploy_command_status(config, task_id, command, "succeeded", None).await?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = mark_deploy_command_status(config, task_id, command, "failed", Some(&e)).await;
+            Err(e)
+        }
     }
 }
 
@@ -12910,6 +13286,84 @@ enum DeployGreenError {
     PollError(String),
 }
 
+async fn recover_stale_merged_pr_deploy(
+    config: &SupabaseConfig,
+    task_id: &str,
+    pr_url: &str,
+    repo_path: &str,
+) -> Result<String, String> {
+    let files = review::fetch_pr_files(pr_url, repo_path)
+        .await
+        .map_err(|e| format!("fetch PR files for stale merged deploy recovery: {}", e))?;
+    let wait_for_deploy_green = deploy_green_wait_required(repo_path, &files).await;
+    let (_, deploy_branch) = fetch_pr_branch_info(pr_url, repo_path)
+        .await
+        .map_err(|e| format!("read PR base branch for stale merged deploy recovery: {}", e))?;
+    if deploy_branch.trim().is_empty() {
+        return Err("PR base branch was empty during stale merged deploy recovery".to_string());
+    }
+
+    let deploy_path = prepare_deploy_checkout(repo_path, task_id, &deploy_branch).await?;
+    ensure_supabase_link_state(repo_path, &deploy_path, &files).await?;
+    let plan = build_deploy_plan(&deploy_path, &files).await?;
+    ensure_railway_links_for_deploy_plan(repo_path, &deploy_path, &plan).await?;
+
+    persist_deploy_plan(config, task_id, &plan).await;
+    agent_comment(
+        config,
+        task_id,
+        &format!(
+            "Recovering stale post-merge deploy plan:\n\n{}",
+            deploy_plan_markdown(&plan)
+        ),
+    )
+    .await;
+
+    let latest_context = supabase::fetch_task(config, task_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|task| task_context_object(&task))
+        .unwrap_or_default();
+    for command in &plan.commands {
+        match deploy_command_status_from_context(&latest_context, command).as_deref() {
+            Some("succeeded") => continue,
+            Some("running") => {
+                return Err(format!(
+                    "Deploy command `{}` was already marked running when the previous worker died; refusing to rerun it automatically because it may have completed externally.",
+                    command.label
+                ));
+            }
+            Some("failed") => {
+                return Err(format!(
+                    "Deploy command `{}` was already marked failed before stale recovery; re-request Merge + Deploy after reviewing the stored error.",
+                    command.label
+                ));
+            }
+            _ => {}
+        }
+        run_tracked_deploy_command(command, config, task_id).await?;
+    }
+
+    if wait_for_deploy_green {
+        wait_for_post_merge_deploy_green(pr_url, repo_path)
+            .await
+            .map_err(|e| format!("post-merge deploy check verification failed: {:?}", e))?;
+    }
+
+    let command_note = if plan.commands.is_empty() {
+        "No manual deploy commands were required."
+    } else {
+        "Required post-merge deploy commands were run."
+    };
+    let check_note = if wait_for_deploy_green {
+        "Post-merge deploy checks are verified green."
+    } else {
+        "No post-merge deploy wait is required for this file set."
+    };
+    Ok(format!("{} {}", command_note, check_note))
+}
+
 async fn wait_for_post_merge_deploy_green(
     pr_url: &str,
     repo_path: &str,
@@ -12971,16 +13425,15 @@ async fn wait_for_post_merge_deploy_green(
             sha_timeout.as_secs()
         ))
     })?;
-    let merge_sha_short = merge_sha
-        .chars()
-        .take(8)
-        .collect::<String>();
+    let base_ref = resolve_pr_base_ref(&owner, &repo, number, repo_path).await;
+    let mut poll_sha = merge_sha.clone();
+    let mut poll_sha_short = short_commit_sha(&poll_sha);
 
     log::info!(
         "[merge-deploy] polling post-merge check-runs for {}/{}@{}",
         owner,
         repo,
-        merge_sha
+        poll_sha
     );
 
     let mut last_detail = "no checks observed yet".to_string();
@@ -12991,7 +13444,7 @@ async fn wait_for_post_merge_deploy_green(
                 "api",
                 &format!(
                     "repos/{}/{}/commits/{}/check-runs?per_page=100",
-                    owner, repo, merge_sha
+                    owner, repo, poll_sha
                 ),
             ])
             .current_dir(repo_path)
@@ -13009,17 +13462,73 @@ async fn wait_for_post_merge_deploy_green(
                     .cloned()
                     .unwrap_or_default();
                 if !checks_owned.is_empty() {
-                    let failed = checks_owned
-                        .iter()
-                        .filter(|check| matches!(check_run_bucket(check), "fail" | "cancel"))
-                        .map(check_run_detail)
-                        .collect::<Vec<_>>();
+                    let (failed, cancelled) = problem_check_run_details(&checks_owned);
                     if !failed.is_empty() {
                         return Err(DeployGreenError::Failed(format!(
                             "post-merge deploy check failed on {}@{}: {}",
                             owner,
-                            merge_sha_short,
+                            poll_sha_short,
                             truncate(&failed.join("; "), 900)
+                        )));
+                    }
+                    if !cancelled.is_empty() {
+                        match default_branch_head_sha(&owner, &repo, &base_ref, repo_path).await {
+                            Ok(Some(branch_head))
+                                if !commit_sha_matches(&poll_sha, &branch_head) =>
+                            {
+                                match commit_is_ancestor_via_github(
+                                    &owner,
+                                    &repo,
+                                    &poll_sha,
+                                    &branch_head,
+                                    repo_path,
+                                )
+                                .await
+                                {
+                                    Ok(true) => {
+                                        let branch_head_short = short_commit_sha(&branch_head);
+                                        log::info!(
+                                            "[merge-deploy] checks on {}/{}@{} were cancelled after {} advanced to {}; the cancelled commit is an ancestor of the live branch head, so polling the branch-level deploy checks on the live default branch commit",
+                                            owner,
+                                            repo,
+                                            poll_sha_short,
+                                            base_ref,
+                                            branch_head_short
+                                        );
+                                        poll_sha = branch_head;
+                                        poll_sha_short = branch_head_short;
+                                        last_detail = format!(
+                                            "cancelled checks on superseded ancestor {}; now polling {}",
+                                            short_commit_sha(&merge_sha),
+                                            poll_sha_short
+                                        );
+                                        continue;
+                                    }
+                                    Ok(false) => {}
+                                    Err(e) => log::warn!(
+                                        "[merge-deploy] could not confirm whether cancelled checks on {}/{}@{} are included in {}: {:?}",
+                                        owner,
+                                        repo,
+                                        poll_sha_short,
+                                        short_commit_sha(&branch_head),
+                                        e
+                                    ),
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => log::warn!(
+                                "[merge-deploy] could not confirm whether cancelled checks on {}/{}@{} were superseded: {:?}",
+                                owner,
+                                repo,
+                                poll_sha_short,
+                                e
+                            ),
+                        }
+                        return Err(DeployGreenError::Failed(format!(
+                            "post-merge deploy check cancelled on {}@{}: {}",
+                            owner,
+                            poll_sha_short,
+                            truncate(&cancelled.join("; "), 900)
                         )));
                     }
 
@@ -13033,19 +13542,19 @@ async fn wait_for_post_merge_deploy_green(
                             "[merge-deploy] post-merge check-runs green on {}/{}@{}",
                             owner,
                             repo,
-                            merge_sha
+                            poll_sha
                         );
                         return Ok(());
                     }
                     last_detail = format!(
                         "pending check-runs on {}: {}",
-                        merge_sha_short,
+                        poll_sha_short,
                         truncate(&pending.join("; "), 900)
                     );
                 } else {
                     last_detail = format!(
                         "no check-runs reported yet on {}",
-                        merge_sha_short
+                        poll_sha_short
                     );
                 }
             }
@@ -13067,6 +13576,119 @@ async fn wait_for_post_merge_deploy_green(
 
         tokio::time::sleep(interval).await;
     }
+}
+
+async fn resolve_pr_base_ref(owner: &str, repo: &str, number: i64, repo_path: &str) -> String {
+    let output = async_cmd("gh")
+        .args([
+            "api",
+            &format!("repos/{}/{}/pulls/{}", owner, repo, number),
+            "--jq",
+            ".base.ref",
+        ])
+        .current_dir(repo_path)
+        .output()
+        .await;
+    if let Ok(out) = output {
+        if out.status.success() {
+            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !stdout.is_empty() && stdout != "null" {
+                return stdout;
+            }
+        }
+    }
+    detect_base_branch(repo_path).await
+}
+
+async fn default_branch_head_sha(
+    owner: &str,
+    repo: &str,
+    base_ref: &str,
+    repo_path: &str,
+) -> Result<Option<String>, DeployGreenError> {
+    let output = async_cmd("gh")
+        .args([
+            "api",
+            &format!("repos/{}/{}/branches/{}", owner, repo, base_ref),
+            "--jq",
+            ".commit.sha",
+        ])
+        .current_dir(repo_path)
+        .output()
+        .await
+        .map_err(|e| DeployGreenError::PollError(format!("spawn gh api branch head: {}", e)))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(DeployGreenError::PollError(format!(
+            "gh api branch head failed: {}",
+            stderr.trim()
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() || stdout == "null" {
+        return Ok(None);
+    }
+    Ok(Some(stdout))
+}
+
+async fn commit_is_ancestor_via_github(
+    owner: &str,
+    repo: &str,
+    ancestor: &str,
+    descendant: &str,
+    repo_path: &str,
+) -> Result<bool, DeployGreenError> {
+    if commit_sha_matches(ancestor, descendant) {
+        return Ok(true);
+    }
+    let output = async_cmd("gh")
+        .args([
+            "api",
+            &format!("repos/{}/{}/compare/{}...{}", owner, repo, ancestor, descendant),
+            "--jq",
+            ".status",
+        ])
+        .current_dir(repo_path)
+        .output()
+        .await
+        .map_err(|e| DeployGreenError::PollError(format!("spawn gh api compare: {}", e)))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(DeployGreenError::PollError(format!(
+            "gh api compare failed: {}",
+            stderr.trim()
+        )));
+    }
+    let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(matches!(status.as_str(), "ahead" | "identical"))
+}
+
+fn short_commit_sha(sha: &str) -> String {
+    sha.chars().take(8).collect::<String>()
+}
+
+fn commit_sha_matches(left: &str, right: &str) -> bool {
+    let left = left.trim().to_ascii_lowercase();
+    let right = right.trim().to_ascii_lowercase();
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+    left == right
+        || (left.len() >= 7 && right.starts_with(&left))
+        || (right.len() >= 7 && left.starts_with(&right))
+}
+
+fn problem_check_run_details(checks: &[Value]) -> (Vec<String>, Vec<String>) {
+    let mut failed = Vec::new();
+    let mut cancelled = Vec::new();
+    for check in checks {
+        match check_run_bucket(check) {
+            "fail" => failed.push(check_run_detail(check)),
+            "cancel" => cancelled.push(check_run_detail(check)),
+            _ => {}
+        }
+    }
+    (failed, cancelled)
 }
 
 /// Bucket a GitHub /commits/SHA/check-runs entry into the same vocabulary
@@ -14203,6 +14825,42 @@ mod merge_deploy_tests {
     }
 
     #[test]
+    fn cancelled_check_runs_are_separated_from_real_failures() {
+        let checks = vec![
+            serde_json::json!({
+                "name": "client-readiness",
+                "status": "completed",
+                "conclusion": "cancelled"
+            }),
+            serde_json::json!({
+                "name": "server-readiness",
+                "status": "completed",
+                "conclusion": "failure"
+            }),
+            serde_json::json!({
+                "name": "lint",
+                "status": "completed",
+                "conclusion": "success"
+            }),
+        ];
+
+        let (failed, cancelled) = problem_check_run_details(&checks);
+
+        assert_eq!(failed, vec!["server-readiness (fail | failure)".to_string()]);
+        assert_eq!(cancelled, vec!["client-readiness (cancel | cancelled)".to_string()]);
+    }
+
+    #[test]
+    fn commit_sha_matches_full_or_short_sha_case_insensitively() {
+        let full = "033C662FC05372E206B1EBB9611D155EFD33E6A0";
+
+        assert!(commit_sha_matches(full, "033c662f"));
+        assert!(commit_sha_matches("033c662f", full));
+        assert!(!commit_sha_matches(full, "d1ff3cea"));
+        assert!(!commit_sha_matches("033", full));
+    }
+
+    #[test]
     fn merge_deploy_running_stale_detects_old_or_missing_started_at() {
         let task_with_started_at = |started_at: String| {
             let mut context = serde_json::Map::new();
@@ -14216,8 +14874,11 @@ mod merge_deploy_tests {
         let fresh = task_with_started_at(chrono::Utc::now().to_rfc3339());
         assert!(!merge_deploy_running_is_stale(&fresh));
 
-        let stale =
-            task_with_started_at((chrono::Utc::now() - chrono::Duration::minutes(91)).to_rfc3339());
+        let stale = task_with_started_at(
+            (chrono::Utc::now()
+                - chrono::Duration::seconds(MERGE_DEPLOY_RUNNING_STALE_SECS + 1))
+            .to_rfc3339(),
+        );
         assert!(merge_deploy_running_is_stale(&stale));
 
         let missing = serde_json::json!({"context": {}});
@@ -14755,6 +15416,8 @@ pub async fn sweep_pr_merged_cards(config: &SupabaseConfig) {
                         "status": "done",
                         "completed_at": chrono::Utc::now().to_rfc3339(),
                         "updated_at": chrono::Utc::now().to_rfc3339(),
+                        "worker_id": Value::Null,
+                        "claimed_at": Value::Null,
                         "review_cycle_count": 0,
                     }),
                 )
@@ -17470,6 +18133,8 @@ fn spawn_review_merge_task(
             &serde_json::json!({
                 "status": "approved",
                 "context": Value::Object(done_ctx),
+                "worker_id": Value::Null,
+                "claimed_at": Value::Null,
                 "updated_at": chrono::Utc::now().to_rfc3339(),
             }),
         )
@@ -17640,6 +18305,8 @@ async fn fail_review_merge(config: &SupabaseConfig, task_id: &str, pr_url: &str,
         &serde_json::json!({
             "status": "approved",
             "context": Value::Object(ctx),
+            "worker_id": Value::Null,
+            "claimed_at": Value::Null,
             "updated_at": chrono::Utc::now().to_rfc3339(),
         }),
     )
