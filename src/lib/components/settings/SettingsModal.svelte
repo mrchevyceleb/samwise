@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { getSettingsStore } from '$lib/stores/settings.svelte';
+  import { getSettingsStore, updateSetting } from '$lib/stores/settings.svelte';
   import { safeInvoke } from '$lib/utils/tauri';
   import SchedulingTab from './SchedulingTab.svelte';
   import ProjectsTab from './ProjectsTab.svelte';
@@ -9,7 +9,7 @@
 
   const settingsStore = getSettingsStore();
 
-  type Tab = 'connection' | 'worker' | 'projects' | 'rules' | 'notifications' | 'automerge' | 'automation' | 'about';
+  type Tab = 'connection' | 'worker' | 'llm-proxy' | 'projects' | 'rules' | 'notifications' | 'automerge' | 'automation' | 'about';
   let closeBtnHovered = $state(false);
   let hoveredTab = $state<string | null>(null);
 
@@ -30,6 +30,29 @@
       loadConfig();
     }
   });
+
+  // LLM Proxy state
+  let proxyStatus = $state<'idle' | 'checking' | 'healthy' | 'error'>('idle');
+  let proxyMessage = $state('');
+
+  async function checkProxy() {
+    const s = settingsStore.value;
+    if (!s.llmProxyBaseUrl?.trim()) {
+      proxyStatus = 'error';
+      proxyMessage = 'No proxy URL configured';
+      return;
+    }
+    proxyStatus = 'checking';
+    proxyMessage = 'Checking proxy...';
+    try {
+      const result = await safeInvoke<string>('check_llm_proxy', { proxyUrl: s.llmProxyBaseUrl });
+      proxyStatus = 'healthy';
+      proxyMessage = result || 'Proxy healthy';
+    } catch (e: any) {
+      proxyStatus = 'error';
+      proxyMessage = e?.toString?.() || 'Proxy unreachable';
+    }
+  }
 
   async function loadConfig() {
     const config = await safeInvoke<{ url: string; anon_key: string; service_role_key: string | null }>('supabase_get_config');
@@ -81,6 +104,7 @@
   const tabs: { id: Tab; label: string; icon: string }[] = [
     { id: 'connection', label: 'Connection', icon: 'M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z' },
     { id: 'worker', label: 'Worker', icon: 'M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm0 0' },
+    { id: 'llm-proxy', label: 'LLM Proxy', icon: 'M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z' },
     { id: 'projects', label: 'Projects', icon: 'M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z' },
     { id: 'rules', label: 'Rules', icon: 'M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4' },
     { id: 'notifications', label: 'Notifications', icon: 'M18 8A6 6 0 006 8c0 7-3 9-3 9h18s-3-2-3-9M13.73 21a2 2 0 01-3.46 0' },
@@ -211,6 +235,160 @@
                   Reconfigure
                 </button>
               </div>
+            </div>
+
+          {:else if activeTab === 'llm-proxy'}
+            <div style="display: flex; flex-direction: column; gap: 20px;">
+              <div style="font-size: 13px; font-weight: 600; color: var(--text-primary); padding-bottom: 4px; border-bottom: 1px solid var(--border-default);">LLM Proxy</div>
+              <div style="font-size: 13px; color: var(--text-secondary);">
+                Route Claude Code through a LiteLLM proxy to use Fireworks GLM instead of Anthropic directly. Same agent loop, 15-20x cheaper.
+              </div>
+
+              <!-- Enable toggle -->
+              <div style="display: flex; align-items: center; gap: 16px; padding: 12px; background: var(--bg-primary); border: 1px solid var(--border-default); border-radius: 8px;">
+                <label style="display: flex; align-items: center; gap: 10px; cursor: pointer; flex: 1;">
+                  <input
+                    type="checkbox"
+                    checked={settingsStore.value.llmProxyEnabled}
+                    onchange={(e: any) => { updateSetting('llmProxyEnabled', e.target.checked); }}
+                    style="width: 16px; height: 16px; accent-color: var(--accent-indigo);"
+                  />
+                  <div>
+                    <div style="font-size: 13px; font-weight: 600; color: var(--text-primary);">Enable LLM Proxy</div>
+                    <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">Route Claude Code through LiteLLM to Fireworks GLM</div>
+                  </div>
+                </label>
+              </div>
+
+              {#if settingsStore.value.llmProxyEnabled}
+                <!-- Backend selector -->
+                <div style="display: flex; flex-direction: column; gap: 8px;">
+                  <div style="font-size: 12px; font-weight: 600; color: var(--text-primary);">Backend Model</div>
+                  <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                    {#each ([
+                      { id: 'fireworks-glm-5.1', label: 'Fireworks GLM 5.1', cost: '$0.98/$3.08 per 1M' },
+                      { id: 'fireworks-glm-5.2', label: 'Fireworks GLM 5.2', cost: '$1.40/$4.40 per 1M (soon)' },
+                      { id: 'openrouter-glm-5.2', label: 'OpenRouter GLM 5.2', cost: '$1.40/$4.40 per 1M' },
+                      { id: 'custom', label: 'Custom', cost: '' },
+                    ] as const) as backend}
+                      <button
+                        onclick={() => updateSetting('llmProxyBackend', backend.id)}
+                        style="padding: 8px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; transition: all 0.15s ease; text-align: left;
+                          background: {settingsStore.value.llmProxyBackend === backend.id ? 'rgba(99,102,241,0.15)' : 'var(--bg-primary)'};
+                          border: 1px solid {settingsStore.value.llmProxyBackend === backend.id ? 'var(--accent-indigo)' : 'var(--border-default)'};
+                          color: {settingsStore.value.llmProxyBackend === backend.id ? 'var(--accent-indigo)' : 'var(--text-secondary)'};"
+                      >
+                        <div style="font-weight: 600;">{backend.label}</div>
+                        {#if backend.cost}
+                          <div style="font-size: 10px; opacity: 0.7; margin-top: 2px;">{backend.cost}</div>
+                        {/if}
+                      </button>
+                    {/each}
+                  </div>
+                </div>
+
+                <!-- Proxy URL -->
+                <div style="display: flex; flex-direction: column; gap: 6px;">
+                  <div style="font-size: 12px; font-weight: 600; color: var(--text-primary);">Proxy Base URL</div>
+                  <div style="font-size: 11px; color: var(--text-muted);">The LiteLLM proxy address (usually localhost:9876)</div>
+                  <input
+                    value={settingsStore.value.llmProxyBaseUrl}
+                    oninput={(e: any) => updateSetting('llmProxyBaseUrl', e.target.value)}
+                    placeholder="http://127.0.0.1:9876"
+                    style="padding: 8px 12px; background: var(--bg-primary); border: 1px solid var(--border-default); border-radius: 6px; color: var(--text-primary); font-size: 13px; font-family: var(--font-mono); outline: none;"
+                  />
+                </div>
+
+                <!-- Proxy API Key -->
+                <div style="display: flex; flex-direction: column; gap: 6px;">
+                  <div style="font-size: 12px; font-weight: 600; color: var(--text-primary);">Proxy API Key</div>
+                  <div style="font-size: 11px; color: var(--text-muted);">Set in LiteLLM config if you enabled master key. Usually left empty.</div>
+                  <input
+                    type="password"
+                    value={settingsStore.value.llmProxyApiKey}
+                    oninput={(e: any) => updateSetting('llmProxyApiKey', e.target.value)}
+                    placeholder="Leave empty if LiteLLM has no auth"
+                    style="padding: 8px 12px; background: var(--bg-primary); border: 1px solid var(--border-default); border-radius: 6px; color: var(--text-primary); font-size: 13px; font-family: var(--font-mono); outline: none;"
+                  />
+                </div>
+
+                <!-- Health check -->
+                <div style="display: flex; flex-direction: column; gap: 8px;">
+                  <button
+                    onclick={checkProxy}
+                    style="padding: 8px 16px; background: var(--accent-indigo); border: none; border-radius: 6px; color: white; font-size: 13px; font-weight: 600; cursor: pointer; transition: all 0.15s ease; align-self: flex-start;"
+                  >
+                    Check Proxy Health
+                  </button>
+                  {#if proxyStatus !== 'idle'}
+                    <div style="display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--bg-primary); border: 1px solid var(--border-default); border-radius: 6px;">
+                      <span style="width: 8px; height: 8px; border-radius: 50%; background: {proxyStatus === 'healthy' ? '#3fb950' : proxyStatus === 'error' ? '#f85149' : '#6366f1'}; {proxyStatus === 'checking' ? 'animation: pulse-dot 1s ease-in-out infinite;' : ''}"></span>
+                      <span style="font-size: 12px; color: var(--text-secondary);">{proxyMessage}</span>
+                    </div>
+                  {/if}
+                </div>
+
+                <!-- Cost comparison -->
+                <div style="padding: 12px; background: rgba(63,185,80,0.05); border: 1px solid rgba(63,185,80,0.2); border-radius: 8px;">
+                  <div style="font-size: 12px; font-weight: 600; color: #3fb950; margin-bottom: 8px;">Cost Savings</div>
+                  <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; font-size: 11px;">
+                    <div style="color: var(--text-muted);">Model</div>
+                    <div style="color: var(--text-muted);">Input/1M</div>
+                    <div style="color: var(--text-muted);">Output/1M</div>
+                    <div style="color: var(--text-secondary);">Claude Opus 4</div>
+                    <div style="color: #f85149;">$15.00</div>
+                    <div style="color: #f85149;">$75.00</div>
+                    <div style="color: var(--text-primary); font-weight: 600;">GLM 5.1</div>
+                    <div style="color: #3fb950;">$0.98</div>
+                    <div style="color: #3fb950;">$3.08</div>
+                    <div style="color: var(--text-primary); font-weight: 600;">GLM 5.2</div>
+                    <div style="color: #3fb950;">$1.40</div>
+                    <div style="color: #3fb950;">$4.40</div>
+                  </div>
+                </div>
+
+                <!-- Vision Adapter -->
+                <div style="padding: 12px; background: rgba(99,102,241,0.05); border: 1px solid rgba(99,102,241,0.2); border-radius: 8px;">
+                  <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 8px;">
+                    <span style="font-size: 16px;">👁️</span>
+                    <div style="font-size: 12px; font-weight: 600; color: var(--accent-indigo);">Vision Adapter</div>
+                  </div>
+                  <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 8px;">
+                    GLM can't see images. When enabled, image attachments are described by a local vision model before being passed to the coding model. Same pattern as Pi's Vision Adapter.
+                  </div>
+                  <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                    <input
+                      type="checkbox"
+                      checked={settingsStore.value.llmVisionAdapterEnabled}
+                      onchange={(e: any) => { updateSetting('llmVisionAdapterEnabled', e.target.checked); }}
+                      style="width: 14px; height: 14px; accent-color: var(--accent-indigo);"
+                    />
+                    <span style="font-size: 12px; color: var(--text-secondary);">Enable vision adapter for image attachments</span>
+                  </label>
+                  {#if settingsStore.value.llmVisionAdapterEnabled}
+                    <div style="display: flex; gap: 8px; margin-top: 8px;">
+                      <div style="flex: 1; display: flex; flex-direction: column; gap: 4px;">
+                        <div style="font-size: 10px; color: var(--text-muted);">Vision Model URL</div>
+                        <input
+                          value={settingsStore.value.llmVisionAdapterUrl}
+                          oninput={(e: any) => updateSetting('llmVisionAdapterUrl', e.target.value)}
+                          placeholder="http://localhost:1234/v1"
+                          style="padding: 6px 8px; background: var(--bg-primary); border: 1px solid var(--border-default); border-radius: 4px; color: var(--text-primary); font-size: 11px; font-family: var(--font-mono); outline: none;"
+                        />
+                      </div>
+                      <div style="flex: 1; display: flex; flex-direction: column; gap: 4px;">
+                        <div style="font-size: 10px; color: var(--text-muted);">Vision Model</div>
+                        <input
+                          value={settingsStore.value.llmVisionAdapterModel}
+                          oninput={(e: any) => updateSetting('llmVisionAdapterModel', e.target.value)}
+                          placeholder="qwen3-vl-4b-instruct"
+                          style="padding: 6px 8px; background: var(--bg-primary); border: 1px solid var(--border-default); border-radius: 4px; color: var(--text-primary); font-size: 11px; font-family: var(--font-mono); outline: none;"
+                        />
+                      </div>
+                    </div>
+                  {/if}
+                </div>
+              {/if}
             </div>
 
           {:else if activeTab === 'projects'}

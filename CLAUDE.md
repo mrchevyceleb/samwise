@@ -18,9 +18,19 @@ The backend worker picks up tasks from the board, writes code via Claude Code CL
 
 ## LLM Backend
 
-**Claude Code is now driven by the Z.ai coding plan, not Anthropic Claude models.** The worker still runs the Claude Code CLI (same agent loop: tool use, streaming, file ops), but the underlying model is **GLM 5.2 Max (thinking mode)** served through the Z.ai coding plan. Do NOT assume Anthropic-model identity, defaults, pricing, context limits, or behavior. Any `claude-*` model name that appears in configs (e.g. `claude-opus-4-8`) is just the label Claude Code sends upstream — it resolves to GLM 5.2 Max on the Z.ai plan.
+**Claude Code now runs on real Anthropic Opus 4.8 (`claude-opus-4-8`), reasoning effort `xhigh`.** This is experimental ("for now"), set up to compare results against the prior GLM setup, and it is fully reversible. The worker runs the Claude Code CLI exactly as before (same agent loop: tool use, streaming, file ops), but the model is genuine Anthropic Opus 4.8. The `claude-opus-4-8` label is now literal: it resolves to real Anthropic Opus 4.8, NOT to GLM. Model and effort constants `CLAUDE_MODEL` / `CLAUDE_EFFORT` live in `src-tauri/src/commands/claude_code.rs`.
 
-This supersedes the earlier Fireworks GLM 5.1 LiteLLM proxy approach documented in `LLM-PROXY-SWAP.md`. Routing is now the Z.ai coding plan, GLM 5.2 Max thinking.
+**Account (do not mix up):** Claude Code authenticates against the **KG Claude account, `mtjohnston42@gmail.com`** (a Claude Max subscription), via OAuth. It must NOT use the Personal account `mjohnst@gmail.com`. OAuth creds live in `CLAUDE_CONFIG_DIR=/home/mrchevyceleb/.config/autosam/claude-config/.credentials.json` (copied from `~/.claude/.credentials.json`).
+
+**Routing mechanism (lives in systemd env, NOT in the repo):** the worker's `load_llm_proxy()` reads `AUTOSAM_LLM_PROXY_URL` and injects it as `ANTHROPIC_BASE_URL`. With those env vars removed, Claude Code hits `api.anthropic.com` directly and authenticates via the OAuth creds above. The switch (done 2026-06-19) removed the Z.ai/GLM proxy env vars (`AUTOSAM_LLM_PROXY_URL`, `AUTOSAM_LLM_PROXY_API_KEY`, `AUTOSAM_DEFAULT_MODEL`, `ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL`) from `~/.config/systemd/user/samwise-agent-one.service`, deleted the `samwise-agent-one.service.d/failover.conf` drop-in (it pointed the proxy at a local `http://127.0.0.1:8788`), and removed `CLAUDE_CODE_SIMPLE=1`.
+
+⚠️ **CLAUDE_CODE_SIMPLE gotcha:** with `CLAUDE_CODE_SIMPLE=1` set, Claude Code forces API-key auth and REJECTS OAuth subscription login, dying with `Not logged in · Please run /login`. That flag was needed for the GLM/Z.ai API-key setup but is incompatible with the KG Max OAuth auth, so it must stay removed for Opus.
+
+No rebuild was needed for this switch: the model/effort were already baked into the deployed `/usr/bin/agent-one`, so it was a pure runtime-config change.
+
+**Revert path:** a backup of the prior GLM config sits at `~/.config/autosam/glm-revert-backup-20260619/`. Restore the `.service` file plus `service.d/` drop-in, `systemctl --user daemon-reload`, then restart the service. A clean revert to GLM also requires restoring `CLAUDE_CODE_SIMPLE=1`.
+
+This supersedes both the earlier Z.ai coding plan / GLM 5.2 Max routing and the older Fireworks GLM 5.1 LiteLLM proxy approach documented in `LLM-PROXY-SWAP.md`. Treat both of those as historical/superseded.
 
 ## Deployment
 

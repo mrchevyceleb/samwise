@@ -1,10 +1,136 @@
 use serde::Serialize;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use tauri::Emitter;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use tauri::{Emitter, Manager};
 use crate::process::cmd;
+
+// ── LLM Proxy ────────────────────────────────────────────────────────
+
+/// When set, Claude Code routes through a local LiteLLM proxy instead of
+/// hitting Anthropic directly. The proxy translates Anthropic Messages API
+/// format to OpenAI/Fireworks format, so Claude Code's agent loop (tool use,
+/// streaming, etc.) works unchanged with any OpenAI-compatible backend.
+///
+/// Configuration is read from settings.json (set via the Settings UI).
+/// Keys: `llmProxyBaseUrl`, `llmProxyApiKey`.
+pub struct LlmProxyConfig {
+    pub base_url: String,
+    pub api_key: String,
+}
+
+impl LlmProxyConfig {
+    /// Load proxy config from settings.json. Returns None if proxy is not
+    /// configured (empty base_url), which means "use Anthropic directly."
+    pub fn load(app: &tauri::AppHandle) -> Option<Self> {
+        let data_dir = app.path().app_data_dir().ok()?;
+        let path = data_dir.join("settings.json");
+        let raw = std::fs::read_to_string(&path).ok()?;
+        let val: serde_json::Value = serde_json::from_str(&raw).ok()?;
+        let base_url = val.get("llmProxyBaseUrl")?.as_str()?.trim().to_string();
+        if base_url.is_empty() {
+            return None;
+        }
+        let api_key = val
+            .get("llmProxyApiKey")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        Some(LlmProxyConfig { base_url, api_key })
+    }
+
+    /// Load proxy config from settings.json (async version for tokio callers).
+    pub async fn load_async(app: &tauri::AppHandle) -> Option<Self> {
+        let data_dir = app.path().app_data_dir().ok()?;
+        let path = data_dir.join("settings.json");
+        let raw = tokio::fs::read_to_string(&path).await.ok()?;
+        let val: serde_json::Value = serde_json::from_str(&raw).ok()?;
+        let base_url = val.get("llmProxyBaseUrl")?.as_str()?.trim().to_string();
+        if base_url.is_empty() {
+            return None;
+        }
+        let api_key = val
+            .get("llmProxyApiKey")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        Some(LlmProxyConfig { base_url, api_key })
+    }
+
+    /// Load proxy config from settings.json read as a raw JSON string.
+    /// Used by worker.rs which already has the settings blob loaded.
+    pub fn from_json(raw: &str) -> Option<Self> {
+        let val: serde_json::Value = serde_json::from_str(raw).ok()?;
+        let base_url = val.get("llmProxyBaseUrl")?.as_str()?.trim().to_string();
+        if base_url.is_empty() {
+            return None;
+        }
+        let api_key = val
+            .get("llmProxyApiKey")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        Some(LlmProxyConfig { base_url, api_key })
+    }
+}
+
+/// Inject proxy env vars into a Command so Claude Code routes through
+/// the LiteLLM proxy instead of Anthropic directly. No-op if proxy is None.
+pub fn inject_proxy_env(
+    cmd: &mut std::process::Command,
+    proxy: &Option<LlmProxyConfig>,
+) {
+    if let Some(p) = proxy {
+        cmd.env("ANTHROPIC_BASE_URL", &p.base_url);
+        cmd.env("ANTHROPIC_API_KEY", &p.api_key);
+    } else {
+        strip_direct_oauth_blockers(cmd);
+    }
+}
+
+/// Same as inject_proxy_env but for tokio::process::Command.
+pub fn inject_proxy_env_async(
+    cmd: &mut tokio::process::Command,
+    proxy: &Option<LlmProxyConfig>,
+) {
+    if let Some(p) = proxy {
+        cmd.env("ANTHROPIC_BASE_URL", &p.base_url);
+        cmd.env("ANTHROPIC_API_KEY", &p.api_key);
+    } else {
+        strip_direct_oauth_blockers_async(cmd);
+    }
+}
+
+/// Env vars from the old proxy/API-key setup force Claude Code away from
+/// OAuth subscription auth. When Sam is running direct Anthropic OAuth, scrub
+/// them from every child process so stale systemd or shell env cannot recreate
+/// the 401 "not logged in" outage.
+const DIRECT_OAUTH_ENV_BLOCKERS: &[&str] = &[
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_SIMPLE",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "AUTOSAM_DEFAULT_MODEL",
+];
+
+fn strip_direct_oauth_blockers(cmd: &mut std::process::Command) {
+    for key in DIRECT_OAUTH_ENV_BLOCKERS {
+        cmd.env_remove(key);
+    }
+}
+
+fn strip_direct_oauth_blockers_async(cmd: &mut tokio::process::Command) {
+    for key in DIRECT_OAUTH_ENV_BLOCKERS {
+        cmd.env_remove(key);
+    }
+}
 
 // ── State ────────────────────────────────────────────────────────────
 
@@ -81,6 +207,129 @@ pub fn find_claude_command() -> (String, Vec<String>) {
     ("claude".to_string(), vec![])
 }
 
+const CLAUDE_CREDENTIALS_FILE: &str = ".credentials.json";
+
+fn home_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("USERPROFILE").map(PathBuf::from)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::env::var_os("HOME").map(PathBuf::from)
+    }
+}
+
+fn canonical_claude_credentials_path() -> Option<PathBuf> {
+    home_dir().map(|home| home.join(".claude").join(CLAUDE_CREDENTIALS_FILE))
+}
+
+fn configured_claude_credentials_path() -> Option<PathBuf> {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .map(|dir| dir.join(CLAUDE_CREDENTIALS_FILE))
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => a == b,
+    }
+}
+
+fn credential_sync_lock() -> &'static StdMutex<()> {
+    static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| StdMutex::new(()))
+}
+
+fn credentials_need_sync(source: &Path, target: &Path, force: bool) -> Result<bool, String> {
+    if force || !target.exists() {
+        return Ok(true);
+    }
+    let source_bytes = std::fs::read(source)
+        .map_err(|e| format!("read source Claude credentials: {}", e))?;
+    let target_bytes = std::fs::read(target)
+        .map_err(|e| format!("read worker Claude credentials: {}", e))?;
+    Ok(source_bytes != target_bytes)
+}
+
+fn atomic_copy_credentials(source: &Path, target: &Path) -> Result<(), String> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("Claude credentials target has no parent: {}", target.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("create Claude config dir {}: {}", parent.display(), e))?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let tmp = parent.join(format!(
+        ".{}.tmp-{}-{}",
+        CLAUDE_CREDENTIALS_FILE,
+        std::process::id(),
+        nonce
+    ));
+    std::fs::copy(source, &tmp).map_err(|e| {
+        format!(
+            "copy Claude credentials {} -> {}: {}",
+            source.display(),
+            tmp.display(),
+            e
+        )
+    })?;
+    lock_down_credentials_permissions(&tmp);
+    std::fs::rename(&tmp, target).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!(
+            "replace Claude credentials {} -> {}: {}",
+            tmp.display(),
+            target.display(),
+            e
+        )
+    })?;
+    lock_down_credentials_permissions(target);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn lock_down_credentials_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn lock_down_credentials_permissions(_path: &Path) {}
+
+/// Keep AutoSam's isolated Claude config fresh from the canonical Claude Code
+/// login without pointing the worker directly at Matt's live config dir. This
+/// fixes the stale-copy OAuth 401 outage while preserving the separate
+/// `CLAUDE_CONFIG_DIR` the service already uses.
+pub fn sync_claude_oauth_credentials_if_needed(force: bool) -> Result<bool, String> {
+    let _guard = credential_sync_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(target) = configured_claude_credentials_path() else {
+        return Ok(false);
+    };
+    let Some(source) = canonical_claude_credentials_path() else {
+        return Ok(false);
+    };
+    if same_path(&source, &target) || !source.exists() {
+        return Ok(false);
+    }
+    if !credentials_need_sync(&source, &target, force)? {
+        return Ok(false);
+    }
+    atomic_copy_credentials(&source, &target)?;
+    Ok(true)
+}
+
+pub async fn sync_claude_oauth_credentials_if_needed_async(force: bool) -> Result<bool, String> {
+    tokio::task::spawn_blocking(move || sync_claude_oauth_credentials_if_needed(force))
+        .await
+        .map_err(|e| format!("join Claude credentials sync task: {}", e))?
+}
+
 // ── Commands ─────────────────────────────────────────────────────────
 
 /// Spawn a persistent Claude Code process with stream-json on stdin/stdout.
@@ -118,6 +367,19 @@ pub fn spawn_claude_code(
         .arg("--dangerously-skip-permissions")
         .arg("--model").arg(CLAUDE_MODEL)
         .arg("--effort").arg(CLAUDE_EFFORT);
+
+    // Inject LLM proxy env vars if configured. In direct OAuth mode, refresh
+    // AutoSam's isolated Claude credentials from the canonical Claude Code
+    // login before spawning so the worker cannot drift into stale 401s.
+    let proxy = LlmProxyConfig::load(&app);
+    if proxy.is_none() {
+        match sync_claude_oauth_credentials_if_needed(false) {
+            Ok(true) => log::info!("[claude-code] refreshed worker Claude OAuth credentials before spawn"),
+            Ok(false) => {}
+            Err(e) => log::warn!("[claude-code] could not refresh worker Claude OAuth credentials: {}", e),
+        }
+    }
+    inject_proxy_env(&mut command, &proxy);
 
     // Add extra args from the frontend (e.g. --resume). Note: --model is already
     // pinned above to CLAUDE_MODEL; frontend args take precedence if they set it again.
@@ -238,7 +500,11 @@ pub fn spawn_claude_code(
 
 /// Run a one-shot Claude Code prompt and return the text output.
 #[tauri::command]
-pub fn claude_code_prompt(prompt: String, cwd: String) -> Result<String, String> {
+pub fn claude_code_prompt(
+    prompt: String,
+    cwd: String,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
     let (claude_exe, prefix_args) = find_claude_command();
     let mut command = cmd(&claude_exe);
     for arg in &prefix_args {
@@ -252,6 +518,18 @@ pub fn claude_code_prompt(prompt: String, cwd: String) -> Result<String, String>
         .arg("--no-input")
         .arg("--model").arg(CLAUDE_MODEL)
         .arg("--effort").arg(CLAUDE_EFFORT);
+
+    // Inject LLM proxy env vars if configured. In direct OAuth mode, refresh
+    // AutoSam's isolated Claude credentials first.
+    let proxy = LlmProxyConfig::load(&app);
+    if proxy.is_none() {
+        match sync_claude_oauth_credentials_if_needed(false) {
+            Ok(true) => log::info!("[claude-code] refreshed worker Claude OAuth credentials before prompt"),
+            Ok(false) => {}
+            Err(e) => log::warn!("[claude-code] could not refresh worker Claude OAuth credentials: {}", e),
+        }
+    }
+    inject_proxy_env(&mut command, &proxy);
 
     let cwd_path = std::path::PathBuf::from(&cwd);
     if cwd_path.exists() && cwd_path.is_dir() {
@@ -317,4 +595,28 @@ pub fn write_claude_code(
         .flush()
         .map_err(|e| format!("stdin flush failed: {}", e))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn direct_oauth_mode_removes_stale_proxy_and_api_key_env() {
+        let mut command = std::process::Command::new("true");
+        for key in DIRECT_OAUTH_ENV_BLOCKERS {
+            command.env(key, "stale");
+        }
+
+        inject_proxy_env(&mut command, &None);
+
+        for key in DIRECT_OAUTH_ENV_BLOCKERS {
+            let value = command
+                .get_envs()
+                .find(|(name, _)| *name == OsStr::new(key))
+                .map(|(_, value)| value);
+            assert_eq!(value, Some(None), "{} should be explicitly removed", key);
+        }
+    }
 }

@@ -52,6 +52,33 @@ pub async fn check_gh_auth() -> Result<String, String> {
     Ok(combined.trim().to_string())
 }
 
+/// Check if the LLM proxy (LiteLLM) is reachable and healthy.
+/// Returns the proxy URL on success, or an error message.
+#[tauri::command]
+pub async fn check_llm_proxy(proxy_url: String) -> Result<String, String> {
+    if proxy_url.trim().is_empty() {
+        return Err("No proxy URL configured".to_string());
+    }
+
+    let health_url = format!("{}/health", proxy_url.trim().trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+
+    let resp = client
+        .get(&health_url)
+        .send()
+        .await
+        .map_err(|e| format!("Proxy at {} unreachable: {}", proxy_url, e))?;
+
+    if resp.status().is_success() {
+        Ok(format!("Proxy healthy at {}", proxy_url))
+    } else {
+        Err(format!("Proxy returned status {}", resp.status()))
+    }
+}
+
 /// Check if Doppler CLI is available.
 #[tauri::command]
 pub async fn check_doppler() -> Result<String, String> {

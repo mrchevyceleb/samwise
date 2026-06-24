@@ -86,6 +86,15 @@ export interface AppSettings {
   // blockers, commit, and push. Max 3 cycles per card. Skipped when Codex
   // emits REQUIRES_HUMAN: yes (product/architecture calls).
   autoFixFromFixesNeededEnabled: boolean;
+  // LLM proxy configuration (LiteLLM proxy that routes Claude Code
+  // through Fireworks GLM instead of Anthropic directly)
+  llmProxyEnabled: boolean;
+  llmProxyBaseUrl: string;
+  llmProxyApiKey: string;
+  llmProxyBackend: 'fireworks-glm-5.1' | 'fireworks-glm-5.2' | 'openrouter-glm-5.2' | 'custom';
+  llmVisionAdapterEnabled: boolean;
+  llmVisionAdapterUrl: string;
+  llmVisionAdapterModel: string;
 }
 
 export interface MCPServerConfig {
@@ -191,6 +200,13 @@ export const DEFAULT_SETTINGS: AppSettings = {
   autoMergeMaxDiffLines: 400,
   autoPrReviewEnabled: true,
   autoFixFromFixesNeededEnabled: true,
+  llmProxyEnabled: false,
+  llmProxyBaseUrl: 'http://127.0.0.1:9876',
+  llmProxyApiKey: '',
+  llmProxyBackend: 'fireworks-glm-5.1',
+  llmVisionAdapterEnabled: true,
+  llmVisionAdapterUrl: 'http://localhost:1234/v1',
+  llmVisionAdapterModel: 'qwen3-vl-4b-instruct',
 };
 
 // ---- Svelte 5 Runes State ----

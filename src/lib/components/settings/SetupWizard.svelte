@@ -65,18 +65,33 @@
     }
   }
 
-  // Step 3: Check Claude Code CLI
+  // Step 3: Check Claude Code CLI (and LLM proxy if configured)
   async function checkClaude() {
     claudeStatus = 'checking';
     claudeMessage = 'Checking Claude Code CLI...';
 
     const version = await safeInvoke<string>('check_claude_code');
-    if (version) {
-      claudeStatus = 'success';
-      claudeMessage = `Found: ${version}`;
-    } else {
+    if (!version) {
       claudeStatus = 'error';
       claudeMessage = 'Claude Code CLI not found. Install via npm: npm install -g @anthropic-ai/claude-code';
+      return;
+    }
+
+    // If LLM proxy is configured in settings, also check it
+    const settings = JSON.parse(localStorage.getItem('autosam-settings') || '{}');
+    if (settings.llmProxyEnabled && settings.llmProxyBaseUrl) {
+      claudeMessage = `Found: ${version}. Checking proxy...`;
+      try {
+        const proxyResult = await safeInvoke<string>('check_llm_proxy', { proxyUrl: settings.llmProxyBaseUrl });
+        claudeStatus = 'success';
+        claudeMessage = `CLI: ${version}. Proxy: ${proxyResult}`;
+      } catch (e: any) {
+        claudeStatus = 'error';
+        claudeMessage = `CLI found but proxy unreachable: ${e?.toString?.() || 'unknown error'}`;
+      }
+    } else {
+      claudeStatus = 'success';
+      claudeMessage = `Found: ${version}`;
     }
   }
 
