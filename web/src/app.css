@@ -49,3 +49,15 @@ select option:disabled {
    are unaffected. Revert this block to restore the motion on GPU-capable hosts. */
 .drift { animation: none; }
 .bob   { animation: none; }
+
+/* The Spark (Moria) has no working browser GPU path on its NVIDIA GB10, so
+   Firefox/WebKit software-render. On this box ANY perpetual animation forces a
+   full-frame re-render every frame at a pathological per-frame cost, so even a
+   single looping status pulse pins a CPU core (measured: idle board ~90% CPU
+   with looping animations, ~28% with none). Cap every animation to one cycle:
+   one-shot entrance animations are unaffected (already a single iteration),
+   while infinite ones (status pulses, spinners) run once then stop so the page
+   can actually idle. This mirrors the Tauri app's perf-lite cap. */
+*, *::before, *::after {
+  animation-iteration-count: 1 !important;
+}
