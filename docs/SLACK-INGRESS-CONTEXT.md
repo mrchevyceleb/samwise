@@ -20,11 +20,17 @@ Slack mention and DM events are normalized in `ASSISTANT-HUB` and inserted into 
 - `conversation_id = a stable UUID derived from the Slack channel/thread, or from the DM channel/user`
 - `role = user`
 - `needs_response = true`
-- `attachments = [{ source: "slack", route_id, slack: { channel, thread_ts, user, ... } }]`
+- `attachments` includes Slack route metadata plus any materialized Slack files:
+  - `{ source: "slack", route_id, slack: { channel, thread_ts, user, ... } }`
+  - `{ source: "slack_file", url, name, mime_type, size?, slack_file_id?, message_ts? }`
 
 AutoSam's worker polls `ae_messages` for `needs_response = true` in `check_remote_chat_messages()`, routes the text through Sam's normal chat/task prompt, and writes Sam's response back to the same `conversation_id`.
 
 When the inbound message carries valid Slack routing metadata, AutoSam copies sanitized route metadata onto its agent response. `ASSISTANT-HUB` polls the same conversation for the matching agent response by `route_id` and posts it back into the originating Slack thread.
+
+Slack files are handled differently from reply route metadata. `ASSISTANT-HUB` downloads files from Slack using `SLACK_SAMWISE_BOT_TOKEN`, uploads them into the public `task-attachments` Supabase Storage bucket, and puts only the public storage URL plus safe file metadata into `ae_messages.attachments`. AutoSam copies those `slack_file` entries onto any task created from that Slack turn, so the worker's existing `task.attachments[]` materialization path can download images/screenshots/PDFs before running Claude Code.
+
+For threaded requests, `ASSISTANT-HUB` collects files from both the triggering mention/DM and earlier messages in the Slack thread before the mention. This supports the common flow where someone posts a screenshot, then replies `@Samwise can you fix this?`.
 
 ## Project Matching
 
@@ -66,4 +72,5 @@ Required `ASSISTANT-HUB` env:
 Required AutoSam behavior:
 
 - Remote chat responses must preserve Slack metadata from inbound `ae_messages.attachments`.
+- Remote chat task creation must preserve sanitized `slack_file` attachments on created `ae_tasks.attachments`.
 - Remote chat processing must not be limited to the default desktop conversation UUID; Slack uses separate conversation IDs per channel/thread/DM route.

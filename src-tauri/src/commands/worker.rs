@@ -7709,6 +7709,7 @@ async fn check_remote_chat_messages(config: &SupabaseConfig, machine_name: &str)
         log::info!("[worker] Remote chat message received: {}", preview);
 
         let reply_attachments = remote_reply_attachments(msg, msg_id);
+        let task_attachments = remote_task_attachments(msg);
         process_remote_chat_message(
             config,
             msg_id,
@@ -7716,6 +7717,7 @@ async fn check_remote_chat_messages(config: &SupabaseConfig, machine_name: &str)
             content,
             machine_name,
             reply_attachments,
+            task_attachments,
         )
         .await;
     }
@@ -7783,6 +7785,51 @@ fn remote_reply_attachments(msg: &serde_json::Value, message_id: &str) -> Option
         None
     } else {
         Some(serde_json::Value::Array(routes))
+    }
+}
+
+fn remote_task_attachments(msg: &serde_json::Value) -> Option<serde_json::Value> {
+    let arr = msg.get("attachments")?.as_array()?;
+    let mut files = Vec::new();
+
+    for item in arr {
+        if item.get("source").and_then(|v| v.as_str()) != Some("slack_file") {
+            continue;
+        }
+        let Some(url) = non_empty_str(item, "url") else {
+            continue;
+        };
+        if !(url.starts_with("https://") || url.starts_with("http://127.0.0.1:")) {
+            continue;
+        }
+
+        let name = non_empty_str(item, "name").unwrap_or_else(|| "slack-file".to_string());
+        let mime_type = non_empty_str(item, "mime_type")
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        let mut file = serde_json::json!({
+            "source": "slack_file",
+            "url": url,
+            "name": name,
+            "mime_type": mime_type,
+        });
+
+        if let Some(size) = item.get("size").and_then(|v| v.as_u64()) {
+            file["size"] = serde_json::Value::Number(size.into());
+        }
+        if let Some(id) = non_empty_str(item, "slack_file_id") {
+            file["slack_file_id"] = serde_json::Value::String(id);
+        }
+        if let Some(ts) = non_empty_str(item, "message_ts") {
+            file["message_ts"] = serde_json::Value::String(ts);
+        }
+
+        files.push(file);
+    }
+
+    if files.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Array(files))
     }
 }
 
@@ -7872,6 +7919,7 @@ async fn process_remote_chat_message(
     user_message: &str,
     machine_name: &str,
     reply_attachments: Option<serde_json::Value>,
+    task_attachments: Option<serde_json::Value>,
 ) {
     use super::chat;
 
@@ -7977,6 +8025,18 @@ async fn process_remote_chat_message(
         let mut enriched = req.clone();
         if from_slack {
             enriched["source"] = serde_json::Value::String("slack".to_string());
+        }
+        if let Some(files) = &task_attachments {
+            let mut merged = Vec::new();
+            if let Some(existing) = enriched.get("attachments").and_then(|v| v.as_array()) {
+                merged.extend(existing.iter().cloned());
+            }
+            if let Some(inbound) = files.as_array() {
+                merged.extend(inbound.iter().cloned());
+            }
+            if !merged.is_empty() {
+                enriched["attachments"] = serde_json::Value::Array(merged);
+            }
         }
         if let Some(project) = &slack_routed_project {
             enriched["project"] = serde_json::Value::String(project.clone());
