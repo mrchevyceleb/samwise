@@ -48,7 +48,7 @@ Slack supports explicit project hashtags as the most reliable routing convention
 
 ## Slack Follow-Ups
 
-Slack route metadata also carries a signed task callback route when `SAMWISE_SLACK_CALLBACK_SECRET` or `AUTOSAM_TASK_WEBHOOK_SECRET` is available in `ASSISTANT-HUB`:
+Slack route metadata also carries a signed task callback route when a shared callback secret is available in `ASSISTANT-HUB`. Resolution order is `SAMWISE_SLACK_CALLBACK_SECRET`, `SAM_CALLBACK_SECRET`, `AUTOSAM_TASK_WEBHOOK_SECRET`, then `TASK_WEBHOOK_SECRET`.
 
 - `callback_url = https://matt-assistant-production.up.railway.app/webhook/slack/samwise-task-callback?...`
 - `callback_secret = <shared secret>`
@@ -94,7 +94,7 @@ Required `ASSISTANT-HUB` env:
 - `SLACK_SIGNING_SECRET`
 - `SLACK_SAMWISE_BOT_TOKEN`
 - `SAMWISE_SERVICE_ROLE_KEY`
-- `SAMWISE_SLACK_CALLBACK_SECRET` optional; falls back to `AUTOSAM_TASK_WEBHOOK_SECRET`
+- `SAMWISE_SLACK_CALLBACK_SECRET` optional; falls back to existing `SAM_CALLBACK_SECRET`, `AUTOSAM_TASK_WEBHOOK_SECRET`, then `TASK_WEBHOOK_SECRET`
 - `AUTOSAM_TASK_WEBHOOK_SECRET` remains used by the `/samwise` slash command/direct task path.
 
 Required AutoSam behavior:
