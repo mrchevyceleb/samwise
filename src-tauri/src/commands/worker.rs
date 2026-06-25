@@ -7312,6 +7312,9 @@ fn title_from_prompt(prompt: &str, fallback: &str) -> String {
 fn infer_telegram_task_type(prompt: &str) -> &'static str {
     let lower = prompt.to_lowercase();
     let trimmed = lower.trim_start();
+    if let Some(tagged) = task_type_from_hashtags(prompt) {
+        return tagged;
+    }
     // Explicit QA intent only (conservative so normal coding tasks that merely
     // mention "test" aren't misrouted).
     if trimmed.starts_with("qa ")
@@ -7337,6 +7340,95 @@ fn infer_telegram_task_type(prompt: &str) -> &'static str {
         "research"
     } else {
         "code"
+    }
+}
+
+fn task_type_from_hashtags(prompt: &str) -> Option<&'static str> {
+    static TAG_RE: OnceLock<Regex> = OnceLock::new();
+    let re = TAG_RE.get_or_init(|| Regex::new(r"(?i)(?:^|\s)#([a-z0-9][\w-]*)").expect("valid hashtag regex"));
+    for cap in re.captures_iter(prompt) {
+        let tag = cap
+            .get(1)
+            .map(|m| m.as_str().to_ascii_lowercase())
+            .unwrap_or_default();
+        match tag.as_str() {
+            "qa" | "qa-verify" | "qaverify" => return Some("qa-verify"),
+            "research" => return Some("research"),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn normalize_task_type(task_type: &str) -> &'static str {
+    match task_type.trim().to_ascii_lowercase().as_str() {
+        "qa" | "qa-verify" | "qaverify" => "qa-verify",
+        "research" => "research",
+        _ => "code",
+    }
+}
+
+fn qa_environment_from_message(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("#prod")
+        || lower.contains("#production")
+        || lower.contains("production")
+        || lower.contains("prod ")
+    {
+        "production"
+    } else {
+        "staging"
+    }
+}
+
+fn project_row<'a>(projects: &'a serde_json::Value, project_name: &str) -> Option<&'a serde_json::Value> {
+    projects.as_array().and_then(|arr| {
+        arr.iter().find(|p| {
+            p.get("name").and_then(|v| v.as_str()) == Some(project_name)
+        })
+    })
+}
+
+fn apply_qa_verify_context(
+    task: &mut serde_json::Value,
+    projects: &serde_json::Value,
+    project_name: &str,
+    message: &str,
+) {
+    if task.get("task_type").and_then(|v| v.as_str()) != Some("qa-verify") {
+        return;
+    }
+    let env = qa_environment_from_message(message);
+    let mut context = task
+        .get("context")
+        .cloned()
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::json!({}));
+    context["qa_environment"] = serde_json::Value::String(env.to_string());
+    task["context"] = context;
+
+    if task
+        .get("preview_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .is_empty()
+    {
+        if let Some(row) = project_row(projects, project_name) {
+            let pick = |k: &str| {
+                row.get(k)
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+            };
+            let url = if env == "production" {
+                pick("production_url").or_else(|| pick("preview_url"))
+            } else {
+                pick("preview_url")
+            };
+            if let Some(u) = url {
+                task["preview_url"] = serde_json::Value::String(u);
+            }
+        }
     }
 }
 
@@ -7396,21 +7488,98 @@ fn telegram_project_prefix_help(projects: &serde_json::Value) -> String {
     }
 }
 
-fn telegram_project_no_match_message(prefix: &str, projects: &serde_json::Value) -> String {
-    let suggestions = super::chat::fuzzy_project_suggestions(prefix, projects, 5);
-    if suggestions.is_empty() {
-        format!("I couldn't match `{}` to a registered project. Use `project: prompt` with the project name from Settings.", prefix)
-    } else {
-        format!(
-            "I couldn't confidently match `{}`. Closest projects:\n{}",
-            prefix,
-            suggestions
-                .into_iter()
-                .map(|name| format!("- {}", name))
-                .collect::<Vec<_>>()
-                .join("\n")
-        )
+fn normalize_route_token(token: &str) -> String {
+    token
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect()
+}
+
+fn project_alias(token: &str) -> Option<&'static str> {
+    match normalize_route_token(token).as_str() {
+        "operly" | "ope" | "opelry" => Some("operly"),
+        "studio" | "rlink" | "rlinkweb" | "rlinkstudio" | "rlinkcore" | "rlinkrebuild"
+        | "rebuild" | "web" | "core" => Some("r-link-studio-rebuild"),
+        "banana" | "bananacode" | "bc" => Some("banana-code"),
+        "cs" | "csapp" => Some("cs-app"),
+        "pixa" | "px" => Some("pixa-app"),
+        "fiscal" | "fiscalpilot" | "fp" => Some("FiscalPilot"),
+        "wecare" | "wecaredash" | "wc" => Some("wecare-dash"),
+        "mj" | "mjsite" | "mattjohnston" | "mattjohnstonio" => Some("MJ-site"),
+        _ => None,
     }
+}
+
+fn extract_project_hashtag_route(
+    message: &str,
+    projects: &serde_json::Value,
+) -> Option<super::chat::ProjectPrefixMatch> {
+    static TAG_RE: OnceLock<Regex> = OnceLock::new();
+    let re = TAG_RE.get_or_init(|| Regex::new(r"(?i)(?:^|\s)#([a-z0-9][\w-]*)").expect("valid hashtag regex"));
+    for cap in re.captures_iter(message) {
+        let token = cap.get(1).map(|m| m.as_str()).unwrap_or_default();
+        let Some(project) = project_alias(token) else {
+            continue;
+        };
+        if project_row(projects, project).is_some() {
+            return Some(super::chat::ProjectPrefixMatch {
+                prefix: format!("#{}", token),
+                prompt: message.trim().to_string(),
+                project: project.to_string(),
+                score: 100,
+            });
+        }
+    }
+    None
+}
+
+fn match_telegram_project_route(
+    message: &str,
+    projects: &serde_json::Value,
+) -> Option<super::chat::ProjectPrefixMatch> {
+    super::chat::match_project_prefix(message, projects)
+        .or_else(|| extract_project_hashtag_route(message, projects))
+}
+
+fn first_projectish_hashtag(message: &str) -> Option<String> {
+    static TAG_RE: OnceLock<Regex> = OnceLock::new();
+    let re = TAG_RE.get_or_init(|| Regex::new(r"(?i)(?:^|\s)#([a-z0-9][\w-]*)").expect("valid hashtag regex"));
+    for cap in re.captures_iter(message) {
+        let token = cap.get(1).map(|m| m.as_str()).unwrap_or_default();
+        if task_type_from_hashtags(&format!("#{}", token)).is_some()
+            || matches!(
+                normalize_route_token(token).as_str(),
+                "review" | "prreview" | "pr"
+            )
+        {
+            continue;
+        }
+        return Some(token.to_string());
+    }
+    None
+}
+
+fn telegram_missing_project_message(projects: &serde_json::Value, message: &str) -> String {
+    let mut msg = telegram_project_prefix_help(projects);
+    msg.push_str("\n\nYou can also use project hashtags like `#studio`, `#operly`, or `#banana-code`.");
+    let candidate = super::chat::split_project_prefix(message)
+        .map(|p| p.prefix)
+        .or_else(|| first_projectish_hashtag(message));
+    if let Some(candidate) = candidate {
+        let suggestions = super::chat::fuzzy_project_suggestions(&candidate, projects, 5);
+        if !suggestions.is_empty() {
+            msg.push_str("\n\nClosest project matches:\n");
+            msg.push_str(
+                &suggestions
+                    .into_iter()
+                    .map(|name| format!("- {}", name))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+        }
+    }
+    msg
 }
 
 /// Check for new Telegram messages and process them through Sam's chat logic.
@@ -7553,16 +7722,8 @@ async fn check_telegram_messages(
             .await
             .ok()
             .unwrap_or(serde_json::json!([]));
-        let Some(prefix) = super::chat::split_project_prefix(&body_text) else {
-            send_telegram_plain(config, &telegram_project_prefix_help(&projects)).await;
-            return;
-        };
-        let Some(project_match) = super::chat::match_project_prefix(&body_text, &projects) else {
-            send_telegram_plain(
-                config,
-                &telegram_project_no_match_message(&prefix.prefix, &projects),
-            )
-            .await;
+        let Some(project_match) = match_telegram_project_route(&body_text, &projects) else {
+            send_telegram_plain(config, &telegram_missing_project_message(&projects, &body_text)).await;
             return;
         };
 
@@ -7599,12 +7760,13 @@ async fn check_telegram_messages(
         );
         let description = project_match.prompt.clone();
 
+        let task_type = infer_telegram_task_type(&project_match.prompt);
         let mut task_row = serde_json::json!({
             "title": title,
             "description": description,
             "status": "queued",
             "priority": "medium",
-            "task_type": "code",
+            "task_type": task_type,
             "source": "telegram",
             "attachments": stored,
             "project": project_match.project.clone(),
@@ -7614,6 +7776,7 @@ async fn check_telegram_messages(
                 "original_telegram_message": body_text,
             },
         });
+        apply_qa_verify_context(&mut task_row, &projects, &project_match.project, &body_text);
         backfill_task_project_fields(&mut task_row, &projects, &project_match.project);
 
         match supabase::create_task(config, &task_row).await {
@@ -7626,7 +7789,7 @@ async fn check_telegram_messages(
                     config,
                     &format!(
                         "Got it. Matched `{}` to {} and queued a task with {} attachment{}.",
-                        prefix.prefix,
+                        project_match.prefix,
                         project_match.project,
                         stored.len(),
                         if stored.len() == 1 { "" } else { "s" }
@@ -7919,6 +8082,23 @@ fn slack_workflow(reply_attachments: &Option<serde_json::Value>) -> Option<Strin
             .map(str::trim)
             .filter(|s| !s.is_empty())?;
         return Some(workflow.to_string());
+    }
+    None
+}
+
+fn slack_task_type(reply_attachments: &Option<serde_json::Value>) -> Option<String> {
+    let arr = reply_attachments.as_ref()?.as_array()?;
+    for item in arr {
+        if item.get("source").and_then(|v| v.as_str()) != Some("slack") {
+            continue;
+        }
+        let task_type = item
+            .get("slack")
+            .and_then(|s| s.get("task_type"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        return Some(normalize_task_type(task_type).to_string());
     }
     None
 }
@@ -8301,6 +8481,7 @@ async fn process_remote_chat_message(
     });
     let from_slack = has_slack_route(&reply_attachments);
     let workflow = slack_workflow(&reply_attachments);
+    let routed_task_type = slack_task_type(&reply_attachments);
 
     if from_slack && workflow.as_deref() == Some("pr_review") {
         let response_text = handle_slack_pr_review_workflow(
@@ -8329,11 +8510,19 @@ async fn process_remote_chat_message(
 
     // 2. Build prompt
     let effective_message = if let Some(project) = &slack_routed_project {
-        format!(
+        let mut msg = format!(
             "{}\n\n[System: Slack provided an explicit project route: {}. Use this exact project for any tasks you create.]",
             user_message,
             project
-        )
+        );
+        if let Some(task_type) = &routed_task_type {
+            if task_type == "qa-verify" {
+                msg.push_str("\n[System: Slack marked this as QA verification. Create a qa-verify task, not a normal coding task.]");
+            } else if task_type == "research" {
+                msg.push_str("\n[System: Slack marked this as research. Create a research task unless the user explicitly asks for code changes.]");
+            }
+        }
+        msg
     } else if !mentioned_projects.is_empty() {
         format!(
             "{}\n\n[System: Matt explicitly tagged @{}. Use this project for any tasks you create.]",
@@ -8369,13 +8558,32 @@ async fn process_remote_chat_message(
     };
 
     // 4. Parse for task creation
-    let (clean_text, task_requests) = chat::parse_chat_response(&raw_response);
+    let (clean_text, mut task_requests) = chat::parse_chat_response(&raw_response);
+    if task_requests.is_empty()
+        && from_slack
+        && matches!(routed_task_type.as_deref(), Some("qa-verify" | "research"))
+        && slack_routed_project.is_some()
+    {
+        let task_type = routed_task_type.as_deref().unwrap_or("code");
+        task_requests.push(serde_json::json!({
+            "title": title_from_prompt(user_message, "Slack task"),
+            "description": user_message,
+            "priority": "medium",
+            "task_type": task_type,
+            "source": "slack",
+        }));
+    }
 
     // 5. Create tasks with @ mention handling
     for req in &task_requests {
         let mut enriched = req.clone();
         if from_slack {
             enriched["source"] = serde_json::Value::String("slack".to_string());
+        }
+        if let Some(task_type) = &routed_task_type {
+            if task_type == "qa-verify" || task_type == "research" {
+                enriched["task_type"] = serde_json::Value::String(task_type.clone());
+            }
         }
         if let Some(callback) = &slack_callback {
             if let Some(cb_url) = callback.get("callback_url").and_then(|v| v.as_str()) {
@@ -8484,6 +8692,9 @@ async fn process_remote_chat_message(
                 }
             }
         }
+        if !project_name.is_empty() {
+            apply_qa_verify_context(&mut enriched, &projects_all, &project_name, user_message);
+        }
         if let Err(e) = supabase::create_task(config, &enriched).await {
             log::warn!("[worker] Failed to create task from remote chat: {}", e);
         }
@@ -8562,27 +8773,10 @@ async fn process_telegram_message(config: &SupabaseConfig, user_message: &str, m
         .await
         .ok()
         .unwrap_or(serde_json::json!([]));
-    let prefix = match chat::split_project_prefix(user_message) {
-        Some(prefix) => prefix,
-        None => {
-            let response_text = telegram_project_prefix_help(&projects_all);
-            let _ = supabase::send_message(
-                config,
-                &serde_json::json!({
-                    "role": "agent",
-                    "content": &response_text,
-                    "conversation_id": supabase::DEFAULT_CONVERSATION_ID,
-                }),
-            )
-            .await;
-            send_telegram_plain(config, &response_text).await;
-            return;
-        }
-    };
-    let routed_project = match chat::match_project_prefix(user_message, &projects_all) {
+    let routed_project = match match_telegram_project_route(user_message, &projects_all) {
         Some(matched) => matched,
         None => {
-            let response_text = telegram_project_no_match_message(&prefix.prefix, &projects_all);
+            let response_text = telegram_missing_project_message(&projects_all, user_message);
             let _ = supabase::send_message(
                 config,
                 &serde_json::json!({
@@ -8776,48 +8970,8 @@ async fn process_telegram_message(config: &SupabaseConfig, user_message: &str, m
             serde_json::Value::Number(serde_json::Number::from(routed_project.score));
         context["original_telegram_message"] = serde_json::Value::String(user_message.to_string());
 
-        // qa-verify from Telegram: stamp the environment (mention "prod"/
-        // "production" -> production, else staging) and pre-resolve the QA
-        // target from the project so backfill doesn't pin the wrong one.
-        if enriched.get("task_type").and_then(|v| v.as_str()) == Some("qa-verify") {
-            let msg_lower = user_message.to_lowercase();
-            let want_production = msg_lower.contains("production") || msg_lower.contains("prod ");
-            let env = if want_production {
-                "production"
-            } else {
-                "staging"
-            };
-            context["qa_environment"] = serde_json::Value::String(env.to_string());
-            if enriched
-                .get("preview_url")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .is_empty()
-            {
-                if let Some(row) = projects_all.as_array().and_then(|arr| {
-                    arr.iter().find(|p| {
-                        p.get("name").and_then(|v| v.as_str())
-                            == Some(routed_project.project.as_str())
-                    })
-                }) {
-                    let pick = |k: &str| {
-                        row.get(k)
-                            .and_then(|v| v.as_str())
-                            .filter(|s| !s.is_empty())
-                            .map(|s| s.to_string())
-                    };
-                    let url = if want_production {
-                        pick("production_url").or_else(|| pick("preview_url"))
-                    } else {
-                        pick("preview_url")
-                    };
-                    if let Some(u) = url {
-                        enriched["preview_url"] = serde_json::Value::String(u);
-                    }
-                }
-            }
-        }
         enriched["context"] = context;
+        apply_qa_verify_context(&mut enriched, &projects_all, &routed_project.project, user_message);
 
         backfill_task_project_fields(&mut enriched, &projects_all, &routed_project.project);
 

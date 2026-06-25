@@ -66,8 +66,20 @@ AutoSam copies these fields onto Slack-created `ae_tasks`. The existing `notify_
 Slack supports workflow hashtags separately from project hashtags:
 
 - `#review` / `#pr-review` -> PR review workflow
+- `#research` -> research task (`task_type = research`)
+- `#qa` / `#qa-verify` -> browser QA task (`task_type = qa-verify`)
 
 When this tag is present, `ASSISTANT-HUB` writes `slack.workflow = "pr_review"` into the route metadata. AutoSam handles that before calling the chat model: it extracts GitHub PR links from the Slack request and thread context, then creates or revives Review-column cards with `pr_url`, `repo_path`, `project`, and `context.pr_review_required = true`. If no PR URL is found, Sam replies in Slack asking for the link. If a card already exists for a PR, Sam reports that instead of duplicating it.
+
+For `#research` and `#qa`, `ASSISTANT-HUB` writes `slack.task_type` into route metadata. AutoSam treats that as authoritative when creating cards, so the model cannot accidentally turn a QA verification request into a normal coding task. QA cards also get `context.qa_environment` (`#prod` / `#production` -> production, otherwise staging) and a project preview URL when available.
+
+Telegram supports the same project/task mode hashtags for Matt's configured chat:
+
+- `#studio #qa verify PR 841 on staging`
+- `#operly #research why archived email reappears on mobile`
+- `operly: #qa verify archive sync on staging`
+
+Telegram images/documents preserve attachments and honor the same `#qa` / `#research` task type routing.
 
 Recommended team syntax:
 
@@ -103,4 +115,5 @@ Required AutoSam behavior:
 - Remote chat task creation must preserve sanitized `slack_file` attachments on created `ae_tasks.attachments`.
 - Remote chat task creation must preserve Slack `callback_url` / `callback_secret` on created `ae_tasks` so task lifecycle callbacks can post back to Slack.
 - `slack.workflow = "pr_review"` must trigger deterministic PR review card creation/revival from PR links in the Slack turn, not a generic coding task.
+- `slack.task_type = "research"` or `"qa-verify"` must be enforced on created cards. `qa-verify` cards must be stamped with QA environment and preview URL when the project registry has one.
 - Remote chat processing must not be limited to the default desktop conversation UUID; Slack uses separate conversation IDs per channel/thread/DM route.
