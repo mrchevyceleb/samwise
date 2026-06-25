@@ -46,6 +46,21 @@ Slack supports explicit project hashtags as the most reliable routing convention
 
 `ASSISTANT-HUB` resolves a single recognized hashtag before separator parsing or channel-name inference and writes the canonical project into Slack route metadata. AutoSam treats that route as authoritative and forces it onto tasks created from that Slack turn, which avoids cards getting stuck in project confirmation when the team includes a hashtag.
 
+## Slack Follow-Ups
+
+Slack route metadata also carries a signed task callback route when `SAMWISE_SLACK_CALLBACK_SECRET` or `AUTOSAM_TASK_WEBHOOK_SECRET` is available in `ASSISTANT-HUB`:
+
+- `callback_url = https://matt-assistant-production.up.railway.app/webhook/slack/samwise-task-callback?...`
+- `callback_secret = <shared secret>`
+
+AutoSam copies these fields onto Slack-created `ae_tasks`. The existing `notify_callback()` path then fires on task status transitions. `ASSISTANT-HUB` verifies `X-Samwise-Signature` and posts important lifecycle updates back into the original Slack thread:
+
+- PR created / Review status
+- Review approved
+- Fixes needed
+- Done
+- Failed
+
 ## Workflow Tags
 
 Slack supports workflow hashtags separately from project hashtags:
@@ -79,11 +94,13 @@ Required `ASSISTANT-HUB` env:
 - `SLACK_SIGNING_SECRET`
 - `SLACK_SAMWISE_BOT_TOKEN`
 - `SAMWISE_SERVICE_ROLE_KEY`
+- `SAMWISE_SLACK_CALLBACK_SECRET` optional; falls back to `AUTOSAM_TASK_WEBHOOK_SECRET`
 - `AUTOSAM_TASK_WEBHOOK_SECRET` remains used by the `/samwise` slash command/direct task path.
 
 Required AutoSam behavior:
 
 - Remote chat responses must preserve Slack metadata from inbound `ae_messages.attachments`.
 - Remote chat task creation must preserve sanitized `slack_file` attachments on created `ae_tasks.attachments`.
+- Remote chat task creation must preserve Slack `callback_url` / `callback_secret` on created `ae_tasks` so task lifecycle callbacks can post back to Slack.
 - `slack.workflow = "pr_review"` must trigger deterministic PR review card creation/revival from PR links in the Slack turn, not a generic coding task.
 - Remote chat processing must not be limited to the default desktop conversation UUID; Slack uses separate conversation IDs per channel/thread/DM route.

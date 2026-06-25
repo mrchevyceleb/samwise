@@ -7711,6 +7711,7 @@ async fn check_remote_chat_messages(config: &SupabaseConfig, machine_name: &str)
 
         let reply_attachments = remote_reply_attachments(msg, msg_id);
         let task_attachments = remote_task_attachments(msg);
+        let slack_callback = remote_slack_callback(msg);
         process_remote_chat_message(
             config,
             msg_id,
@@ -7719,6 +7720,7 @@ async fn check_remote_chat_messages(config: &SupabaseConfig, machine_name: &str)
             machine_name,
             reply_attachments,
             task_attachments,
+            slack_callback,
         )
         .await;
     }
@@ -7836,6 +7838,46 @@ fn remote_task_attachments(msg: &serde_json::Value) -> Option<serde_json::Value>
     }
 }
 
+fn remote_slack_callback(msg: &serde_json::Value) -> Option<serde_json::Value> {
+    let arr = msg.get("attachments")?.as_array()?;
+    for item in arr {
+        if item.get("source").and_then(|v| v.as_str()) != Some("slack") {
+            continue;
+        }
+        let callback_url = non_empty_str(item, "callback_url")?;
+        let callback_secret = non_empty_str(item, "callback_secret")?;
+        if !(callback_url.starts_with("https://") || callback_url.starts_with("http://127.0.0.1:")) {
+            continue;
+        }
+        let slack = item.get("slack")?;
+        let channel = non_empty_str(slack, "channel")?;
+        let thread_ts = non_empty_str(slack, "thread_ts")?;
+        let route_id = non_empty_str(item, "route_id").unwrap_or_default();
+        let user = non_empty_str(slack, "user").unwrap_or_default();
+        let event_ts = non_empty_str(slack, "event_ts").unwrap_or_default();
+        let channel_name = slack
+            .get("channel_name")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        return Some(serde_json::json!({
+            "callback_url": callback_url,
+            "callback_secret": callback_secret,
+            "slack_route": {
+                "route_id": route_id,
+                "channel": channel,
+                "channel_name": channel_name,
+                "thread_ts": thread_ts,
+                "event_ts": event_ts,
+                "user": user,
+            }
+        }));
+    }
+    None
+}
+
 fn slack_routed_project(reply_attachments: &Option<serde_json::Value>) -> Option<String> {
     let arr = reply_attachments.as_ref()?.as_array()?;
     for item in arr {
@@ -7932,6 +7974,7 @@ async fn handle_slack_pr_review_workflow(
     projects_all: &serde_json::Value,
     routed_project: Option<&str>,
     task_attachments: &Option<serde_json::Value>,
+    slack_callback: &Option<serde_json::Value>,
 ) -> String {
     let pr_urls = extract_github_pr_urls(user_message);
     if pr_urls.is_empty() {
@@ -7965,21 +8008,72 @@ async fn handle_slack_pr_review_workflow(
                 let mut context = task_context_object(existing);
                 context.insert("slack_review_requested_at".to_string(), Value::String(now.clone()));
                 context.insert("pr_review_required".to_string(), Value::Bool(true));
+                if let Some(route) = slack_callback
+                    .as_ref()
+                    .and_then(|v| v.get("slack_route"))
+                    .cloned()
+                {
+                    context.insert("slack_route".to_string(), route);
+                }
+                let mut updates = serde_json::json!({
+                    "status": "review",
+                    "completed_at": Value::Null,
+                    "failure_reason": Value::Null,
+                    "last_pr_review_at": Value::Null,
+                    "context": Value::Object(context),
+                    "updated_at": now,
+                });
+                if let Some(cb_url) = slack_callback
+                    .as_ref()
+                    .and_then(|v| v.get("callback_url"))
+                    .and_then(|v| v.as_str())
+                {
+                    updates["callback_url"] = serde_json::json!(cb_url);
+                }
+                if let Some(cb_secret) = slack_callback
+                    .as_ref()
+                    .and_then(|v| v.get("callback_secret"))
+                    .and_then(|v| v.as_str())
+                {
+                    updates["callback_secret"] = serde_json::json!(cb_secret);
+                }
                 let _ = supabase::update_task(
                     config,
                     task_id,
-                    &serde_json::json!({
-                        "status": "review",
-                        "completed_at": Value::Null,
-                        "failure_reason": Value::Null,
-                        "last_pr_review_at": Value::Null,
-                        "context": Value::Object(context),
-                        "updated_at": now,
-                    }),
+                    &updates,
                 )
                 .await;
                 revived.push(pr_url);
             } else {
+                if !task_id.is_empty() {
+                    let mut context = task_context_object(existing);
+                    if let Some(route) = slack_callback
+                        .as_ref()
+                        .and_then(|v| v.get("slack_route"))
+                        .cloned()
+                    {
+                        context.insert("slack_route".to_string(), route);
+                    }
+                    let mut updates = serde_json::json!({
+                        "context": Value::Object(context),
+                        "updated_at": chrono::Utc::now().to_rfc3339(),
+                    });
+                    if let Some(cb_url) = slack_callback
+                        .as_ref()
+                        .and_then(|v| v.get("callback_url"))
+                        .and_then(|v| v.as_str())
+                    {
+                        updates["callback_url"] = serde_json::json!(cb_url);
+                    }
+                    if let Some(cb_secret) = slack_callback
+                        .as_ref()
+                        .and_then(|v| v.get("callback_secret"))
+                        .and_then(|v| v.as_str())
+                    {
+                        updates["callback_secret"] = serde_json::json!(cb_secret);
+                    }
+                    let _ = supabase::update_task(config, task_id, &updates).await;
+                }
                 already.push(pr_url);
             }
             continue;
@@ -8024,6 +8118,27 @@ async fn handle_slack_pr_review_workflow(
             },
             "updated_at": chrono::Utc::now().to_rfc3339(),
         });
+        if let Some(cb_url) = slack_callback
+            .as_ref()
+            .and_then(|v| v.get("callback_url"))
+            .and_then(|v| v.as_str())
+        {
+            task["callback_url"] = serde_json::json!(cb_url);
+        }
+        if let Some(cb_secret) = slack_callback
+            .as_ref()
+            .and_then(|v| v.get("callback_secret"))
+            .and_then(|v| v.as_str())
+        {
+            task["callback_secret"] = serde_json::json!(cb_secret);
+        }
+        if let Some(route) = slack_callback
+            .as_ref()
+            .and_then(|v| v.get("slack_route"))
+            .cloned()
+        {
+            task["context"]["slack_route"] = route;
+        }
         if let Some(num) = pr_number_from_url(task.get("pr_url").and_then(|v| v.as_str()).unwrap_or("")) {
             task["pr_number"] = serde_json::json!(num);
         }
@@ -8129,6 +8244,7 @@ async fn process_remote_chat_message(
     machine_name: &str,
     reply_attachments: Option<serde_json::Value>,
     task_attachments: Option<serde_json::Value>,
+    slack_callback: Option<serde_json::Value>,
 ) {
     use super::chat;
 
@@ -8193,6 +8309,7 @@ async fn process_remote_chat_message(
             &projects_all,
             slack_routed_project.as_deref(),
             &task_attachments,
+            &slack_callback,
         )
         .await;
         send_remote_agent_message_or_requeue(
@@ -8259,6 +8376,23 @@ async fn process_remote_chat_message(
         let mut enriched = req.clone();
         if from_slack {
             enriched["source"] = serde_json::Value::String("slack".to_string());
+        }
+        if let Some(callback) = &slack_callback {
+            if let Some(cb_url) = callback.get("callback_url").and_then(|v| v.as_str()) {
+                enriched["callback_url"] = serde_json::Value::String(cb_url.to_string());
+            }
+            if let Some(cb_secret) = callback.get("callback_secret").and_then(|v| v.as_str()) {
+                enriched["callback_secret"] = serde_json::Value::String(cb_secret.to_string());
+            }
+            let mut context = enriched
+                .get("context")
+                .cloned()
+                .filter(|v| v.is_object())
+                .unwrap_or_else(|| serde_json::json!({}));
+            if let Some(route) = callback.get("slack_route").cloned() {
+                context["slack_route"] = route;
+            }
+            enriched["context"] = context;
         }
         if let Some(files) = &task_attachments {
             let mut merged = Vec::new();
