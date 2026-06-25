@@ -418,6 +418,20 @@ pub async fn insert_review_log(config: &SupabaseConfig, row: &Value) -> Result<V
 pub const DEFAULT_CONVERSATION_ID: &str = "00000000-0000-0000-0000-000000000001";
 
 pub async fn fetch_messages(config: &SupabaseConfig) -> Result<Value, String> {
+    fetch_messages_for_conversation(config, DEFAULT_CONVERSATION_ID).await
+}
+
+pub async fn fetch_messages_for_conversation(
+    config: &SupabaseConfig,
+    conversation_id: &str,
+) -> Result<Value, String> {
+    if !conversation_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return Err("Invalid conversation_id format".to_string());
+    }
+
     let client = build_client(config)?;
     // Newest 200, not oldest 200. Realtime only catches inserts after the app
     // opens, so an asc+limit window strands every message between #200 and now.
@@ -425,7 +439,7 @@ pub async fn fetch_messages(config: &SupabaseConfig) -> Result<Value, String> {
     let url = format!(
         "{}?conversation_id=eq.{}&order=created_at.desc&limit=200",
         rest_url(config, "ae_messages"),
-        DEFAULT_CONVERSATION_ID
+        conversation_id
     );
     handle_response(client.get(&url).send().await.map_err(|e| e.to_string())?).await
 }
@@ -449,8 +463,8 @@ pub async fn send_message(config: &SupabaseConfig, message: &Value) -> Result<Va
 pub async fn fetch_pending_chat_messages(config: &SupabaseConfig) -> Result<Vec<Value>, String> {
     let client = build_client(config)?;
     let url = format!(
-        "{}/rest/v1/ae_messages?conversation_id=eq.{}&role=eq.user&needs_response=eq.true&order=created_at.asc&limit=5",
-        config.url, DEFAULT_CONVERSATION_ID
+        "{}/rest/v1/ae_messages?role=eq.user&needs_response=eq.true&order=created_at.asc&limit=5",
+        config.url
     );
     let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
@@ -461,6 +475,31 @@ pub async fn fetch_pending_chat_messages(config: &SupabaseConfig) -> Result<Vec<
     }
     let rows: Vec<Value> = resp.json().await.map_err(|e| e.to_string())?;
     Ok(rows)
+}
+
+pub async fn mark_message_needs_response(
+    config: &SupabaseConfig,
+    message_id: &str,
+) -> Result<(), String> {
+    // Validate UUID format to prevent URL injection
+    if !message_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return Err("Invalid message_id format".to_string());
+    }
+    let client = build_client(config)?;
+    let url = format!("{}/rest/v1/ae_messages?id=eq.{}", config.url, message_id);
+    let resp = client
+        .patch(&url)
+        .json(&serde_json::json!({ "needs_response": true }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("mark_message_needs_response: HTTP {}", resp.status()));
+    }
+    Ok(())
 }
 
 /// Mark a message as responded to

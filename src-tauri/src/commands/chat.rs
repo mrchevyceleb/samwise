@@ -287,7 +287,14 @@ async fn chat_respond_inner(
 // ── Fetch recent chat messages ──────────────────────────────────────
 
 pub async fn fetch_recent_chat(config: &supabase::SupabaseConfig) -> String {
-    let messages = match supabase::fetch_messages(config).await {
+    fetch_recent_chat_for_conversation(config, DEFAULT_CONVERSATION_ID).await
+}
+
+pub async fn fetch_recent_chat_for_conversation(
+    config: &supabase::SupabaseConfig,
+    conversation_id: &str,
+) -> String {
+    let messages = match supabase::fetch_messages_for_conversation(config, conversation_id).await {
         Ok(m) => m,
         Err(_) => return String::new(),
     };

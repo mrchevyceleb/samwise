@@ -7692,6 +7692,12 @@ async fn check_remote_chat_messages(config: &SupabaseConfig, machine_name: &str)
             }
             continue;
         }
+        let conversation_id = msg
+            .get("conversation_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(supabase::DEFAULT_CONVERSATION_ID)
+            .to_string();
 
         // Mark as responded BEFORE processing to prevent duplicate pickup on next poll
         if let Err(e) = supabase::mark_message_responded(config, msg_id).await {
@@ -7702,7 +7708,159 @@ async fn check_remote_chat_messages(config: &SupabaseConfig, machine_name: &str)
         let preview: String = content.chars().take(50).collect();
         log::info!("[worker] Remote chat message received: {}", preview);
 
-        process_remote_chat_message(config, msg_id, content, machine_name).await;
+        let reply_attachments = remote_reply_attachments(msg, msg_id);
+        process_remote_chat_message(
+            config,
+            msg_id,
+            &conversation_id,
+            content,
+            machine_name,
+            reply_attachments,
+        )
+        .await;
+    }
+}
+
+fn non_empty_str(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn remote_reply_attachments(msg: &serde_json::Value, message_id: &str) -> Option<serde_json::Value> {
+    let arr = msg.get("attachments")?.as_array()?;
+    let mut routes = Vec::new();
+
+    for item in arr {
+        let source = item
+            .get("source")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if source == "slack" {
+            let route_id = non_empty_str(item, "route_id")?;
+            let slack = item.get("slack")?;
+            let channel = non_empty_str(slack, "channel")?;
+            let thread_ts = non_empty_str(slack, "thread_ts")?;
+            let user = non_empty_str(slack, "user")?;
+            let event_ts = non_empty_str(slack, "event_ts").unwrap_or_default();
+            let channel_name = item
+                .get("slack")
+                .and_then(|s| s.get("channel_name"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let project = item
+                .get("slack")
+                .and_then(|s| s.get("project"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let task_type = non_empty_str(slack, "task_type").unwrap_or_else(|| "code".to_string());
+
+            routes.push(serde_json::json!({
+                "source": "slack",
+                "route_id": route_id,
+                "reply_to_message_id": message_id,
+                "slack": {
+                    "channel": channel,
+                    "channel_name": channel_name,
+                    "thread_ts": thread_ts,
+                    "event_ts": event_ts,
+                    "user": user,
+                    "project": project,
+                    "task_type": task_type,
+                },
+            }));
+        }
+    }
+
+    if routes.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Array(routes))
+    }
+}
+
+fn slack_routed_project(reply_attachments: &Option<serde_json::Value>) -> Option<String> {
+    let arr = reply_attachments.as_ref()?.as_array()?;
+    for item in arr {
+        if item.get("source").and_then(|v| v.as_str()) != Some("slack") {
+            continue;
+        }
+        let project = item
+            .get("slack")
+            .and_then(|s| s.get("project"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        return Some(project.to_string());
+    }
+    None
+}
+
+fn has_slack_route(reply_attachments: &Option<serde_json::Value>) -> bool {
+    reply_attachments
+        .as_ref()
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .any(|item| item.get("source").and_then(|v| v.as_str()) == Some("slack"))
+        })
+        .unwrap_or(false)
+}
+
+async fn send_remote_agent_message(
+    config: &SupabaseConfig,
+    message_id: &str,
+    conversation_id: &str,
+    response_text: &str,
+    reply_attachments: &Option<serde_json::Value>,
+) -> Result<(), String> {
+    let mut payload = serde_json::json!({
+        "role": "agent",
+        "content": response_text,
+        "conversation_id": conversation_id,
+    });
+
+    if let Some(attachments) = reply_attachments {
+        payload["attachments"] = attachments.clone();
+    }
+
+    supabase::send_message(config, &payload)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("Failed to send remote agent reply for {}: {}", message_id, e))
+}
+
+async fn send_remote_agent_message_or_requeue(
+    config: &SupabaseConfig,
+    message_id: &str,
+    conversation_id: &str,
+    response_text: &str,
+    reply_attachments: &Option<serde_json::Value>,
+) {
+    if let Err(e) = send_remote_agent_message(
+        config,
+        message_id,
+        conversation_id,
+        response_text,
+        reply_attachments,
+    )
+    .await
+    {
+        log::warn!("[worker] {}", e);
+        if let Err(reset_err) = supabase::mark_message_needs_response(config, message_id).await {
+            log::warn!(
+                "[worker] Failed to requeue remote chat message {} after reply send failure: {}",
+                message_id,
+                reset_err
+            );
+        }
     }
 }
 
@@ -7710,20 +7868,21 @@ async fn check_remote_chat_messages(config: &SupabaseConfig, machine_name: &str)
 async fn process_remote_chat_message(
     config: &SupabaseConfig,
     message_id: &str,
+    conversation_id: &str,
     user_message: &str,
     machine_name: &str,
+    reply_attachments: Option<serde_json::Value>,
 ) {
     use super::chat;
 
     // 0. Fast-path: confirmation of pending tasks (checked BEFORE status query)
     if let Some(response_text) = chat::handle_pending_confirmation(config, user_message).await {
-        let _ = supabase::send_message(
+        send_remote_agent_message_or_requeue(
             config,
-            &serde_json::json!({
-                "role": "agent",
-                "content": &response_text,
-                "conversation_id": supabase::DEFAULT_CONVERSATION_ID,
-            }),
+            message_id,
+            conversation_id,
+            &response_text,
+            &reply_attachments,
         )
         .await;
         return;
@@ -7733,13 +7892,12 @@ async fn process_remote_chat_message(
     if chat::is_status_query(user_message) {
         let board_ctx = build_simple_board_context(config, machine_name).await;
         let response_text = chat::build_status_response(&board_ctx);
-        let _ = supabase::send_message(
+        send_remote_agent_message_or_requeue(
             config,
-            &serde_json::json!({
-                "role": "agent",
-                "content": &response_text,
-                "conversation_id": supabase::DEFAULT_CONVERSATION_ID,
-            }),
+            message_id,
+            conversation_id,
+            &response_text,
+            &reply_attachments,
         )
         .await;
         log::info!(
@@ -7750,7 +7908,7 @@ async fn process_remote_chat_message(
     }
 
     // 1. Build context
-    let recent_chat = chat::fetch_recent_chat(config).await;
+    let recent_chat = chat::fetch_recent_chat_for_conversation(config, conversation_id).await;
     let project_registry = chat::build_project_registry(config).await;
     let board_ctx = build_simple_board_context(config, machine_name).await;
 
@@ -7760,9 +7918,24 @@ async fn process_remote_chat_message(
         .ok()
         .unwrap_or(serde_json::json!([]));
     let mentioned_projects = chat::extract_project_mentions(user_message, &projects_all);
+    let slack_routed_project = slack_routed_project(&reply_attachments).and_then(|candidate| {
+        projects_all.as_array().and_then(|arr| {
+            arr.iter()
+                .filter_map(|p| p.get("name").and_then(|v| v.as_str()))
+                .find(|name| *name == candidate)
+                .map(str::to_string)
+        })
+    });
+    let from_slack = has_slack_route(&reply_attachments);
 
     // 2. Build prompt
-    let effective_message = if !mentioned_projects.is_empty() {
+    let effective_message = if let Some(project) = &slack_routed_project {
+        format!(
+            "{}\n\n[System: Slack provided an explicit project route: {}. Use this exact project for any tasks you create.]",
+            user_message,
+            project
+        )
+    } else if !mentioned_projects.is_empty() {
         format!(
             "{}\n\n[System: Matt explicitly tagged @{}. Use this project for any tasks you create.]",
             user_message,
@@ -7784,13 +7957,12 @@ async fn process_remote_chat_message(
         Err(e) => {
             log::warn!("[worker] Remote chat response failed: {}", e);
             let error_msg = format!("Sorry, hit a snag: {}. Try again?", e);
-            let _ = supabase::send_message(
+            send_remote_agent_message_or_requeue(
                 config,
-                &serde_json::json!({
-                    "role": "agent",
-                    "content": &error_msg,
-                    "conversation_id": supabase::DEFAULT_CONVERSATION_ID,
-                }),
+                message_id,
+                conversation_id,
+                &error_msg,
+                &reply_attachments,
             )
             .await;
             return;
@@ -7803,7 +7975,12 @@ async fn process_remote_chat_message(
     // 5. Create tasks with @ mention handling
     for req in &task_requests {
         let mut enriched = req.clone();
-        if let Some(mentioned) = mentioned_projects.first() {
+        if from_slack {
+            enriched["source"] = serde_json::Value::String("slack".to_string());
+        }
+        if let Some(project) = &slack_routed_project {
+            enriched["project"] = serde_json::Value::String(project.clone());
+        } else if let Some(mentioned) = mentioned_projects.first() {
             enriched["project"] = serde_json::Value::String(mentioned.clone());
         }
 
@@ -7891,13 +8068,12 @@ async fn process_remote_chat_message(
         clean_text.trim().to_string()
     };
 
-    let _ = supabase::send_message(
+    send_remote_agent_message_or_requeue(
         config,
-        &serde_json::json!({
-            "role": "agent",
-            "content": &response_text,
-            "conversation_id": supabase::DEFAULT_CONVERSATION_ID,
-        }),
+        message_id,
+        conversation_id,
+        &response_text,
+        &reply_attachments,
     )
     .await;
 
