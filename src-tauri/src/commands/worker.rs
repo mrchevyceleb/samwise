@@ -12,6 +12,7 @@ use super::supabase::{self, SupabaseConfig, SupabaseState};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use crate::process::async_cmd;
+use regex::Regex;
 
 // ── LLM Proxy ────────────────────────────────────────────────────────
 
@@ -7763,6 +7764,7 @@ fn remote_reply_attachments(msg: &serde_json::Value, message_id: &str) -> Option
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
             let task_type = non_empty_str(slack, "task_type").unwrap_or_else(|| "code".to_string());
+            let workflow = non_empty_str(slack, "workflow");
 
             routes.push(serde_json::json!({
                 "source": "slack",
@@ -7776,6 +7778,7 @@ fn remote_reply_attachments(msg: &serde_json::Value, message_id: &str) -> Option
                     "user": user,
                     "project": project,
                     "task_type": task_type,
+                    "workflow": workflow,
                 },
             }));
         }
@@ -7859,6 +7862,212 @@ fn has_slack_route(reply_attachments: &Option<serde_json::Value>) -> bool {
                 .any(|item| item.get("source").and_then(|v| v.as_str()) == Some("slack"))
         })
         .unwrap_or(false)
+}
+
+fn slack_workflow(reply_attachments: &Option<serde_json::Value>) -> Option<String> {
+    let arr = reply_attachments.as_ref()?.as_array()?;
+    for item in arr {
+        if item.get("source").and_then(|v| v.as_str()) != Some("slack") {
+            continue;
+        }
+        let workflow = item
+            .get("slack")
+            .and_then(|s| s.get("workflow"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        return Some(workflow.to_string());
+    }
+    None
+}
+
+fn extract_github_pr_urls(text: &str) -> Vec<String> {
+    static PR_URL_RE: OnceLock<Regex> = OnceLock::new();
+    let re = PR_URL_RE.get_or_init(|| {
+        Regex::new(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+(?:[/?#][^\s<>)\]]*)?")
+            .expect("valid PR URL regex")
+    });
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for m in re.find_iter(text) {
+        let url = normalize_pr_url(
+            m.as_str()
+                .trim_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | ')' | ']' | '>' | '"')),
+        );
+        if review::is_safe_pr_url(&url) && seen.insert(url.clone()) {
+            out.push(url);
+        }
+    }
+    out
+}
+
+fn find_project_for_pr<'a>(
+    projects_all: &'a serde_json::Value,
+    routed_project: Option<&str>,
+    pr_url: &str,
+) -> Option<&'a serde_json::Value> {
+    let arr = projects_all.as_array()?;
+    if let Some(project_name) = routed_project {
+        if let Some(project) = arr
+            .iter()
+            .find(|p| p.get("name").and_then(|v| v.as_str()) == Some(project_name))
+        {
+            return Some(project);
+        }
+    }
+
+    let pr_ref = github_pull_ref_from_url(pr_url)?;
+    let repo_key = format!("{}/{}", pr_ref.owner, pr_ref.repo).to_lowercase();
+    arr.iter().find(|p| {
+        p.get("repo_url")
+            .and_then(|v| v.as_str())
+            .map(|url| url.to_lowercase().contains(&repo_key))
+            .unwrap_or(false)
+    })
+}
+
+async fn handle_slack_pr_review_workflow(
+    config: &SupabaseConfig,
+    user_message: &str,
+    projects_all: &serde_json::Value,
+    routed_project: Option<&str>,
+    task_attachments: &Option<serde_json::Value>,
+) -> String {
+    let pr_urls = extract_github_pr_urls(user_message);
+    if pr_urls.is_empty() {
+        return "I saw `#review`, but I couldn't find a GitHub PR link in the Slack message or thread. Drop the PR link and tag me again.".to_string();
+    }
+
+    let existing_tasks = supabase::fetch_tasks(config, None)
+        .await
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    let mut existing_by_pr: HashMap<String, Value> = HashMap::new();
+    for task in existing_tasks {
+        if let Some(pr_url) = task.get("pr_url").and_then(|v| v.as_str()) {
+            existing_by_pr.insert(normalize_pr_url(pr_url), task);
+        }
+    }
+
+    let mut created = Vec::new();
+    let mut revived = Vec::new();
+    let mut already = Vec::new();
+    let mut missing_project = Vec::new();
+    let now = chrono::Utc::now().to_rfc3339();
+
+    for pr_url in pr_urls {
+        let normalized = normalize_pr_url(&pr_url);
+        if let Some(existing) = existing_by_pr.get(&normalized) {
+            let task_id = existing.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let status = existing.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            if !task_id.is_empty() && matches!(status, "done" | "failed") {
+                let mut context = task_context_object(existing);
+                context.insert("slack_review_requested_at".to_string(), Value::String(now.clone()));
+                context.insert("pr_review_required".to_string(), Value::Bool(true));
+                let _ = supabase::update_task(
+                    config,
+                    task_id,
+                    &serde_json::json!({
+                        "status": "review",
+                        "completed_at": Value::Null,
+                        "failure_reason": Value::Null,
+                        "last_pr_review_at": Value::Null,
+                        "context": Value::Object(context),
+                        "updated_at": now,
+                    }),
+                )
+                .await;
+                revived.push(pr_url);
+            } else {
+                already.push(pr_url);
+            }
+            continue;
+        }
+
+        let Some(project) = find_project_for_pr(projects_all, routed_project, &pr_url) else {
+            missing_project.push(pr_url);
+            continue;
+        };
+        let project_name = project.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let repo_path = project.get("repo_path").and_then(|v| v.as_str()).unwrap_or("");
+        let repo_url = project.get("repo_url").and_then(|v| v.as_str()).unwrap_or("");
+        if repo_path.is_empty() {
+            missing_project.push(pr_url);
+            continue;
+        }
+
+        let pr_num = pr_number_from_url(&pr_url)
+            .map(|n| format!("#{}", n))
+            .unwrap_or_default();
+        let title = format!("Review PR {}{}", pr_num, if project_name.is_empty() { "" } else { " from Slack" });
+        let mut task = serde_json::json!({
+            "title": title,
+            "description": format!(
+                "Slack `#review` request. Review this PR using the normal Samwise PR review workflow.\n\nPR: {}\n\nSlack request/context:\n{}",
+                pr_url,
+                user_message,
+            ),
+            "status": "review",
+            "priority": "high",
+            "task_type": "code",
+            "source": "slack",
+            "assignee": "sam",
+            "project": project_name,
+            "repo_path": repo_path,
+            "repo_url": repo_url,
+            "pr_url": pr_url,
+            "context": {
+                "pr_review_required": true,
+                "slack_review_workflow": true,
+                "slack_review_requested_at": now,
+            },
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+        });
+        if let Some(num) = pr_number_from_url(task.get("pr_url").and_then(|v| v.as_str()).unwrap_or("")) {
+            task["pr_number"] = serde_json::json!(num);
+        }
+        if let Some(files) = task_attachments {
+            task["attachments"] = files.clone();
+        }
+        if let Some(preview_url) = project
+            .get("preview_url")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            task["preview_url"] = serde_json::json!(preview_url);
+        }
+
+        match supabase::create_task(config, &task).await {
+            Ok(row) => {
+                let id = first_returned_id(&row).unwrap_or_else(|| "?".to_string());
+                created.push(format!("{} ({})", pr_url, short_task_id(&id)));
+            }
+            Err(e) => {
+                log::warn!("[worker] Slack #review task create failed for {}: {}", pr_url, e);
+                missing_project.push(pr_url);
+            }
+        }
+    }
+
+    let mut lines = Vec::new();
+    if !created.is_empty() {
+        lines.push(format!("Queued PR review for {}: {}", if created.len() == 1 { "this PR" } else { "these PRs" }, created.join(", ")));
+    }
+    if !revived.is_empty() {
+        lines.push(format!("Moved existing completed card(s) back to Review: {}", revived.join(", ")));
+    }
+    if !already.is_empty() {
+        lines.push(format!("Already had active card(s) for: {}", already.join(", ")));
+    }
+    if !missing_project.is_empty() {
+        lines.push(format!("Could not match project/repo for: {}. Add a project hashtag like `#studio` or make sure the repo is registered in AutoSam.", missing_project.join(", ")));
+    }
+    if lines.is_empty() {
+        "I saw `#review`, but nothing was queued. Add a PR link and project hashtag, then tag me again.".to_string()
+    } else {
+        lines.join("\n")
+    }
 }
 
 async fn send_remote_agent_message(
@@ -7975,6 +8184,31 @@ async fn process_remote_chat_message(
         })
     });
     let from_slack = has_slack_route(&reply_attachments);
+    let workflow = slack_workflow(&reply_attachments);
+
+    if from_slack && workflow.as_deref() == Some("pr_review") {
+        let response_text = handle_slack_pr_review_workflow(
+            config,
+            user_message,
+            &projects_all,
+            slack_routed_project.as_deref(),
+            &task_attachments,
+        )
+        .await;
+        send_remote_agent_message_or_requeue(
+            config,
+            message_id,
+            conversation_id,
+            &response_text,
+            &reply_attachments,
+        )
+        .await;
+        log::info!(
+            "[worker] Slack #review workflow handled for message {}",
+            message_id
+        );
+        return;
+    }
 
     // 2. Build prompt
     let effective_message = if let Some(project) = &slack_routed_project {

@@ -46,6 +46,18 @@ Slack supports explicit project hashtags as the most reliable routing convention
 
 `ASSISTANT-HUB` resolves a single recognized hashtag before separator parsing or channel-name inference and writes the canonical project into Slack route metadata. AutoSam treats that route as authoritative and forces it onto tasks created from that Slack turn, which avoids cards getting stuck in project confirmation when the team includes a hashtag.
 
+## Workflow Tags
+
+Slack supports workflow hashtags separately from project hashtags:
+
+- `#review` / `#pr-review` -> PR review workflow
+
+When this tag is present, `ASSISTANT-HUB` writes `slack.workflow = "pr_review"` into the route metadata. AutoSam handles that before calling the chat model: it extracts GitHub PR links from the Slack request and thread context, then creates or revives Review-column cards with `pr_url`, `repo_path`, `project`, and `context.pr_review_required = true`. If no PR URL is found, Sam replies in Slack asking for the link. If a card already exists for a PR, Sam reports that instead of duplicating it.
+
+Recommended team syntax:
+
+`@Samwise #studio #review these PRs`
+
 ## Why This Exists
 
 The older Slack path posted directly to `supabase/functions/task-webhook` and required strict syntax such as:
@@ -73,4 +85,5 @@ Required AutoSam behavior:
 
 - Remote chat responses must preserve Slack metadata from inbound `ae_messages.attachments`.
 - Remote chat task creation must preserve sanitized `slack_file` attachments on created `ae_tasks.attachments`.
+- `slack.workflow = "pr_review"` must trigger deterministic PR review card creation/revival from PR links in the Slack turn, not a generic coding task.
 - Remote chat processing must not be limited to the default desktop conversation UUID; Slack uses separate conversation IDs per channel/thread/DM route.
