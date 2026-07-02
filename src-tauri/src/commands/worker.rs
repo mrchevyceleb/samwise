@@ -8483,7 +8483,34 @@ async fn process_remote_chat_message(
     let workflow = slack_workflow(&reply_attachments);
     let routed_task_type = slack_task_type(&reply_attachments);
 
-    if from_slack && workflow.as_deref() == Some("pr_review") {
+    // Detect PR-review intent from the message text itself, not only from the
+    // upstream Slack hashtag parser. The parser tags workflow="pr_review" only
+    // when the literal "#review" hashtag is present, so a natural-language ask
+    // like "review this pr <url>" or "review <url>" would otherwise fall through
+    // to the generic Claude Code chat fallback (run_claude_code_opts with a
+    // 3-turn budget) and crash with "Reached max turns" on any non-trivial PR.
+    // Treat a message naming a github pull URL alongside the word "review" as
+    // review intent and route it to the same workflow. The workflow re-extracts
+    // the URL and re-resolves the project/repo, so this only ever creates a
+    // task for a real, allowlisted PR.
+    let slack_pr_review_intent = from_slack
+        && user_message.split_whitespace().any(|token| {
+            token.starts_with("https://github.com/")
+                && token.contains("/pull/")
+                && review::is_safe_pr_url(token)
+        })
+        && {
+            let lower = user_message.to_ascii_lowercase();
+            lower.split_whitespace().any(|w| w == "review")
+                || lower.contains("pr review")
+                || lower.contains("pr-review")
+                || lower.contains("/pr-review")
+                || lower.contains("review this")
+                || lower.contains("please review")
+                || lower.contains("can you review")
+        };
+
+    if (from_slack && workflow.as_deref() == Some("pr_review")) || slack_pr_review_intent {
         let response_text = handle_slack_pr_review_workflow(
             config,
             user_message,
