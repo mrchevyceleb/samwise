@@ -8,8 +8,8 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::process::async_cmd;
 use super::supabase::{self, SupabaseConfig};
+use crate::process::async_cmd;
 
 const REVIEW_PROMPT: &str = include_str!("../../prompts/review.md");
 
@@ -17,10 +17,10 @@ const REVIEW_PROMPT: &str = include_str!("../../prompts/review.md");
 /// place so upgrading the model is a single edit rather than a scavenger
 /// hunt across review.rs and worker.rs.
 ///
-pub const CODEX_MODEL: &str = "gpt-5.5";
+pub const CODEX_MODEL: &str = "gpt-5.6-sol";
 /// `-c` config argument for Codex reasoning effort. Matches the Codex CLI
-/// schema: `minimal | low | medium | high | xhigh`.
-pub const CODEX_REASONING_CONFIG: &str = "model_reasoning_effort=\"xhigh\"";
+/// schema supported by Sol, including `max` and `ultra`.
+pub const CODEX_REASONING_CONFIG: &str = "model_reasoning_effort=\"ultra\"";
 
 /// Hardcoded blocker path patterns. Any changed file matching any of these
 /// blocks auto-merge. Includes Samwise's own review infrastructure so Sam
@@ -41,9 +41,15 @@ const BLOCKER_SUFFIXES: &[&str] = &[".sql", ".env"];
 // don't false-positive, while `api_secret.ts`, `auth_token.rs`, and
 // `doppler_config.json` still do. `\b` treats `_` as a word character, which
 // misses snake_case; use explicit non-word / underscore / dash / dot separators.
-const BLOCKER_FILENAME_REGEX: &str = r"(?i)(^|[^A-Za-z0-9])(auth|secret|token|doppler)([^A-Za-z0-9]|$)";
+const BLOCKER_FILENAME_REGEX: &str =
+    r"(?i)(^|[^A-Za-z0-9])(auth|secret|token|doppler)([^A-Za-z0-9]|$)";
 const BLOCKER_ENV_PREFIX: &str = ".env";
-const BLOCKER_DEP_FILES: &[&str] = &["package.json", "Cargo.toml", "Cargo.lock", "package-lock.json"];
+const BLOCKER_DEP_FILES: &[&str] = &[
+    "package.json",
+    "Cargo.toml",
+    "Cargo.lock",
+    "package-lock.json",
+];
 const BLOCKER_DELETIONS: i64 = 100;
 
 const DEFAULT_MIN_SCORE: i64 = 8;
@@ -70,8 +76,13 @@ const DIFF_DELIMITER: &str = "===SAMWISE-DIFF-9f3c2a8b1d7e===";
 
 #[derive(Debug)]
 pub enum AutoMergeOutcome {
-    ReadyForMergeDeploy { head_sha: String },
-    Blocked { reason: String, scores: Option<Value> },
+    ReadyForMergeDeploy {
+        head_sha: String,
+    },
+    Blocked {
+        reason: String,
+        scores: Option<Value>,
+    },
     Skipped,
 }
 
@@ -95,23 +106,39 @@ pub async fn try_auto_merge(
     settings: &Option<Value>,
 ) -> AutoMergeOutcome {
     // 1. Gate: feature flag
-    let enabled = settings.as_ref()
+    let enabled = settings
+        .as_ref()
         .and_then(|s| s.get("autoMergeEnabled"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     if !enabled {
-        log::info!("[review] auto-merge disabled in settings; skipping for task {}", task_id);
-        log_decision(config, task_id, pr_url, None, None, None, "skipped", "autoMergeEnabled=false").await;
+        log::info!(
+            "[review] auto-merge disabled in settings; skipping for task {}",
+            task_id
+        );
+        log_decision(
+            config,
+            task_id,
+            pr_url,
+            None,
+            None,
+            None,
+            "skipped",
+            "autoMergeEnabled=false",
+        )
+        .await;
         return AutoMergeOutcome::Skipped;
     }
 
     // Clamp settings to safe ranges so an invalid config can't silently lower the gate to 0.
-    let min_score = settings.as_ref()
+    let min_score = settings
+        .as_ref()
         .and_then(|s| s.get("autoMergeMinScore"))
         .and_then(|v| v.as_i64())
         .unwrap_or(DEFAULT_MIN_SCORE)
         .clamp(1, 10);
-    let max_diff_lines = settings.as_ref()
+    let max_diff_lines = settings
+        .as_ref()
         .and_then(|s| s.get("autoMergeMaxDiffLines"))
         .and_then(|v| v.as_i64())
         .unwrap_or(DEFAULT_MAX_DIFF_LINES)
@@ -119,29 +146,89 @@ pub async fn try_auto_merge(
 
     // Validate pr_url shape to avoid unexpected gh invocations.
     if !is_safe_pr_url(pr_url) {
-        return block(config, task_id, pr_url, None, None, None, "pr_url failed safety validation").await;
+        return block(
+            config,
+            task_id,
+            pr_url,
+            None,
+            None,
+            None,
+            "pr_url failed safety validation",
+        )
+        .await;
     }
 
     // 2. Capture head SHA up front so we can TOCTOU-protect the merge.
     let head_sha = match fetch_pr_head_sha(pr_url, repo_path).await {
         Ok(s) => s,
-        Err(e) => return block(config, task_id, pr_url, None, None, None, &format!("failed to read PR head SHA: {}", e)).await,
+        Err(e) => {
+            return block(
+                config,
+                task_id,
+                pr_url,
+                None,
+                None,
+                None,
+                &format!("failed to read PR head SHA: {}", e),
+            )
+            .await
+        }
     };
 
     // 3. Fetch diff + file list via gh.
     let diff = match fetch_pr_diff(pr_url, repo_path).await {
         Ok(d) => d,
-        Err(e) => return block(config, task_id, pr_url, None, None, None, &format!("failed to read PR diff: {}", e)).await,
+        Err(e) => {
+            return block(
+                config,
+                task_id,
+                pr_url,
+                None,
+                None,
+                None,
+                &format!("failed to read PR diff: {}", e),
+            )
+            .await
+        }
     };
     if diff.trim().is_empty() {
-        return block(config, task_id, pr_url, None, None, None, "PR diff is empty").await;
+        return block(
+            config,
+            task_id,
+            pr_url,
+            None,
+            None,
+            None,
+            "PR diff is empty",
+        )
+        .await;
     }
     let files = match fetch_pr_files(pr_url, repo_path).await {
         Ok(f) => f,
-        Err(e) => return block(config, task_id, pr_url, None, None, None, &format!("failed to list PR files: {}", e)).await,
+        Err(e) => {
+            return block(
+                config,
+                task_id,
+                pr_url,
+                None,
+                None,
+                None,
+                &format!("failed to list PR files: {}", e),
+            )
+            .await
+        }
     };
     if files.is_empty() {
-        return block(config, task_id, pr_url, None, None, None, "PR file list is empty").await;
+        return block(
+            config,
+            task_id,
+            pr_url,
+            None,
+            None,
+            None,
+            "PR file list is empty",
+        )
+        .await;
     }
 
     // 4. Blocker path check.
@@ -152,73 +239,168 @@ pub async fn try_auto_merge(
     // 5. Line count + big-deletion check.
     let (changed_lines, deletions) = count_diff_lines(&diff);
     if changed_lines > max_diff_lines {
-        return block(config, task_id, pr_url, None, None, None,
-            &format!("diff is {} lines, exceeds autoMergeMaxDiffLines={}", changed_lines, max_diff_lines)).await;
+        return block(
+            config,
+            task_id,
+            pr_url,
+            None,
+            None,
+            None,
+            &format!(
+                "diff is {} lines, exceeds autoMergeMaxDiffLines={}",
+                changed_lines, max_diff_lines
+            ),
+        )
+        .await;
     }
     if deletions > BLOCKER_DELETIONS {
-        return block(config, task_id, pr_url, None, None, None,
-            &format!("diff deletes {} lines (threshold: {})", deletions, BLOCKER_DELETIONS)).await;
+        return block(
+            config,
+            task_id,
+            pr_url,
+            None,
+            None,
+            None,
+            &format!(
+                "diff deletes {} lines (threshold: {})",
+                deletions, BLOCKER_DELETIONS
+            ),
+        )
+        .await;
     }
 
     // 6. Run Codex review.
     let review = match run_codex_review(repo_path, task_title, task_description, &diff).await {
         Ok(r) => r,
-        Err(e) => return block(config, task_id, pr_url, None, None, None, &format!("codex review failed: {}", e)).await,
+        Err(e) => {
+            return block(
+                config,
+                task_id,
+                pr_url,
+                None,
+                None,
+                None,
+                &format!("codex review failed: {}", e),
+            )
+            .await
+        }
     };
 
     let scores = extract_scores(&review);
     // Validate every score is an integer in [1, 10]. Out-of-range values mean Codex
     // ignored the schema; fail closed so a hallucinated 100 can't bypass the gate.
     if !scores_are_valid(&scores) {
-        return block(config, task_id, pr_url, Some(scores), None, None,
-            "review returned non-integer or out-of-range scores").await;
+        return block(
+            config,
+            task_id,
+            pr_url,
+            Some(scores),
+            None,
+            None,
+            "review returned non-integer or out-of-range scores",
+        )
+        .await;
     }
-    let blockers_vec: Vec<Value> = review.get("blockers")
+    let blockers_vec: Vec<Value> = review
+        .get("blockers")
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
     let blockers_val = Value::Array(blockers_vec.clone());
-    let summary = review.get("summary").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let summary = review
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
     // 7. Blockers array check.
     if !blockers_vec.is_empty() {
-        let joined = blockers_vec.iter()
+        let joined = blockers_vec
+            .iter()
             .filter_map(|v| v.as_str())
             .collect::<Vec<_>>()
             .join("; ");
-        return block(config, task_id, pr_url, Some(scores), Some(blockers_val), None,
-            &format!("review flagged blockers: {}", joined)).await;
+        return block(
+            config,
+            task_id,
+            pr_url,
+            Some(scores),
+            Some(blockers_val),
+            None,
+            &format!("review flagged blockers: {}", joined),
+        )
+        .await;
     }
 
     // 8. Min-score check.
     let min = match min_across_dimensions(&scores) {
         Some(m) => m,
         None => {
-            return block(config, task_id, pr_url, Some(scores), Some(blockers_val), None,
-                "review JSON missing numeric scores").await;
+            return block(
+                config,
+                task_id,
+                pr_url,
+                Some(scores),
+                Some(blockers_val),
+                None,
+                "review JSON missing numeric scores",
+            )
+            .await;
         }
     };
     if min < min_score {
-        return block(config, task_id, pr_url, Some(scores), Some(blockers_val), None,
-            &format!("lowest review score {} is below autoMergeMinScore {}", min, min_score)).await;
+        return block(
+            config,
+            task_id,
+            pr_url,
+            Some(scores),
+            Some(blockers_val),
+            None,
+            &format!(
+                "lowest review score {} is below autoMergeMinScore {}",
+                min, min_score
+            ),
+        )
+        .await;
     }
 
     // Persist scores + summary now, even before CI, so Matt can see them.
-    let _ = supabase::update_task(config, task_id, &serde_json::json!({
-        "review_scores": scores,
-        "review_summary": summary,
-    })).await;
+    let _ = supabase::update_task(
+        config,
+        task_id,
+        &serde_json::json!({
+            "review_scores": scores,
+            "review_summary": summary,
+        }),
+    )
+    .await;
 
     // 9. CI poll.
     let ci_ok = match wait_for_ci(pr_url, repo_path).await {
         Ok(true) => true,
         Ok(false) => {
-            return block(config, task_id, pr_url, Some(scores), Some(blockers_val), Some(false),
-                "CI checks failed or did not pass within 15 minutes").await;
+            return block(
+                config,
+                task_id,
+                pr_url,
+                Some(scores),
+                Some(blockers_val),
+                Some(false),
+                "CI checks failed or did not pass within 15 minutes",
+            )
+            .await;
         }
         Err(e) => {
-            return block(config, task_id, pr_url, Some(scores), Some(blockers_val), Some(false),
-                &format!("CI polling error: {}", e)).await;
+            return block(
+                config,
+                task_id,
+                pr_url,
+                Some(scores),
+                Some(blockers_val),
+                Some(false),
+                &format!("CI polling error: {}", e),
+            )
+            .await;
         }
     };
 
@@ -233,7 +415,8 @@ pub async fn try_auto_merge(
         Some(ci_ok),
         "ready_for_merge_deploy",
         "all gates passed",
-    ).await;
+    )
+    .await;
     AutoMergeOutcome::ReadyForMergeDeploy { head_sha }
 }
 
@@ -242,7 +425,9 @@ pub async fn try_auto_merge(
 pub fn is_safe_pr_url(pr_url: &str) -> bool {
     // Permit only standard GitHub PR URLs. Prevents leading '-' or metacharacter
     // surprises if a future caller passes something exotic.
-    let re = match regex::Regex::new(r"^https://github\.com/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+/pull/\d+$") {
+    let re = match regex::Regex::new(
+        r"^https://github\.com/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+/pull/\d+$",
+    ) {
         Ok(r) => r,
         Err(_) => return false,
     };
@@ -275,11 +460,16 @@ pub async fn fetch_pr_head_sha(pr_url: &str, repo_path: &str) -> Result<String, 
         .await
         .map_err(|e| format!("spawn gh: {}", e))?;
     if !output.status.success() {
-        return Err(format!("gh pr view (headRefOid): {}", String::from_utf8_lossy(&output.stderr).trim()));
+        return Err(format!(
+            "gh pr view (headRefOid): {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
     let v: Value = serde_json::from_slice(&output.stdout)
         .map_err(|e| format!("parse head sha json: {}", e))?;
-    v.get("headRefOid").and_then(|s| s.as_str()).map(String::from)
+    v.get("headRefOid")
+        .and_then(|s| s.as_str())
+        .map(String::from)
         .ok_or_else(|| "no headRefOid in gh pr view output".to_string())
 }
 
@@ -291,7 +481,10 @@ async fn fetch_pr_diff(pr_url: &str, repo_path: &str) -> Result<String, String> 
         .await
         .map_err(|e| format!("spawn gh: {}", e))?;
     if !output.status.success() {
-        return Err(format!("gh pr diff: {}", String::from_utf8_lossy(&output.stderr).trim()));
+        return Err(format!(
+            "gh pr diff: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
@@ -304,13 +497,19 @@ pub async fn fetch_pr_files(pr_url: &str, repo_path: &str) -> Result<Vec<String>
         .await
         .map_err(|e| format!("spawn gh: {}", e))?;
     if !output.status.success() {
-        return Err(format!("gh pr view: {}", String::from_utf8_lossy(&output.stderr).trim()));
+        return Err(format!(
+            "gh pr view: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
     let v: Value = serde_json::from_slice(&output.stdout)
         .map_err(|e| format!("parse gh pr view json: {}", e))?;
-    let files = v.get("files").and_then(|x| x.as_array())
+    let files = v
+        .get("files")
+        .and_then(|x| x.as_array())
         .ok_or_else(|| "gh pr view missing files field".to_string())?;
-    let names: Vec<String> = files.iter()
+    let names: Vec<String> = files
+        .iter()
         .filter_map(|f| f.get("path").and_then(|p| p.as_str()).map(String::from))
         .collect();
     Ok(names)
@@ -331,7 +530,12 @@ async fn collect_pr_review_context(pr_url: &str, cwd: &str) -> String {
 
     let output = match output {
         Ok(o) => o,
-        Err(e) => return format!("- GitHub status preflight unavailable: failed to spawn gh: {}", e),
+        Err(e) => {
+            return format!(
+                "- GitHub status preflight unavailable: failed to spawn gh: {}",
+                e
+            )
+        }
     };
     if !output.status.success() {
         return format!(
@@ -342,16 +546,45 @@ async fn collect_pr_review_context(pr_url: &str, cwd: &str) -> String {
 
     let parsed: Value = match serde_json::from_slice(&output.stdout) {
         Ok(v) => v,
-        Err(e) => return format!("- GitHub status preflight unavailable: failed to parse gh output: {}", e),
+        Err(e) => {
+            return format!(
+                "- GitHub status preflight unavailable: failed to parse gh output: {}",
+                e
+            )
+        }
     };
 
-    let state = parsed.get("state").and_then(|v| v.as_str()).unwrap_or("unknown");
-    let mergeable = parsed.get("mergeable").and_then(|v| v.as_str()).unwrap_or("unknown");
-    let review_decision = parsed.get("reviewDecision").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or("none");
-    let merged_at = parsed.get("mergedAt").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or("none");
-    let head_ref = parsed.get("headRefName").and_then(|v| v.as_str()).unwrap_or("unknown");
-    let head_sha = parsed.get("headRefOid").and_then(|v| v.as_str()).unwrap_or("unknown");
-    let short_sha = if head_sha.len() >= 7 { &head_sha[..7] } else { head_sha };
+    let state = parsed
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let mergeable = parsed
+        .get("mergeable")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let review_decision = parsed
+        .get("reviewDecision")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("none");
+    let merged_at = parsed
+        .get("mergedAt")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("none");
+    let head_ref = parsed
+        .get("headRefName")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let head_sha = parsed
+        .get("headRefOid")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let short_sha = if head_sha.len() >= 7 {
+        &head_sha[..7]
+    } else {
+        head_sha
+    };
 
     let mut out = format!(
         "- State: {}\n- Merged at: {}\n- Mergeable: {}\n- Review decision: {}\n- Head: {} ({})\n- Vercel policy: ignore Vercel deploy/comment checks for merge readiness; they are informational only",
@@ -378,7 +611,8 @@ fn summarize_status_check_rollup(pr: &Value) -> String {
     let mut lines = Vec::new();
 
     for check in checks {
-        let name = check.get("name")
+        let name = check
+            .get("name")
             .or_else(|| check.get("context"))
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
@@ -390,13 +624,21 @@ fn summarize_status_check_rollup(pr: &Value) -> String {
         } else {
             match status.as_str() {
                 "SUCCESS" | "NEUTRAL" | "SKIPPED" => success += 1,
-                "PENDING" | "EXPECTED" | "QUEUED" | "IN_PROGRESS" | "REQUESTED" | "WAITING" => pending += 1,
-                "FAILURE" | "FAILED" | "ERROR" | "CANCELLED" | "TIMED_OUT" | "ACTION_REQUIRED" => failed += 1,
+                "PENDING" | "EXPECTED" | "QUEUED" | "IN_PROGRESS" | "REQUESTED" | "WAITING" => {
+                    pending += 1
+                }
+                "FAILURE" | "FAILED" | "ERROR" | "CANCELLED" | "TIMED_OUT" | "ACTION_REQUIRED" => {
+                    failed += 1
+                }
                 _ => other += 1,
             }
         }
         if lines.len() < 12 {
-            let suffix = if ignored_vercel { " (ignored: Vercel informational)" } else { "" };
+            let suffix = if ignored_vercel {
+                " (ignored: Vercel informational)"
+            } else {
+                ""
+            };
             lines.push(format!("  - {}: {}{}", name, status, suffix));
         }
     }
@@ -410,14 +652,21 @@ fn summarize_status_check_rollup(pr: &Value) -> String {
         out.push_str(&line);
     }
     if checks.len() > 12 {
-        out.push_str(&format!("\n  - ...{} more checks omitted", checks.len() - 12));
+        out.push_str(&format!(
+            "\n  - ...{} more checks omitted",
+            checks.len() - 12
+        ));
     }
     out
 }
 
 fn check_status_label(check: &Value) -> String {
     for key in ["conclusion", "state", "status"] {
-        if let Some(value) = check.get(key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        if let Some(value) = check
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
             let upper = value.to_uppercase();
             if upper == "COMPLETED" {
                 continue;
@@ -443,11 +692,16 @@ fn check_blocker_paths(files: &[String]) -> Option<String> {
         }
         for s in BLOCKER_SUFFIXES {
             if f.ends_with(s) {
-                return Some(format!("touches blocker path '{}' (matched suffix '{}')", f, s));
+                return Some(format!(
+                    "touches blocker path '{}' (matched suffix '{}')",
+                    f, s
+                ));
             }
         }
-        let base = std::path::Path::new(f).file_name()
-            .and_then(|n| n.to_str()).unwrap_or(f);
+        let base = std::path::Path::new(f)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(f);
         if base.starts_with(BLOCKER_ENV_PREFIX) {
             return Some(format!("touches env file '{}'", f));
         }
@@ -487,7 +741,9 @@ fn count_diff_lines(diff: &str) -> (i64, i64) {
 
 /// Truncate a string to at most `max_bytes`, on a UTF-8 char boundary.
 fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes { return s; }
+    if s.len() <= max_bytes {
+        return s;
+    }
     let mut end = max_bytes;
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
@@ -508,7 +764,8 @@ async fn run_codex_review(
     diff: &str,
 ) -> Result<Value, String> {
     let tmp_path = std::env::temp_dir().join(format!("samwise-review-{}", uuid_like()));
-    tokio::fs::create_dir_all(&tmp_path).await
+    tokio::fs::create_dir_all(&tmp_path)
+        .await
         .map_err(|e| format!("create tmp dir: {}", e))?;
     // RAII: tmp dir is cleaned on every return path, including timeouts/parse errors.
     let _tmp_guard = TempDir(tmp_path.clone());
@@ -529,14 +786,18 @@ async fn run_codex_review(
             "summary":            {"type": "string"}
         }
     });
-    tokio::fs::write(&schema_path, serde_json::to_vec_pretty(&schema).unwrap()).await
+    tokio::fs::write(&schema_path, serde_json::to_vec_pretty(&schema).unwrap())
+        .await
         .map_err(|e| format!("write schema: {}", e))?;
 
     let truncated = truncate_utf8(diff, MAX_DIFF_BYTES);
     let was_truncated = truncated.len() < diff.len();
     let sanitized = sanitize_diff_for_prompt(truncated);
     let bounded_diff = if was_truncated {
-        format!("{}\n\n[diff truncated at {} bytes; require human review]", sanitized, MAX_DIFF_BYTES)
+        format!(
+            "{}\n\n[diff truncated at {} bytes; require human review]",
+            sanitized, MAX_DIFF_BYTES
+        )
     } else {
         sanitized
     };
@@ -569,14 +830,21 @@ async fn run_codex_review(
     let mut cmd = async_cmd("codex");
     cmd.args([
         "exec",
-        "-m", CODEX_MODEL,
-        "-c", CODEX_REASONING_CONFIG,
-        "-s", "read-only",
-        "-c", "approval_policy=\"never\"",
-        "--output-schema", &schema_path_str,
-        "-o", &output_path_str,
+        "-m",
+        CODEX_MODEL,
+        "-c",
+        CODEX_REASONING_CONFIG,
+        "-s",
+        "read-only",
+        "-c",
+        "approval_policy=\"never\"",
+        "--output-schema",
+        &schema_path_str,
+        "-o",
+        &output_path_str,
         "--skip-git-repo-check",
-        "-C", repo_path,
+        "-C",
+        repo_path,
         &prompt,
     ]);
 
@@ -584,20 +852,25 @@ async fn run_codex_review(
 
     let mut child = cmd.spawn().map_err(|e| format!("spawn codex: {}", e))?;
     let wait_fut = child.wait();
-    let status = match tokio::time::timeout(Duration::from_secs(CODEX_TIMEOUT_SECS), wait_fut).await {
+    let status = match tokio::time::timeout(Duration::from_secs(CODEX_TIMEOUT_SECS), wait_fut).await
+    {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err(format!("wait codex: {}", e)),
         Err(_) => {
             // Kill the stuck child so we don't leak a multi-minute process.
             let _ = child.kill().await;
-            return Err(format!("codex review timed out after {}s", CODEX_TIMEOUT_SECS));
+            return Err(format!(
+                "codex review timed out after {}s",
+                CODEX_TIMEOUT_SECS
+            ));
         }
     };
     if !status.success() {
         return Err(format!("codex exec exited non-zero: {}", status));
     }
 
-    let body = tokio::fs::read_to_string(&output_path).await
+    let body = tokio::fs::read_to_string(&output_path)
+        .await
         .map_err(|e| format!("read codex output: {}", e))?;
     let parsed: Value = match serde_json::from_str::<Value>(&body) {
         Ok(v) => v,
@@ -610,12 +883,20 @@ async fn run_codex_review(
 fn extract_json_object(s: &str) -> Option<Value> {
     let start = s.find('{')?;
     let end = s.rfind('}')?;
-    if end <= start { return None; }
+    if end <= start {
+        return None;
+    }
     serde_json::from_str::<Value>(&s[start..=end]).ok()
 }
 
 fn extract_scores(review: &Value) -> Value {
-    let keys = ["correctness", "blast_radius", "test_coverage", "reversibility", "matches_task_intent"];
+    let keys = [
+        "correctness",
+        "blast_radius",
+        "test_coverage",
+        "reversibility",
+        "matches_task_intent",
+    ];
     let mut map = serde_json::Map::new();
     for k in keys {
         if let Some(v) = review.get(k) {
@@ -626,8 +907,16 @@ fn extract_scores(review: &Value) -> Value {
 }
 
 fn scores_are_valid(scores: &Value) -> bool {
-    let Some(obj) = scores.as_object() else { return false; };
-    let keys = ["correctness", "blast_radius", "test_coverage", "reversibility", "matches_task_intent"];
+    let Some(obj) = scores.as_object() else {
+        return false;
+    };
+    let keys = [
+        "correctness",
+        "blast_radius",
+        "test_coverage",
+        "reversibility",
+        "matches_task_intent",
+    ];
     for k in keys {
         match obj.get(k).and_then(|v| v.as_i64()) {
             Some(n) if (1..=10).contains(&n) => {}
@@ -639,7 +928,13 @@ fn scores_are_valid(scores: &Value) -> bool {
 
 fn min_across_dimensions(scores: &Value) -> Option<i64> {
     let obj = scores.as_object()?;
-    let keys = ["correctness", "blast_radius", "test_coverage", "reversibility", "matches_task_intent"];
+    let keys = [
+        "correctness",
+        "blast_radius",
+        "test_coverage",
+        "reversibility",
+        "matches_task_intent",
+    ];
     let mut min_val: Option<i64> = None;
     for k in keys {
         let v = obj.get(k)?.as_i64()?;
@@ -684,7 +979,9 @@ pub async fn wait_for_ci(pr_url: &str, repo_path: &str) -> Result<bool, String> 
                     .unwrap_or_default();
 
                 if checks.is_empty() {
-                    if observations >= CI_MIN_OBSERVATIONS && start.elapsed() >= Duration::from_secs(60) {
+                    if observations >= CI_MIN_OBSERVATIONS
+                        && start.elapsed() >= Duration::from_secs(60)
+                    {
                         log::info!("[review] no CI checks on PR {} after {} observations; treating as pass",
                             pr_url, observations);
                         return Ok(true);
@@ -696,7 +993,8 @@ pub async fn wait_for_ci(pr_url: &str, repo_path: &str) -> Result<bool, String> 
                     let mut considered_checks = 0usize;
 
                     for c in &checks {
-                        let name = c.get("name")
+                        let name = c
+                            .get("name")
                             .or_else(|| c.get("context"))
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
@@ -715,7 +1013,9 @@ pub async fn wait_for_ci(pr_url: &str, repo_path: &str) -> Result<bool, String> 
                         let bucket = match conclusion.to_uppercase().as_str() {
                             "SUCCESS" => "pass",
                             "SKIPPED" | "NEUTRAL" => "skipping",
-                            "FAILURE" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED" | "ERROR" => "fail",
+                            "FAILURE" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED" | "ERROR" => {
+                                "fail"
+                            }
                             _ => {
                                 // Conclusion absent or empty → check state / status
                                 match state.to_uppercase().as_str() {
@@ -731,19 +1031,32 @@ pub async fn wait_for_ci(pr_url: &str, repo_path: &str) -> Result<bool, String> 
                         };
 
                         match bucket {
-                            "pass" => { any_pass = true; }
+                            "pass" => {
+                                any_pass = true;
+                            }
                             "skipping" => {}
-                            "fail" => { any_fail = true; }
-                            _ => { all_done = false; }
+                            "fail" => {
+                                any_fail = true;
+                            }
+                            _ => {
+                                all_done = false;
+                            }
                         }
                     }
 
                     if considered_checks == 0 {
-                        log::info!("[review] only ignored Vercel checks on PR {}; treating CI as pass", pr_url);
+                        log::info!(
+                            "[review] only ignored Vercel checks on PR {}; treating CI as pass",
+                            pr_url
+                        );
                         return Ok(true);
                     }
-                    if any_fail { return Ok(false); }
-                    if all_done && any_pass { return Ok(true); }
+                    if any_fail {
+                        return Ok(false);
+                    }
+                    if all_done && any_pass {
+                        return Ok(true);
+                    }
                     if all_done && !any_pass {
                         return Ok(false);
                     }
@@ -752,7 +1065,8 @@ pub async fn wait_for_ci(pr_url: &str, repo_path: &str) -> Result<bool, String> 
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
             if gh_checks_no_checks_reported(&stderr) {
-                if observations >= CI_MIN_OBSERVATIONS && start.elapsed() >= Duration::from_secs(60) {
+                if observations >= CI_MIN_OBSERVATIONS && start.elapsed() >= Duration::from_secs(60)
+                {
                     log::info!("[review] no CI checks reported on PR {} after {} observations; treating as pass",
                         pr_url, observations);
                     return Ok(true);
@@ -763,7 +1077,11 @@ pub async fn wait_for_ci(pr_url: &str, repo_path: &str) -> Result<bool, String> 
         }
 
         if start.elapsed() >= max {
-            log::warn!("[review] CI polling timed out after {}s for PR {}", CI_POLL_MAX_SECS, pr_url);
+            log::warn!(
+                "[review] CI polling timed out after {}s for PR {}",
+                CI_POLL_MAX_SECS,
+                pr_url
+            );
             return Ok(false);
         }
         tokio::time::sleep(interval).await;
@@ -780,8 +1098,12 @@ mod tests {
 
     #[test]
     fn detects_gh_no_checks_reported_error() {
-        assert!(gh_checks_no_checks_reported("no checks reported on the 'sam/1234abcd' branch"));
-        assert!(gh_checks_no_checks_reported("No checks reported on the 'main' branch"));
+        assert!(gh_checks_no_checks_reported(
+            "no checks reported on the 'sam/1234abcd' branch"
+        ));
+        assert!(gh_checks_no_checks_reported(
+            "No checks reported on the 'main' branch"
+        ));
         assert!(!gh_checks_no_checks_reported("HTTP 500 from GitHub"));
     }
 }
@@ -793,9 +1115,12 @@ mod tests {
 pub async fn gh_pr_approve(pr_url: &str, repo_path: &str) -> Result<(), String> {
     let output = async_cmd("gh")
         .args([
-            "pr", "review", pr_url,
+            "pr",
+            "review",
+            pr_url,
             "--approve",
-            "-b", "Auto-approved by Samwise merge pipeline (Codex review passed, CI green).",
+            "-b",
+            "Auto-approved by Samwise merge pipeline (Codex review passed, CI green).",
         ])
         .current_dir(repo_path)
         .output()
@@ -808,7 +1133,8 @@ pub async fn gh_pr_approve(pr_url: &str, repo_path: &str) -> Result<(), String> 
         // will fail if a review truly is required and this somehow didn't stick.
         log::warn!(
             "[review] gh pr review --approve returned non-zero (non-fatal). stderr={} stdout={}",
-            stderr, stdout
+            stderr,
+            stdout
         );
     } else {
         log::info!("[review] posted APPROVED review on {}", pr_url);
@@ -838,10 +1164,13 @@ pub async fn gh_merge(pr_url: &str, repo_path: &str, head_sha: &str) -> Result<(
         attempt += 1;
         let output = async_cmd("gh")
             .args([
-                "pr", "merge", pr_url,
+                "pr",
+                "merge",
+                pr_url,
                 "--squash",
                 "--admin",
-                "--match-head-commit", &current_sha,
+                "--match-head-commit",
+                &current_sha,
             ])
             .current_dir(repo_path)
             // If a wrapping timeout drops this future, kill the gh child so a
@@ -875,7 +1204,11 @@ pub async fn gh_merge(pr_url: &str, repo_path: &str, head_sha: &str) -> Result<(
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             match fetch_pr_head_sha(pr_url, repo_path).await {
                 Ok(new_sha) => {
-                    log::info!("[review] re-fetched head SHA: {} -> {}", current_sha, new_sha);
+                    log::info!(
+                        "[review] re-fetched head SHA: {} -> {}",
+                        current_sha,
+                        new_sha
+                    );
                     current_sha = new_sha;
                     continue;
                 }
@@ -898,10 +1231,17 @@ async fn gh_pr_is_merged(pr_url: &str, repo_path: &str) -> Result<bool, String> 
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
-    let parsed: Value = serde_json::from_slice(&output.stdout)
-        .map_err(|e| format!("parse gh pr view: {}", e))?;
-    let state = parsed.get("state").and_then(|v| v.as_str()).unwrap_or("").to_uppercase();
-    let merged_at = parsed.get("mergedAt").and_then(|v| v.as_str()).unwrap_or("");
+    let parsed: Value =
+        serde_json::from_slice(&output.stdout).map_err(|e| format!("parse gh pr view: {}", e))?;
+    let state = parsed
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_uppercase();
+    let merged_at = parsed
+        .get("mergedAt")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     Ok(state == "MERGED" || !merged_at.is_empty())
 }
 
@@ -914,11 +1254,26 @@ async fn block(
     ci_passed: Option<bool>,
     reason: &str,
 ) -> AutoMergeOutcome {
-    log::warn!("[review] blocking auto-merge for task {}: {}", task_id, reason);
-    log_decision(config, task_id, pr_url,
-        scores.as_ref(), blockers.as_ref(), ci_passed,
-        "blocked", reason).await;
-    AutoMergeOutcome::Blocked { reason: reason.to_string(), scores }
+    log::warn!(
+        "[review] blocking auto-merge for task {}: {}",
+        task_id,
+        reason
+    );
+    log_decision(
+        config,
+        task_id,
+        pr_url,
+        scores.as_ref(),
+        blockers.as_ref(),
+        ci_passed,
+        "blocked",
+        reason,
+    )
+    .await;
+    AutoMergeOutcome::Blocked {
+        reason: reason.to_string(),
+        scores,
+    }
 }
 
 async fn log_decision(
@@ -978,7 +1333,10 @@ pub async fn run_samwise_pr_review(
     repo_path: &str,
 ) -> Result<PrReviewResult, String> {
     if !is_safe_pr_url(pr_url) {
-        return Err(format!("refusing pr_url that doesn't match the github shape: {}", pr_url));
+        return Err(format!(
+            "refusing pr_url that doesn't match the github shape: {}",
+            pr_url
+        ));
     }
     let cwd = resolve_codex_cwd(repo_path);
     let host_pr_context = collect_pr_review_context(pr_url, &cwd).await;
@@ -1004,11 +1362,16 @@ pub async fn run_samwise_pr_review(
     cmd.args([
         "--search",
         "exec",
-        "-m", CODEX_MODEL,
-        "-c", CODEX_REASONING_CONFIG,
-        "-s", "workspace-write",
-        "-c", "approval_policy=\"never\"",
-        "-c", "sandbox_workspace_write.network_access=true",
+        "-m",
+        CODEX_MODEL,
+        "-c",
+        CODEX_REASONING_CONFIG,
+        "-s",
+        "workspace-write",
+        "-c",
+        "approval_policy=\"never\"",
+        "-c",
+        "sandbox_workspace_write.network_access=true",
     ])
     .arg(&prompt)
     .current_dir(&cwd)
@@ -1016,7 +1379,9 @@ pub async fn run_samwise_pr_review(
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::piped());
 
-    let mut child = cmd.spawn().map_err(|e| format!("failed to spawn codex: {}", e))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn codex: {}", e))?;
 
     let stdout = child.stdout.take();
     let stdout_handle = tokio::spawn(async move {
@@ -1041,7 +1406,9 @@ pub async fn run_samwise_pr_review(
     let status = match tokio::time::timeout(
         Duration::from_secs(SAMWISE_PR_REVIEW_TIMEOUT_SECS),
         child.wait(),
-    ).await {
+    )
+    .await
+    {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err(format!("codex wait failed: {}", e)),
         Err(_) => {
@@ -1067,7 +1434,10 @@ pub async fn run_samwise_pr_review(
     // matching them would incorrectly kick a clean PR into Inconclusive.
     if !status.success() {
         let combined_lower = format!("{}\n{}", stdout.to_lowercase(), stderr.to_lowercase());
-        if combined_lower.contains("not logged in") || combined_lower.contains("please run /login") || combined_lower.contains("codex login") {
+        if combined_lower.contains("not logged in")
+            || combined_lower.contains("please run /login")
+            || combined_lower.contains("codex login")
+        {
             return Ok(PrReviewResult {
                 verdict: PrReviewVerdict::Inconclusive,
                 markdown: format!(
@@ -1077,7 +1447,10 @@ pub async fn run_samwise_pr_review(
                 requires_human: true,
             });
         }
-        if combined_lower.contains("rate limit") || combined_lower.contains("rate_limit_error") || combined_lower.contains("overloaded_error") {
+        if combined_lower.contains("rate limit")
+            || combined_lower.contains("rate_limit_error")
+            || combined_lower.contains("overloaded_error")
+        {
             return Ok(PrReviewResult {
                 verdict: PrReviewVerdict::Inconclusive,
                 markdown: format!(
@@ -1100,7 +1473,8 @@ pub async fn run_samwise_pr_review(
     }
 
     // Parse for the last `VERDICT:` line.
-    let (verdict, requires_human, body) = normalize_pr_review_result(parse_pr_review_output(&stdout));
+    let (verdict, requires_human, body) =
+        normalize_pr_review_result(parse_pr_review_output(&stdout));
     Ok(PrReviewResult {
         verdict,
         markdown: body,
@@ -1121,12 +1495,16 @@ pub async fn run_full_pr_review(
     repo_path: &str,
 ) -> Result<String, String> {
     if !is_safe_pr_url(pr_url) {
-        return Err(format!("refusing pr_url that doesn't match the github shape: {}", pr_url));
+        return Err(format!(
+            "refusing pr_url that doesn't match the github shape: {}",
+            pr_url
+        ));
     }
 
     let cwd = resolve_codex_cwd(repo_path);
     let tmp_path = std::env::temp_dir().join(format!("samwise-full-pr-review-{}", uuid_like()));
-    tokio::fs::create_dir_all(&tmp_path).await
+    tokio::fs::create_dir_all(&tmp_path)
+        .await
         .map_err(|e| format!("create tmp dir: {}", e))?;
     let _tmp_guard = TempDir(tmp_path.clone());
     let output_path = tmp_path.join("last-message.txt");
@@ -1151,8 +1529,10 @@ pub async fn run_full_pr_review(
         "--search",
         "exec",
         "--json",
-        "-m", CODEX_MODEL,
-        "-c", CODEX_REASONING_CONFIG,
+        "-m",
+        CODEX_MODEL,
+        "-c",
+        CODEX_REASONING_CONFIG,
         "--dangerously-bypass-approvals-and-sandbox",
         "-C",
     ])
@@ -1171,13 +1551,19 @@ pub async fn run_full_pr_review(
     #[cfg(unix)]
     cmd.process_group(0);
 
-    let mut child = cmd.spawn().map_err(|e| format!("failed to spawn codex: {}", e))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn codex: {}", e))?;
     let child_pid = child.id().unwrap_or(0);
     post_full_pr_review_comment(
         config,
         task_id,
-        &format!("Codex `$pr-review` process started for this PR (pid {}).", child_pid),
-    ).await;
+        &format!(
+            "Codex `$pr-review` process started for this PR (pid {}).",
+            child_pid
+        ),
+    )
+    .await;
 
     let last_activity = std::sync::Arc::new(std::sync::Mutex::new(Instant::now()));
     let heartbeat_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -1215,10 +1601,14 @@ pub async fn run_full_pr_review(
                             let pid = child_pid as i32;
                             // Negative pid = whole process group (Codex is a
                             // group leader), so subprocesses die too.
-                            unsafe { libc::kill(-pid, libc::SIGTERM); }
+                            unsafe {
+                                libc::kill(-pid, libc::SIGTERM);
+                            }
                             tokio::spawn(async move {
                                 tokio::time::sleep(Duration::from_secs(10)).await;
-                                unsafe { libc::kill(-pid, libc::SIGKILL); }
+                                unsafe {
+                                    libc::kill(-pid, libc::SIGKILL);
+                                }
                             });
                         }
                     }
@@ -1239,9 +1629,14 @@ pub async fn run_full_pr_review(
                 if quiet_for < Duration::from_secs(FULL_PR_REVIEW_FRESH_GUARD_SECS)
                     && last_touch_at.elapsed() >= Duration::from_secs(60)
                 {
-                    let _ = supabase::update_task(&config_hb, &task_id_hb, &serde_json::json!({
-                        "updated_at": chrono::Utc::now().to_rfc3339(),
-                    })).await;
+                    let _ = supabase::update_task(
+                        &config_hb,
+                        &task_id_hb,
+                        &serde_json::json!({
+                            "updated_at": chrono::Utc::now().to_rfc3339(),
+                        }),
+                    )
+                    .await;
                     last_touch_at = Instant::now();
                 }
 
@@ -1262,10 +1657,14 @@ pub async fn run_full_pr_review(
                             // (or any deploy subprocess it spawned) can't block
                             // child.wait() until the 90 min hard timeout or
                             // outlive the row's restart window.
-                            unsafe { libc::kill(-pid, libc::SIGTERM); }
+                            unsafe {
+                                libc::kill(-pid, libc::SIGTERM);
+                            }
                             tokio::spawn(async move {
                                 tokio::time::sleep(Duration::from_secs(10)).await;
-                                unsafe { libc::kill(-pid, libc::SIGKILL); }
+                                unsafe {
+                                    libc::kill(-pid, libc::SIGKILL);
+                                }
                             });
                         }
                     }
@@ -1342,7 +1741,9 @@ pub async fn run_full_pr_review(
     let status = match tokio::time::timeout(
         Duration::from_secs(FULL_PR_REVIEW_TIMEOUT_SECS),
         child.wait(),
-    ).await {
+    )
+    .await
+    {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             heartbeat_alive.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -1353,7 +1754,9 @@ pub async fn run_full_pr_review(
             // Group-kill so a hung deploy subprocess can't outlive the timeout.
             #[cfg(unix)]
             if child_pid > 0 {
-                unsafe { libc::kill(-(child_pid as i32), libc::SIGKILL); }
+                unsafe {
+                    libc::kill(-(child_pid as i32), libc::SIGKILL);
+                }
             }
             let _ = child.kill().await;
             let stdout = stdout_handle.await.unwrap_or_default();
@@ -1381,7 +1784,9 @@ pub async fn run_full_pr_review(
 
     let stdout = stdout_handle.await.unwrap_or_default();
     let stderr = stderr_handle.await.unwrap_or_default();
-    let final_message = tokio::fs::read_to_string(&output_path).await.unwrap_or_default();
+    let final_message = tokio::fs::read_to_string(&output_path)
+        .await
+        .unwrap_or_default();
     let response = if final_message.trim().is_empty() {
         stdout.trim().to_string()
     } else {
@@ -1390,7 +1795,9 @@ pub async fn run_full_pr_review(
 
     if status.success() {
         if response.trim().is_empty() {
-            return Ok("Codex completed `$pr-review`, but did not return a final message.".to_string());
+            return Ok(
+                "Codex completed `$pr-review`, but did not return a final message.".to_string(),
+            );
         }
         return Ok(response);
     }
@@ -1411,12 +1818,16 @@ pub async fn run_full_pr_review(
 }
 
 async fn post_full_pr_review_comment(config: &SupabaseConfig, task_id: &str, content: &str) {
-    let _ = supabase::post_comment(config, &serde_json::json!({
-        "task_id": task_id,
-        "author": "agent",
-        "content": content,
-        "mentions": [],
-    })).await;
+    let _ = supabase::post_comment(
+        config,
+        &serde_json::json!({
+            "task_id": task_id,
+            "author": "agent",
+            "content": content,
+            "mentions": [],
+        }),
+    )
+    .await;
 }
 
 async fn full_pr_review_task_is_live(config: &SupabaseConfig, task_id: &str) -> bool {
@@ -1449,8 +1860,14 @@ fn summarize_codex_exec_event(event: &Value) -> Option<String> {
     let lower_type = event_type.to_ascii_lowercase();
 
     if event_type == "function_call" {
-        let tool_name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
-        let args = payload.get("arguments").and_then(|v| v.as_str()).unwrap_or("");
+        let tool_name = payload
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("tool");
+        let args = payload
+            .get("arguments")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if tool_name == "exec_command" {
             if let Ok(parsed_args) = serde_json::from_str::<Value>(args) {
                 if let Some(cmd) = parsed_args.get("cmd").and_then(|v| v.as_str()) {
@@ -1482,7 +1899,10 @@ fn summarize_codex_exec_event(event: &Value) -> Option<String> {
     }
 
     if lower_type.contains("exec") || lower_type.contains("command") {
-        if lower_type.contains("end") || lower_type.contains("complete") || lower_type.contains("completed") {
+        if lower_type.contains("end")
+            || lower_type.contains("complete")
+            || lower_type.contains("completed")
+        {
             let code = payload
                 .get("exit_code")
                 .or_else(|| event.pointer("/item/exit_code"))
@@ -1495,23 +1915,27 @@ fn summarize_codex_exec_event(event: &Value) -> Option<String> {
                 None => "Command finished.".to_string(),
             });
         }
-        if let Some(command) = first_command_string(payload, &[
-            "/command",
-            "/cmd",
-            "/item/command",
-            "/item/cmd",
-            "/item/input/command",
-            "/item/args/command",
-            "/call/command",
-            "/call/args/command",
-            "/message/command",
-        ]) {
+        if let Some(command) = first_command_string(
+            payload,
+            &[
+                "/command",
+                "/cmd",
+                "/item/command",
+                "/item/cmd",
+                "/item/input/command",
+                "/item/args/command",
+                "/call/command",
+                "/call/args/command",
+                "/message/command",
+            ],
+        ) {
             return Some(format!("Running: {}", short_one_line(&command, 120)));
         }
         return Some("Running a shell command.".to_string());
     }
 
-    if lower_type.contains("patch") && (lower_type.contains("apply") || lower_type.contains("edit")) {
+    if lower_type.contains("patch") && (lower_type.contains("apply") || lower_type.contains("edit"))
+    {
         return Some("Applying code changes.".to_string());
     }
 
@@ -1520,14 +1944,20 @@ fn summarize_codex_exec_event(event: &Value) -> Option<String> {
     }
 
     if lower_type.contains("mcp") {
-        if let Some(name) = first_string(payload, &["/name", "/tool_name", "/item/name", "/call/name"]) {
+        if let Some(name) = first_string(
+            payload,
+            &["/name", "/tool_name", "/item/name", "/call/name"],
+        ) {
             return Some(format!("Using MCP tool: {}", short_one_line(name, 80)));
         }
         return Some("Using an MCP tool.".to_string());
     }
 
     if lower_type.contains("tool") {
-        if let Some(name) = first_string(payload, &["/name", "/tool_name", "/item/name", "/call/name"]) {
+        if let Some(name) = first_string(
+            payload,
+            &["/name", "/tool_name", "/item/name", "/call/name"],
+        ) {
             return Some(format!("Using tool: {}", short_one_line(name, 80)));
         }
     }
@@ -1546,12 +1976,16 @@ fn summarize_codex_exec_event(event: &Value) -> Option<String> {
 }
 
 fn first_string<'a>(value: &'a Value, pointers: &[&str]) -> Option<&'a str> {
-    pointers.iter().find_map(|p| value.pointer(p).and_then(|v| v.as_str()))
+    pointers
+        .iter()
+        .find_map(|p| value.pointer(p).and_then(|v| v.as_str()))
 }
 
 fn first_command_string(value: &Value, pointers: &[&str]) -> Option<String> {
     for pointer in pointers {
-        let Some(v) = value.pointer(pointer) else { continue; };
+        let Some(v) = value.pointer(pointer) else {
+            continue;
+        };
         if let Some(s) = v.as_str() {
             return Some(s.to_string());
         }
@@ -1598,11 +2032,24 @@ fn parse_pr_review_output(raw: &str) -> (PrReviewVerdict, bool, String) {
     // first non-empty one.
     for (idx, line) in lines.iter().enumerate().rev() {
         let stripped = line.trim();
-        if stripped.is_empty() { continue; }
+        if stripped.is_empty() {
+            continue;
+        }
         let lower = stripped.to_lowercase();
         if let Some(rest) = lower.strip_prefix("verdict:") {
             let tag = rest.trim();
-            verdict = if tag.starts_with("merge_now") {
+            // The $samwise-pr-review skill template specifies `merge_now`, but
+            // Codex in practice also emits the synonyms `merge`, `approve`,
+            // `approved`, and `ship` for a clean PR. Without accepting these,
+            // every clean review collapsed to Inconclusive and stranded
+            // mergeable PRs in Review/Fixes Needed until a human caught it.
+            // Accept all of them as MergeNow. `fix_issues` stays distinct;
+            // anything else is genuinely inconclusive.
+            verdict = if tag.starts_with("merge_now")
+                || tag.starts_with("merge")
+                || tag.starts_with("approve")
+                || tag.starts_with("ship")
+            {
                 PrReviewVerdict::MergeNow
             } else if tag.starts_with("fix_issues") {
                 PrReviewVerdict::FixIssues
@@ -1631,7 +2078,9 @@ fn parse_pr_review_output(raw: &str) -> (PrReviewVerdict, bool, String) {
     let mut body_cut = v_idx;
     for (idx, line) in lines[..v_idx].iter().enumerate().rev() {
         let stripped = line.trim();
-        if stripped.is_empty() { continue; }
+        if stripped.is_empty() {
+            continue;
+        }
         let lower = stripped.to_lowercase();
         if let Some(rest) = lower.strip_prefix("requires_human:") {
             requires_human = rest.trim().starts_with("yes");
@@ -1722,7 +2171,10 @@ fn is_verification_only_blocker(line: &str) -> bool {
         "not installed locally",
         "hold merge until",
     ];
-    if !verification_markers.iter().any(|marker| lower.contains(marker)) {
+    if !verification_markers
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
         return false;
     }
 
@@ -1751,7 +2203,9 @@ fn is_verification_only_blocker(line: &str) -> bool {
         "unsafe",
         "wrong",
     ];
-    !code_issue_markers.iter().any(|marker| lower.contains(marker))
+    !code_issue_markers
+        .iter()
+        .any(|marker| lower.contains(marker))
 }
 
 fn markdown_section_lines<'a>(markdown: &'a str, heading: &str) -> Vec<&'a str> {
@@ -1800,7 +2254,9 @@ fn resolve_codex_cwd(repo_path: &str) -> String {
 }
 
 fn trim_to(s: &str, max: usize) -> String {
-    if s.len() <= max { return s.to_string(); }
+    if s.len() <= max {
+        return s.to_string();
+    }
     // Walk backward to the nearest char boundary so we never slice through a
     // multi-byte UTF-8 codepoint. Codex output routinely includes emojis and
     // non-ASCII glyphs, so a naive `s[..max]` can panic here.
