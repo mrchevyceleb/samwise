@@ -7117,6 +7117,22 @@ async fn describe_image_attachments(
         return HashMap::new();
     }
 
+    // If the coder itself is vision-capable (e.g. Kimi K3 Fast), skip the local
+    // describe pass entirely and let Claude Code send the image files straight to
+    // the model — it reads them via its Read tool and the proxy forwards them, so
+    // the model sees the real screenshot instead of a lossy local description.
+    // Only a text-only coder (e.g. GLM 5.2) needs the local describe step.
+    let coder_handles_vision = std::env::var("AUTOSAM_CODER_HANDLES_VISION")
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    if coder_handles_vision {
+        log::info!(
+            "[worker] Vision adapter: skipped — AUTOSAM_CODER_HANDLES_VISION set; coder sees images directly"
+        );
+        return HashMap::new();
+    }
+
     let image_exts = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"];
     let image_files: Vec<&std::path::PathBuf> = attachment_paths
         .iter()
