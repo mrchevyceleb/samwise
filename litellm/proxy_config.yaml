@@ -1,0 +1,66 @@
+# LiteLLM proxy config for AutoSam
+# Routes Claude Code (thinking it's talking to Anthropic) through to Fireworks GLM
+#
+# Model name mapping:
+#   "claude-opus-4-8"       -> Fireworks GLM 5.2 (primary)
+#   "claude-opus-4-20250514" -> Fireworks GLM 5.2 (fallback)
+#   "glm-5.2"               -> Fireworks GLM 5.2 (direct)
+#   "glm-5.1"               -> Fireworks GLM 5.1 (fallback)
+#
+# Start: litellm --config proxy_config.yaml --port 9876 --host 127.0.0.1
+
+litellm_settings:
+  drop_params: true
+  # Drop unsupported Anthropic-specific params instead of erroring.
+  # GLM on Fireworks doesn't support every Anthropic param, but the
+  # critical ones (tool_use, streaming) work fine.
+
+general_settings:
+  health_check_interval: 0
+
+model_list:
+  # Primary: maps "claude-opus-4-8" (what AutoSam sends) to Fireworks GLM 5.2
+  - model_name: claude-opus-4-8
+    litellm_params:
+      model: openai/accounts/fireworks/models/glm-5p2
+      api_key: os.environ/FIREWORKS_API_KEY
+      api_base: https://api.fireworks.ai/inference/v1
+      reasoning_effort: max
+    model_info:
+      supports_function_calling: true
+      supports_parallel_function_calling: true
+      max_tokens: 65536
+
+  # Fallback: maps the alternate model name AutoSam uses on retry
+  - model_name: claude-opus-4-20250514
+    litellm_params:
+      model: openai/accounts/fireworks/models/glm-5p2
+      api_key: os.environ/FIREWORKS_API_KEY
+      api_base: https://api.fireworks.ai/inference/v1
+      reasoning_effort: max
+    model_info:
+      supports_function_calling: true
+      supports_parallel_function_calling: true
+      max_tokens: 65536
+
+  # Direct access to GLM 5.2
+  - model_name: glm-5.2
+    litellm_params:
+      model: openai/accounts/fireworks/models/glm-5p2
+      api_key: os.environ/FIREWORKS_API_KEY
+      api_base: https://api.fireworks.ai/inference/v1
+      reasoning_effort: max
+    model_info:
+      supports_function_calling: true
+      max_tokens: 65536
+
+  # Fallback: GLM 5.1 still available
+  - model_name: glm-5.1
+    litellm_params:
+      model: openai/accounts/fireworks/models/glm-5p1
+      api_key: os.environ/FIREWORKS_API_KEY
+      api_base: https://api.fireworks.ai/inference/v1
+      reasoning_effort: max
+    model_info:
+      supports_function_calling: true
+      max_tokens: 16384

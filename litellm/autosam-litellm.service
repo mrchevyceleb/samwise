@@ -1,0 +1,20 @@
+[Unit]
+Description=AutoSam LiteLLM Proxy (Claude Code -> Fireworks GLM)
+After=network.target
+
+[Service]
+Type=simple
+User=mrchevyceleb
+WorkingDirectory=/home/mrchevyceleb/samwise/Personal-Apps/AutoSam/litellm
+ExecStart=/home/mrchevyceleb/.local/share/autosam-litellm/bin/litellm --config proxy_config.yaml --port 9876 --host 127.0.0.1
+EnvironmentFile=/home/mrchevyceleb/.config/autosam/litellm.env
+Restart=always
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/mrchevyceleb
+
+[Install]
+WantedBy=default.target
