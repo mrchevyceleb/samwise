@@ -9501,6 +9501,16 @@ async fn detect_stuck_pr_checks(pr_url: &str) -> Option<String> {
 /// Run Claude Code CLI one-shot with explicit max_turns and timeout_secs.
 /// Pass 0 for either to use defaults (no limit / no timeout).
 /// Also used by commands/chat.rs for direct chat responses.
+///
+/// This is a decide-and-reply helper, not a coding-task runner: every caller
+/// wants text (or a JSON block) back, never real file/shell side effects. Tools
+/// are disabled (`--tools ""`) so Claude can't try to actually carry out an
+/// imperative ask (e.g. "set the webhook secret in doppler") via Bash/Edit
+/// instead of just replying or emitting a create_task block. Without this, an
+/// action-phrased message burns the turn budget on tool calls and crashes with
+/// "Reached max turns" before ever producing output — the same failure mode
+/// already special-cased once for PR-review asks; disabling tools here fixes
+/// the whole class instead of one phrasing at a time.
 pub async fn run_claude_code_opts(
     cwd: &str,
     prompt: &str,
@@ -9519,6 +9529,8 @@ pub async fn run_claude_code_opts(
         .arg("--output-format")
         .arg("text")
         .arg("--dangerously-skip-permissions")
+        .arg("--tools")
+        .arg("")
         .arg("--model")
         .arg(super::claude_code::CLAUDE_MODEL)
         .arg("--effort")
