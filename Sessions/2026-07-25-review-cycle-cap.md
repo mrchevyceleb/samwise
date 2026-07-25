@@ -27,4 +27,14 @@ A status-independent 24-hour board audit found 16 cards at `review_cycle_count >
 
 ## Rollout
 
-This branch is not merged and the live worker has not been rebuilt or restarted. The current production worker remains unchanged until an explicit merge/deploy decision.
+Explicit production approval was given on 2026-07-25.
+
+- Fast-forwarded `master` to code commit `055298afd172ecbe0d805cc083710736c989fe2e` and pushed `origin/master`.
+- Re-ran the full Rust library suite: 32 passed.
+- Re-ran Svelte checking: 0 errors, with the existing warning baseline.
+- Built the production application with `npx tauri build --no-bundle`, preserving embedded frontend assets.
+- Backed up the prior binary to `~/.local/share/autosam/backups/agent-one-20260725T145630Z`.
+- Atomically replaced `/usr/bin/agent-one`; deployed SHA-256 is `e927990d7058b20d842b69a0b6ff9124fe572bec9b54e5af2ed8f3d40b0218c2` and the binary contains 20 embedded `_app/immutable` asset markers.
+- Restarted `samwise-agent-one.service`. Final healthy PID is `1608414`, with exactly one `agent-one` process and no startup panic, fatal, OOM, or error signals.
+- No environment or persisted setting overrides `AUTOSAM_MAX_REVIEW_CYCLES` / `autoFixMaxReviewCycles`, so the live effective limit is the new default of five.
+- Startup recovery briefly reclaimed externally owned PR #1155. The duplicate coding child was stopped, the card was restored to clean `approved` state, and the worker was started again without claiming it. Final board state preserved the live external closeout.
