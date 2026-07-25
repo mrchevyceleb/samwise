@@ -492,6 +492,54 @@ const MERGE_DEPLOY_RETRIES_KEY: &str = "samwise_merge_deploy_retries";
 /// with the fixes_needed sweep. Tunable at runtime via AUTOSAM_FIX_TIMEOUT_SECS
 /// (set in the systemd unit) so it can be raised without rebuilding the binary.
 const AUTO_FIX_CLAUDE_TIMEOUT_SECS_DEFAULT: u64 = 1800;
+/// Three review/fix passes proved too small in production: 16 cards reached
+/// cycle 3 in one 24-hour window because each review often exposes a new
+/// adjacent blocker. Five remains bounded while giving the fixer enough room
+/// to converge. Runtime/settings overrides are clamped to 1..=10.
+const AUTO_FIX_MAX_REVIEW_CYCLES_DEFAULT: i64 = 5;
+const AUTO_FIX_CAP_NOTIFICATION_PREFIX: &str = "auto_fix_cap_notified";
+
+fn normalize_auto_fix_max_review_cycles(value: Option<i64>) -> i64 {
+    value
+        .unwrap_or(AUTO_FIX_MAX_REVIEW_CYCLES_DEFAULT)
+        .clamp(1, 10)
+}
+
+fn auto_fix_cycle_is_capped(cycle_count: i64, max_review_cycles: i64) -> bool {
+    cycle_count >= max_review_cycles
+}
+
+fn auto_fix_cap_notification_marker(max_review_cycles: i64, head: &str) -> String {
+    format!("{}:{}:{}", AUTO_FIX_CAP_NOTIFICATION_PREFIX, max_review_cycles, head)
+}
+
+fn auto_fix_cap_notification_recorded(
+    failure_reason: Option<&str>,
+    max_review_cycles: i64,
+    current_head: &str,
+) -> bool {
+    let prefix = format!("{}:{}:", AUTO_FIX_CAP_NOTIFICATION_PREFIX, max_review_cycles);
+    let Some(recorded_head) = failure_reason.and_then(|reason| reason.strip_prefix(&prefix)) else {
+        return false;
+    };
+    // When both GitHub and the local remote ref were unavailable, remember the
+    // notification for this capped state instead of spamming forever. A real
+    // new push moves the task back through review and clears failure_reason.
+    recorded_head == "unknown" || recorded_head == current_head
+}
+
+fn auto_fix_max_review_cycles(settings: Option<&Value>) -> i64 {
+    normalize_auto_fix_max_review_cycles(
+        std::env::var("AUTOSAM_MAX_REVIEW_CYCLES")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .or_else(|| {
+                settings
+                    .and_then(|s| s.get("autoFixMaxReviewCycles"))
+                    .and_then(|v| v.as_i64())
+            }),
+    )
+}
 
 fn auto_fix_claude_timeout_secs() -> u64 {
     std::env::var("AUTOSAM_FIX_TIMEOUT_SECS")
@@ -15089,6 +15137,24 @@ fn path_to_slash_string(path: impl AsRef<Path>) -> String {
 mod merge_deploy_tests {
     use super::*;
 
+    #[test]
+    fn auto_fix_cycle_cap_defaults_to_five_and_stays_bounded() {
+        assert_eq!(normalize_auto_fix_max_review_cycles(None), 5);
+        assert_eq!(normalize_auto_fix_max_review_cycles(Some(5)), 5);
+        assert_eq!(normalize_auto_fix_max_review_cycles(Some(0)), 1);
+        assert_eq!(normalize_auto_fix_max_review_cycles(Some(99)), 10);
+        assert!(!auto_fix_cycle_is_capped(3, 5));
+        assert!(!auto_fix_cycle_is_capped(4, 5));
+        assert!(auto_fix_cycle_is_capped(5, 5));
+
+        let marker = auto_fix_cap_notification_marker(5, "abc123");
+        assert!(auto_fix_cap_notification_recorded(Some(&marker), 5, "abc123"));
+        assert!(!auto_fix_cap_notification_recorded(Some(&marker), 5, "def456"));
+        assert!(!auto_fix_cap_notification_recorded(Some(&marker), 4, "abc123"));
+        let unknown = auto_fix_cap_notification_marker(5, "unknown");
+        assert!(auto_fix_cap_notification_recorded(Some(&unknown), 5, "abc123"));
+    }
+
     fn run_test_git(repo: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")
             .args(args)
@@ -17447,7 +17513,7 @@ pub async fn sweep_adopt_orphan_prs(config: &SupabaseConfig) {
 
 /// Decide whether to fire the auto-fix loop after a `fix_issues` verdict.
 /// Gated by the `autoFixFromFixesNeededEnabled` setting, Codex's
-/// `REQUIRES_HUMAN` flag, and a 3-cycle cap per card.
+/// `REQUIRES_HUMAN` flag, and a configurable bounded cycle cap per card.
 async fn maybe_spawn_auto_fix(
     config: SupabaseConfig,
     task_id: String,
@@ -17494,6 +17560,7 @@ async fn maybe_spawn_auto_fix(
         .and_then(|s| s.get("autoFixFromFixesNeededEnabled"))
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
+    let max_review_cycles = auto_fix_max_review_cycles(settings_val.as_ref());
     if !auto_fix_on {
         send_terminal_telegram(
             &config,
@@ -17538,9 +17605,9 @@ async fn maybe_spawn_auto_fix(
                 .and_then(|task| task_context_string(task, "head_ref"))
         })
         .unwrap_or_else(|| task_branch_name(&short_task_id(&task_id)));
-    if cycle_count >= 3 {
+    if auto_fix_cycle_is_capped(cycle_count, max_review_cycles) {
         // Cap reached. Before parking this PR for a human, attempt ONE final
-        // merge at a relaxed score floor. The 3-cycle cap most often fires on
+        // merge at a relaxed score floor. The cycle cap most often fires on
         // CI-green, no-blocker PRs whose only problem is a sub-threshold Codex
         // score (5 to 6) the auto-fix cannot raise (nothing concrete to fix), so
         // the card cycles to the cap and then sits forever waiting for a human.
@@ -17552,7 +17619,11 @@ async fn maybe_spawn_auto_fix(
         let already_tried = cap_ctx
             .and_then(|c| c.get("cap_merge_attempted"))
             .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+            .unwrap_or(false)
+            && cap_ctx
+                .and_then(|c| c.get("cap_merge_attempted_limit"))
+                .and_then(|v| v.as_i64())
+                == Some(max_review_cycles);
         if already_tried {
             // Self-heal the #1 manual babysitter tax: a capped card whose cap-floor
             // merge already failed gets parked forever, even after a human or fixer
@@ -17577,6 +17648,7 @@ async fn maybe_spawn_auto_fix(
                 if let Some(obj) = reset_ctx.as_object_mut() {
                     obj.remove("cap_merge_attempted");
                     obj.remove("cap_merge_attempted_sha");
+                    obj.remove("cap_merge_attempted_limit");
                     obj.remove(PR_REVIEW_STATUS_KEY);
                     obj.remove(PR_REVIEW_STARTED_AT_KEY);
                     obj.remove("auto_merge_blocked_reason");
@@ -17597,7 +17669,9 @@ async fn maybe_spawn_auto_fix(
                 agent_comment(&config, &task_id, "A new commit was pushed after the cap-floor merge attempt. Re-opening for a fresh review on the updated code instead of leaving it parked.").await;
                 return;
             }
-            agent_comment(&config, &task_id, "Hit the 3-cycle cap and the relaxed cap-floor merge was already attempted without success. Leaving in Fixes Needed for you.").await;
+            // The cap-floor attempt already posted its terminal result. The
+            // stale sweep revisits this row every 90 seconds, so return silently
+            // until a genuinely new PR head reopens review above.
             return;
         }
 
@@ -17609,14 +17683,65 @@ async fn maybe_spawn_auto_fix(
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         if !auto_merge_on {
-            agent_comment(&config, &task_id, "Hit the 3-cycle auto-fix cap and auto-merge is off, so leaving this in Fixes Needed for you.").await;
+            let mut cap_head = review::fetch_pr_head_sha(&pr_url, &repo_path)
+                .await
+                .ok()
+                .filter(|sha| !sha.is_empty());
+            if cap_head.is_none() {
+                cap_head = run_git(
+                    &["rev-parse", &format!("origin/{}", expected_branch)],
+                    &repo_path,
+                )
+                .await
+                .ok()
+                .map(|sha| sha.trim().to_string())
+                .filter(|sha| !sha.is_empty());
+            }
+            let cap_head = cap_head.unwrap_or_else(|| "unknown".to_string());
+            let previous_reason = latest_task
+                .as_ref()
+                .and_then(|task| task.get("failure_reason"))
+                .and_then(|value| value.as_str());
+            if auto_fix_cap_notification_recorded(
+                previous_reason,
+                max_review_cycles,
+                &cap_head,
+            ) {
+                return;
+            }
+
+            let comment = format!("Hit the {}-cycle auto-fix cap and auto-merge is off, so leaving this in Fixes Needed for you.", max_review_cycles);
+            let comment_posted = supabase::post_comment(
+                &config,
+                &serde_json::json!({
+                    "task_id": &task_id,
+                    "author": "agent",
+                    "content": &comment,
+                    "mentions": [],
+                }),
+            )
+            .await
+            .is_ok();
             send_terminal_telegram(
                 &config,
                 &task_id,
                 &format!("Auto-fix capped: {}", pr_url),
-                "3 cycles and auto-merge is off. Your call.",
+                &format!("{} cycles and auto-merge is off. Your call.", max_review_cycles),
             )
             .await;
+            // Record dedupe state only after the durable board comment succeeds.
+            // This uses a top-level field instead of a context read-modify-write,
+            // so concurrent review/deploy context keys cannot be overwritten.
+            if comment_posted {
+                let marker = auto_fix_cap_notification_marker(max_review_cycles, &cap_head);
+                let _ = supabase::update_task_if_status(
+                    &config,
+                    &task_id,
+                    "fixes_needed",
+                    &serde_json::json!({ "failure_reason": marker }),
+                )
+                .await;
+            }
             return;
         }
 
@@ -17654,6 +17779,7 @@ async fn maybe_spawn_auto_fix(
             .filter(|c| c.is_object())
             .unwrap_or_else(|| serde_json::json!({}));
         new_ctx["cap_merge_attempted"] = serde_json::json!(true);
+        new_ctx["cap_merge_attempted_limit"] = serde_json::json!(max_review_cycles);
         // Stamp the head SHA the cap-merge ran against so the self-heal above can
         // tell a later genuine new-commit push apart from the same parked state.
         if let Ok(sha) = review::fetch_pr_head_sha(&pr_url, &repo_path).await {
@@ -17667,8 +17793,8 @@ async fn maybe_spawn_auto_fix(
             &config,
             &task_id,
             &format!(
-                "Hit the 3-cycle auto-fix cap. Attempting a final merge at the relaxed cap floor (min score {}). Every other gate (blockers, CI, diff size, blocker paths) still applies at full strength.",
-                cap_floor
+                "Hit the {}-cycle auto-fix cap. Attempting a final merge at the relaxed cap floor (min score {}). Every other gate (blockers, CI, diff size, blocker paths) still applies at full strength.",
+                max_review_cycles, cap_floor
             ),
         )
         .await;
@@ -17731,14 +17857,14 @@ async fn maybe_spawn_auto_fix(
                 agent_comment(
                     &config,
                     &task_id,
-                    "3-cycle cap reached and the relaxed cap-floor merge still did not pass (real blockers, CI not green, or score below the floor). Leaving in Fixes Needed for you.",
+                    &format!("{}-cycle cap reached and the relaxed cap-floor merge still did not pass (real blockers, CI not green, or score below the floor). Leaving in Fixes Needed for you.", max_review_cycles),
                 )
                 .await;
                 send_terminal_telegram(
                     &config,
                     &task_id,
                     &format!("Auto-fix capped: {}", pr_url),
-                    "3 cycles plus a relaxed cap-floor merge both failed. Your call.",
+                    &format!("{} cycles plus a relaxed cap-floor merge both failed. Your call.", max_review_cycles),
                 )
                 .await;
             }
@@ -17753,6 +17879,7 @@ async fn maybe_spawn_auto_fix(
         repo_path,
         review_markdown,
         cycle_count as u32,
+        max_review_cycles as u32,
         expected_branch,
     );
 }
@@ -17767,6 +17894,7 @@ pub fn spawn_auto_fix_task(
     repo_path: String,
     review_markdown: String,
     prev_cycle_count: u32,
+    max_review_cycles: u32,
     expected_branch: String,
 ) {
     tokio::spawn(async move {
@@ -17779,6 +17907,7 @@ pub fn spawn_auto_fix_task(
             &serde_json::json!({
                 "status": "in_progress",
                 "review_cycle_count": new_cycle,
+                "failure_reason": serde_json::Value::Null,
                 "updated_at": chrono::Utc::now().to_rfc3339(),
             }),
         )
@@ -17793,8 +17922,8 @@ pub fn spawn_auto_fix_task(
         notify_callback(&config, &task_id, "in_progress", Some(&pr_url), None);
 
         agent_comment(&config, &task_id, &format!(
-            "Running auto-fix cycle {}/3 on this PR. Feeding Codex's blocker list back to Claude Code.",
-            new_cycle
+            "Running auto-fix cycle {}/{} on this PR. Feeding Codex's blocker list back to Claude Code.",
+            new_cycle, max_review_cycles
         )).await;
 
         // Pre-flight: make sure the worktree is on the PR head branch before we
@@ -17874,7 +18003,7 @@ add new features, refactor unrelated code, or bump dependencies.\n\n\
 When you are done, stage and commit everything with a short structured body:\n\
 ```\n\
 git add -A && git commit -m \"$(cat <<'EOF'\n\
-samwise: address review blockers (cycle {}/3)\n\n\
+samwise: address review blockers (cycle {}/{})\n\n\
 Blockers addressed:\n\
 - <bullet per blocker>\n\n\
 How it was fixed:\n\
@@ -17896,6 +18025,7 @@ decision or schema change), stop and explain which blocker and why, without \
 making any other changes.",
             review_markdown,
             new_cycle,
+            max_review_cycles,
             customer_success_review_section = customer_success_review_section,
             customer_success_scope_instruction = customer_success_scope_instruction
         );
@@ -18179,7 +18309,7 @@ async fn fail_auto_fix(config: &SupabaseConfig, task_id: &str, pr_url: &str, rea
 ///
 /// Guard rails:
 /// - Only fires when `autoFixFromFixesNeededEnabled` is on (default true).
-/// - Respects the 3-cycle cap (`review_cycle_count < 3`).
+/// - Respects the configured cycle cap (default 5).
 /// - Skips cards that moved out of `fixes_needed` between the fetch and claim.
 /// - Idle threshold: 8 min. Shorter than the 15-min fix timeout so we never
 ///   re-fire while a cycle is still running; long enough to avoid double-fires
@@ -18196,6 +18326,7 @@ async fn sweep_stale_fixes_needed_cards(
     if !auto_fix_on {
         return;
     }
+    let max_review_cycles = auto_fix_max_review_cycles(cached_settings.as_ref());
 
     let Ok(tasks) = supabase::fetch_tasks(config, Some("fixes_needed")).await else {
         return;
@@ -18225,14 +18356,14 @@ async fn sweep_stale_fixes_needed_cards(
             .get("review_cycle_count")
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
-        // Capped cards (3 cycles) do NOT just get skipped. Re-enter
+        // Capped cards do NOT just get skipped. Re-enter
         // maybe_spawn_auto_fix, whose cap branch attempts the relaxed cap-floor
         // merge (guarded by context.cap_merge_attempted so it runs at most once).
         // This is what catches cards that parked at the cap via the "no new
         // commit" path, where the verdict path never re-calls maybe_spawn_auto_fix
         // and the cap-floor merge would otherwise never fire. Spawn it detached so
         // the up-to-15min CI poll never stalls the sweep loop.
-        if cycle_count >= 3 {
+        if auto_fix_cycle_is_capped(cycle_count, max_review_cycles) {
             let cap_repo_path = task_worktree_path(&repo_path, &task_id)
                 .filter(|p| p.is_dir())
                 .map(|p| p.to_string_lossy().into_owned())
@@ -18267,8 +18398,8 @@ async fn sweep_stale_fixes_needed_cards(
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| repo_path.clone());
         log::info!(
-            "[auto-fix-sweep] re-firing auto-fix for stale fixes_needed task {} (cycle {}/3) in {}",
-            task_id, cycle_count + 1, fix_repo_path
+            "[auto-fix-sweep] re-firing auto-fix for stale fixes_needed task {} (cycle {}/{}) in {}",
+            task_id, cycle_count + 1, max_review_cycles, fix_repo_path
         );
         spawn_auto_fix_task(
             config.clone(),
@@ -18277,6 +18408,7 @@ async fn sweep_stale_fixes_needed_cards(
             fix_repo_path,
             review_markdown,
             cycle_count as u32,
+            max_review_cycles as u32,
             expected_branch,
         );
     }

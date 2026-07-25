@@ -118,6 +118,7 @@ The full lifecycle is:
 1. Task picked up → Sam codes → opens PR (GitHub)
 2. `$samwise-pr-review` (Codex skill) runs automatically via `sweep_pr_review_queue`
 3. Verdict: `MergeNow` → card moves to **`approved`** (Ready to Merge) — **SAM STOPS HERE**
+   - A fix verdict can run up to **5** automatic review/fix cycles by default. Override with `AUTOSAM_MAX_REVIEW_CYCLES` or persisted `autoFixMaxReviewCycles`; values are bounded to 1–10.
 4. Merge + deploy is handled externally by one of:
    - **`pr-review-batch` cron** at 12 past the hour — runs via Rivendell's Codex forge, does the full review → merge → deploy
    - **"Merge and Deploy" button** in the AutoSam UI — Matt clicks it, which stamps `samwise_merge_deploy_status: "requested"` in context, and `sweep_merge_deploy_requests` in the worker executes it
