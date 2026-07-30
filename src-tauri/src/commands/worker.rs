@@ -451,6 +451,12 @@ const CLOSE_ORIGIN_TICKET_URL: &str =
     "https://iycloielqcjnjqddeuet.supabase.co/functions/v1/close-origin-ticket";
 const POST_MERGE_DEPLOY_GREEN_TIMEOUT_SECS: u64 = 60 * 60;
 const POST_MERGE_DEPLOY_GREEN_POLL_SECS: u64 = 20;
+/// Bounded number of transient retries (with backoff) for a deploy command
+/// before escalating to Claude Code. Deploy steps (Supabase Edge Function,
+/// Railway) often fail on a brief API/Docker/auth hiccup and succeed on retry.
+const DEPLOY_TRANSIENT_RETRIES: u32 = 3;
+/// Backoff between transient deploy retries.
+const DEPLOY_RETRY_BACKOFF_SECS: u64 = 45;
 // A Merge + Deploy "running" longer than this is treated as dead (stale). It
 // MUST exceed the maximum legitimate run so the stale handler never races a
 // still-live task: pre-merge is capped at MERGE_DEPLOY_PREMERGE_TIMEOUT_SECS
@@ -13553,10 +13559,12 @@ async fn run_deploy_command(command: &DeployCommand) -> Result<(), String> {
     ))
 }
 
-/// Run a deploy command. On non-zero exit, hand the failure to Claude Code in
-/// the deploy checkout with a focused prompt and retry the command once.
-/// Bounded to a single escalation per command — no retry loops. On final
-/// failure, returns the original error followed by Sam's summary.
+/// Run a deploy command. On non-zero exit, first retry with backoff a bounded
+/// number of times — deploy commands often fail on a brief API/Docker/auth
+/// hiccup and succeed on retry. Only if those transient retries exhaust do we
+/// hand the failure to Claude Code in the deploy checkout with a focused prompt
+/// and retry the command once more. Bounded to a single Claude escalation after
+/// the transient retries. On final failure, returns the error + Sam's summary.
 async fn run_deploy_command_with_escalation(
     command: &DeployCommand,
     config: &SupabaseConfig,
@@ -13566,6 +13574,46 @@ async fn run_deploy_command_with_escalation(
         Ok(()) => return Ok(()),
         Err(e) => e,
     };
+
+    // Transient retry: deploy steps (Supabase Edge Function, Railway, etc.)
+    // frequently fail on a short-lived API/Docker/auth blip and succeed on the
+    // next attempt. Retry with backoff BEFORE escalating to Claude Code — Sam
+    // can't fix an infra hiccup by editing code, and the escalation only adds
+    // latency (and phantom-commit risk) for a failure that self-heals.
+    let mut last_err = first_err;
+    for attempt in 2..=DEPLOY_TRANSIENT_RETRIES {
+        agent_comment(
+            config,
+            task_id,
+            &format!(
+                "Deploy step `{}` failed; transient blips self-heal, retrying in ~{}s (retry {}/{}).\n\n```\n{}\n```",
+                command.label,
+                DEPLOY_RETRY_BACKOFF_SECS,
+                attempt - 1,
+                DEPLOY_TRANSIENT_RETRIES,
+                truncate(&last_err, 1200)
+            ),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_secs(DEPLOY_RETRY_BACKOFF_SECS)).await;
+        match run_deploy_command(command).await {
+            Ok(()) => {
+                agent_comment(
+                    config,
+                    task_id,
+                    &format!(
+                        "Deploy step `{}` green on transient retry {}.",
+                        command.label,
+                        attempt - 1
+                    ),
+                )
+                .await;
+                return Ok(());
+            }
+            Err(e) => last_err = e,
+        }
+    }
+    let first_err = last_err;
 
     agent_comment(
         config,
