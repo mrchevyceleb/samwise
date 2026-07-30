@@ -10094,6 +10094,16 @@ pub async fn run_claude_code_streaming(
                                     .unwrap_or("unknown");
                                 let input = block.get("input");
 
+                                // "Consecutive" means no other tool use happened between
+                                // identical Bash commands. A legitimate edit/test loop often
+                                // runs the same test again after an Edit or Read; reset the
+                                // detector on every non-Bash tool so that workflow is never
+                                // mistaken for a command stall.
+                                if !matches!(tool_name, "Bash" | "bash") {
+                                    last_bash_command.clear();
+                                    bash_repeat = 0;
+                                }
+
                                 // Build a human-readable progress message
                                 let progress = match tool_name {
                                     "Read" | "read_file" => {
