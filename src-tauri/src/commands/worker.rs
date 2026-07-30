@@ -9943,6 +9943,9 @@ pub async fn run_claude_code_streaming(
     }
 
     let last_activity_stream = last_activity.clone();
+    // Clone the pid slot into the stream parser so it can SIGTERM the Claude
+    // child early when it detects a pathological command loop (Bash branch).
+    let pid_slot_stream = process_id_slot.clone();
 
     // Read stdout line-by-line, parse stream-json, post progress comments.
     // Also captures raw-stdout tail + any `result` event carrying an error so
@@ -9956,12 +9959,23 @@ pub async fn run_claude_code_streaming(
         let mut last_comment_time = std::time::Instant::now();
         // Throttle: don't post more than one progress comment per 10 seconds
         const MIN_COMMENT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+        // Loop-stall detection: track the last bash command + how many times it
+        // repeated consecutively. Claude Code re-running the EXACT same command
+        // back-to-back (e.g. `tsc --noEmit` 40x) is a pathological loop that
+        // otherwise spins until the wall-clock timeout, wasting ~30min and
+        // failing the card. Abort early when it repeats.
+        let mut last_bash_command = String::new();
+        let mut bash_repeat: u32 = 0;
+        let mut loop_aborted = false;
 
         if let Some(reader) = stdout {
             use tokio::io::{AsyncBufReadExt, BufReader};
             let mut lines = BufReader::new(reader).lines();
 
             while let Ok(Some(line)) = lines.next_line().await {
+                if loop_aborted {
+                    break;
+                }
                 if line.is_empty() {
                     continue;
                 }
@@ -10112,7 +10126,41 @@ pub async fn run_claude_code_streaming(
                                             .and_then(|i| i.get("command"))
                                             .and_then(|v| v.as_str())
                                             .unwrap_or("...");
+                                        // Loop-stall guard: count consecutive
+                                        // identical commands. Legit work never
+                                        // runs the exact same command back-to-
+                                        // back; a repeat means the model is
+                                        // stuck (e.g. re-checking a failing tsc).
+                                        if command == last_bash_command {
+                                            bash_repeat += 1;
+                                        } else {
+                                            last_bash_command = command.to_string();
+                                            bash_repeat = 1;
+                                        }
                                         let short: String = command.chars().take(80).collect();
+                                        const BASH_LOOP_THRESHOLD: u32 = 4;
+                                        if bash_repeat >= BASH_LOOP_THRESHOLD {
+                                            let msg = format!(
+                                                "Command-loop detected: `{}` repeated {}x. Aborting this run to avoid a timeout stall (the model is stuck re-running the same command).",
+                                                short, bash_repeat
+                                            );
+                                            agent_comment(&config_clone, &task_id_owned, &msg).await;
+                                            error_summary = Some(format!(
+                                                "Claude Code looped on the same command `{}` {} times; aborted to avoid a timeout stall.",
+                                                short, bash_repeat
+                                            ));
+                                            // Kill the child so the outer wait() returns now.
+                                            let pid_opt = { *pid_slot_stream.lock().await };
+                                            if let Some(pid) = pid_opt {
+                                                if pid > 0 {
+                                                    #[cfg(unix)]
+                                                    unsafe {
+                                                        libc::kill(pid as i32, libc::SIGTERM);
+                                                    }
+                                                }
+                                            }
+                                            loop_aborted = true;
+                                        }
                                         format!("Running: {}", short)
                                     }
                                     "Grep" | "grep" => {
