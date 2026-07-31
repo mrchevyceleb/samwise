@@ -12641,16 +12641,15 @@ async fn start_merge_deploy_task(
                 let _ = supabase::update_task(
                     &config_clone,
                     &task_id,
-                    &serde_json::json!({
+                    &terminal_task_patch(serde_json::json!({
                         "status": "done",
                         "completed_at": chrono::Utc::now().to_rfc3339(),
                         "updated_at": chrono::Utc::now().to_rfc3339(),
                         "worker_id": Value::Null,
                         "claimed_at": Value::Null,
-                        "review_cycle_count": 0,
                         "context": Value::Object(context),
                         "failure_reason": Value::Null,
-                    }),
+                    })),
                 )
                 .await;
                 notify_callback(&config_clone, &task_id, "done", Some(&pr_url), None);
@@ -15239,9 +15238,29 @@ fn path_to_slash_string(path: impl AsRef<Path>) -> String {
     path.as_ref().to_string_lossy().replace('\\', "/")
 }
 
+// Terminal updates must leave review_cycle_count absent so Supabase preserves
+// the durable cap history used by samcheck and by reopened-card safeguards.
+fn terminal_task_patch(mut patch: Value) -> Value {
+    if let Some(fields) = patch.as_object_mut() {
+        fields.remove("review_cycle_count");
+    }
+    patch
+}
+
 #[cfg(test)]
 mod merge_deploy_tests {
     use super::*;
+
+    #[test]
+    fn terminal_task_patch_omits_review_cycle_count() {
+        let patch = terminal_task_patch(serde_json::json!({
+            "status": "done",
+            "review_cycle_count": 0,
+            "failure_reason": Value::Null,
+        }));
+        assert_eq!(patch.get("status").and_then(Value::as_str), Some("done"));
+        assert!(patch.get("review_cycle_count").is_none());
+    }
 
     #[test]
     fn auto_fix_cycle_cap_defaults_to_five_and_stays_bounded() {
@@ -16397,14 +16416,13 @@ pub async fn sweep_pr_merged_cards(config: &SupabaseConfig) {
                 let _ = supabase::update_task(
                     config,
                     task_id,
-                    &serde_json::json!({
+                    &terminal_task_patch(serde_json::json!({
                         "status": "done",
                         "completed_at": chrono::Utc::now().to_rfc3339(),
                         "updated_at": chrono::Utc::now().to_rfc3339(),
                         "worker_id": Value::Null,
                         "claimed_at": Value::Null,
-                        "review_cycle_count": 0,
-                    }),
+                    })),
                 )
                 .await;
                 notify_callback(config, task_id, "done", Some(pr_url), None);
@@ -16446,12 +16464,11 @@ pub async fn sweep_pr_merged_cards(config: &SupabaseConfig) {
             let _ = supabase::update_task(
                 config,
                 task_id,
-                &serde_json::json!({
+                &terminal_task_patch(serde_json::json!({
                     "status": "failed",
                     "failure_reason": "PR was closed without merging. The code never landed on main.",
                     "updated_at": chrono::Utc::now().to_rfc3339(),
-                    "review_cycle_count": 0,
-                }),
+                })),
             )
             .await;
             notify_callback(
