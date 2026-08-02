@@ -161,6 +161,9 @@ fn task_repo_serial_keys(task: &Value) -> Vec<String> {
 }
 
 fn task_is_repo_active(task: &Value) -> bool {
+    if task_is_on_hold(task) {
+        return false;
+    }
     let status = task
         .get("status")
         .and_then(|v| v.as_str())
@@ -171,6 +174,12 @@ fn task_is_repo_active(task: &Value) -> bool {
     status == "review"
         && pr_review_context_status(task) == Some("running")
         && !pr_review_running_is_stale(task)
+}
+
+fn task_is_on_hold(task: &Value) -> bool {
+    task.get("on_hold")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
 }
 
 fn pr_review_last_review_at(task: &Value) -> Option<&str> {
@@ -232,6 +241,9 @@ fn pr_review_should_run_now(task: &Value) -> bool {
 }
 
 fn task_needs_pr_review_run(task: &Value) -> bool {
+    if task_is_on_hold(task) {
+        return false;
+    }
     let status = task
         .get("status")
         .and_then(|v| v.as_str())
@@ -10425,7 +10437,7 @@ fn pr_review_running_is_stale(task: &Value) -> bool {
         > PR_REVIEW_RUNNING_STALE_SECS
 }
 
-async fn mark_pr_review_running(config: &SupabaseConfig, task_id: &str) {
+async fn mark_pr_review_running(config: &SupabaseConfig, task_id: &str) -> bool {
     let started_at = chrono::Utc::now().to_rfc3339();
     let mut updates = serde_json::Map::new();
     updates.insert(
@@ -10448,7 +10460,16 @@ async fn mark_pr_review_running(config: &SupabaseConfig, task_id: &str) {
         updates.insert("context".to_string(), Value::Object(context));
     }
 
-    let _ = supabase::update_task(config, task_id, &Value::Object(updates)).await;
+    supabase::update_task_if_status_not_held(
+        config,
+        task_id,
+        "review",
+        &Value::Object(updates),
+    )
+    .await
+    .ok()
+    .and_then(|value| value.as_array().map(|rows| !rows.is_empty()))
+    .unwrap_or(false)
 }
 
 async fn mark_pr_review_finished(config: &SupabaseConfig, task_id: &str, error: Option<&str>) {
@@ -10511,7 +10532,13 @@ pub fn spawn_pr_review_task(
     tokio::spawn(async move {
         // Stamp first so the poll-loop watcher (which also triggers on fixes_needed
         // -> review) doesn't double-fire before the codex run finishes.
-        mark_pr_review_running(&config, &task_id).await;
+        if !mark_pr_review_running(&config, &task_id).await {
+            log::info!(
+                "[pr-review] task {} was held or moved before launch; skipping review",
+                task_id
+            );
+            return;
+        }
 
         agent_comment(
             &config,
@@ -10539,13 +10566,11 @@ pub fn spawn_pr_review_task(
             .await
             .ok()
             .flatten()
-            .and_then(|task| {
-                task.get("status")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
+            .map(|task| {
+                task.get("status").and_then(|v| v.as_str()) == Some("review")
+                    && !task_is_on_hold(&task)
             })
-            .as_deref()
-            == Some("review");
+            .unwrap_or(false);
         if !still_in_review {
             log::info!(
                 "[pr-review] task {} moved out of review before verdict; dropping stale verdict",
@@ -10580,7 +10605,7 @@ pub fn spawn_pr_review_task(
         match result.verdict {
             review::PrReviewVerdict::MergeNow => {
                 mark_pr_review_finished(&config, &task_id, None).await;
-                let updated = supabase::update_task_if_status(
+                let updated = supabase::update_task_if_status_not_held(
                     &config,
                     &task_id,
                     "review",
@@ -10702,7 +10727,7 @@ pub fn spawn_pr_review_task(
             }
             review::PrReviewVerdict::FixIssues => {
                 mark_pr_review_finished(&config, &task_id, None).await;
-                let updated = supabase::update_task_if_status(
+                let updated = supabase::update_task_if_status_not_held(
                     &config,
                     &task_id,
                     "review",
@@ -10754,7 +10779,7 @@ pub fn spawn_pr_review_task(
                 // maybe_spawn_auto_fix has a guard that checks status ==
                 // fixes_needed before spawning.
                 // auto-fix. INCONCLUSIVE means Codex couldn't
-                let updated = supabase::update_task_if_status(
+                let updated = supabase::update_task_if_status_not_held(
                     &config,
                     &task_id,
                     "review",
@@ -12006,7 +12031,7 @@ pub async fn sweep_merge_deploy_requests(config: &SupabaseConfig) {
         .iter()
         .filter(|t| {
             let status = t.get("status").and_then(|v| v.as_str()).unwrap_or("");
-            status == "approved" && merge_deploy_request_is_pending(t)
+            status == "approved" && !task_is_on_hold(t) && merge_deploy_request_is_pending(t)
         })
         .collect();
     if pending.len() >= 2 {
@@ -12041,6 +12066,9 @@ pub async fn sweep_merge_deploy_requests(config: &SupabaseConfig) {
     let mut running_repos: HashSet<String> = HashSet::new();
     let mut stale_running: Vec<&Value> = Vec::new();
     for task in arr {
+        if task_is_on_hold(task) {
+            continue;
+        }
         match merge_deploy_context_status(task) {
             Some("recovering") => {
                 if let Some(repo_key) = merge_deploy_repo_key(task) {
@@ -12332,6 +12360,9 @@ pub async fn sweep_merge_deploy_requests(config: &SupabaseConfig) {
 
     let mut queued_by_repo: HashMap<String, Vec<&Value>> = HashMap::new();
     for task in arr {
+        if task_is_on_hold(task) {
+            continue;
+        }
         let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("");
         if !matches!(status, "approved" | "fixes_needed" | "review") {
             continue;
@@ -12614,15 +12645,30 @@ async fn start_merge_deploy_task(
             );
         }
         context.insert(MERGE_DEPLOY_ERROR_KEY.to_string(), Value::Null);
-        let _ = supabase::update_task(
+        let expected_status = task
+            .get("status")
+            .and_then(|value| value.as_str())
+            .unwrap_or("approved");
+        let claimed = supabase::update_task_if_status_not_held(
             &config_clone,
             &task_id,
+            expected_status,
             &serde_json::json!({
                 "context": Value::Object(context),
                 "updated_at": chrono::Utc::now().to_rfc3339(),
             }),
         )
-        .await;
+        .await
+        .ok()
+        .and_then(|value| value.as_array().map(|rows| !rows.is_empty()))
+        .unwrap_or(false);
+        if !claimed {
+            log::info!(
+                "[merge-deploy] task {} was held or moved before launch; skipping",
+                task_id
+            );
+            return;
+        }
 
         agent_comment(&config_clone, &task_id, &start_comment).await;
 
@@ -12893,6 +12939,18 @@ async fn run_merge_deploy_workflow(
             false,
         ));
     }
+    if supabase::fetch_task(config, task_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|latest| task_is_on_hold(&latest))
+        .unwrap_or(true)
+    {
+        return Err(MergeDeployError::new(
+            "merge/deploy stopped because the task is held or its current state could not be verified",
+            false,
+        ));
+    }
 
     // The pre-merge phase (everything up to and including the GitHub merge) runs
     // under a hard timeout. A hung git/gh subprocess here would otherwise hold
@@ -13029,6 +13087,21 @@ async fn run_merge_deploy_workflow(
             Err(e) => {
                 log::warn!("[merge-deploy] post-merge-in CI check failed: {}, but --admin bypasses branch protection; proceeding anyway", e);
             }
+        }
+
+        // HOLD can be applied while CI/preflight work is running. Re-check at
+        // the destructive boundary so a late hold cannot race into a merge.
+        if supabase::fetch_task(config, task_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|latest| task_is_on_hold(&latest))
+            .unwrap_or(true)
+        {
+            return Err(MergeDeployError::new(
+                "merge stopped because the task was held or its current state could not be verified",
+                false,
+            ));
         }
 
         // Post an APPROVED review on the PR so branch-protection rules
@@ -15348,6 +15421,24 @@ mod merge_deploy_tests {
         }));
         assert_eq!(patch.get("status").and_then(Value::as_str), Some("done"));
         assert!(patch.get("review_cycle_count").is_none());
+    }
+
+    #[test]
+    fn hold_blocks_automatic_review_sweep_eligibility() {
+        let held = serde_json::json!({
+            "status": "review",
+            "on_hold": true,
+            "pr_url": "https://github.com/R-Link-LLC/operly/pull/814",
+            "repo_path": "/tmp/operly",
+        });
+        assert!(task_is_on_hold(&held));
+        assert!(!task_needs_pr_review_run(&held));
+        assert!(!task_is_repo_active(&serde_json::json!({
+            "status": "in_progress",
+            "on_hold": true,
+        })));
+        assert!(!task_is_on_hold(&serde_json::json!({ "on_hold": false })));
+        assert!(!task_is_on_hold(&serde_json::json!({})));
     }
 
     #[test]
@@ -18289,7 +18380,7 @@ pub fn spawn_auto_fix_task(
     tokio::spawn(async move {
         let new_cycle = prev_cycle_count + 1;
 
-        let claimed = supabase::update_task_if_status(
+        let claimed = supabase::update_task_if_status_not_held(
             &config,
             &task_id,
             "fixes_needed",
@@ -18534,7 +18625,7 @@ making any other changes.",
                     // telegram like every other terminal branch — without it
                     // the card sits silently in Fixes Needed and Matt has no
                     // way to know auto-fix gave up.
-                    let updated = supabase::update_task_if_status(
+                    let updated = supabase::update_task_if_status_not_held(
                         &config,
                         &task_id,
                         "in_progress",
@@ -18567,6 +18658,23 @@ making any other changes.",
                     return;
                 }
 
+                let can_push = supabase::fetch_task(&config, &task_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|task| {
+                        task.get("status").and_then(|value| value.as_str()) == Some("in_progress")
+                            && !task_is_on_hold(&task)
+                    })
+                    .unwrap_or(false);
+                if !can_push {
+                    log::info!(
+                        "[auto-fix] task {} was held or moved before push; preserving local work without publishing it",
+                        task_id
+                    );
+                    return;
+                }
+
                 let push = async_cmd("git")
                     .args(["push", "origin", &branch])
                     .current_dir(&repo_path)
@@ -18595,7 +18703,7 @@ making any other changes.",
                                 obj.insert("context".to_string(), Value::Object(context));
                             }
                         }
-                        let updated = supabase::update_task_if_status(
+                        let updated = supabase::update_task_if_status_not_held(
                             &config,
                             &task_id,
                             "in_progress",
@@ -18652,7 +18760,7 @@ making any other changes.",
 }
 
 async fn fail_auto_fix(config: &SupabaseConfig, task_id: &str, pr_url: &str, reason: &str) {
-    let updated = supabase::update_task_if_status(
+    let updated = supabase::update_task_if_status_not_held(
         config,
         task_id,
         "in_progress",
@@ -18725,6 +18833,9 @@ async fn sweep_stale_fixes_needed_cards(
     let idle_cutoff = chrono::Utc::now() - chrono::Duration::minutes(8);
 
     for task in arr {
+        if task_is_on_hold(task) {
+            continue;
+        }
         let task_id = task.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let pr_url = task.get("pr_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let repo_path = task.get("repo_path").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -18851,7 +18962,7 @@ pub async fn sweep_pr_review_queue(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        if task_id.is_empty() {
+        if task_id.is_empty() || task_is_on_hold(task) {
             continue;
         }
         if pr_url.is_empty() {
@@ -19086,7 +19197,7 @@ pub async fn sweep_review_merge_requests(config: &SupabaseConfig) {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        if task_id.is_empty() {
+        if task_id.is_empty() || task_is_on_hold(task) {
             continue;
         }
         // Only cards explicitly requested via the Review & Merge button.
@@ -19181,7 +19292,7 @@ fn spawn_review_merge_task(
             Value::String(chrono::Utc::now().to_rfc3339()),
         );
         claim_ctx.insert(REVIEW_MERGE_ERROR_KEY.to_string(), Value::Null);
-        let claimed = supabase::update_task_if_status(
+        let claimed = supabase::update_task_if_status_not_held(
             &config,
             &task_id,
             "approved",

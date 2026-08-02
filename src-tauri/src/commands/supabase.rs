@@ -323,6 +323,33 @@ pub async fn update_task_if_status(
     .await
 }
 
+/// Update only when status still matches and the card is not held. This makes
+/// the hold gate atomic with automatic worker transitions instead of relying on
+/// an earlier, race-prone task-list snapshot.
+pub async fn update_task_if_status_not_held(
+    config: &SupabaseConfig,
+    id: &str,
+    expected_status: &str,
+    updates: &Value,
+) -> Result<Value, String> {
+    let client = build_client(config)?;
+    let url = format!(
+        "{}?id=eq.{}&status=eq.{}&on_hold=eq.false",
+        rest_url(config, "ae_tasks"),
+        id,
+        expected_status
+    );
+    handle_response(
+        client
+            .patch(&url)
+            .json(updates)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?,
+    )
+    .await
+}
+
 pub async fn claim_task(
     config: &SupabaseConfig,
     task_id: &str,
