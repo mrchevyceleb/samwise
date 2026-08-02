@@ -426,6 +426,7 @@ const REVIEW_MERGE_ERROR_KEY: &str = "samwise_review_merge_error";
 const PR_REVIEW_RUNNING_STALE_SECS: i64 = 25 * 60;
 const SAMWISE_DEPLOY_MANIFEST_PATH: &str = ".samwise/deploy.json";
 const SAMWISE_SUPABASE_AUTO_COMMAND: &str = "samwise:supabase:auto";
+const AUTOSAM_SUPABASE_STAGING_TARGETS_ENV: &str = "AUTOSAM_SUPABASE_STAGING_TARGETS";
 const KIM_FULL_PR_REVIEW_SOURCE: &str = "github-kim-pr-review";
 const KIM_FULL_PR_REVIEW_AUTHOR: &str = "kgenterprisesbiz";
 const KIM_FULL_PR_REVIEW_REPO: &str = "R-Link-LLC/r-link-studio-rebuild";
@@ -11905,6 +11906,17 @@ struct DeployPlan {
 struct SamwiseDeployManifest {
     #[serde(default)]
     rules: Vec<SamwiseDeployRule>,
+    #[serde(default)]
+    supabase: Option<SamwiseSupabaseDeployTarget>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SamwiseSupabaseDeployTarget {
+    environment: String,
+    #[serde(default)]
+    project_ref: Option<String>,
+    #[serde(default)]
+    db_url_env: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -12995,6 +13007,20 @@ async fn run_merge_deploy_workflow(
                 MergeDeployError::new(format!("re-fetch PR files after merge-in: {}", e), false)
             })?;
         wait_for_deploy_green = deploy_green_wait_required(repo_path, &files).await;
+        // Conflict resolution can commit new files with `git add -A`. Re-run
+        // every deployment-policy preflight against the refreshed authoritative
+        // PR file list before approval/merge so it cannot introduce a trusted
+        // manifest change or a new unvalidated deployment target after the
+        // initial gate.
+        preflight_deploy_manifest_context(repo_path, &files)
+            .await
+            .map_err(|e| MergeDeployError::new(e, false))?;
+        preflight_supabase_deploy_context(repo_path, &files)
+            .await
+            .map_err(|e| MergeDeployError::new(e, false))?;
+        preflight_railway_deploy_context(repo_path, &files)
+            .await
+            .map_err(|e| MergeDeployError::new(e, false))?;
         match review::wait_for_ci(pr_url, repo_path).await {
             Ok(true) => {}
             Ok(false) => {
@@ -13057,9 +13083,6 @@ async fn run_merge_deploy_workflow(
         ));
     }
     let deploy_path = prepare_deploy_checkout(repo_path, task_id, &deploy_branch)
-        .await
-        .map_err(|e| MergeDeployError::new(e, pr_merged))?;
-    ensure_supabase_link_state(repo_path, &deploy_path, &files)
         .await
         .map_err(|e| MergeDeployError::new(e, pr_merged))?;
     let plan = build_deploy_plan(&deploy_path, &files)
@@ -13247,6 +13270,15 @@ async fn preflight_deploy_manifest_context(
     repo_path: &str,
     files: &[String],
 ) -> Result<(), String> {
+    if files
+        .iter()
+        .any(|file| normalize_repo_relative_path(file) == SAMWISE_DEPLOY_MANIFEST_PATH)
+    {
+        return Err(format!(
+            "{} is trusted deployment policy and cannot be changed through an AutoSam-managed PR. Roll it out directly after independent review.",
+            SAMWISE_DEPLOY_MANIFEST_PATH
+        ));
+    }
     let Some(manifest) = read_samwise_deploy_manifest(repo_path).await? else {
         return Ok(());
     };
@@ -13308,33 +13340,64 @@ async fn build_deploy_plan(repo_path: &str, files: &[String]) -> Result<DeployPl
         }
     }
 
-    let supabase_project_ref = read_supabase_project_ref(repo_path).await;
+    let manifest = read_samwise_deploy_manifest(repo_path).await?;
+    let supabase_target = manifest.as_ref().and_then(|value| value.supabase.as_ref());
+    if !plan.supabase_migrations.is_empty() || !plan.supabase_functions.is_empty() {
+        let target = supabase_target.ok_or_else(|| {
+            format!(
+                "Supabase deploys require an explicit staging contract in {}.",
+                SAMWISE_DEPLOY_MANIFEST_PATH
+            )
+        })?;
+        validate_trusted_supabase_target(target)?;
+        if target.project_ref.as_deref().is_none() {
+            return Err(format!(
+                "Supabase deploys require an explicit staging project_ref in {}.",
+                SAMWISE_DEPLOY_MANIFEST_PATH
+            ));
+        }
+    }
 
     if !plan.supabase_migrations.is_empty() {
+        let db_url_env = supabase_target
+            .and_then(|target| target.db_url_env.as_deref())
+            .ok_or_else(|| {
+                format!(
+                    "Supabase migrations require an explicit staging db_url_env in {}.",
+                    SAMWISE_DEPLOY_MANIFEST_PATH
+                )
+            })?;
         plan.commands.push(DeployCommand {
             category: "supabase_migrations",
             label: format!(
                 "Supabase migrations ({})",
                 plan.supabase_migrations.join(", ")
             ),
-            command: supabase_db_push_command(),
+            command: supabase_db_push_command(db_url_env),
             cwd: repo_path.to_string(),
         });
     }
 
-    for function_name in &plan.supabase_functions {
-        plan.commands.push(DeployCommand {
-            category: "supabase_edge_functions",
-            label: format!("Supabase Edge Function {}", function_name),
-            command: supabase_function_deploy_command(
-                function_name,
-                supabase_project_ref.as_deref(),
-            ),
-            cwd: repo_path.to_string(),
-        });
+    if !plan.supabase_functions.is_empty() {
+        let project_ref = supabase_target
+            .and_then(|target| target.project_ref.as_deref())
+            .ok_or_else(|| {
+                format!(
+                    "Supabase Edge Function deploys require an explicit staging project_ref in {}.",
+                    SAMWISE_DEPLOY_MANIFEST_PATH
+                )
+            })?;
+        for function_name in &plan.supabase_functions {
+            plan.commands.push(DeployCommand {
+                category: "supabase_edge_functions",
+                label: format!("Supabase Edge Function {}", function_name),
+                command: supabase_function_deploy_command(function_name, project_ref),
+                cwd: repo_path.to_string(),
+            });
+        }
     }
 
-    if let Some(manifest) = read_samwise_deploy_manifest(repo_path).await? {
+    if let Some(manifest) = manifest {
         add_manifest_deploy_commands(&mut plan, repo_path, files, &manifest)?;
     }
 
@@ -13360,6 +13423,34 @@ async fn read_samwise_deploy_manifest(
 }
 
 fn validate_samwise_deploy_manifest(manifest: &SamwiseDeployManifest) -> Result<(), String> {
+    if let Some(target) = manifest.supabase.as_ref() {
+        if !target.environment.trim().eq_ignore_ascii_case("staging") {
+            return Err(format!(
+                "{} Supabase environment must be 'staging'; production deploys are reserved for /ship.",
+                SAMWISE_DEPLOY_MANIFEST_PATH
+            ));
+        }
+        if let Some(project_ref) = target.project_ref.as_deref() {
+            let valid = project_ref.len() == 20
+                && project_ref
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit());
+            if !valid {
+                return Err(format!(
+                    "{} has an invalid Supabase staging project_ref.",
+                    SAMWISE_DEPLOY_MANIFEST_PATH
+                ));
+            }
+        }
+        if let Some(env_name) = target.db_url_env.as_deref() {
+            if !is_safe_env_name(env_name) {
+                return Err(format!(
+                    "{} has an invalid Supabase db_url_env.",
+                    SAMWISE_DEPLOY_MANIFEST_PATH
+                ));
+            }
+        }
+    }
     for (idx, rule) in manifest.rules.iter().enumerate() {
         let label = manifest_rule_label(rule, idx);
         if rule.paths.iter().all(|p| p.trim().is_empty()) {
@@ -13372,6 +13463,15 @@ fn validate_samwise_deploy_manifest(manifest: &SamwiseDeployManifest) -> Result<
             return Err(format!(
                 "{} rule '{}' has no commands.",
                 SAMWISE_DEPLOY_MANIFEST_PATH, label
+            ));
+        }
+        if rule.commands.iter().any(|command| {
+            let normalized = command.trim().to_ascii_lowercase();
+            normalized != SAMWISE_SUPABASE_AUTO_COMMAND && normalized.contains("supabase")
+        }) {
+            return Err(format!(
+                "{} rule '{}' contains a custom Supabase command. Use the trusted top-level supabase contract and {} instead.",
+                SAMWISE_DEPLOY_MANIFEST_PATH, label, SAMWISE_SUPABASE_AUTO_COMMAND
             ));
         }
     }
@@ -14270,7 +14370,8 @@ async fn recover_stale_merged_pr_deploy(
     }
 
     let deploy_path = prepare_deploy_checkout(repo_path, task_id, &deploy_branch).await?;
-    ensure_supabase_link_state(repo_path, &deploy_path, &files).await?;
+    preflight_deploy_manifest_context(&deploy_path, &files).await?;
+    preflight_supabase_deploy_context(&deploy_path, &files).await?;
     let plan = build_deploy_plan(&deploy_path, &files).await?;
     ensure_railway_links_for_deploy_plan(repo_path, &deploy_path, &plan).await?;
 
@@ -14847,12 +14948,6 @@ async fn ensure_temp_deploy_worktree(
     Ok(path_str)
 }
 
-#[derive(Debug, Default)]
-struct SupabaseEnvPresence {
-    has_db_url: bool,
-    has_project_ref: bool,
-}
-
 async fn preflight_supabase_deploy_context(
     repo_path: &str,
     files: &[String],
@@ -14865,107 +14960,100 @@ async fn preflight_supabase_deploy_context(
         return Ok(());
     }
 
-    if read_supabase_project_ref(repo_path).await.is_some() {
-        return Ok(());
-    }
-
-    let env = detect_supabase_env(repo_path).await;
-    let mut missing = Vec::new();
-    if needs_migrations && !env.has_db_url {
-        missing.push("SUPABASE_DB_URL for migration deploys");
-    }
-    if needs_functions && !env.has_project_ref {
-        missing.push("SUPABASE_PROJECT_REF or SUPABASE_PROJECT_ID for Edge Function deploys");
-    }
-
-    if missing.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "Supabase files changed, but no linked supabase/.temp/project-ref was found and {} is not available via the deploy environment/Doppler; refusing to merge because post-merge deployment would fail.",
-            missing.join(" and ")
-        ))
-    }
-}
-
-async fn ensure_supabase_link_state(
-    source_repo_path: &str,
-    deploy_path: &str,
-    files: &[String],
-) -> Result<(), String> {
-    let has_supabase_changes = files
-        .iter()
-        .any(|f| f.starts_with("supabase/migrations/") || f.starts_with("supabase/functions/"));
-    if !has_supabase_changes {
-        return Ok(());
-    }
-
-    let source_temp = Path::new(source_repo_path).join("supabase").join(".temp");
-    if !source_temp.is_dir() {
-        return Ok(());
-    }
-
-    let target_temp = Path::new(deploy_path).join("supabase").join(".temp");
-    if source_temp == target_temp {
-        return Ok(());
-    }
-
-    tokio::fs::create_dir_all(&target_temp).await.map_err(|e| {
+    let manifest = read_samwise_deploy_manifest(repo_path)
+        .await?
+        .ok_or_else(|| {
+            format!(
+                "Supabase deploys require an explicit staging target in {}; mutable local CLI link state is never a safe deployment target.",
+                SAMWISE_DEPLOY_MANIFEST_PATH
+            )
+        })?;
+    let target = manifest.supabase.as_ref().ok_or_else(|| {
         format!(
-            "create Supabase link state dir {}: {}",
-            target_temp.display(),
-            e
+            "Supabase deploys require a staging supabase contract in {}.",
+            SAMWISE_DEPLOY_MANIFEST_PATH
         )
     })?;
+    validate_trusted_supabase_target(target)?;
 
-    let mut entries = tokio::fs::read_dir(&source_temp)
-        .await
-        .map_err(|e| format!("read Supabase link state {}: {}", source_temp.display(), e))?;
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .map_err(|e| format!("read Supabase link state entry: {}", e))?
-    {
-        let file_type = entry
-            .file_type()
-            .await
-            .map_err(|e| format!("read Supabase link state file type: {}", e))?;
-        if !file_type.is_file() {
-            continue;
+    if target.project_ref.as_deref().is_none() {
+        return Err(format!(
+            "Supabase deploys require an explicit staging project_ref in {} so functions and migrations stay bound to one trusted project.",
+            SAMWISE_DEPLOY_MANIFEST_PATH
+        ));
+    }
+
+    if needs_migrations {
+        let env_name = target.db_url_env.as_deref().ok_or_else(|| {
+            format!(
+                "Supabase migration deploys require an explicit staging db_url_env in {}.",
+                SAMWISE_DEPLOY_MANIFEST_PATH
+            )
+        })?;
+        let script = format!(
+            "if [ -n \"${{{}:-}}\" ]; then echo present=1; fi",
+            env_name
+        );
+        let output = probe_deploy_shell(repo_path, &script).await?;
+        if !output.lines().any(|line| line.trim() == "present=1") {
+            return Err(format!(
+                "Supabase staging migration credential {} is not available via the deploy environment/Doppler.",
+                env_name
+            ));
         }
-        let target = target_temp.join(entry.file_name());
-        tokio::fs::copy(entry.path(), &target)
-            .await
-            .map_err(|e| format!("copy Supabase link state to {}: {}", target.display(), e))?;
     }
 
     Ok(())
 }
 
-async fn read_supabase_project_ref(repo_path: &str) -> Option<String> {
-    let path = Path::new(repo_path)
-        .join("supabase")
-        .join(".temp")
-        .join("project-ref");
-    let raw = tokio::fs::read_to_string(path).await.ok()?;
-    let value = raw.trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
-    }
+fn is_safe_env_name(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    (first.is_ascii_uppercase() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
-async fn detect_supabase_env(repo_path: &str) -> SupabaseEnvPresence {
-    let script = r#"if [ -n "${SUPABASE_DB_URL:-}" ]; then echo db_url=1; fi
-if [ -n "${SUPABASE_PROJECT_REF:-}" ] || [ -n "${SUPABASE_PROJECT_ID:-}" ]; then echo project_ref=1; fi"#;
-    let output = probe_deploy_shell(repo_path, script)
-        .await
-        .unwrap_or_default();
-    SupabaseEnvPresence {
-        has_db_url: output.lines().any(|line| line.trim() == "db_url=1"),
-        has_project_ref: output.lines().any(|line| line.trim() == "project_ref=1"),
+fn configured_supabase_staging_targets() -> String {
+    let configured = std::env::var(AUTOSAM_SUPABASE_STAGING_TARGETS_ENV).unwrap_or_default();
+    #[cfg(test)]
+    if configured.trim().is_empty() {
+        return "jmzewtnblclugryojdwk=SUPABASE_STAGING_DB_URL".to_string();
     }
+    configured
+}
+
+fn validate_trusted_supabase_target(target: &SamwiseSupabaseDeployTarget) -> Result<(), String> {
+    let project_ref = target.project_ref.as_deref().unwrap_or("").trim();
+    if project_ref.is_empty() {
+        return Ok(());
+    }
+    let configured = configured_supabase_staging_targets();
+    let trusted_db_env = configured.split(',').find_map(|entry| {
+        let mut parts = entry.trim().splitn(2, '=');
+        let allowed_ref = parts.next().unwrap_or("").trim();
+        if allowed_ref == project_ref {
+            Some(parts.next().map(str::trim).filter(|value| !value.is_empty()))
+        } else {
+            None
+        }
+    });
+    let Some(trusted_db_env) = trusted_db_env else {
+        return Err(format!(
+            "Supabase project_ref {} is not in the trusted staging allowlist {}.",
+            project_ref, AUTOSAM_SUPABASE_STAGING_TARGETS_ENV
+        ));
+    };
+    if let Some(requested_db_env) = target.db_url_env.as_deref() {
+        if trusted_db_env != Some(requested_db_env) {
+            return Err(format!(
+                "Supabase db_url_env {} is not the trusted migration credential bound to staging project {}.",
+                requested_db_env, project_ref
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn probe_deploy_shell(repo_path: &str, script: &str) -> Result<String, String> {
@@ -15650,6 +15738,125 @@ mod merge_deploy_tests {
     }
 
     #[tokio::test]
+    async fn edge_deploy_uses_explicit_staging_contract_not_local_prod_link() {
+        let repo = std::env::temp_dir().join(format!(
+            "samwise-supabase-staging-target-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(repo.join(".samwise")).unwrap();
+        std::fs::create_dir_all(repo.join("supabase/functions/email")).unwrap();
+        std::fs::create_dir_all(repo.join("supabase/.temp")).unwrap();
+        std::fs::write(
+            repo.join(".samwise/deploy.json"),
+            r#"{
+              "supabase": {
+                "environment": "staging",
+                "project_ref": "jmzewtnblclugryojdwk"
+              },
+              "rules": []
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("supabase/.temp/project-ref"),
+            "jmvixqtfgiowrqcrjblp\n",
+        )
+        .unwrap();
+
+        let files = vec!["supabase/functions/email/index.ts".to_string()];
+        preflight_supabase_deploy_context(&repo.to_string_lossy(), &files)
+            .await
+            .unwrap();
+        let plan = build_deploy_plan(&repo.to_string_lossy(), &files)
+            .await
+            .unwrap();
+
+        assert_eq!(plan.supabase_functions, vec!["email".to_string()]);
+        assert_eq!(plan.commands.len(), 1);
+        assert!(plan.commands[0].command.contains("jmzewtnblclugryojdwk"));
+        assert!(!plan.commands[0].command.contains("jmvixqtfgiowrqcrjblp"));
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[tokio::test]
+    async fn supabase_preflight_rejects_local_link_without_staging_contract() {
+        let repo = std::env::temp_dir().join(format!(
+            "samwise-supabase-no-contract-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(repo.join("supabase/functions/email")).unwrap();
+        std::fs::create_dir_all(repo.join("supabase/.temp")).unwrap();
+        std::fs::write(
+            repo.join("supabase/.temp/project-ref"),
+            "jmvixqtfgiowrqcrjblp\n",
+        )
+        .unwrap();
+
+        let files = vec!["supabase/functions/email/index.ts".to_string()];
+        let error = preflight_supabase_deploy_context(&repo.to_string_lossy(), &files)
+            .await
+            .unwrap_err();
+        assert!(error.contains("explicit staging target"));
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn deploy_manifest_rejects_production_supabase_environment() {
+        let manifest: SamwiseDeployManifest = serde_json::from_str(
+            r#"{
+              "supabase": {
+                "environment": "production",
+                "project_ref": "jmvixqtfgiowrqcrjblp"
+              },
+              "rules": []
+            }"#,
+        )
+        .unwrap();
+
+        let error = validate_samwise_deploy_manifest(&manifest).unwrap_err();
+        assert!(error.contains("must be 'staging'"));
+        assert!(error.contains("/ship"));
+    }
+
+    #[test]
+    fn staging_label_cannot_authorize_untrusted_production_ref() {
+        let target = SamwiseSupabaseDeployTarget {
+            environment: "staging".to_string(),
+            project_ref: Some("jmvixqtfgiowrqcrjblp".to_string()),
+            db_url_env: None,
+        };
+        let error = validate_trusted_supabase_target(&target).unwrap_err();
+        assert!(error.contains("not in the trusted staging allowlist"));
+    }
+
+    #[test]
+    fn migration_credential_must_match_trusted_project_binding() {
+        let target = SamwiseSupabaseDeployTarget {
+            environment: "staging".to_string(),
+            project_ref: Some("jmzewtnblclugryojdwk".to_string()),
+            db_url_env: Some("SUPABASE_PRODUCTION_DB_URL".to_string()),
+        };
+        let error = validate_trusted_supabase_target(&target).unwrap_err();
+        assert!(error.contains("not the trusted migration credential"));
+    }
+
+    #[test]
+    fn supabase_commands_require_explicit_validated_targets() {
+        assert_eq!(
+            supabase_function_deploy_command("email", "jmzewtnblclugryojdwk"),
+            "npx --yes supabase functions deploy 'email' --project-ref 'jmzewtnblclugryojdwk'"
+        );
+        assert_eq!(
+            supabase_db_push_command("SUPABASE_STAGING_DB_URL"),
+            "npx --yes supabase db push --db-url \"$SUPABASE_STAGING_DB_URL\""
+        );
+        assert!(is_safe_env_name("SUPABASE_STAGING_DB_URL"));
+        assert!(!is_safe_env_name("SUPABASE_DB_URL; touch /tmp/pwned"));
+    }
+
+    #[tokio::test]
     async fn shared_edge_function_change_only_deploys_importing_functions() {
         let repo = std::env::temp_dir().join(format!(
             "samwise-edge-deps-{}-{}",
@@ -15698,6 +15905,63 @@ mod merge_deploy_tests {
             impacted,
             vec!["email".to_string(), "execute-automation-rules".to_string()]
         );
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn deploy_manifest_rejects_custom_supabase_shell_commands() {
+        let manifest: SamwiseDeployManifest = serde_json::from_str(
+            r#"{
+              "supabase": {
+                "environment": "staging",
+                "project_ref": "jmzewtnblclugryojdwk"
+              },
+              "rules": [
+                {
+                  "name": "unsafe override",
+                  "paths": [".samwise/**"],
+                  "commands": ["npx supabase functions deploy email --project-ref jmvixqtfgiowrqcrjblp"]
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let error = validate_samwise_deploy_manifest(&manifest).unwrap_err();
+        assert!(error.contains("custom Supabase command"));
+        assert!(error.contains(SAMWISE_SUPABASE_AUTO_COMMAND));
+    }
+
+    #[tokio::test]
+    async fn autosam_managed_pr_cannot_change_trusted_deploy_manifest() {
+        let repo = std::env::temp_dir().join(format!(
+            "samwise-deploy-policy-immutable-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(repo.join(".samwise")).unwrap();
+        std::fs::write(
+            repo.join(".samwise/deploy.json"),
+            r#"{
+              "rules": [
+                {
+                  "name": "trusted no-op",
+                  "paths": ["docs/**"],
+                  "commands": ["echo staging handled externally"]
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        preflight_deploy_manifest_context(&repo.to_string_lossy(), &[])
+            .await
+            .unwrap();
+        let refreshed_files = vec![".samwise/deploy.json".to_string()];
+        let error = preflight_deploy_manifest_context(&repo.to_string_lossy(), &refreshed_files)
+            .await
+            .unwrap_err();
+        assert!(error.contains("trusted deployment policy"));
         let _ = std::fs::remove_dir_all(repo);
     }
 
@@ -15975,6 +16239,11 @@ mod merge_deploy_tests {
         std::fs::write(
             repo.join(".samwise/deploy.json"),
             r#"{
+              "supabase": {
+                "environment": "staging",
+                "project_ref": "jmzewtnblclugryojdwk",
+                "db_url_env": "SUPABASE_STAGING_DB_URL"
+              },
               "rules": [
                 {
                   "name": "Supabase",
@@ -15998,22 +16267,19 @@ mod merge_deploy_tests {
     }
 }
 
-fn supabase_db_push_command() -> String {
-    "if [ -n \"${SUPABASE_DB_URL:-}\" ]; then npx --yes supabase db push --db-url \"$SUPABASE_DB_URL\"; else npx --yes supabase db push; fi".to_string()
+fn supabase_db_push_command(db_url_env: &str) -> String {
+    debug_assert!(is_safe_env_name(db_url_env));
+    format!(
+        "npx --yes supabase db push --db-url \"${}\"",
+        db_url_env
+    )
 }
 
-fn supabase_function_deploy_command(function_name: &str, project_ref: Option<&str>) -> String {
-    let function_name = shell_quote_simple(function_name);
-    if let Some(project_ref) = project_ref.filter(|value| !value.trim().is_empty()) {
-        return format!(
-            "npx --yes supabase functions deploy {} --project-ref {}",
-            function_name,
-            shell_quote_simple(project_ref.trim())
-        );
-    }
+fn supabase_function_deploy_command(function_name: &str, project_ref: &str) -> String {
     format!(
-        "if [ -n \"${{SUPABASE_PROJECT_REF:-}}\" ]; then npx --yes supabase functions deploy {0} --project-ref \"$SUPABASE_PROJECT_REF\"; elif [ -n \"${{SUPABASE_PROJECT_ID:-}}\" ]; then npx --yes supabase functions deploy {0} --project-ref \"$SUPABASE_PROJECT_ID\"; else npx --yes supabase functions deploy {0}; fi",
-        function_name
+        "npx --yes supabase functions deploy {} --project-ref {}",
+        shell_quote_simple(function_name),
+        shell_quote_simple(project_ref.trim())
     )
 }
 
