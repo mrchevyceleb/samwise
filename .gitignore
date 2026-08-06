@@ -27,3 +27,6 @@ supabase/.temp/
 # Claude Code local state
 .claude/scheduled_tasks.lock
 .claude/settings.local.json
+
+# Pi subagent scratch artifacts (transcripts, scout I/O) - not source
+.pi-subagents/

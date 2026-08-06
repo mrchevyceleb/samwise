@@ -43,6 +43,8 @@ Slack supports explicit project hashtags as the most reliable routing convention
 - `#fiscal` -> `FiscalPilot`
 - `#wecare` -> `wecare-dash`
 - `#mj-site` -> `MJ-site`
+- `#vibe` / `#vibe-kids` / `#vk` -> `vibe-kids`
+- `#vibecanvas` -> `vibecanvas`
 
 `ASSISTANT-HUB` resolves a single recognized hashtag before separator parsing or channel-name inference and writes the canonical project into Slack route metadata. AutoSam treats that route as authoritative and forces it onto tasks created from that Slack turn, which avoids cards getting stuck in project confirmation when the team includes a hashtag.
 

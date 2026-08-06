@@ -18,19 +18,31 @@ The backend worker picks up tasks from the board, writes code via Claude Code CL
 
 ## LLM Backend
 
-**Claude Code now runs on real Anthropic Opus 4.8 (`claude-opus-4-8`), reasoning effort `xhigh`.** This is experimental ("for now"), set up to compare results against the prior GLM setup, and it is fully reversible. The worker runs the Claude Code CLI exactly as before (same agent loop: tool use, streaming, file ops), but the model is genuine Anthropic Opus 4.8. The `claude-opus-4-8` label is now literal: it resolves to real Anthropic Opus 4.8, NOT to GLM. Model and effort constants `CLAUDE_MODEL` / `CLAUDE_EFFORT` live in `src-tauri/src/commands/claude_code.rs`.
+**The coding harness is selectable: `AUTOSAM_CODER=claude|pi`.** Currently **pi** on Fireworks `accounts/fireworks/routers/kimi-k3`. Only the code-writing step is affected; worktrees, the board, Slack/Telegram ingestion, crons, review sweeps and deploys are all harness-agnostic.
 
-**Account (do not mix up):** Claude Code authenticates against the **KG Claude account, `mtjohnston42@gmail.com`** (a Claude Max subscription), via OAuth. It must NOT use the Personal account `mjohnst@gmail.com`. OAuth creds live in `CLAUDE_CONFIG_DIR=/home/mrchevyceleb/.config/autosam/claude-config/.credentials.json` (copied from `~/.claude/.credentials.json`).
+Dispatch lives in `src-tauri/src/commands/coder.rs`. `run_claude_code_streaming` and `run_claude_code_opts` in `worker.rs` are the two entrypoints that branch on it (21 call sites, unchanged — the names are historical). Both backends honour the same contract: PID slot, cancellation via the `TASK_CANCELLED` sentinel, throttled progress comments, final-text return.
 
-**Routing mechanism (lives in systemd env, NOT in the repo):** the worker's `load_llm_proxy()` reads `AUTOSAM_LLM_PROXY_URL` and injects it as `ANTHROPIC_BASE_URL`. With those env vars removed, Claude Code hits `api.anthropic.com` directly and authenticates via the OAuth creds above. The switch (done 2026-06-19) removed the Z.ai/GLM proxy env vars (`AUTOSAM_LLM_PROXY_URL`, `AUTOSAM_LLM_PROXY_API_KEY`, `AUTOSAM_DEFAULT_MODEL`, `ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL`) from `~/.config/systemd/user/samwise-agent-one.service`, deleted the `samwise-agent-one.service.d/failover.conf` drop-in (it pointed the proxy at a local `http://127.0.0.1:8788`), and removed `CLAUDE_CODE_SIMPLE=1`.
+**Why pi:** Claude Code validates model names client-side and only accepts Anthropic IDs, so every non-Anthropic model had to go through a LiteLLM rewrite. That forces `drop_params: true` (silently discarding whatever the provider won't take) and cannot pass images at all when the target is text-only. pi talks to providers natively — `pi --list-models` shows ~230 models with an explicit `images` column.
 
-⚠️ **CLAUDE_CODE_SIMPLE gotcha:** with `CLAUDE_CODE_SIMPLE=1` set, Claude Code forces API-key auth and REJECTS OAuth subscription login, dying with `Not logged in · Please run /login`. That flag was needed for the GLM/Z.ai API-key setup but is incompatible with the KG Max OAuth auth, so it must stay removed for Opus.
+**pi specifics:**
+- Discovery must not use PATH: **`/usr/bin/pi` on this host is an unrelated 2024 ELF binary (a Lisp)**. `find_pi_command()` resolves `~/node_modules/@earendil-works/pi-coding-agent/dist/cli.js` under `node`. The spawned process renames itself to `pi`, so `pgrep -f cli.js` finds nothing — look for `comm=pi` as a child of agent-one.
+- Prompt goes on **stdin**, never argv (ARG_MAX + process-table leakage).
+- pi has **no `--max-turns`**; the cap is enforced by counting `turn_start` events in the parser and SIGTERMing.
+- LiteLLM env is scrubbed from pi spawns (`strip_direct_oauth_blockers_async`) — pi's own `anthropic` provider reads `ANTHROPIC_API_KEY` and would otherwise route back through the proxy.
+- `AUTOSAM_PI_PROVIDER` / `AUTOSAM_PI_MODEL` / `AUTOSAM_PI_THINKING` tune it; `AUTOSAM_PI_NO_EXTENSIONS=1` disables pi extension loading.
+- Rollback: set `AUTOSAM_CODER=claude` in `~/.config/systemd/user/samwise-agent-one.service.d/coder.conf` and restart. The Claude Code path is untouched and `autosam-litellm.service` still runs.
 
-No rebuild was needed for this switch: the model/effort were already baked into the deployed `/usr/bin/agent-one`, so it was a pure runtime-config change.
+**Claude Code path (fallback), if re-enabled:** routes through `autosam-litellm.service` on `127.0.0.1:9876`, config `~/.config/autosam/litellm_config.yaml`, currently mapping the Anthropic aliases to Fireworks **GLM 5.2** (Kimi K3 Fast ran 07-23 → 07-24 and was reverted over a 78% zero-edit session rate). `drop_params: true` is REQUIRED or Fireworks 400s every request. `CLAUDE_CODE_SIMPLE=1` must STAY set on this path (it forces API-key auth); removing it makes Claude Code attempt OAuth against the proxy and die with `Not logged in · Please run /login`. ⚠️ GLM 5.2 is text-only and rejects image blocks outright.
 
-**Revert path:** a backup of the prior GLM config sits at `~/.config/autosam/glm-revert-backup-20260619/`. Restore the `.service` file plus `service.d/` drop-in, `systemctl --user daemon-reload`, then restart the service. A clean revert to GLM also requires restoring `CLAUDE_CODE_SIMPLE=1`.
+**Account (dormant):** KG Claude Max OAuth creds remain at `CLAUDE_CONFIG_DIR=/home/mrchevyceleb/.config/autosam/claude-config/.credentials.json` (`mtjohnston42@gmail.com`, NOT Personal `mjohnst@gmail.com`). Only relevant if reverting to Anthropic-direct.
 
-This supersedes both the earlier Z.ai coding plan / GLM 5.2 Max routing and the older Fireworks GLM 5.1 LiteLLM proxy approach documented in `LLM-PROXY-SWAP.md`. Treat both of those as historical/superseded.
+**Vision:** `AUTOSAM_CODER_HANDLES_VISION` is **derived**, not hand-set — `coder::coder_handles_vision()` infers it from the active harness and model. It used to be a manual flag and drifted: set for vision-capable Kimi on 07-23, the model was reverted to text-only GLM the next day, and it stayed on for 13 days while Sam went blind on every screenshot. Set it explicitly only to override the inference. When the coder can't see, images are described by the local model at `AUTOSAM_VISION_MODEL_URL` (LM Studio) and pasted into the prompt. Playwright screenshot QA is separate and never went through the proxy.
+
+**Attachments are validated on download.** Bytes that claim to be an image but sniff as HTML are rejected instead of reaching the model. Slack answers an unauthorized file fetch with `200` + its sign-in page, so from 2026-06-25 until 2026-08-06 *every* Slack screenshot was stored as a login page and nothing errored — the bot token was missing the `files:read` scope. The Telegram fetch path carries the same guard.
+
+No rebuild was needed for the Kimi setup: the model/effort label is baked into `/usr/bin/agent-one`, and the actual backend swap is pure runtime config (proxy yaml + systemd env). Edit the proxy config and restart `autosam-litellm.service` to change backends; the worker picks up the new route on its next child spawn.
+
+**History (all superseded by Kimi K3 Fast as of 2026-07-23):** real Anthropic Opus 4.8 direct (2026-06-19), then Fireworks GLM 5.2 with MAX thinking via the same LiteLLM proxy (2026-06-29), plus the older Z.ai GLM 5.2 Max and Fireworks GLM 5.1 LiteLLM approaches in `LLM-PROXY-SWAP.md`. Kimi snapshots: `~/.config/autosam/litellm_config.yaml.bak-kimi-20260723`. Older GLM revert artifacts: `~/.config/autosam/glm-revert-backup-20260619/`.
 
 ## Deployment
 
@@ -39,6 +51,8 @@ This supersedes both the earlier Z.ai coding plan / GLM 5.2 Max routing and the 
 **Secondary host:** Trenzalore. The Tauri desktop app can run on either machine, both reading the same Supabase. The worker loop is single-active (enforced via `ae_workers` heartbeat).
 
 **Linux host requirement (Spark):** Codex's PR-review sandbox uses bubblewrap, which needs unprivileged user namespaces. Ubuntu 24.04 blocks these by default via AppArmor, which silently breaks `$samwise-pr-review` (every review returns INCONCLUSIVE and cards stick in Review). Fix is `kernel.apparmor_restrict_unprivileged_userns=0` (persisted in `/etc/sysctl.d/60-unprivileged-userns.conf`). The sandbox also needs network for `gh`, set via `[sandbox_workspace_write] network_access = true` in `~/.codex/config.toml` and the `-c sandbox_workspace_write.network_access=true` flag in `review.rs`.
+
+**Codex auth = raw OpenAI API key (since 2026-08-05, NOT ChatGPT subscription):** `$samwise-pr-review` runs the Codex CLI (`gpt-5.6-sol`, ultra reasoning) as the same user, so it reads `~/.codex/auth.json` fresh on every spawn. That file must stay `auth_mode = "apikey"` with `OPENAI_API_KEY` set. The canonical key lives in Doppler `agent-one/prd` as `OPENAI_API_KEY` (sk-proj, API-billed). To rotate or re-wire: `doppler secrets get OPENAI_API_KEY --project agent-one --config prd --plain | codex login --with-api-key` (the `--api-key` flag was removed in Codex v0.144; stdin pipe only). No service restart is needed after re-login because Codex spawns per review. The pre-2026-08-05 ChatGPT OAuth backup sits at `~/.codex/auth.json.bak-chatgpt-20260805`. Symptoms of being on the wrong auth: reviews die with `exit status 1` / INCONCLUSIVE within a minute, or `gpt-5.6-sol` 500s (ChatGPT-account subscription can't serve that model). Full swap detail: `docs/CODEX-AUTH-API-KEY.md`.
 
 ## Commands
 

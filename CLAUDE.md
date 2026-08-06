@@ -18,9 +18,70 @@ The backend worker picks up tasks from the board, writes code via Claude Code CL
 
 ## LLM Backend
 
-**Claude Code currently runs on Fireworks Kimi K3 Fast (`accounts/fireworks/routers/kimi-k3-fast`), swapped in 2026-07-23.** The worker runs the Claude Code CLI exactly as before (same agent loop: tool use, streaming, file ops). The `claude-opus-4-8` label that agent-one hardcodes is just what Claude Code *thinks* it is talking to — a LiteLLM proxy rewrites that name to the Fireworks Kimi router before forwarding. Model and effort constants `CLAUDE_MODEL` / `CLAUDE_EFFORT` still live in `src-tauri/src/commands/claude_code.rs` (unchanged; the label is decoupled from the real model by the proxy). Kimi K3 Fast reasons natively, so no `thinking`/effort param is forwarded.
+### The coding harness is selectable: `AUTOSAM_CODER=claude|pi`
+
+Sam's code-writing step runs through one of two harnesses. Everything else in the
+pipeline (worktrees, board, Slack/Telegram ingestion, crons, triggers, review
+sweeps, merge/deploy) is harness-agnostic and untouched by the choice.
+
+| | `claude` (default) | `pi` |
+|---|---|---|
+| Binary | Claude Code CLI | `pi -p --mode json` |
+| Models | Anthropic IDs only, so non-Anthropic needs the LiteLLM proxy | any provider pi is configured for, natively |
+| Vision | only if the proxy target accepts images | wherever the model does (`pi --list-models` has an `images` column) |
+| Selection | `CLAUDE_MODEL` in `commands/claude_code.rs` + proxy rewrite | `AUTOSAM_PI_PROVIDER` / `AUTOSAM_PI_MODEL` / `AUTOSAM_PI_THINKING` |
+
+Dispatch lives in `src-tauri/src/commands/coder.rs`; `run_claude_code_streaming`
+and `run_claude_code_opts` in `worker.rs` are the two entrypoints that branch on
+it. Both harnesses honour the same contract (PID slot, cancellation via
+`TASK_CANCELLED`, progress comments, final-text return), so the swap is one env
+var and rollback is the same.
+
+**pi specifics.** Discovery deliberately avoids PATH: `/usr/bin/pi` on this host
+is an unrelated 2024 ELF binary (a Lisp), so `find_pi_command()` resolves
+`~/node_modules/@earendil-works/pi-coding-agent/dist/cli.js` under `node` and
+only falls back to PATH last. The prompt goes on **stdin**, never argv. pi has no
+`--max-turns` flag, so the cap is enforced by counting `turn_start` events in the
+parser and SIGTERMing the child. Agent-one's LiteLLM env vars are scrubbed from
+pi spawns (`strip_direct_oauth_blockers_async`) — pi has its own `anthropic`
+provider that reads `ANTHROPIC_API_KEY`, and leaving them set would quietly route
+pi back through the proxy it exists to remove. `AUTOSAM_PI_NO_EXTENSIONS=1`
+disables pi extension loading if a nested-agent extension misbehaves unattended.
+
+### Claude Code path (default) — LiteLLM proxy
+
+**Live target is Fireworks GLM 5.2 (`accounts/fireworks/models/glm-5p2`).** Kimi
+K3 Fast ran 2026-07-23 → 07-24 and was reverted the next day over a 78% zero-edit
+session rate and tool-looping; the revert note is in the config header. The
+`claude-opus-4-8` label agent-one hardcodes is only what Claude Code *thinks* it
+is talking to — LiteLLM rewrites it before forwarding.
+
+⚠️ **GLM 5.2 is text-only.** It rejects image blocks outright
+(`400 "This model does not support image inputs"`), so on this path screenshots
+must go through the local describe adapter — see the vision note below.
 
 **Why a proxy at all:** Claude Code validates model names client-side and rejects non-Anthropic IDs, so it can't be pointed at Fireworks directly. LiteLLM sits in the middle, accepts the Anthropic name, rewrites it to the Fireworks model, and forwards.
+
+### Vision / image attachments
+
+`AUTOSAM_CODER_HANDLES_VISION` means "the coder can see images itself, skip the
+local describe pass". It must match the actual coder, and drifting apart is a
+silent failure — Sam keeps working, just blind, and probes screenshots with
+`file` instead of reading them.
+
+- **Coder can see images** (pi on kimi-k3, or a vision-capable proxy target) → set `1`.
+- **Coder is text-only** (GLM 5.2 today) → set `0`, and images are described by
+  the local model at `AUTOSAM_VISION_MODEL_URL` (LM Studio) before being pasted
+  into the prompt.
+
+Set in the drop-in `~/.config/systemd/user/samwise-agent-one.service.d/vision.conf`.
+It was left at `1` for 13 days after the GLM revert, which is how Sam went blind
+on Slack screenshots (task `8740cede`, 2026-08-06).
+
+Attachments are also validated on download: a file claiming to be an image whose
+bytes are HTML is rejected rather than handed to the model. Slack answers an
+unauthenticated file fetch with `200` + its sign-in page, and an upstream
+uploader that only checks `res.ok` will store that as `image/png`.
 
 **Routing mechanism (lives in systemd env + a second service, NOT in the repo):**
 - `samwise-agent-one.service` sets `AUTOSAM_LLM_PROXY_URL=http://127.0.0.1:9876` and `AUTOSAM_LLM_PROXY_API_KEY=sk-litellm-autosam-master`. The worker's `load_llm_proxy()` reads these and injects them as `ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY` per Claude Code spawn. `CLAUDE_CODE_SIMPLE=1` is set (fine here — auth is the proxy master key, not OAuth; see the gotcha below).
@@ -33,6 +94,9 @@ The backend worker picks up tasks from the board, writes code via Claude Code CL
 ⚠️ **CLAUDE_CODE_SIMPLE gotcha:** with `CLAUDE_CODE_SIMPLE=1` set, Claude Code forces API-key auth and REJECTS OAuth subscription login, dying with `Not logged in · Please run /login`. That flag is correct for any API-key/proxy setup (GLM, Kimi) but is incompatible with the OAuth-direct Opus path below, where it must be removed.
 
 ### History (superseded)
+- **2026-08-06:** added the pluggable `AUTOSAM_CODER` harness (pi alongside Claude Code) so model choice no longer depends on what survives a proxy rewrite.
+- **2026-07-24:** Kimi K3 Fast reverted to **GLM 5.2** after a 78% zero-edit session rate and tool-looping. The `AUTOSAM_CODER_HANDLES_VISION=1` drop-in from the Kimi swap was left behind, blinding image tasks until 2026-08-06.
+- **2026-07-23:** switched to **Fireworks Kimi K3 Fast** (`accounts/fireworks/routers/kimi-k3-fast`). Snapshot: `litellm_config.yaml.bak-kimi-20260723`.
 - **2026-06-29:** Opus 4.8 hit the KG monthly spend limit → switched to **Fireworks GLM 5.2** (`accounts/fireworks/models/glm-5p2`, max thinking) via this same LiteLLM proxy on :9876. This established the proxy machinery still in use.
 - **2026-06-19 → 06-29 (Opus era, now off):** ran **real Anthropic Opus 4.8, effort `xhigh`**, OAuth-direct (no proxy). Auth was the **KG Claude account `mtjohnston42@gmail.com`** (Claude Max), NOT Personal `mjohnst@gmail.com`; OAuth creds at `CLAUDE_CONFIG_DIR=/home/mrchevyceleb/.config/autosam/claude-config/.credentials.json` (copied from `~/.claude/.credentials.json`). OAuth-direct mode requires REMOVING `AUTOSAM_LLM_PROXY_*` env (so `load_llm_proxy()` returns None and Claude Code hits `api.anthropic.com`) **and** removing `CLAUDE_CODE_SIMPLE=1`. To restore Opus: revert those env changes; the old GLM env backup is at `~/.config/autosam/glm-revert-backup-20260619/`.
 - Both the earlier Z.ai coding-plan / GLM 5.2 Max routing and the older Fireworks GLM 5.1 LiteLLM approach in `LLM-PROXY-SWAP.md` are historical/superseded.

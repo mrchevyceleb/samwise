@@ -126,7 +126,13 @@ fn strip_direct_oauth_blockers(cmd: &mut std::process::Command) {
     }
 }
 
-fn strip_direct_oauth_blockers_async(cmd: &mut tokio::process::Command) {
+/// Scrub Anthropic/proxy routing vars from a child command.
+///
+/// Also used for pi spawns: pi has its own `anthropic` provider that reads
+/// `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL`, so leaving agent-one's LiteLLM
+/// values in the environment would quietly route pi through the very proxy the
+/// pi backend exists to remove.
+pub fn strip_direct_oauth_blockers_async(cmd: &mut tokio::process::Command) {
     for key in DIRECT_OAUTH_ENV_BLOCKERS {
         cmd.env_remove(key);
     }

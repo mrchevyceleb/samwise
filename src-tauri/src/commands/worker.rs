@@ -4279,17 +4279,22 @@ async fn execute_task(
     let visual_qa_enabled = true;
     let mut dev_server_handle: Option<dev_server::DevServerHandle> = None;
 
-    // 5. Run Claude Code CLI
-    let action_label = if is_research {
-        "Running analysis with Claude Code..."
-    } else if bypass_pr_pipeline {
-        "Running scheduled maintenance directly with Claude Code..."
-    } else if flexible_repo_mode {
-        "Starting flexible repo task with Claude Code..."
-    } else {
-        "Starting code changes with Claude Code..."
+    // 5. Hand off to the coding harness (Claude Code or pi — see coder.rs).
+    // Name the harness in the comment so the card says what actually ran.
+    let harness = match super::coder::active_backend() {
+        super::coder::CoderBackend::Pi => "pi",
+        super::coder::CoderBackend::ClaudeCode => "Claude Code",
     };
-    agent_comment(config, &task_id, action_label).await;
+    let action_label = if is_research {
+        format!("Running analysis with {}...", harness)
+    } else if bypass_pr_pipeline {
+        format!("Running scheduled maintenance directly with {}...", harness)
+    } else if flexible_repo_mode {
+        format!("Starting flexible repo task with {}...", harness)
+    } else {
+        format!("Starting code changes with {}...", harness)
+    };
+    agent_comment(config, &task_id, &action_label).await;
 
     // Build a context-aware prompt with repo info
     let mut prompt_parts: Vec<String> = Vec::new();
@@ -4380,7 +4385,26 @@ async fn execute_task(
     // /tmp/samwise-attachments/<task_id>/ directory so Claude Code can read
     // them as local files. Append the paths to the prompt so Claude knows
     // to consult them (images carry info text can't).
-    let attachment_paths = materialize_task_attachments(&task_id, &task).await;
+    let (attachment_paths, attachment_failures) =
+        materialize_task_attachments(&task_id, &task).await;
+    // Say so out loud when an attachment doesn't arrive. Silently proceeding
+    // means working blind on a task whose whole point is usually the screenshot.
+    if !attachment_failures.is_empty() {
+        agent_comment(
+            config,
+            &task_id,
+            &format!(
+                "Heads up: {} attachment(s) failed to download, so I can't see them. Working from the description alone.\n{}",
+                attachment_failures.len(),
+                attachment_failures
+                    .iter()
+                    .map(|f| format!("- {}", f))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        )
+        .await;
+    }
     if !attachment_paths.is_empty() {
         // When proxy is active (non-vision model like GLM), image attachments
         // can't be sent directly. Run them through a local vision model first.
@@ -7090,8 +7114,130 @@ async fn upload_bytes_to_task_attachments(
     ))
 }
 
+/// Longest filename we will write for an attachment. Linux NAME_MAX is 255
+/// bytes; staying well under it leaves room for the sanitizer's expansions and
+/// any suffix a caller adds.
+const ATTACHMENT_NAME_MAX: usize = 120;
+
+/// Turn an arbitrary attachment name (or URL tail) into a safe, bounded filename.
+///
+/// Signed Supabase Storage URLs carry the JWT in a `?token=...` query string. If
+/// that reaches the filesystem the name blows past NAME_MAX and the write fails
+/// with `File name too long (os error 36)` — observed 2026-08-05, which silently
+/// dropped the attachment from the task. Strip query/fragment, keep only the
+/// final path segment, sanitize, then cap while preserving the extension.
+fn sanitize_attachment_filename(raw: &str) -> Option<String> {
+    let base = raw
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(raw)
+        .rsplit('/')
+        .next()
+        .unwrap_or(raw)
+        .trim();
+    if base.is_empty() {
+        return None;
+    }
+
+    let safe: String = base
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let safe = safe.trim_matches('.').to_string();
+    if safe.is_empty() {
+        return None;
+    }
+    if safe.len() <= ATTACHMENT_NAME_MAX {
+        return Some(safe);
+    }
+
+    // Too long: keep a short extension and truncate the stem to fit.
+    let ext = std::path::Path::new(&safe)
+        .extension()
+        .and_then(|e| e.to_str())
+        .filter(|e| e.len() <= 8)
+        .map(|e| format!(".{}", e))
+        .unwrap_or_default();
+    let stem_budget = ATTACHMENT_NAME_MAX.saturating_sub(ext.len());
+    let stem: String = safe.chars().take(stem_budget).collect();
+    Some(format!("{}{}", stem, ext))
+}
+
+/// Extensions we expect to hold real image bytes.
+const IMAGE_EXTENSIONS: [&str; 7] = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"];
+
+fn looks_like_html(bytes: &[u8]) -> bool {
+    let head = &bytes[..bytes.len().min(512)];
+    let text = String::from_utf8_lossy(head);
+    let lowered = text.trim_start().to_ascii_lowercase();
+    lowered.starts_with("<!doctype html") || lowered.starts_with("<html")
+}
+
+fn looks_like_image(bytes: &[u8], ext: &str) -> bool {
+    match ext {
+        "png" => bytes.starts_with(&[0x89, b'P', b'N', b'G']),
+        "jpg" | "jpeg" => bytes.starts_with(&[0xFF, 0xD8, 0xFF]),
+        "gif" => bytes.starts_with(b"GIF8"),
+        "webp" => bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP",
+        "bmp" => bytes.starts_with(b"BM"),
+        // SVG is text; accept anything XML/SVG-shaped that isn't an HTML page.
+        "svg" => {
+            let head = String::from_utf8_lossy(&bytes[..bytes.len().min(512)]);
+            let lowered = head.trim_start().to_ascii_lowercase();
+            lowered.starts_with("<?xml") || lowered.starts_with("<svg")
+        }
+        _ => true,
+    }
+}
+
+/// Reject bytes that claim to be an image but plainly are not.
+///
+/// Slack answers an unauthenticated file fetch with `200 OK` and its sign-in
+/// HTML rather than an error status, so an upstream uploader that only checks
+/// `res.ok` will happily store a login page as `image/png`. That is exactly what
+/// happened to task 8740cede on 2026-08-06: the "screenshot" on disk was a Slack
+/// sign-in page, so the coding model had nothing to look at and worked blind.
+/// Failing loudly here means the attachment is dropped with a clear log line
+/// instead of being fed to the model as if it were the real thing.
+fn validate_attachment_bytes(bytes: &[u8], filename: &str) -> Result<(), String> {
+    if bytes.is_empty() {
+        return Err("downloaded 0 bytes".to_string());
+    }
+
+    let ext = std::path::Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    if !IMAGE_EXTENSIONS.contains(&ext.as_str()) {
+        return Ok(());
+    }
+
+    if ext != "svg" && looks_like_html(bytes) {
+        return Err(format!(
+            "expected an image but got an HTML page ({} bytes) — the source URL most likely returned an auth/login wall instead of the file",
+            bytes.len()
+        ));
+    }
+    if !looks_like_image(bytes, &ext) {
+        return Err(format!(
+            "content does not match the .{} extension ({} bytes); refusing to pass a corrupt image to the model",
+            ext,
+            bytes.len()
+        ));
+    }
+    Ok(())
+}
+
 /// Download an attachment URL to a local file under /tmp/samwise-attachments/<task_id>/
-/// so Claude Code can read it off disk. Returns (local_path, original_name).
+/// so the coding agent can read it off disk. Returns the local path.
 async fn download_attachment_for_task(
     task_id: &str,
     url: &str,
@@ -7115,28 +7261,18 @@ async fn download_attachment_for_task(
     if !resp.status().is_success() {
         return Err(format!("GET {} returned {}", url, resp.status()));
     }
-    let name = name_hint
-        .map(|s| s.to_string())
-        .or_else(|| {
-            url.rsplit('/')
-                .next()
-                .and_then(|s| s.split('?').next())
-                .map(|s| s.to_string())
-        })
-        .filter(|s| !s.is_empty())
+    // Both the caller-supplied name and the URL tail can carry a query string
+    // (signed storage URLs embed a JWT), so run each through the same sanitizer
+    // rather than trusting name_hint verbatim.
+    let safe = name_hint
+        .and_then(sanitize_attachment_filename)
+        .or_else(|| sanitize_attachment_filename(url))
         .unwrap_or_else(|| format!("{}.bin", uuid::Uuid::new_v4()));
-    let safe = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    let path = dir.join(&safe);
+
     let bytes = resp.bytes().await.map_err(|e| format!("body: {}", e))?;
+    validate_attachment_bytes(&bytes, &safe)?;
+
+    let path = dir.join(&safe);
     std::fs::write(&path, &bytes).map_err(|e| format!("write {}: {}", path.display(), e))?;
     Ok(path)
 }
@@ -7146,14 +7282,14 @@ async fn download_attachment_for_task(
 /// paths. Errors are logged but never fatal — a broken URL shouldn't kill
 /// the whole task.
 async fn materialize_task_attachments(
-
     task_id: &str,
     task: &serde_json::Value,
-) -> Vec<std::path::PathBuf> {
+) -> (Vec<std::path::PathBuf>, Vec<String>) {
     let Some(arr) = task.get("attachments").and_then(|v| v.as_array()) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let mut out = Vec::new();
+    let mut failures = Vec::new();
     for entry in arr {
         let url = entry.get("url").and_then(|v| v.as_str());
         let name = entry.get("name").and_then(|v| v.as_str());
@@ -7162,10 +7298,13 @@ async fn materialize_task_attachments(
         };
         match download_attachment_for_task(task_id, u, name).await {
             Ok(p) => out.push(p),
-            Err(e) => log::warn!("[worker] attachment download failed ({}): {}", u, e),
+            Err(e) => {
+                log::warn!("[worker] attachment download failed ({}): {}", u, e);
+                failures.push(format!("{}: {}", name.unwrap_or(u), e));
+            }
         }
     }
-    out
+    (out, failures)
 }
 /// When the LLM proxy is active (routing through a non-vision model like GLM),
 /// image attachments can't be sent directly. This function detects image files
@@ -7184,19 +7323,13 @@ async fn describe_image_attachments(
         return HashMap::new();
     }
 
-    // If the coder itself is vision-capable (e.g. Kimi K3 Fast), skip the local
-    // describe pass entirely and let Claude Code send the image files straight to
-    // the model — it reads them via its Read tool and the proxy forwards them, so
-    // the model sees the real screenshot instead of a lossy local description.
-    // Only a text-only coder (e.g. GLM 5.2) needs the local describe step.
-    let coder_handles_vision = std::env::var("AUTOSAM_CODER_HANDLES_VISION")
-        .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false);
-    if coder_handles_vision {
-        log::info!(
-            "[worker] Vision adapter: skipped — AUTOSAM_CODER_HANDLES_VISION set; coder sees images directly"
-        );
+    // If the coder itself is vision-capable, skip the local describe pass and
+    // let it read the image files directly — the model then sees the real
+    // screenshot instead of a lossy text rendering of it. Only a text-only
+    // coder needs the describe step. Derived from the active harness + model
+    // rather than a hand-maintained flag; see coder::coder_handles_vision.
+    if super::coder::coder_handles_vision() {
+        log::info!("[worker] Vision adapter: skipped — coder sees images directly");
         return HashMap::new();
     }
 
@@ -7590,6 +7723,9 @@ fn project_alias(token: &str) -> Option<&'static str> {
         "fiscal" | "fiscalpilot" | "fp" => Some("FiscalPilot"),
         "wecare" | "wecaredash" | "wc" => Some("wecare-dash"),
         "mj" | "mjsite" | "mattjohnston" | "mattjohnstonio" => Some("MJ-site"),
+        // Exact tokens only — bare "vibe" must not steal vibecanvas.
+        "vibe" | "vibekids" | "vk" => Some("vibe-kids"),
+        "vibecanvas" => Some("vibecanvas"),
         _ => None,
     }
 }
@@ -7645,7 +7781,7 @@ fn first_projectish_hashtag(message: &str) -> Option<String> {
 
 fn telegram_missing_project_message(projects: &serde_json::Value, message: &str) -> String {
     let mut msg = telegram_project_prefix_help(projects);
-    msg.push_str("\n\nYou can also use project hashtags like `#studio`, `#operly`, or `#banana-code`.");
+    msg.push_str("\n\nYou can also use project hashtags like `#studio`, `#operly`, `#banana-code`, or `#vibe`.");
     let candidate = super::chat::split_project_prefix(message)
         .map(|p| p.prefix)
         .or_else(|| first_projectish_hashtag(message));
@@ -7814,6 +7950,19 @@ async fn check_telegram_messages(
         for (fid, _caption) in &pending_file_ids {
             match download_telegram_file(&token, fid).await {
                 Ok((bytes, mime, name)) => {
+                    // Same guard as the Slack path: an upstream that answers a
+                    // denied file request with 200 + an HTML page would
+                    // otherwise be stored as a valid image and only discovered
+                    // later, by a model quietly working from nothing.
+                    if let Err(e) = validate_attachment_bytes(&bytes, &name) {
+                        log::warn!("[worker] Telegram attachment rejected ({}): {}", name, e);
+                        send_telegram_plain(
+                            config,
+                            &format!("That attachment didn't come through as a real file ({}). Mind sending it again?", e),
+                        )
+                        .await;
+                        continue;
+                    }
                     match upload_bytes_to_task_attachments(config, bytes, &mime, Some(&name)).await
                     {
                         Ok(url) => stored.push(serde_json::json!({
@@ -9594,7 +9743,117 @@ async fn detect_stuck_pr_checks(pr_url: &str) -> Option<String> {
 /// "Reached max turns" before ever producing output — the same failure mode
 /// already special-cased once for PR-review asks; disabling tools here fixes
 /// the whole class instead of one phrasing at a time.
+/// Is this tool a shell command? Claude Code calls it `Bash`, pi calls it `bash`.
+fn tool_is_shell(tool_name: &str) -> bool {
+    matches!(tool_name, "Bash" | "bash" | "shell")
+}
+
+/// Pull a filesystem path out of a tool's arguments. Claude Code uses
+/// `file_path`, pi uses `path`.
+fn tool_arg_path(input: Option<&serde_json::Value>) -> &str {
+    input
+        .and_then(|i| i.get("file_path").or_else(|| i.get("path")))
+        .and_then(|v| v.as_str())
+        .unwrap_or("...")
+}
+
+fn tool_arg_str<'a>(input: Option<&'a serde_json::Value>, key: &str) -> &'a str {
+    input
+        .and_then(|i| i.get(key))
+        .and_then(|v| v.as_str())
+        .unwrap_or("...")
+}
+
+/// Render one tool call as the casual progress line Sam posts to the card.
+///
+/// Shared by both harnesses so the board reads identically whichever one ran.
+/// Claude Code emits PascalCase tool names (`Read`, `Bash`), pi emits lowercase
+/// (`read`, `bash`); both are matched here.
+fn tool_progress_message(tool_name: &str, input: Option<&serde_json::Value>) -> String {
+    match tool_name {
+        "Read" | "read" | "read_file" => {
+            let path = tool_arg_path(input);
+            let short = path.rsplit(['/', '\\']).next().unwrap_or(path);
+            format!("Reading {}", short)
+        }
+        "Edit" | "edit" | "edit_file" | "MultiEdit" | "multiedit" => {
+            let path = tool_arg_path(input);
+            let short = path.rsplit(['/', '\\']).next().unwrap_or(path);
+            format!("Editing {}", short)
+        }
+        "Write" | "write" | "write_file" => {
+            let path = tool_arg_path(input);
+            let short = path.rsplit(['/', '\\']).next().unwrap_or(path);
+            format!("Writing {}", short)
+        }
+        name if tool_is_shell(name) => {
+            let command = tool_arg_str(input, "command");
+            let short: String = command.chars().take(80).collect();
+            format!("Running: {}", short)
+        }
+        "Grep" | "grep" => format!("Searching for \"{}\"", tool_arg_str(input, "pattern")),
+        "Glob" | "glob" => format!("Finding files: {}", tool_arg_str(input, "pattern")),
+        "Agent" | "agent" | "subagent" => "Spawning a sub-agent...".to_string(),
+        _ => format!("Using {}", tool_name),
+    }
+}
+
+/// Consecutive-identical-command detector.
+///
+/// A model re-running the exact same shell command back-to-back is stuck (the
+/// classic case is `tsc --noEmit` 40 times), and left alone it burns the whole
+/// wall-clock timeout and fails the card. "Consecutive" deliberately means no
+/// other tool ran in between: a legitimate edit/test loop re-runs the same test
+/// after an Edit, so any non-shell tool resets the counter.
+#[derive(Default)]
+struct CommandLoopDetector {
+    last_command: String,
+    repeats: u32,
+}
+
+impl CommandLoopDetector {
+    const THRESHOLD: u32 = 4;
+
+    /// Feed a tool call. Returns Some(repeat_count) once the same shell command
+    /// has repeated enough times to call it a stall.
+    fn observe(&mut self, tool_name: &str, input: Option<&serde_json::Value>) -> Option<u32> {
+        if !tool_is_shell(tool_name) {
+            self.last_command.clear();
+            self.repeats = 0;
+            return None;
+        }
+        let command = tool_arg_str(input, "command");
+        if command == self.last_command {
+            self.repeats += 1;
+        } else {
+            self.last_command = command.to_string();
+            self.repeats = 1;
+        }
+        (self.repeats >= Self::THRESHOLD).then_some(self.repeats)
+    }
+}
+
+/// One-shot agent run. Dispatches to whichever harness is active.
+///
+/// The name is historical: every call site predates the pi backend and there is
+/// no value in churning 21 of them. See `commands/coder.rs`.
 pub async fn run_claude_code_opts(
+    cwd: &str,
+    prompt: &str,
+    max_turns: u32,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    match super::coder::active_backend() {
+        super::coder::CoderBackend::Pi => {
+            run_pi_opts_impl(cwd, prompt, max_turns, timeout_secs).await
+        }
+        super::coder::CoderBackend::ClaudeCode => {
+            run_claude_code_opts_impl(cwd, prompt, max_turns, timeout_secs).await
+        }
+    }
+}
+
+async fn run_claude_code_opts_impl(
     cwd: &str,
     prompt: &str,
     max_turns: u32,
@@ -9818,7 +10077,53 @@ fn detect_rate_limit(text: &str) -> Option<String> {
 
 /// Run Claude Code CLI with stream-json output, posting progress comments as it works.
 /// Returns the final text output. Used for worker tasks where transparency is important.
+/// Streaming agent run that posts progress to the task card. Dispatches to
+/// whichever harness is active (`AUTOSAM_CODER`). Both backends honour the same
+/// contract: same PID slot, same cancellation semantics and `TASK_CANCELLED`
+/// sentinel, same "final assistant text" return value.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_claude_code_streaming(
+    cwd: &str,
+    prompt: &str,
+    max_turns: u32,
+    timeout_secs: u64,
+    config: &supabase::SupabaseConfig,
+    task_id: &str,
+    process_id_slot: Arc<tokio::sync::Mutex<Option<u32>>>,
+    model_override: Option<&str>,
+) -> Result<String, String> {
+    match super::coder::active_backend() {
+        super::coder::CoderBackend::Pi => {
+            run_pi_streaming_impl(
+                cwd,
+                prompt,
+                max_turns,
+                timeout_secs,
+                config,
+                task_id,
+                process_id_slot,
+                model_override,
+            )
+            .await
+        }
+        super::coder::CoderBackend::ClaudeCode => {
+            run_claude_code_streaming_impl(
+                cwd,
+                prompt,
+                max_turns,
+                timeout_secs,
+                config,
+                task_id,
+                process_id_slot,
+                model_override,
+            )
+            .await
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_claude_code_streaming_impl(
     cwd: &str,
     prompt: &str,
     max_turns: u32,
@@ -9972,13 +10277,10 @@ pub async fn run_claude_code_streaming(
         let mut last_comment_time = std::time::Instant::now();
         // Throttle: don't post more than one progress comment per 10 seconds
         const MIN_COMMENT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
-        // Loop-stall detection: track the last bash command + how many times it
-        // repeated consecutively. Claude Code re-running the EXACT same command
-        // back-to-back (e.g. `tsc --noEmit` 40x) is a pathological loop that
-        // otherwise spins until the wall-clock timeout, wasting ~30min and
-        // failing the card. Abort early when it repeats.
-        let mut last_bash_command = String::new();
-        let mut bash_repeat: u32 = 0;
+        // Loop-stall detection: abort when the model re-runs the EXACT same
+        // command back-to-back (e.g. `tsc --noEmit` 40x), which otherwise spins
+        // until the wall-clock timeout, wasting ~30min and failing the card.
+        let mut loop_detector = CommandLoopDetector::default();
         let mut loop_aborted = false;
 
         if let Some(reader) = stdout {
@@ -10107,104 +10409,35 @@ pub async fn run_claude_code_streaming(
                                     .unwrap_or("unknown");
                                 let input = block.get("input");
 
-                                // "Consecutive" means no other tool use happened between
-                                // identical Bash commands. A legitimate edit/test loop often
-                                // runs the same test again after an Edit or Read; reset the
-                                // detector on every non-Bash tool so that workflow is never
-                                // mistaken for a command stall.
-                                if !matches!(tool_name, "Bash" | "bash") {
-                                    last_bash_command.clear();
-                                    bash_repeat = 0;
+                                // Loop-stall guard: abort when the model gets
+                                // stuck re-running one command (e.g. a failing
+                                // tsc) instead of letting it burn the timeout.
+                                if let Some(repeats) = loop_detector.observe(tool_name, input) {
+                                    let short: String =
+                                        tool_arg_str(input, "command").chars().take(80).collect();
+                                    let msg = format!(
+                                        "Command-loop detected: `{}` repeated {}x. Aborting this run to avoid a timeout stall (the model is stuck re-running the same command).",
+                                        short, repeats
+                                    );
+                                    agent_comment(&config_clone, &task_id_owned, &msg).await;
+                                    error_summary = Some(format!(
+                                        "Claude Code looped on the same command `{}` {} times; aborted to avoid a timeout stall.",
+                                        short, repeats
+                                    ));
+                                    // Kill the child so the outer wait() returns now.
+                                    let pid_opt = { *pid_slot_stream.lock().await };
+                                    if let Some(pid) = pid_opt {
+                                        if pid > 0 {
+                                            #[cfg(unix)]
+                                            unsafe {
+                                                libc::kill(pid as i32, libc::SIGTERM);
+                                            }
+                                        }
+                                    }
+                                    loop_aborted = true;
                                 }
 
-                                // Build a human-readable progress message
-                                let progress = match tool_name {
-                                    "Read" | "read_file" => {
-                                        let path = input
-                                            .and_then(|i| i.get("file_path").or(i.get("path")))
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("...");
-                                        // Show just the filename, not full path
-                                        let short = path.rsplit(['/', '\\']).next().unwrap_or(path);
-                                        format!("Reading {}", short)
-                                    }
-                                    "Edit" | "edit_file" => {
-                                        let path = input
-                                            .and_then(|i| i.get("file_path").or(i.get("path")))
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("...");
-                                        let short = path.rsplit(['/', '\\']).next().unwrap_or(path);
-                                        format!("Editing {}", short)
-                                    }
-                                    "Write" | "write_file" => {
-                                        let path = input
-                                            .and_then(|i| i.get("file_path").or(i.get("path")))
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("...");
-                                        let short = path.rsplit(['/', '\\']).next().unwrap_or(path);
-                                        format!("Writing {}", short)
-                                    }
-                                    "Bash" | "bash" => {
-                                        let command = input
-                                            .and_then(|i| i.get("command"))
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("...");
-                                        // Loop-stall guard: count consecutive
-                                        // identical commands. Legit work never
-                                        // runs the exact same command back-to-
-                                        // back; a repeat means the model is
-                                        // stuck (e.g. re-checking a failing tsc).
-                                        if command == last_bash_command {
-                                            bash_repeat += 1;
-                                        } else {
-                                            last_bash_command = command.to_string();
-                                            bash_repeat = 1;
-                                        }
-                                        let short: String = command.chars().take(80).collect();
-                                        const BASH_LOOP_THRESHOLD: u32 = 4;
-                                        if bash_repeat >= BASH_LOOP_THRESHOLD {
-                                            let msg = format!(
-                                                "Command-loop detected: `{}` repeated {}x. Aborting this run to avoid a timeout stall (the model is stuck re-running the same command).",
-                                                short, bash_repeat
-                                            );
-                                            agent_comment(&config_clone, &task_id_owned, &msg).await;
-                                            error_summary = Some(format!(
-                                                "Claude Code looped on the same command `{}` {} times; aborted to avoid a timeout stall.",
-                                                short, bash_repeat
-                                            ));
-                                            // Kill the child so the outer wait() returns now.
-                                            let pid_opt = { *pid_slot_stream.lock().await };
-                                            if let Some(pid) = pid_opt {
-                                                if pid > 0 {
-                                                    #[cfg(unix)]
-                                                    unsafe {
-                                                        libc::kill(pid as i32, libc::SIGTERM);
-                                                    }
-                                                }
-                                            }
-                                            loop_aborted = true;
-                                        }
-                                        format!("Running: {}", short)
-                                    }
-                                    "Grep" | "grep" => {
-                                        let pattern = input
-                                            .and_then(|i| i.get("pattern"))
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("...");
-                                        format!("Searching for \"{}\"", pattern)
-                                    }
-                                    "Glob" | "glob" => {
-                                        let pattern = input
-                                            .and_then(|i| i.get("pattern"))
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("...");
-                                        format!("Finding files: {}", pattern)
-                                    }
-                                    "Agent" | "agent" => "Spawning a sub-agent...".to_string(),
-                                    _ => {
-                                        format!("Using {}", tool_name)
-                                    }
-                                };
+                                let progress = tool_progress_message(tool_name, input);
 
                                 // Post comment if enough time has passed since last one
                                 if last_comment_time.elapsed() >= MIN_COMMENT_INTERVAL {
@@ -10334,6 +10567,548 @@ pub async fn run_claude_code_streaming(
     }
 
     Ok(result_text.trim().to_string())
+}
+
+// ── pi harness ───────────────────────────────────────────────────────
+//
+// pi's `--mode json` emits NDJSON, one event per line. The events we care about
+// map onto the same three things the Claude Code parser extracts — tool calls
+// (progress comments), the final assistant text (the run's result), and errors:
+//
+//   {"type":"session","id":...}
+//   {"type":"turn_start"}
+//   {"type":"message_update","assistantMessageEvent":{
+//       "type":"toolcall_end","toolCall":{"name":"bash","arguments":{...}}}}
+//   {"type":"turn_end","message":{...},"toolResults":[{"isError":false,...}]}
+//   {"type":"agent_end","messages":[...],"willRetry":false}
+
+/// Build the argv for a pi headless run.
+///
+/// Context files (AGENTS.md / CLAUDE.md) are deliberately left enabled: Claude
+/// Code loads them too, so the repo's conventions reach the model either way.
+/// Extensions are also on by default, matching how pi behaves interactively,
+/// but `AUTOSAM_PI_NO_EXTENSIONS=1` turns them off — worth reaching for if a
+/// nested-agent extension ever misbehaves in an unattended run.
+fn pi_command_args(cfg: &super::coder::PiConfig) -> Vec<String> {
+    let mut args = vec![
+        "-p".to_string(),
+        "--mode".to_string(),
+        "json".to_string(),
+        "--provider".to_string(),
+        cfg.provider.clone(),
+        "--model".to_string(),
+        cfg.model.clone(),
+        "--thinking".to_string(),
+        cfg.thinking.clone(),
+    ];
+    if std::env::var("AUTOSAM_PI_NO_EXTENSIONS")
+        .ok()
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+    {
+        args.push("--no-extensions".to_string());
+    }
+    args
+}
+
+/// Pull the last assistant text out of a pi `agent_end` event.
+fn pi_result_text_from_agent_end(parsed: &serde_json::Value) -> Option<String> {
+    let messages = parsed.get("messages")?.as_array()?;
+    for msg in messages.iter().rev() {
+        if msg.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        let content = msg.get("content")?.as_array()?;
+        let text = content
+            .iter()
+            .filter(|c| c.get("type").and_then(|v| v.as_str()) == Some("text"))
+            .filter_map(|c| c.get("text").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.trim().is_empty() {
+            return Some(text);
+        }
+    }
+    None
+}
+
+/// Extract a completed tool call from a pi `message_update` event.
+/// Returns (tool_name, arguments).
+fn pi_toolcall_from_event(parsed: &serde_json::Value) -> Option<(String, serde_json::Value)> {
+    let event = parsed.get("assistantMessageEvent")?;
+    if event.get("type").and_then(|v| v.as_str()) != Some("toolcall_end") {
+        return None;
+    }
+    let call = event.get("toolCall")?;
+    let name = call.get("name").and_then(|v| v.as_str())?.to_string();
+    let args = call
+        .get("arguments")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    Some((name, args))
+}
+
+/// Spawn pi headless, streaming progress to the task card.
+///
+/// Mirrors `run_claude_code_streaming`'s contract exactly: same signature, same
+/// PID-slot/cancellation/heartbeat behaviour, same `TASK_CANCELLED` sentinel,
+/// same "return the model's final text" result. Only the process and the wire
+/// format differ.
+#[allow(clippy::too_many_arguments)]
+async fn run_pi_streaming_impl(
+    cwd: &str,
+    prompt: &str,
+    max_turns: u32,
+    timeout_secs: u64,
+    config: &supabase::SupabaseConfig,
+    task_id: &str,
+    process_id_slot: Arc<tokio::sync::Mutex<Option<u32>>>,
+    model_override: Option<&str>,
+) -> Result<String, String> {
+    use std::sync::atomic::Ordering;
+
+    let (exe, prefix_args) = super::coder::find_pi_command();
+    let pi_cfg = super::coder::PiConfig::resolve(model_override);
+    log::info!(
+        "[worker] pi harness: {} {} (provider={} model={} thinking={})",
+        exe,
+        prefix_args.join(" "),
+        pi_cfg.provider,
+        pi_cfg.model,
+        pi_cfg.thinking
+    );
+
+    let mut cmd = async_cmd(&exe);
+    for arg in &prefix_args {
+        cmd.arg(arg);
+    }
+    for arg in pi_command_args(&pi_cfg) {
+        cmd.arg(arg);
+    }
+
+    // pi authenticates itself (~/.pi/agent/auth.json). agent-one's LiteLLM vars
+    // would hijack pi's own `anthropic` provider, so scrub them.
+    super::claude_code::strip_direct_oauth_blockers_async(&mut cmd);
+
+    let resolved_cwd = resolve_chat_cwd(cwd);
+    cmd.current_dir(&resolved_cwd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| format!("Failed to run pi: {}", e))?;
+
+    // Prompt goes on stdin, never argv: task descriptions routinely exceed
+    // ARG_MAX and argv is world-readable in the process table.
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        let payload = prompt.to_string();
+        if let Err(e) = stdin.write_all(payload.as_bytes()).await {
+            log::warn!("[worker] pi stdin write failed: {}", e);
+        }
+        drop(stdin);
+    }
+
+    {
+        let mut pid = process_id_slot.lock().await;
+        *pid = Some(child.id().unwrap_or(0));
+    }
+
+    let last_activity = std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+    let heartbeat_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let task_started_at = std::time::Instant::now();
+
+    // Heartbeat + cancellation watcher, identical in behaviour to the Claude
+    // path: nudge the card when the stream goes quiet, and kill the child if
+    // Matt deletes or cancels the task mid-run.
+    {
+        let last_activity_hb = last_activity.clone();
+        let alive_hb = heartbeat_alive.clone();
+        let cancelled_hb = cancelled.clone();
+        let pid_slot_hb = process_id_slot.clone();
+        let config_hb = config.clone();
+        let task_id_hb = task_id.to_string();
+        tokio::spawn(async move {
+            let mut last_hb_post = std::time::Instant::now();
+            while alive_hb.load(Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                if !alive_hb.load(Ordering::Relaxed) {
+                    break;
+                }
+                if !task_is_live(&config_hb, &task_id_hb).await {
+                    log::info!(
+                        "[worker] Task {} was deleted/cancelled mid-run; killing pi subprocess",
+                        task_id_hb
+                    );
+                    cancelled_hb.store(true, Ordering::Relaxed);
+                    let pid_opt = { *pid_slot_hb.lock().await };
+                    if let Some(pid) = pid_opt {
+                        if pid > 0 {
+                            #[cfg(unix)]
+                            unsafe {
+                                libc::kill(pid as i32, libc::SIGTERM);
+                            }
+                        }
+                    }
+                    alive_hb.store(false, Ordering::Relaxed);
+                    break;
+                }
+                let quiet_for = {
+                    let guard = last_activity_hb.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.elapsed()
+                };
+                if quiet_for >= std::time::Duration::from_secs(120)
+                    && last_hb_post.elapsed() >= std::time::Duration::from_secs(120)
+                {
+                    let mins = task_started_at.elapsed().as_secs() / 60;
+                    agent_comment(
+                        &config_hb,
+                        &task_id_hb,
+                        &format!("Still working. {} min in, nothing's hung.", mins),
+                    )
+                    .await;
+                    last_hb_post = std::time::Instant::now();
+                }
+            }
+        });
+    }
+
+    let stdout = child.stdout.take();
+    let config_clone = config.clone();
+    let task_id_owned = task_id.to_string();
+    let last_activity_stream = last_activity.clone();
+    let pid_slot_stream = process_id_slot.clone();
+
+    let stdout_handle = tokio::spawn(async move {
+        let mut result_text = String::new();
+        let mut raw_tail = String::new();
+        let mut error_summary: Option<String> = None;
+        const RAW_TAIL_CAP: usize = 4096;
+        const MIN_COMMENT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+        let mut last_comment_time = std::time::Instant::now();
+        let mut loop_detector = CommandLoopDetector::default();
+        let mut aborted = false;
+        // pi has no --max-turns flag, so the cap is enforced here by counting
+        // turn_start events and killing the child when it is exceeded.
+        let mut turns: u32 = 0;
+
+        if let Some(reader) = stdout {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut lines = BufReader::new(reader).lines();
+
+            while let Ok(Some(line)) = lines.next_line().await {
+                if aborted {
+                    break;
+                }
+                if line.is_empty() {
+                    continue;
+                }
+
+                if raw_tail.len() + line.len() + 1 > RAW_TAIL_CAP {
+                    let drop_len = (raw_tail.len() + line.len() + 1).saturating_sub(RAW_TAIL_CAP);
+                    if drop_len >= raw_tail.len() {
+                        raw_tail.clear();
+                    } else {
+                        let mut safe_drop = drop_len;
+                        while safe_drop < raw_tail.len() && !raw_tail.is_char_boundary(safe_drop) {
+                            safe_drop += 1;
+                        }
+                        raw_tail.drain(..safe_drop);
+                    }
+                }
+                raw_tail.push_str(&line);
+                raw_tail.push('\n');
+
+                let parsed: serde_json::Value = match serde_json::from_str(&line) {
+                    Ok(v) => v,
+                    // pi prints extension boot chatter on stdout before the
+                    // stream proper; non-JSON lines are expected, not errors.
+                    Err(_) => continue,
+                };
+                let event_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+                match event_type {
+                    "turn_start" => {
+                        turns += 1;
+                        if max_turns > 0 && turns > max_turns {
+                            let msg = format!(
+                                "Hit the {}-turn cap for this run. Stopping here rather than letting it wander.",
+                                max_turns
+                            );
+                            agent_comment(&config_clone, &task_id_owned, &msg).await;
+                            error_summary =
+                                Some(format!("pi exceeded the {}-turn cap", max_turns));
+                            let pid_opt = { *pid_slot_stream.lock().await };
+                            if let Some(pid) = pid_opt {
+                                if pid > 0 {
+                                    #[cfg(unix)]
+                                    unsafe {
+                                        libc::kill(pid as i32, libc::SIGTERM);
+                                    }
+                                }
+                            }
+                            aborted = true;
+                        }
+                    }
+                    "message_update" => {
+                        let Some((tool_name, args)) = pi_toolcall_from_event(&parsed) else {
+                            continue;
+                        };
+                        let input = Some(&args);
+
+                        if let Some(repeats) = loop_detector.observe(&tool_name, input) {
+                            let short: String =
+                                tool_arg_str(input, "command").chars().take(80).collect();
+                            agent_comment(
+                                &config_clone,
+                                &task_id_owned,
+                                &format!(
+                                    "Command-loop detected: `{}` repeated {}x. Aborting this run to avoid a timeout stall (the model is stuck re-running the same command).",
+                                    short, repeats
+                                ),
+                            )
+                            .await;
+                            error_summary = Some(format!(
+                                "pi looped on the same command `{}` {} times; aborted to avoid a timeout stall.",
+                                short, repeats
+                            ));
+                            log::warn!("[worker] pi command-loop abort: {}", short);
+                            let pid_opt = { *pid_slot_stream.lock().await };
+                            if let Some(pid) = pid_opt {
+                                if pid > 0 {
+                                    #[cfg(unix)]
+                                    unsafe {
+                                        libc::kill(pid as i32, libc::SIGTERM);
+                                    }
+                                }
+                            }
+                            aborted = true;
+                        }
+
+                        let progress = tool_progress_message(&tool_name, input);
+                        if last_comment_time.elapsed() >= MIN_COMMENT_INTERVAL {
+                            agent_comment(&config_clone, &task_id_owned, &progress).await;
+                            last_comment_time = std::time::Instant::now();
+                            if let Ok(mut g) = last_activity_stream.lock() {
+                                *g = std::time::Instant::now();
+                            }
+                        } else {
+                            log::debug!("[worker] Throttled progress: {}", progress);
+                        }
+                    }
+                    "agent_end" => {
+                        if let Some(text) = pi_result_text_from_agent_end(&parsed) {
+                            result_text = text;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        (result_text, raw_tail, error_summary)
+    });
+
+    let stderr = child.stderr.take();
+    let stderr_handle = tokio::spawn(async move {
+        let mut output = String::new();
+        if let Some(mut reader) = stderr {
+            use tokio::io::AsyncReadExt;
+            let _ = reader.read_to_string(&mut output).await;
+        }
+        output
+    });
+
+    let status = if timeout_secs > 0 {
+        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), child.wait()).await
+        {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                heartbeat_alive.store(false, Ordering::Relaxed);
+                return Err(format!("pi process error: {}", e));
+            }
+            Err(_) => {
+                heartbeat_alive.store(false, Ordering::Relaxed);
+                let _ = child.kill().await;
+                return Err(format!("pi timed out after {}s", timeout_secs));
+            }
+        }
+    } else {
+        match child.wait().await {
+            Ok(s) => s,
+            Err(e) => {
+                heartbeat_alive.store(false, Ordering::Relaxed);
+                return Err(format!("pi process error: {}", e));
+            }
+        }
+    };
+
+    heartbeat_alive.store(false, Ordering::Relaxed);
+
+    if cancelled.load(Ordering::Relaxed) {
+        return Err("TASK_CANCELLED".to_string());
+    }
+
+    let (result_text, raw_tail, error_summary) = stdout_handle.await.unwrap_or_default();
+    let stderr_text = stderr_handle.await.unwrap_or_default();
+
+    if !status.success() {
+        let stderr = stderr_text.trim();
+        if let Some(msg) = detect_rate_limit(stderr)
+            .or_else(|| detect_rate_limit(&result_text))
+            .or_else(|| detect_rate_limit(&raw_tail))
+        {
+            return Err(msg);
+        }
+        let detail = if let Some(s) = error_summary {
+            s
+        } else if !stderr.is_empty() {
+            stderr.to_string()
+        } else {
+            let snippet = tail_chars(raw_tail.trim(), 1200);
+            if snippet.is_empty() {
+                "no stderr, no stdout captured".to_string()
+            } else {
+                format!("no stderr — stdout tail: {}", snippet)
+            }
+        };
+        let exit_code = status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| format!("{}", status));
+        return Err(format!("pi failed (exit {}): {}", exit_code, detail));
+    }
+
+    // A turn-cap or loop abort SIGTERMs the child, which can still exit 0.
+    // Surface it as a failure so the caller does not treat a truncated run
+    // as a clean finish.
+    if let Some(summary) = error_summary {
+        return Err(summary);
+    }
+    if let Some(msg) = detect_rate_limit(&result_text) {
+        return Err(msg);
+    }
+
+    Ok(result_text.trim().to_string())
+}
+
+/// One-shot pi run with no tools and no progress streaming. Mirrors
+/// `run_claude_code_opts`.
+async fn run_pi_opts_impl(
+    cwd: &str,
+    prompt: &str,
+    _max_turns: u32,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    let (exe, prefix_args) = super::coder::find_pi_command();
+    let pi_cfg = super::coder::PiConfig::resolve(None);
+
+    let mut cmd = async_cmd(&exe);
+    for arg in &prefix_args {
+        cmd.arg(arg);
+    }
+    // Text mode: these callers want the model's prose, not an event stream.
+    // No tools, matching the Claude one-shot path's `--tools ""`.
+    cmd.arg("-p")
+        .arg("--mode")
+        .arg("text")
+        .arg("--no-tools")
+        .arg("--no-session")
+        .arg("--provider")
+        .arg(&pi_cfg.provider)
+        .arg("--model")
+        .arg(&pi_cfg.model)
+        .arg("--thinking")
+        .arg(&pi_cfg.thinking);
+
+    super::claude_code::strip_direct_oauth_blockers_async(&mut cmd);
+
+    let resolved_cwd = resolve_chat_cwd(cwd);
+    cmd.current_dir(&resolved_cwd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| format!("Failed to run pi: {}", e))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        let payload = prompt.to_string();
+        if let Err(e) = stdin.write_all(payload.as_bytes()).await {
+            log::warn!("[worker] pi stdin write failed: {}", e);
+        }
+        drop(stdin);
+    }
+
+    let stdout = child.stdout.take();
+    let stdout_handle = tokio::spawn(async move {
+        let mut output = String::new();
+        if let Some(mut reader) = stdout {
+            use tokio::io::AsyncReadExt;
+            let _ = reader.read_to_string(&mut output).await;
+        }
+        output
+    });
+    let stderr = child.stderr.take();
+    let stderr_handle = tokio::spawn(async move {
+        let mut output = String::new();
+        if let Some(mut reader) = stderr {
+            use tokio::io::AsyncReadExt;
+            let _ = reader.read_to_string(&mut output).await;
+        }
+        output
+    });
+
+    let status = if timeout_secs > 0 {
+        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), child.wait()).await
+        {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => return Err(format!("pi process error: {}", e)),
+            Err(_) => {
+                let _ = child.kill().await;
+                return Err(format!("pi timed out after {}s", timeout_secs));
+            }
+        }
+    } else {
+        child
+            .wait()
+            .await
+            .map_err(|e| format!("pi process error: {}", e))?
+    };
+
+    let stdout_text = stdout_handle.await.unwrap_or_default();
+    let stderr_text = stderr_handle.await.unwrap_or_default();
+
+    if !status.success() {
+        let stderr = stderr_text.trim();
+        if let Some(msg) =
+            detect_rate_limit(stderr).or_else(|| detect_rate_limit(stdout_text.trim()))
+        {
+            return Err(msg);
+        }
+        let detail = if !stderr.is_empty() {
+            stderr.to_string()
+        } else {
+            let snippet = tail_chars(stdout_text.trim(), 1200);
+            if snippet.is_empty() {
+                "no stderr, no stdout captured".to_string()
+            } else {
+                format!("no stderr — stdout tail: {}", snippet)
+            }
+        };
+        let exit_code = status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| format!("{}", status));
+        return Err(format!("pi failed (exit {}): {}", exit_code, detail));
+    }
+
+    if let Some(msg) = detect_rate_limit(stdout_text.trim()) {
+        return Err(msg);
+    }
+
+    Ok(stdout_text.trim().to_string())
 }
 
 /// Is the task still active? Returns false if the row is gone or its status
@@ -15409,6 +16184,183 @@ fn terminal_task_patch(mut patch: Value) -> Value {
 }
 
 #[cfg(test)]
+mod pi_harness_tests {
+    use super::*;
+
+    /// Captured verbatim from `pi -p --mode json` on 2026-08-06.
+    const TOOLCALL_END: &str = r#"{"type":"message_update","assistantMessageEvent":{"type":"toolcall_end","contentIndex":1,"toolCall":{"type":"toolCall","id":"bash_0","name":"bash","arguments":{"command":"ls -la"}}}}"#;
+    const READ_CALL: &str = r#"{"type":"message_update","assistantMessageEvent":{"type":"toolcall_end","contentIndex":2,"toolCall":{"type":"toolCall","id":"read_1","name":"read","arguments":{"path":"src/lib/types.ts"}}}}"#;
+    const TOOLCALL_DELTA: &str = r#"{"type":"message_update","assistantMessageEvent":{"type":"toolcall_delta","contentIndex":1,"delta":"{"}}"#;
+    const AGENT_END: &str = r#"{"type":"agent_end","messages":[{"role":"user","content":[{"type":"text","text":"go"}]},{"role":"assistant","content":[{"type":"text","text":"Done. Fixed the popup."}],"model":"accounts/fireworks/routers/kimi-k3"}],"willRetry":false}"#;
+
+    fn parse(line: &str) -> serde_json::Value {
+        serde_json::from_str(line).expect("fixture should be valid JSON")
+    }
+
+    #[test]
+    fn completed_toolcalls_are_extracted() {
+        let (name, args) = pi_toolcall_from_event(&parse(TOOLCALL_END)).expect("bash call");
+        assert_eq!(name, "bash");
+        assert_eq!(args.get("command").and_then(|v| v.as_str()), Some("ls -la"));
+    }
+
+    /// Only `toolcall_end` carries complete arguments; the streamed deltas are
+    /// partial JSON fragments and must not produce progress comments.
+    #[test]
+    fn streaming_deltas_are_ignored() {
+        assert!(pi_toolcall_from_event(&parse(TOOLCALL_DELTA)).is_none());
+        assert!(pi_toolcall_from_event(&parse(AGENT_END)).is_none());
+    }
+
+    #[test]
+    fn final_assistant_text_is_pulled_from_agent_end() {
+        assert_eq!(
+            pi_result_text_from_agent_end(&parse(AGENT_END)).as_deref(),
+            Some("Done. Fixed the popup.")
+        );
+    }
+
+    /// pi names its tools lowercase and passes `path`, not `file_path`. The
+    /// board should read the same as it does under Claude Code.
+    #[test]
+    fn pi_tool_names_render_the_same_progress_lines() {
+        let (name, args) = pi_toolcall_from_event(&parse(READ_CALL)).unwrap();
+        assert_eq!(tool_progress_message(&name, Some(&args)), "Reading types.ts");
+
+        let (name, args) = pi_toolcall_from_event(&parse(TOOLCALL_END)).unwrap();
+        assert_eq!(tool_progress_message(&name, Some(&args)), "Running: ls -la");
+    }
+
+    #[test]
+    fn claude_and_pi_tool_names_agree() {
+        let args = serde_json::json!({"file_path": "/repo/src/App.tsx"});
+        let pi_args = serde_json::json!({"path": "/repo/src/App.tsx"});
+        assert_eq!(
+            tool_progress_message("Edit", Some(&args)),
+            tool_progress_message("edit", Some(&pi_args))
+        );
+    }
+
+    #[test]
+    fn loop_detector_fires_only_on_consecutive_identical_commands() {
+        let mut d = CommandLoopDetector::default();
+        let cmd = serde_json::json!({"command": "npx tsc --noEmit"});
+        assert!(d.observe("bash", Some(&cmd)).is_none());
+        assert!(d.observe("bash", Some(&cmd)).is_none());
+        assert!(d.observe("bash", Some(&cmd)).is_none());
+        assert_eq!(d.observe("bash", Some(&cmd)), Some(4));
+    }
+
+    #[test]
+    fn a_real_edit_test_loop_is_not_mistaken_for_a_stall() {
+        let mut d = CommandLoopDetector::default();
+        let cmd = serde_json::json!({"command": "npm test"});
+        let edit = serde_json::json!({"path": "a.ts"});
+        for _ in 0..10 {
+            assert!(d.observe("bash", Some(&cmd)).is_none());
+            assert!(d.observe("edit", Some(&edit)).is_none());
+        }
+    }
+
+    #[test]
+    fn detector_is_harness_agnostic() {
+        let mut d = CommandLoopDetector::default();
+        let cmd = serde_json::json!({"command": "make"});
+        // Claude Code's "Bash" and pi's "bash" both count as shell calls.
+        assert!(d.observe("Bash", Some(&cmd)).is_none());
+        assert!(d.observe("bash", Some(&cmd)).is_none());
+        assert!(d.observe("Bash", Some(&cmd)).is_none());
+        assert_eq!(d.observe("bash", Some(&cmd)), Some(4));
+    }
+
+    #[test]
+    fn pi_argv_carries_provider_model_and_thinking() {
+        let cfg = super::super::coder::PiConfig::resolve(None);
+        let args = pi_command_args(&cfg);
+        assert!(args.contains(&"-p".to_string()));
+        assert!(args.windows(2).any(|w| w[0] == "--mode" && w[1] == "json"));
+        assert!(args.windows(2).any(|w| w[0] == "--model" && w[1] == cfg.model));
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "--provider" && w[1] == cfg.provider));
+    }
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::*;
+
+    /// Regression: the signed Supabase Storage URL that produced
+    /// "File name too long (os error 36)" on 2026-08-05.
+    #[test]
+    fn signed_storage_name_is_stripped_and_capped() {
+        let name = "1785955059360-w8ae3r0uaer.png?token=eyJraWQiOiJzdG9yYWdlLXVybC1zaWduaW5nLWtleV81ZmIwNGVlNy0wODUwLTQwYzgtYjY1NC1jNzZlYTlkZDY2Y2IiLCJhbGciOiJIUzI1NiJ9.eyJ1cmwiOiJzdXBwb3J0LWF0dGFjaG1lbnRzLzM2ZTk4ZGY5LWQwZTItNDM4YS1iMDBmLTFiMWNiNjM2MDcxNy8xNzg1OTU1MDU5MzYwLXc4YWUzcjB1YWVyLnBuZyIsInNjb3BlIjoiZG93bmxvYWQiLCJpYXQiOjE3ODU5NTUwNzcsImV4cCI6MTc4ODU0NzA3N30";
+        let safe = sanitize_attachment_filename(name).expect("should produce a name");
+        assert_eq!(safe, "1785955059360-w8ae3r0uaer.png");
+        assert!(safe.len() <= ATTACHMENT_NAME_MAX);
+    }
+
+    #[test]
+    fn url_tail_is_used_when_no_name_hint() {
+        let url = "https://example.supabase.co/storage/v1/object/public/task-attachments/6f1965a9.png?token=abc.def";
+        assert_eq!(
+            sanitize_attachment_filename(url).as_deref(),
+            Some("6f1965a9.png")
+        );
+    }
+
+    #[test]
+    fn absurdly_long_name_is_capped_but_keeps_extension() {
+        let long = format!("{}.png", "a".repeat(500));
+        let safe = sanitize_attachment_filename(&long).expect("should produce a name");
+        assert!(safe.len() <= ATTACHMENT_NAME_MAX, "len was {}", safe.len());
+        assert!(safe.ends_with(".png"));
+    }
+
+    /// Regression: task 8740cede on 2026-08-06 stored a Slack sign-in page as
+    /// image.png, so the coder had a login wall where the screenshot should be.
+    #[test]
+    fn slack_signin_html_is_rejected_as_an_image() {
+        let html = br#"<!DOCTYPE html><html lang="en-US" data-cdn="https://a.slack-edge.com/"><head><title>Slack</title>"#;
+        let err = validate_attachment_bytes(html, "image.png")
+            .expect_err("HTML masquerading as a PNG must be rejected");
+        assert!(err.contains("HTML page"), "unexpected message: {}", err);
+    }
+
+    #[test]
+    fn real_png_magic_bytes_pass() {
+        let png = [
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+        ];
+        assert!(validate_attachment_bytes(&png, "shot.png").is_ok());
+    }
+
+    #[test]
+    fn wrong_magic_bytes_for_extension_are_rejected() {
+        let jpeg = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+        assert!(validate_attachment_bytes(&jpeg, "actually-a-jpeg.png").is_err());
+    }
+
+    #[test]
+    fn empty_download_is_rejected() {
+        assert!(validate_attachment_bytes(&[], "shot.png").is_err());
+    }
+
+    #[test]
+    fn non_image_attachments_are_not_sniffed() {
+        // A .log or .txt can legitimately contain anything, including HTML.
+        let body = b"<!DOCTYPE html><html>a saved page</html>";
+        assert!(validate_attachment_bytes(body, "page.txt").is_ok());
+    }
+
+    #[test]
+    fn svg_is_accepted_but_html_named_svg_is_not() {
+        assert!(validate_attachment_bytes(b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>", "d.svg").is_ok());
+        assert!(validate_attachment_bytes(b"<!DOCTYPE html><html></html>", "d.svg").is_err());
+    }
+}
+
+#[cfg(test)]
 mod merge_deploy_tests {
     use super::*;
 
@@ -18402,8 +19354,13 @@ pub fn spawn_auto_fix_task(
         notify_callback(&config, &task_id, "in_progress", Some(&pr_url), None);
 
         agent_comment(&config, &task_id, &format!(
-            "Running auto-fix cycle {}/{} on this PR. Feeding Codex's blocker list back to Claude Code.",
-            new_cycle, max_review_cycles
+            "Running auto-fix cycle {}/{} on this PR. Feeding Codex's blocker list back to {}.",
+            new_cycle,
+            max_review_cycles,
+            match super::coder::active_backend() {
+                super::coder::CoderBackend::Pi => "pi",
+                super::coder::CoderBackend::ClaudeCode => "Claude Code",
+            }
         )).await;
 
         // Pre-flight: make sure the worktree is on the PR head branch before we
