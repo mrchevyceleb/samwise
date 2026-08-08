@@ -1,6 +1,12 @@
 # AutoSam Codex Auth — Raw OpenAI API Key (2026-08-05)
 
-## Current setup
+> ⚠️ **SUPERSEDED 2026-08-08 — historical only.** Reviews no longer authenticate through
+> `~/.codex/auth.json` in any mode. They run through **OpenRouter** (`openai/gpt-5.6-sol`,
+> `xhigh`), keyed from `OPENROUTER_API_KEY` in Doppler `agent-one/prd` and pinned per spawn in
+> `src-tauri/src/commands/review.rs`. See `CLAUDE.md` → **PR review backend**. Nothing below is
+> the live configuration; keep it for the account/billing history only.
+
+## Setup as of 2026-08-05 (no longer live)
 
 AutoSam's PR reviewer is the **Codex CLI** (`$samwise-pr-review`, model `gpt-5.6-sol`, ultra reasoning), spawned per review by the worker as the local user. Since 2026-08-05 it authenticates with a **raw OpenAI API key**, NOT the ChatGPT subscription OAuth it used before.
 

@@ -52,15 +52,14 @@ No rebuild was needed for the Kimi setup: the model/effort label is baked into `
 
 **Linux host requirement (Spark):** Codex's PR-review sandbox uses bubblewrap, which needs unprivileged user namespaces. Ubuntu 24.04 blocks these by default via AppArmor, which silently breaks `$samwise-pr-review` (every review returns INCONCLUSIVE and cards stick in Review). Fix is `kernel.apparmor_restrict_unprivileged_userns=0` (persisted in `/etc/sysctl.d/60-unprivileged-userns.conf`). The sandbox also needs network for `gh`, set via `[sandbox_workspace_write] network_access = true` in `~/.codex/config.toml` and the `-c sandbox_workspace_write.network_access=true` flag in `review.rs`.
 
-**Codex auth: currently the ChatGPT subscription (`auth_mode = "chatgpt"`), verified working 2026-08-06.** `$samwise-pr-review` runs the Codex CLI (`gpt-5.6-sol`, ultra reasoning) as the same user, so it reads `~/.codex/auth.json` fresh on every spawn. No service restart is needed after re-login because Codex spawns per review.
+**Codex auth: OpenRouter, since 2026-08-08.** `$samwise-pr-review` runs the Codex CLI pinned to `openai/gpt-5.6-sol` at `xhigh` reasoning through OpenRouter, billed from `OPENROUTER_API_KEY` in Doppler `agent-one/prd`. `~/.codex/auth.json` is no longer on the path for reviews at all — the provider, model, and key are pinned per spawn in `src-tauri/src/commands/review.rs` (`CODEX_PROVIDER_ARGS`, `resolve_openrouter_key`). Full detail in `CLAUDE.md` → **PR review backend**.
 
-Both auth modes work; the choice is billing, not capability.
-- **Subscription (live):** no per-review API charge. Exposure is plan rate limits, where a review fails rather than queues. Smoke-tested 2026-08-06: `codex exec --model gpt-5.6-sol -c model_reasoning_effort=high` returns normally.
-- **API key:** `doppler secrets get OPENAI_API_KEY --project agent-one --config prd --plain | codex login --with-api-key` (the `--api-key` flag was removed in Codex v0.144, so stdin pipe only). ⚠️ **As of 2026-08-06 that key has a $0 balance** — it is valid and can see 130 models, but `gpt-5.6-sol` returns `credit_balance_exhausted`. Note this is a *credit* error, not a model error, so the key reaches the model fine and will work the moment credits are added. Matt does not control that account's billing.
+- The key is resolved per review (agent-one's env first, else Doppler) and set on the codex child only. It is deliberately NOT exported into agent-one's environment, because every spawned child — including the coding harness running model-authored commands — would inherit it.
+- Codex 0.144 dropped `wire_api = "chat"`, so any replacement provider must speak the Responses API.
+- The model slug needs the `openai/` prefix on OpenRouter; a bare `gpt-5.6-sol` is not a valid id there.
+- Changing the review model is a `CODEX_MODEL` edit plus a rebuild+deploy, not a `codex login`.
 
-⚠️ **Correcting an earlier note in this file:** the 2026-08-05 switch to an API key was documented as being required because "ChatGPT-account subscription can't serve that model." That is not true today — subscription auth serves `gpt-5.6-sol` fine. Do not switch auth on that basis. The pre-2026-08-05 backup is at `~/.codex/auth.json.bak-chatgpt-20260805`; historical detail in `docs/CODEX-AUTH-API-KEY.md`.
-
-To check which mode is live: `python3 -c "import json,os;d=json.load(open(os.path.expanduser('~/.codex/auth.json')));print(d.get('auth_mode'), bool(d.get('OPENAI_API_KEY')))"`.
+Superseded (do not restore on the basis of these): the ChatGPT subscription (`auth_mode = "chatgpt"`) that ran until 2026-08-08, and the 2026-08-05 raw-OpenAI-API-key experiment whose account sat at a $0 balance (`docs/CODEX-AUTH-API-KEY.md`, historical). The ChatGPT plan hit its usage limit on 2026-08-08, which is part of why reviews moved to per-token OpenRouter billing.
 
 ## Commands
 

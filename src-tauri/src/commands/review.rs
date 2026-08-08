@@ -17,10 +17,109 @@ const REVIEW_PROMPT: &str = include_str!("../../prompts/review.md");
 /// place so upgrading the model is a single edit rather than a scavenger
 /// hunt across review.rs and worker.rs.
 ///
-pub const CODEX_MODEL: &str = "gpt-5.6-sol";
-/// `-c` config argument for Codex reasoning effort. Matches the Codex CLI
-/// schema supported by Sol, including `max` and `ultra`.
-pub const CODEX_REASONING_CONFIG: &str = "model_reasoning_effort=\"ultra\"";
+/// Reviews run through OpenRouter (see `CODEX_PROVIDER_ARGS`), so the slug has to
+/// carry the `openai/` provider prefix — a bare `gpt-5.6-sol` is not a valid
+/// OpenRouter model id.
+pub const CODEX_MODEL: &str = "openai/gpt-5.6-sol";
+/// `-c` config argument for Codex reasoning effort. `xhigh` is verified working
+/// against OpenRouter's `openai/gpt-5.6-sol`.
+pub const CODEX_REASONING_CONFIG: &str = "model_reasoning_effort=\"xhigh\"";
+
+/// Provider pin for every Codex CLI invocation Samwise makes. Reviews bill against
+/// the OpenRouter key in Doppler `agent-one/prd` (`OPENROUTER_API_KEY`, resolved per
+/// spawn by `resolve_openrouter_key` below), not this machine's ChatGPT login.
+///
+/// The provider is declared inline rather than read from `~/.codex/config.toml` for
+/// the same reason `sandbox_workspace_write.network_access` is pinned below: an edit
+/// to the machine-global Codex config (or a different `CODEX_HOME` on the spawning
+/// process) must not be able to silently repoint reviews at another model or account.
+/// Note this pins the *provider and model only* — Codex still loads the rest of the
+/// user config (trust levels, hooks, MCP servers) from whatever `CODEX_HOME` it
+/// inherits, since `--ignore-user-config` is not passed.
+///
+/// Codex 0.144 dropped `wire_api = "chat"`, so any provider swapped in here has to
+/// speak the OpenAI Responses API. OpenRouter does.
+pub const CODEX_PROVIDER_ARGS: &[&str] = &[
+    "-c",
+    "model_providers.openrouter.name=\"OpenRouter\"",
+    "-c",
+    "model_providers.openrouter.base_url=\"https://openrouter.ai/api/v1\"",
+    "-c",
+    "model_providers.openrouter.env_key=\"OPENROUTER_API_KEY\"",
+    "-c",
+    "model_providers.openrouter.wire_api=\"responses\"",
+    "-c",
+    "model_provider=\"openrouter\"",
+];
+
+/// Env var Codex reads for the OpenRouter key (the `env_key` above).
+const OPENROUTER_KEY_ENV: &str = "OPENROUTER_API_KEY";
+const OPENROUTER_DOPPLER_PROJECT: &str = "agent-one";
+const OPENROUTER_DOPPLER_CONFIG: &str = "prd";
+
+/// Resolve the OpenRouter key for a Codex spawn: agent-one's own environment first,
+/// then Doppler `agent-one/prd`.
+///
+/// Deliberately **not** exported into agent-one's process environment. The coding
+/// harness runs model-authored shell commands against untrusted task text, and every
+/// child (pi, npm scripts, deploy steps) inherits agent-one's env — a process-wide
+/// billable key would be one `env` away from a prompt-injected task. The key is set on
+/// the codex child only, via `cmd.env`, and reviews are the only thing that needs it.
+///
+/// The Doppler fallback also means a Doppler hiccup degrades one review instead of
+/// blocking agent-one from starting at all.
+async fn resolve_openrouter_key() -> Result<String, String> {
+    if let Ok(v) = std::env::var(OPENROUTER_KEY_ENV) {
+        if !v.trim().is_empty() {
+            return Ok(v.trim().to_string());
+        }
+    }
+
+    // `--scope` matters: a bare `doppler secrets get` resolves its token from the
+    // process cwd, and Codex reviews run inside per-task worktrees that carry their
+    // own scoped tokens (which 404 on this project).
+    let scope = std::env::var("HOME").unwrap_or_else(|_| "/home/mrchevyceleb".to_string());
+    let output = async_cmd("doppler")
+        .args([
+            "secrets",
+            "get",
+            OPENROUTER_KEY_ENV,
+            "--plain",
+            "--project",
+            OPENROUTER_DOPPLER_PROJECT,
+            "--config",
+            OPENROUTER_DOPPLER_CONFIG,
+            "--scope",
+        ])
+        .arg(&scope)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .map_err(|e| {
+            format!(
+                "{} is unset and `doppler` could not be run to fetch it ({}). Codex reviews \
+                 authenticate to OpenRouter with that key.",
+                OPENROUTER_KEY_ENV, e
+            )
+        })?;
+
+    let key = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() || key.is_empty() {
+        return Err(format!(
+            "could not resolve {}: it is unset in agent-one's environment and \
+             `doppler secrets get {} --project {} --config {} --scope {}` failed ({}). \
+             Stderr: {}",
+            OPENROUTER_KEY_ENV,
+            OPENROUTER_KEY_ENV,
+            OPENROUTER_DOPPLER_PROJECT,
+            OPENROUTER_DOPPLER_CONFIG,
+            scope,
+            output.status,
+            trim_to(String::from_utf8_lossy(&output.stderr).trim(), 300)
+        ));
+    }
+    Ok(key)
+}
 
 /// Hardcoded blocker path patterns. Any changed file matching any of these
 /// blocks auto-merge. Includes Samwise's own review infrastructure so Sam
@@ -763,6 +862,7 @@ async fn run_codex_review(
     task_description: &str,
     diff: &str,
 ) -> Result<Value, String> {
+    let openrouter_key = resolve_openrouter_key().await?;
     let tmp_path = std::env::temp_dir().join(format!("samwise-review-{}", uuid_like()));
     tokio::fs::create_dir_all(&tmp_path)
         .await
@@ -828,8 +928,10 @@ async fn run_codex_review(
     // Use spawn so we can actually kill the child on timeout, and pin a read-only
     // sandbox + no-approvals policy so the review can't mutate the repo.
     let mut cmd = async_cmd("codex");
+    cmd.arg("exec");
+    cmd.args(CODEX_PROVIDER_ARGS);
+    cmd.env(OPENROUTER_KEY_ENV, &openrouter_key);
     cmd.args([
-        "exec",
         "-m",
         CODEX_MODEL,
         "-c",
@@ -1338,6 +1440,7 @@ pub async fn run_samwise_pr_review(
             pr_url
         ));
     }
+    let openrouter_key = resolve_openrouter_key().await?;
     let cwd = resolve_codex_cwd(repo_path);
     let host_pr_context = collect_pr_review_context(pr_url, &cwd).await;
     let prompt = format!(
@@ -1359,9 +1462,10 @@ pub async fn run_samwise_pr_review(
     // parks the card in Review forever. Pin it on here so we don't depend on
     // machine-global ~/.codex/config.toml being set on whatever host we run on.
     let mut cmd = async_cmd("codex");
+    cmd.args(["--search", "exec"]);
+    cmd.args(CODEX_PROVIDER_ARGS);
+    cmd.env(OPENROUTER_KEY_ENV, &openrouter_key);
     cmd.args([
-        "--search",
-        "exec",
         "-m",
         CODEX_MODEL,
         "-c",
@@ -1434,6 +1538,25 @@ pub async fn run_samwise_pr_review(
     // matching them would incorrectly kick a clean PR into Inconclusive.
     if !status.success() {
         let combined_lower = format!("{}\n{}", stdout.to_lowercase(), stderr.to_lowercase());
+        // OpenRouter auth/credit failures. Reviews bill against the key in Doppler
+        // agent-one/prd, so an expired key or an empty balance is an ops problem, not
+        // a verdict on the PR — surface it as such instead of letting it fall through
+        // to a generic non-zero exit that reads like a broken review.
+        if combined_lower.contains("no auth credentials found")
+            || combined_lower.contains("insufficient credits")
+            || combined_lower.contains("credit_balance_exhausted")
+            || combined_lower.contains("402")
+            || (combined_lower.contains("openrouter") && combined_lower.contains("401"))
+        {
+            return Ok(PrReviewResult {
+                verdict: PrReviewVerdict::Inconclusive,
+                markdown: format!(
+                    "OpenRouter rejected the review request (bad key or no credits). Reviews use `OPENROUTER_API_KEY` from Doppler `agent-one/prd`. Check the key and the OpenRouter balance, then drag the card out and back to re-trigger.\n\nRaw output:\n\n```\n{}\n```",
+                    trim_to(&stdout, 2000)
+                ),
+                requires_human: true,
+            });
+        }
         if combined_lower.contains("not logged in")
             || combined_lower.contains("please run /login")
             || combined_lower.contains("codex login")
@@ -1500,6 +1623,7 @@ pub async fn run_full_pr_review(
             pr_url
         ));
     }
+    let openrouter_key = resolve_openrouter_key().await?;
 
     let cwd = resolve_codex_cwd(repo_path);
     let tmp_path = std::env::temp_dir().join(format!("samwise-full-pr-review-{}", uuid_like()));
@@ -1525,9 +1649,10 @@ pub async fn run_full_pr_review(
     );
 
     let mut cmd = async_cmd("codex");
+    cmd.args(["--search", "exec"]);
+    cmd.args(CODEX_PROVIDER_ARGS);
+    cmd.env(OPENROUTER_KEY_ENV, &openrouter_key);
     cmd.args([
-        "--search",
-        "exec",
         "--json",
         "-m",
         CODEX_MODEL,

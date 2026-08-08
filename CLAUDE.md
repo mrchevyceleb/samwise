@@ -93,6 +93,46 @@ uploader that only checks `res.ok` will store that as `image/png`.
 
 ⚠️ **CLAUDE_CODE_SIMPLE gotcha:** with `CLAUDE_CODE_SIMPLE=1` set, Claude Code forces API-key auth and REJECTS OAuth subscription login, dying with `Not logged in · Please run /login`. That flag is correct for any API-key/proxy setup (GLM, Kimi) but is incompatible with the OAuth-direct Opus path below, where it must be removed.
 
+### PR review backend: Codex CLI → OpenRouter (2026-08-08)
+
+The coder and the reviewer are billed to different accounts on purpose. Sam **codes** with pi
+on Fireworks kimi-k3 (above); he **reviews** with the Codex CLI pointed at OpenRouter
+`openai/gpt-5.6-sol` at `model_reasoning_effort="xhigh"`, paid from `OPENROUTER_API_KEY` in
+Doppler `agent-one/prd` rather than this machine's ChatGPT login.
+
+- Wiring is `CODEX_MODEL` / `CODEX_REASONING_CONFIG` / `CODEX_PROVIDER_ARGS` in
+  `src-tauri/src/commands/review.rs`, applied to all three codex spawns (the scored auto-merge
+  review, `$samwise-pr-review`, and the full `$pr-review` merge/deploy run).
+- The provider and model are pinned **inline via `-c`**, not in `~/.codex/config.toml`, so a
+  host-config edit cannot silently repoint reviews at another model or account. This pins the
+  provider/model only — `--ignore-user-config` is not passed, so Codex still reads trust levels,
+  hooks and MCP servers from whatever `CODEX_HOME` it inherits.
+  (`~/.codex/config.toml` carries the same block for manual debug runs only. agent-one sets no
+  `CODEX_HOME`, so a hand-run `codex` reproduces it; an interactive shell here exports
+  `CODEX_HOME=~/.codex-personal` and does not.)
+- ⚠️ **Codex 0.144 dropped `wire_api = "chat"`.** Any provider swapped in here must speak the
+  OpenAI **Responses** API. OpenRouter does; a chat-completions-only endpoint needs a LiteLLM
+  bridge.
+- The model slug must carry the `openai/` prefix. A bare `gpt-5.6-sol` is a valid ChatGPT-plan
+  model but not a valid OpenRouter id.
+- `resolve_openrouter_key()` resolves the key per spawn — agent-one's env first, then
+  `doppler secrets get ... --project agent-one --config prd --scope $HOME` — and sets it on the
+  **codex child only** via `cmd.env`. It is deliberately NOT exported into agent-one's
+  environment: every child inherits that env, including the coding harness running
+  model-authored shell commands against untrusted task text. (`--scope` is required; a bare
+  `doppler secrets get` resolves its token from the cwd, and per-task worktrees carry their own
+  scoped tokens that 404 this project.) A resolution failure fails that one review with a
+  readable message rather than blocking the service from starting.
+- An OpenRouter 401/402 (dead key, no credits) is classified as Inconclusive + requires-human,
+  not as a verdict on the PR.
+- Cost note: a codex turn ships ~78K tokens of system prompt + tools and a real review lands
+  around 125-160K, so at $5/Mtok in / $30 out a full review is dollars, not cents — and
+  OpenRouter doubles the rate above a 272K-token prompt. This is per-token billing now, not a
+  flat plan, and there is no local spend cap beyond the wall-clock timeouts.
+- Unaffected and still on the ChatGPT OAuth account: interactive `codex`, the `/codex-fix` pass
+  inside the worker (that runs through the *coder* harness, `worker.rs`), and Rivendell's
+  `pr-review-batch` forge cron.
+
 ### History (superseded)
 - **2026-08-06:** added the pluggable `AUTOSAM_CODER` harness (pi alongside Claude Code) so model choice no longer depends on what survives a proxy rewrite.
 - **2026-07-24:** Kimi K3 Fast reverted to **GLM 5.2** after a 78% zero-edit session rate and tool-looping. The `AUTOSAM_CODER_HANDLES_VISION=1` drop-in from the Kimi swap was left behind, blinding image tasks until 2026-08-06.
