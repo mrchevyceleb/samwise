@@ -11377,6 +11377,55 @@ pub fn spawn_pr_review_task(
             agent_comment(&config, &task_id, &result.markdown).await;
         }
 
+        // Mirror the finished review onto the GitHub PR itself when the card
+        // came from Slack: an external PR has no merge step as the deliverable,
+        // so the review IS the product and must land where the requester can
+        // see it. (2026-08-27 fix: three Slack reviews that day landed
+        // board-only and samcheck had to relay each one by hand.)
+        if let Some(task_row) = supabase::fetch_task(&config, &task_id)
+            .await
+            .ok()
+            .flatten()
+        {
+            let is_external_review =
+                task_row.get("source").and_then(|v| v.as_str()) == Some("slack")
+                    || task_row
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .map(|t| t.starts_with("Review PR #"))
+                        .unwrap_or(false);
+            if is_external_review && !pr_url.is_empty() {
+                let verdict_line = match result.verdict {
+                    review::PrReviewVerdict::MergeNow => {
+                        "✅ Verdict: no blockers — ready to merge".to_string()
+                    }
+                    review::PrReviewVerdict::FixIssues => {
+                        "❌ Verdict: fixes requested — blockers below".to_string()
+                    }
+                    review::PrReviewVerdict::Inconclusive => {
+                        "⚠️ Verdict: inconclusive — needs a human look".to_string()
+                    }
+                };
+                let mut pr_body = format!("**AutoSam review**\n\n{}", verdict_line);
+                if !result.markdown.trim().is_empty() {
+                    pr_body.push_str("\n\n");
+                    pr_body.push_str(result.markdown.trim());
+                }
+                pr_body.push('\n');
+                if let Err(e) = async_cmd("gh")
+                    .args(["pr", "comment", &pr_url, "--body", &pr_body])
+                    .output()
+                    .await
+                {
+                    log::warn!(
+                        "[pr-review] failed to mirror review onto external PR {}: {}",
+                        pr_url,
+                        e
+                    );
+                }
+            }
+        }
+
         match result.verdict {
             review::PrReviewVerdict::MergeNow => {
                 mark_pr_review_finished(&config, &task_id, None).await;
