@@ -425,6 +425,30 @@ const PR_REVIEW_STARTED_AT_KEY: &str = "samwise_pr_review_started_at";
 const PR_REVIEW_COMPLETED_AT_KEY: &str = "samwise_pr_review_completed_at";
 const PR_REVIEW_STATUS_KEY: &str = "samwise_pr_review_status";
 const PR_REVIEW_ERROR_KEY: &str = "samwise_pr_review_error";
+// Pi-style delta verify (review → fix → verify → done). Stamped on the task
+// context when an auto-fix cycle pushes: the next review pass verifies ONLY
+// the fix delta (base sha -> new head) instead of running a full cold
+// re-review of the whole PR, which was what cycled cards to the cap via
+// sequential reviewer discovery.
+const DELTA_VERIFY_PENDING_KEY: &str = "delta_verify_pending";
+const DELTA_VERIFY_BASE_SHA_KEY: &str = "delta_verify_base_sha";
+/// The substantive `## Blockers` bullets from the review that triggered the
+/// fix, stamped alongside the base sha so the delta verifier can confirm the
+/// fixer actually addressed each one (a regression-free delta that ignores
+/// the blockers is not clean).
+const DELTA_VERIFY_BLOCKERS_KEY: &str = "delta_verify_blockers";
+/// failure_reason prefix stamped when the delta-verify loop parks a card
+/// after its bounded fix/verify budget. Carries the parked head so the stale
+/// fixes_needed sweep leaves the card parked at the same head but re-opens
+/// it on a real push — without this marker the sweep re-fires the parked
+/// card into more cycles, defeating the budget (observed 2026-08-19 on
+/// 4c3af96a: parked at cyc2, sweep re-fired cyc3 nine minutes later).
+const DELTA_VERIFY_CAPPED_PREFIX: &str = "delta_verify_capped";
+/// Max fix cycles the delta-verify loop feeds back into auto-fix. Pi's
+/// /codex-fix rule: review, fix, verify, ONE regression-fix pass, done.
+/// A verify that still finds P0/P1 at this count parks for Matt instead of
+/// spending a third cycle.
+const DELTA_VERIFY_MAX_FIX_CYCLES: i64 = 2;
 
 // Button-driven "Review & Merge" flow: Sam runs a comprehensive pre-merge
 // review (correctness, regressions, UI, UX, blind spots, security), FIXES
@@ -545,6 +569,209 @@ fn auto_fix_cap_notification_recorded(
     // notification for this capped state instead of spamming forever. A real
     // new push moves the task back through review and clears failure_reason.
     recorded_head == "unknown" || recorded_head == current_head
+}
+
+/// Marker stamped on `failure_reason` after an auto-fix cycle that produced no
+/// commit, fingerprinting the exact (PR head, review) pair that went nowhere.
+/// The stale sweep re-fires every 90s against an 8-minute idle window, so
+/// without this a no-op cycle is retried verbatim until the card caps out —
+/// four wasted cycles that never had anything to fix. Either side of the pair
+/// changing (a new push, or a fresh review) clears the match and lets the
+/// retry through.
+const AUTO_FIX_NOOP_PREFIX: &str = "auto_fix_noop";
+
+/// Marker stamped when a card is parked because its review carries no
+/// actionable blockers, keyed to the (head, review) pair it was parked at.
+/// Bounds the park comment to once per pair.
+const AUTO_FIX_NO_BLOCKERS_PREFIX: &str = "auto_fix_no_blockers";
+
+/// True when `failure_reason` holds nothing a human needs, so automation may
+/// overwrite it with dedupe state: empty, or a marker this module wrote itself.
+/// A real diagnostic (pre-flight checkout failure, coder crash, push rejection)
+/// must never be clobbered by a fingerprint.
+fn failure_reason_is_automation_marker(failure_reason: Option<&str>) -> bool {
+    match failure_reason.map(str::trim) {
+        None | Some("") => true,
+        Some(reason) => {
+            reason.starts_with(AUTO_FIX_NOOP_PREFIX)
+                || reason.starts_with(AUTO_FIX_NO_BLOCKERS_PREFIX)
+                || reason.starts_with(AUTO_FIX_CAP_NOTIFICATION_PREFIX)
+        }
+    }
+}
+
+fn auto_fix_state_fingerprint(prefix: &str, head: &str, review_markdown: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(head.trim().as_bytes());
+    hasher.update([0u8]);
+    hasher.update(review_markdown.trim().as_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().take(8).map(|b| format!("{:02x}", b)).collect();
+    format!("{}:{}", prefix, hex)
+}
+
+fn auto_fix_noop_marker(head: &str, review_markdown: &str) -> String {
+    auto_fix_state_fingerprint(AUTO_FIX_NOOP_PREFIX, head, review_markdown)
+}
+
+/// True when the last auto-fix cycle already no-op'd against this exact PR head
+/// and review body, so re-running it would produce the same nothing.
+fn auto_fix_noop_recorded(failure_reason: Option<&str>, head: &str, review_markdown: &str) -> bool {
+    let Some(reason) = failure_reason else {
+        return false;
+    };
+    if !reason.starts_with(AUTO_FIX_NOOP_PREFIX) {
+        return false;
+    }
+    // An unknown head cannot prove the PR is unchanged. Allow the retry rather
+    // than parking a card forever on a failed SHA lookup.
+    if head.trim().is_empty() || head == "unknown" {
+        return false;
+    }
+    reason == auto_fix_noop_marker(head, review_markdown)
+}
+
+/// The park marker carries its head in plaintext (`prefix:<head>:<hash>`) so the
+/// sweep can tell "parked at this same head" from "parked, then someone pushed".
+fn auto_fix_no_blockers_marker(head: &str, review_markdown: &str) -> String {
+    format!(
+        "{}:{}:{}",
+        AUTO_FIX_NO_BLOCKERS_PREFIX,
+        head.trim(),
+        auto_fix_state_fingerprint(AUTO_FIX_NO_BLOCKERS_PREFIX, head, review_markdown)
+    )
+}
+
+/// The head a delta-verify budget-cap park marker was stamped at, if
+/// `failure_reason` is one (`delta_verify_capped:<head>`).
+fn delta_verify_capped_parked_head(failure_reason: Option<&str>) -> Option<String> {
+    let reason = failure_reason?;
+    let head = reason
+        .strip_prefix(&format!("{}:", DELTA_VERIFY_CAPPED_PREFIX))?
+        .trim();
+    if head.is_empty() {
+        None
+    } else {
+        Some(head.to_string())
+    }
+}
+
+/// The head a park marker was stamped at, if `failure_reason` is one.
+fn auto_fix_no_blockers_parked_head(failure_reason: Option<&str>) -> Option<String> {
+    let reason = failure_reason?;
+    let rest = reason.strip_prefix(&format!("{}:", AUTO_FIX_NO_BLOCKERS_PREFIX))?;
+    let head = rest.split(':').next().unwrap_or_default().trim();
+    if head.is_empty() || head == "unknown" {
+        return None;
+    }
+    Some(head.to_string())
+}
+
+fn auto_fix_no_blockers_recorded(
+    failure_reason: Option<&str>,
+    head: &str,
+    review_markdown: &str,
+) -> bool {
+    let Some(reason) = failure_reason else {
+        return false;
+    };
+    if !reason.starts_with(AUTO_FIX_NO_BLOCKERS_PREFIX) {
+        return false;
+    }
+    if head.trim().is_empty() || head == "unknown" {
+        return false;
+    }
+    reason == auto_fix_no_blockers_marker(head, review_markdown)
+}
+
+/// A fix cycle needs blockers to act on. When the latest review has none, the
+/// run is guaranteed to end in "finished without producing a new commit":
+/// `review.rs` normalizes a blocker-less `fix_issues` verdict to `Inconclusive`,
+/// and the `Inconclusive` arm moves the card to `fixes_needed` and calls
+/// straight into the auto-fix funnel — which is exactly how a card used to spend
+/// its entire budget on runs that could not change the diff. Park it honestly
+/// instead. The cycle cap stays unspent, so a real push or a fresh review still
+/// gets the full fix budget.
+///
+/// Bounded to one comment per (head, review) pair, and never overwrites a
+/// human-readable `failure_reason` that is already on the card.
+async fn park_auto_fix_without_blockers(
+    config: &SupabaseConfig,
+    task_id: &str,
+    pr_url: &str,
+    repo_path: &str,
+    review_markdown: &str,
+    failure_reason: Option<&str>,
+) {
+    let Some(head) = review::fetch_pr_head_sha(pr_url, repo_path)
+        .await
+        .ok()
+        .filter(|sha| !sha.is_empty())
+    else {
+        // Without a head there is no fingerprint, so a marker written now would
+        // never match on the next pass and every sweep tick would post another
+        // comment and telegram. During a GitHub outage that is an unbounded
+        // notification loop. Refuse the cycle, say nothing, retry next tick.
+        log::info!(
+            "[auto-fix] task {} has no actionable blockers but its PR head is unavailable; skipping this tick without notifying",
+            task_id
+        );
+        return;
+    };
+    if auto_fix_no_blockers_recorded(failure_reason, &head, review_markdown) {
+        return;
+    }
+    if !failure_reason_is_automation_marker(failure_reason) {
+        // The card already carries a real diagnostic for a human. Still refuse
+        // to spend a cycle, but do not clobber it or pile another comment on.
+        log::info!(
+            "[auto-fix] task {} has no actionable blockers and already carries a failure reason; not spending a cycle",
+            task_id
+        );
+        return;
+    }
+    // Claim the park atomically BEFORE notifying, conditioned on the exact
+    // failure_reason that was read. If a concurrent writer stamped a real
+    // diagnostic in the meantime the PATCH matches no rows, so the diagnostic
+    // survives and no duplicate comment goes out.
+    let marker = auto_fix_no_blockers_marker(&head, review_markdown);
+    let claimed = supabase::update_task_if_status_and_failure_reason(
+        config,
+        task_id,
+        "fixes_needed",
+        failure_reason,
+        &serde_json::json!({ "failure_reason": marker }),
+    )
+    .await
+    .ok()
+    .and_then(|v| v.as_array().map(|arr| !arr.is_empty()))
+    .unwrap_or(false);
+    if !claimed {
+        log::info!(
+            "[auto-fix] task {} changed under the no-blocker park; leaving it to the next pass",
+            task_id
+        );
+        return;
+    }
+    log::info!(
+        "[auto-fix] task {} has no actionable blockers at head {}; parked without spending a cycle",
+        task_id,
+        head
+    );
+    agent_comment(
+        config,
+        task_id,
+        "The latest review left no actionable blockers, so a fix cycle would have nothing to change. Parking this without spending a cycle — the fix budget stays intact, and a new push re-opens this for a fresh review automatically. Your call on whether anything is actually outstanding.",
+    )
+    .await;
+    send_terminal_telegram(
+        config,
+        task_id,
+        &format!("No actionable blockers: {}", pr_url),
+        "The review left nothing to fix, so no cycle was spent. Your call.",
+    )
+    .await;
 }
 
 fn auto_fix_max_review_cycles(settings: Option<&Value>) -> i64 {
@@ -871,6 +1098,18 @@ fn task_pr_review_skip_reason(task: &Value) -> Option<&'static str> {
 
 fn task_requires_pr_review(task: &Value) -> bool {
     task_pr_review_skip_reason(task).is_none()
+}
+
+/// Slack `#review` cards never ran `/codex-fix`. They still need a PR review.
+/// AutoSam-coded tickets already got that pass before the PR opened, and
+/// auto-merge is never on, so a second `$samwise-pr-review` is a dead gate.
+fn task_is_external_pr_review_request(task: &Value) -> bool {
+    if task_context_bool(task, "slack_review_workflow").unwrap_or(false) {
+        return true;
+    }
+    let source = task.get("source").and_then(|v| v.as_str()).unwrap_or("");
+    let title = task.get("title").and_then(|v| v.as_str()).unwrap_or("");
+    source == "slack" && title.starts_with("Review PR")
 }
 
 fn builtin_direct_command_name(prompt: &str) -> Option<&'static str> {
@@ -1291,7 +1530,21 @@ async fn create_task_worktree(
             .await
             .is_ok()
         {
-            let _ = run_git(&["checkout", &task_branch], &worktree_str).await;
+            if run_git(&["checkout", &task_branch], &worktree_str)
+                .await
+                .is_err()
+            {
+                // Local branch is gone (e.g. cleaned up after a prior closeout) but the
+                // worktree dir survived. Recreate the branch from the fresh base so the
+                // agent isn't left stranded on a stale/foreign branch (wrong-refspec
+                // pushes otherwise strand the card in review).
+                let origin_ref = format!("origin/{}", base_branch);
+                run_git(
+                    &["checkout", "-b", &task_branch, &origin_ref],
+                    &worktree_str,
+                )
+                .await?;
+            }
             let _ = run_git(&["fetch", "origin", "--prune"], &worktree_str).await;
             return Ok((worktree_str, base_branch, task_branch));
         }
@@ -2033,6 +2286,7 @@ async fn worker_loop(
                                         let machine_name_spawn = machine_name.clone();
                                         let config_spawn = config.clone();
                                         let task_spawn = task.clone();
+                                        let task_for_completion = task.clone();
                                         let pid_slot_spawn = pid_slot.clone();
                                         let active_spawn = active.clone();
                                         let task_title_spawn = task_title.clone();
@@ -2100,6 +2354,9 @@ async fn worker_loop(
                                                     if msg.contains("PR created")
                                                         && pr_review_on
                                                         && !auto_merge_on
+                                                        && task_is_external_pr_review_request(
+                                                            &task_for_completion,
+                                                        )
                                                     {
                                                         agent_chat(&config_spawn, &format!(
                                                             "PR's up for \"{}\": {}. Running Codex review now. I'll post the verdict and route the card in a minute — no need to pick up something new yet.",
@@ -5023,11 +5280,13 @@ from Matt, stop without making changes and explain specifically what you need cl
                 "Running /codex-fix for a review pass before QA...",
             )
             .await;
+            // 1800s: large diffs on slow backends regularly exceed 1200s; the timeout
+            // path already degrades gracefully (proceed to QA with a comment).
             let codex_result = run_claude_code_streaming(
                 &repo_path,
                 &codex_prompt,
                 0,
-                1200,
+                1800,
                 config,
                 &task_id,
                 process_id_slot.clone(), None
@@ -5734,20 +5993,44 @@ from Matt, stop without making changes and explain specifically what you need cl
             match pr_result {
                 Ok(pr_url) => {
                     let pr_review_required = task_requires_pr_review(&task);
+                    let external_review = task_is_external_pr_review_request(&task);
+                    // Auto-merge is never on. AutoSam-coded tickets already ran
+                    // /codex-fix before this PR opened, so a second OpenRouter
+                    // $samwise-pr-review is a dead gate that parks every card.
+                    // Send those straight to Ready to Merge. Slack #review cards
+                    // never coded here, so they still need the review pass.
+                    let land_in_review = pr_review_required && external_review;
                     let mut pr_updates = serde_json::json!({
-                        "status": "review",
+                        "status": if land_in_review { "review" } else { "approved" },
                         "pr_url": pr_url,
                         "updated_at": chrono::Utc::now().to_rfc3339(),
                     });
                     if let Some(pr_number) = pr_number_from_url(&pr_url) {
                         pr_updates["pr_number"] = serde_json::json!(pr_number);
                     }
+                    if !land_in_review {
+                        pr_updates["worker_id"] = serde_json::Value::Null;
+                        pr_updates["claimed_at"] = serde_json::Value::Null;
+                    }
                     let _ = supabase::update_task(config, &task_id, &pr_updates).await;
-                    notify_callback(config, &task_id, "review", Some(&pr_url), None);
+                    notify_callback(
+                        config,
+                        &task_id,
+                        if land_in_review { "review" } else { "approved" },
+                        Some(&pr_url),
+                        None,
+                    );
                     agent_comment(
                         config,
                         &task_id,
-                        &format!("PR's up: {}. Let me know if you want any changes.", pr_url),
+                        &if land_in_review {
+                            format!("PR's up: {}. Let me know if you want any changes.", pr_url)
+                        } else {
+                            format!(
+                                "PR's up: {}. /codex-fix already ran on this branch, so I am sending it to Ready to Merge instead of a second review gate.",
+                                pr_url
+                            )
+                        },
                     )
                     .await;
 
@@ -5768,7 +6051,7 @@ from Matt, stop without making changes and explain specifically what you need cl
                         .and_then(|v| v.as_bool())
                         .unwrap_or(true);
                     let has_downstream = auto_merge_on_for_telegram
-                        || (pr_review_on_for_telegram && pr_review_required);
+                        || (pr_review_on_for_telegram && pr_review_required && external_review);
                     if notify_task_completed_code && !has_downstream {
                         send_telegram(
                             config,
@@ -5920,7 +6203,7 @@ from Matt, stop without making changes and explain specifically what you need cl
                         .and_then(|s| s.get("autoPrReviewEnabled"))
                         .and_then(|v| v.as_bool())
                         .unwrap_or(true);
-                    if !auto_merge_on && auto_pr_review_on && pr_review_required {
+                    if !auto_merge_on && auto_pr_review_on && pr_review_required && external_review {
                         spawn_pr_review_task(
                             config.clone(),
                             task_id.clone(),
@@ -7359,7 +7642,7 @@ async fn describe_image_attachments(
     let lm_studio_url = std::env::var("AUTOSAM_VISION_MODEL_URL")
         .unwrap_or_else(|_| "http://localhost:1234/v1".to_string());
     let vision_model = std::env::var("AUTOSAM_VISION_MODEL")
-        .unwrap_or_else(|_| "qwen3-vl-4b-instruct".to_string());
+        .unwrap_or_else(|_| "qwen/qwen3.8-27b".to_string());
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -11298,6 +11581,33 @@ async fn mark_pr_review_finished_with_status(
 /// (inconclusive) and post the markdown body as a Sam comment. Always
 /// stamps `last_pr_review_at` so the poll-loop watcher doesn't re-fire on
 /// the same card.
+/// Remove the delta-verify stamps once a verify (or a fallback) has consumed
+/// them, so a later unrelated push can never route through a stale base sha.
+/// The write is conditioned on the pending marker still being set at the
+/// database, so a concurrent context stamp landing between our read and
+/// write is never silently clobbered.
+async fn clear_delta_verify_markers(config: &SupabaseConfig, task_id: &str) {
+    if let Ok(Some(task)) = supabase::fetch_task(config, task_id).await {
+        let mut context = task_context_object(&task);
+        let removed = context.remove(DELTA_VERIFY_PENDING_KEY).is_some()
+            | context.remove(DELTA_VERIFY_BASE_SHA_KEY).is_some()
+            | context.remove(DELTA_VERIFY_BLOCKERS_KEY).is_some();
+        if removed {
+            let _ = supabase::update_task_if_context_flag(
+                config,
+                task_id,
+                DELTA_VERIFY_PENDING_KEY,
+                "true",
+                &serde_json::json!({
+                    "context": Value::Object(context),
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                }),
+            )
+            .await;
+        }
+    }
+}
+
 pub fn spawn_pr_review_task(
     config: SupabaseConfig,
     task_id: String,
@@ -11315,25 +11625,157 @@ pub fn spawn_pr_review_task(
             return;
         }
 
-        agent_comment(
-            &config,
-            &task_id,
-            "Running $samwise-pr-review on this PR — hang tight, Codex takes a minute.",
-        )
-        .await;
+        // Pi-style delta verify: a card arriving here straight out of an
+        // auto-fix push gets a scoped verify of just the fix delta, not a
+        // full cold re-review of the whole PR.
+        let delta_req = supabase::fetch_task(&config, &task_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|t| {
+                let pending = t
+                    .get("context")
+                    .and_then(|c| c.get(DELTA_VERIFY_PENDING_KEY))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !pending {
+                    return None;
+                }
+                let base = t
+                    .get("context")
+                    .and_then(|c| c.get(DELTA_VERIFY_BASE_SHA_KEY))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .filter(|s| !s.is_empty())?;
+                let cycles = t
+                    .get("review_cycle_count")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let blockers = t
+                    .get("context")
+                    .and_then(|c| c.get(DELTA_VERIFY_BLOCKERS_KEY))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                Some((base, cycles, blockers))
+            });
 
-        let result = match review::run_samwise_pr_review(&pr_url, &repo_path).await {
-            Ok(r) => r,
-            Err(e) => {
-                log::warn!("[pr-review] run failed for task {}: {}", task_id, e);
-                mark_pr_review_finished(&config, &task_id, Some(&e)).await;
+        let mut delta_result: Option<review::PrReviewResult> = None;
+        if let Some((base_sha, fix_cycles, orig_blockers)) = delta_req {
+            agent_comment(
+                &config,
+                &task_id,
+                &format!(
+                    "Delta-verify: checking only the fix commits pushed since the review (base {}). No full re-review.",
+                    &base_sha[..base_sha.len().min(10)]
+                ),
+            )
+            .await;
+            match review::run_delta_verify_review(&pr_url, &repo_path, &base_sha, &orig_blockers).await {
+                Ok(r) => {
+                    clear_delta_verify_markers(&config, &task_id).await;
+                    if matches!(r.verdict, review::PrReviewVerdict::Inconclusive) {
+                        // A blind verify is worse than a full review: fall back.
+                        agent_comment(
+                            &config,
+                            &task_id,
+                            "Delta verify came back inconclusive; falling back to a full $samwise-pr-review.",
+                        )
+                        .await;
+                    } else if matches!(r.verdict, review::PrReviewVerdict::FixIssues)
+                        && fix_cycles >= DELTA_VERIFY_MAX_FIX_CYCLES
+                    {
+                        // Verify still finds P0/P1 after the bounded
+                        // regression-fix budget (Pi: review, fix, verify, fix
+                        // regressions, done). Park for Matt instead of
+                        // spending a third cycle. Stamp the parked head so
+                        // the stale sweep does not re-fire this card into
+                        // more cycles (a real push re-opens it there).
+                        mark_pr_review_finished(&config, &task_id, None).await;
+                        let park_head = review::fetch_pr_head_sha(&pr_url, &repo_path)
+                            .await
+                            .unwrap_or_else(|_| "unknown".to_string());
+                        let updated = supabase::update_task_if_status_not_held(
+                            &config,
+                            &task_id,
+                            "review",
+                            &serde_json::json!({
+                                "status": "fixes_needed",
+                                "worker_id": Value::Null,
+                                "claimed_at": Value::Null,
+                                "failure_reason": format!("{}:{}", DELTA_VERIFY_CAPPED_PREFIX, park_head),
+                                "updated_at": chrono::Utc::now().to_rfc3339(),
+                            }),
+                        )
+                        .await
+                        .ok()
+                        .and_then(|v| v.as_array().map(|arr| !arr.is_empty()))
+                        .unwrap_or(false);
+                        if updated {
+                            if !r.markdown.trim().is_empty() {
+                                agent_comment(&config, &task_id, &r.markdown).await;
+                            }
+                            agent_comment(
+                                &config,
+                                &task_id,
+                                &format!(
+                                    "Delta verify still finds regressions after {} fix cycles — the bounded fix/verify budget is spent. Parking here; your call.",
+                                    fix_cycles
+                                ),
+                            )
+                            .await;
+                            send_terminal_telegram(
+                                &config,
+                                &task_id,
+                                &format!("Delta verify capped: {}", pr_url),
+                                "Regressions persist after the bounded fix/verify loop. Your call.",
+                            )
+                            .await;
+                        }
+                        return;
+                    } else {
+                        delta_result = Some(r);
+                    }
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[pr-review] delta verify failed for task {}: {}; falling back to full review",
+                        task_id, e
+                    );
+                    clear_delta_verify_markers(&config, &task_id).await;
+                    agent_comment(
+                        &config,
+                        &task_id,
+                        &format!("Delta verify errored ({}); falling back to a full $samwise-pr-review.", e),
+                    )
+                    .await;
+                }
+            }
+        }
+
+        let result = match delta_result {
+            Some(r) => r,
+            None => {
                 agent_comment(
                     &config,
                     &task_id,
-                    &format!("Codex review errored: {}. Leaving the card in Review.", e),
+                    "Running $samwise-pr-review on this PR — hang tight, Codex takes a minute.",
                 )
                 .await;
-                return;
+                match review::run_samwise_pr_review(&pr_url, &repo_path).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        log::warn!("[pr-review] run failed for task {}: {}", task_id, e);
+                        mark_pr_review_finished(&config, &task_id, Some(&e)).await;
+                        agent_comment(
+                            &config,
+                            &task_id,
+                            &format!("Codex review errored: {}. Leaving the card in Review.", e),
+                        )
+                        .await;
+                        return;
+                    }
+                }
             }
         };
 
@@ -16460,6 +16902,65 @@ mod merge_deploy_tests {
         assert!(auto_fix_cap_notification_recorded(Some(&unknown), 5, "abc123"));
     }
 
+    #[test]
+    fn auto_fix_noop_marker_only_matches_the_same_head_and_review() {
+        let review = "## Blockers\n- [high] src/a.rs:1 do the thing";
+        let marker = auto_fix_noop_marker("abc123", review);
+
+        // Same head + same review: the retry would produce the same nothing.
+        assert!(auto_fix_noop_recorded(Some(&marker), "abc123", review));
+        // A new push must re-enable the retry.
+        assert!(!auto_fix_noop_recorded(Some(&marker), "def456", review));
+        // A fresh review must re-enable the retry.
+        assert!(!auto_fix_noop_recorded(
+            Some(&marker),
+            "abc123",
+            "## Blockers\n- [high] src/b.rs:2 something else"
+        ));
+        // A failed SHA lookup must never park the card.
+        assert!(!auto_fix_noop_recorded(Some(&marker), "unknown", review));
+        assert!(!auto_fix_noop_recorded(Some(&marker), "", review));
+        // Unrelated / absent failure reasons are not no-op markers.
+        assert!(!auto_fix_noop_recorded(None, "abc123", review));
+        assert!(!auto_fix_noop_recorded(
+            Some("auto_fix_cap_notified:5:abc123"),
+            "abc123",
+            review
+        ));
+        // A park marker exposes the head it was stamped at, so the sweep can
+        // tell "still the same code" from "someone pushed".
+        assert_eq!(
+            auto_fix_no_blockers_parked_head(Some(&auto_fix_no_blockers_marker("abc123", review))),
+            Some("abc123".to_string())
+        );
+        assert_eq!(auto_fix_no_blockers_parked_head(Some(&marker)), None);
+        assert_eq!(auto_fix_no_blockers_parked_head(None), None);
+        assert_eq!(
+            auto_fix_no_blockers_parked_head(Some(&auto_fix_no_blockers_marker("unknown", review))),
+            None
+        );
+
+        // The two markers must not be confusable with each other.
+        let parked = auto_fix_no_blockers_marker("abc123", review);
+        assert!(!auto_fix_noop_recorded(Some(&parked), "abc123", review));
+        assert!(!auto_fix_no_blockers_recorded(Some(&marker), "abc123", review));
+        assert!(auto_fix_no_blockers_recorded(Some(&parked), "abc123", review));
+
+        // Automation may overwrite its own markers and an empty reason, but must
+        // never clobber a real diagnostic a human needs to read.
+        assert!(failure_reason_is_automation_marker(None));
+        assert!(failure_reason_is_automation_marker(Some("")));
+        assert!(failure_reason_is_automation_marker(Some("   ")));
+        assert!(failure_reason_is_automation_marker(Some(&marker)));
+        assert!(failure_reason_is_automation_marker(Some(&parked)));
+        assert!(failure_reason_is_automation_marker(Some(
+            "auto_fix_cap_notified:5:abc123"
+        )));
+        assert!(!failure_reason_is_automation_marker(Some(
+            "pre-flight checkout 'sam/abc' failed: fatal: not a git repository"
+        )));
+    }
+
     fn run_test_git(repo: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")
             .args(args)
@@ -16503,6 +17004,27 @@ mod merge_deploy_tests {
                 "blocked": true,
                 "fix_owner": "human-ops"
             }
+        })));
+    }
+
+    #[test]
+    fn slack_review_cards_are_external_and_autosam_code_cards_are_not() {
+        assert!(task_is_external_pr_review_request(&serde_json::json!({
+            "source": "slack",
+            "title": "Review PR #930 from Slack",
+            "context": { "slack_review_workflow": true }
+        })));
+        assert!(task_is_external_pr_review_request(&serde_json::json!({
+            "source": "slack",
+            "title": "Review PR #930 from Slack"
+        })));
+        assert!(!task_is_external_pr_review_request(&serde_json::json!({
+            "source": "slack",
+            "title": "Yahoo Email Connection Drops Repeatedly After Re-adding"
+        })));
+        assert!(!task_is_external_pr_review_request(&serde_json::json!({
+            "source": "board",
+            "title": "Add more language options to CC Languages"
         })));
     }
 
@@ -19003,7 +19525,16 @@ async fn maybe_spawn_auto_fix(
     review_markdown: String,
     requires_human: bool,
 ) {
-    if requires_human {
+    // The REQUIRES_HUMAN early return is qualified by "…and Codex actually
+    // named something". `normalize_pr_review_result` rewrites a blocker-less
+    // `fix_issues` to Inconclusive with requires_human FORCED true, so an
+    // unqualified gate would page Matt with "Codex flagged blockers that need a
+    // product/architecture call" for the one case where Codex flagged nothing
+    // at all. Those fall through instead: past the cap branch (so a capped card
+    // still gets its cap-floor merge attempt — blocker-less-but-CI-green is
+    // precisely the population that path exists for) and into the no-blocker
+    // park below. Reviews carrying real blockers keep the original behavior.
+    if requires_human && review::has_substantive_blocker(&review_markdown) {
         agent_comment(&config, &task_id, "Codex flagged this as needing your judgment (REQUIRES_HUMAN: yes). Leaving in Fixes Needed for you.").await;
         send_terminal_telegram(
             &config,
@@ -19353,6 +19884,25 @@ async fn maybe_spawn_auto_fix(
         return;
     }
 
+    // Under the cap, but is there anything to fix? Both verdict callers reach
+    // here — including the `Inconclusive` arm, which is where a blocker-less
+    // review lands — so this is the single funnel that has to refuse.
+    if !review::has_substantive_blocker(&review_markdown) {
+        park_auto_fix_without_blockers(
+            &config,
+            &task_id,
+            &pr_url,
+            &repo_path,
+            &review_markdown,
+            latest_task
+                .as_ref()
+                .and_then(|task| task.get("failure_reason"))
+                .and_then(|v| v.as_str()),
+        )
+        .await;
+        return;
+    }
+
     spawn_auto_fix_task(
         config,
         task_id,
@@ -19455,6 +20005,25 @@ pub fn spawn_auto_fix_task(
                 return;
             }
         }
+
+        // Pi-style delta verify: remember the exact head the fixer starts
+        // from (the reviewed head). After the push, the re-review verifies
+        // ONLY base..new-head instead of re-reviewing the whole PR cold.
+        let fix_base_sha = async_cmd("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&repo_path)
+            .output()
+            .await
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    String::from_utf8(o.stdout).ok()
+                } else {
+                    None
+                }
+            })
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
 
         // Build fix prompt. Focus Claude Code on the blockers only — not risks,
         // not "not verified" items. The review markdown is already structured
@@ -19631,14 +20200,48 @@ making any other changes.",
                     // telegram like every other terminal branch — without it
                     // the card sits silently in Fixes Needed and Matt has no
                     // way to know auto-fix gave up.
+                    // Fingerprint the (head, review) pair that produced nothing so
+                    // the stale sweep does not re-run this identical no-op every
+                    // 8 minutes until the card hits the cycle cap. A new push or a
+                    // fresh review changes the fingerprint and re-enables retries.
+                    //
+                    // Only when the worktree is genuinely CLEAN, though. "No new
+                    // commit" here is inferred from HEAD == origin/<branch>, which
+                    // is also true when the coder made real edits and only the
+                    // commit failed. Suppressing retries in that case would strand
+                    // fixable work, so a dirty (or unreadable) worktree keeps the
+                    // marker off and leaves the card retryable.
+                    let worktree_clean = async_cmd("git")
+                        .args(["status", "--porcelain"])
+                        .current_dir(&repo_path)
+                        .output()
+                        .await
+                        .ok()
+                        .filter(|o| o.status.success())
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().is_empty())
+                        .unwrap_or(false);
+                    let mut noop_update = serde_json::json!({
+                        "status": "fixes_needed",
+                        "updated_at": chrono::Utc::now().to_rfc3339(),
+                    });
+                    if worktree_clean {
+                        noop_update["failure_reason"] =
+                            serde_json::json!(auto_fix_noop_marker(&head_before, &review_markdown));
+                    } else {
+                        // Leave the field out entirely rather than writing NULL:
+                        // the claim already cleared it, so an explicit NULL adds
+                        // nothing except the chance of erasing a diagnostic some
+                        // other path wrote while this run was in flight.
+                        log::info!(
+                            "[auto-fix] task {} produced no commit but the worktree is dirty or unreadable; leaving it retryable",
+                            task_id
+                        );
+                    }
                     let updated = supabase::update_task_if_status_not_held(
                         &config,
                         &task_id,
                         "in_progress",
-                        &serde_json::json!({
-                            "status": "fixes_needed",
-                            "updated_at": chrono::Utc::now().to_rfc3339(),
-                        }),
+                        &noop_update,
                     )
                     .await
                     .ok()
@@ -19705,6 +20308,27 @@ making any other changes.",
                             context.remove(PR_REVIEW_STARTED_AT_KEY);
                             context.remove(PR_REVIEW_COMPLETED_AT_KEY);
                             context.remove(PR_REVIEW_ERROR_KEY);
+                            // Pi-style delta verify: the next review pass checks
+                            // ONLY these fix commits (base -> pushed head), not
+                            // the whole PR. head_before is the just-pushed head.
+                            if !fix_base_sha.is_empty() && fix_base_sha != head_before {
+                                context.insert(
+                                    DELTA_VERIFY_PENDING_KEY.to_string(),
+                                    Value::Bool(true),
+                                );
+                                context.insert(
+                                    DELTA_VERIFY_BASE_SHA_KEY.to_string(),
+                                    Value::String(fix_base_sha.clone()),
+                                );
+                                // The blockers the fixer was required to address;
+                                // the verifier confirms each one credibly landed.
+                                context.insert(
+                                    DELTA_VERIFY_BLOCKERS_KEY.to_string(),
+                                    Value::String(review::substantive_blockers_section(
+                                        &review_markdown,
+                                    )),
+                                );
+                            }
                             if let Some(obj) = updates.as_object_mut() {
                                 obj.insert("context".to_string(), Value::Object(context));
                             }
@@ -19727,7 +20351,7 @@ making any other changes.",
                         agent_comment(
                             &config,
                             &task_id,
-                            "Pushed fixes. Codex will re-review on the next poll.",
+                            "Pushed fixes. Delta-verify runs on the next poll — it checks only these fix commits, not a full re-review.",
                         )
                         .await;
                     }
@@ -19903,6 +20527,146 @@ async fn sweep_stale_fixes_needed_cards(
             .filter(|p| p.is_dir())
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| repo_path.clone());
+
+        // Everything below decides whether this card has anything worth
+        // spending a fix cycle on. The sweep used to re-fire unconditionally,
+        // which is how cards burned their whole budget on runs that could not
+        // possibly change the diff: a review with no actionable blockers, or a
+        // review whose blockers the head already satisfies. Both terminate in
+        // "finished without producing a new commit", 8 minutes apart, until the
+        // cap parks the card for a human who then finds nothing to do.
+        let current_head = review::fetch_pr_head_sha(&pr_url, &fix_repo_path)
+            .await
+            .ok()
+            .filter(|sha| !sha.is_empty())
+            .unwrap_or_else(|| "unknown".to_string());
+        let failure_reason = task
+            .get("failure_reason")
+            .and_then(|v| v.as_str());
+
+        // 1. The previous cycle already no-op'd against this exact head and
+        //    review. Nothing has changed, so the retry has the same nothing to
+        //    do. Wait for a real push or a fresh review.
+        if auto_fix_noop_recorded(failure_reason, &current_head, &review_markdown) {
+            log::info!(
+                "[auto-fix-sweep] task {} unchanged since its no-op cycle (head {}); not spending a cycle",
+                task_id,
+                current_head
+            );
+            continue;
+        }
+
+        // 1b. The delta-verify loop parked this card after its bounded
+        //    fix/verify budget. Same head (or an unreadable head — never
+        //    re-fire on a failed lookup) = stay parked. A real push re-opens
+        //    the card for a fresh review, mirroring the no-blockers park.
+        if let Some(parked_head) = delta_verify_capped_parked_head(failure_reason) {
+            let head_moved = current_head != "unknown"
+                && parked_head != "unknown"
+                && parked_head != current_head;
+            if !head_moved {
+                log::info!(
+                    "[auto-fix-sweep] task {} is delta-verify parked (head {}); not re-firing",
+                    task_id,
+                    parked_head
+                );
+                continue;
+            }
+            let reopened = supabase::update_task_if_status_and_failure_reason(
+                config,
+                &task_id,
+                "fixes_needed",
+                failure_reason,
+                &serde_json::json!({
+                    "status": "review",
+                    "failure_reason": serde_json::Value::Null,
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                }),
+            )
+            .await
+            .ok()
+            .and_then(|v| v.as_array().map(|arr| !arr.is_empty()))
+            .unwrap_or(false);
+            if reopened {
+                log::info!(
+                    "[auto-fix-sweep] delta-verify parked task {} got a new push ({}); re-opening for review",
+                    task_id,
+                    current_head
+                );
+                agent_comment(
+                    config,
+                    &task_id,
+                    "A new commit was pushed after the delta-verify budget parked this card. Re-opening for a fresh review of the updated code.",
+                )
+                .await;
+            }
+            continue;
+        }
+
+        // 2. The latest review carries no actionable blockers — only
+        //    placeholders or verification-only notes, or there is no review at
+        //    all. Auto-fix has no input, so park rather than burn a cycle on a
+        //    run that cannot change the diff. Deliberately NOT a flip back to
+        //    `review`: the Inconclusive verdict arm routes straight back to
+        //    `fixes_needed` and into the fix funnel, so re-reviewing would
+        //    ping-pong the card until the cap instead of converging.
+        if !review::has_substantive_blocker(&review_markdown) {
+            // A parked card whose PR head has MOVED is a different situation:
+            // someone pushed, so the stale blocker-less review no longer
+            // describes the code. Re-open it for a fresh review at the new head
+            // rather than re-parking against a review of the old one — this is
+            // the promised "a new push re-opens this", and it cannot ping-pong
+            // because the head has to change for it to fire. Status only; the
+            // Inconclusive arm already marks the review run finished, so there
+            // is no context key to clear and no read-modify-write to race.
+            let parked_head = auto_fix_no_blockers_parked_head(failure_reason);
+            let head_moved = matches!(
+                parked_head.as_deref(),
+                Some(parked) if current_head != "unknown" && parked != current_head
+            );
+            if head_moved {
+                let reopened = supabase::update_task_if_status_and_failure_reason(
+                    config,
+                    &task_id,
+                    "fixes_needed",
+                    failure_reason,
+                    &serde_json::json!({
+                        "status": "review",
+                        "failure_reason": serde_json::Value::Null,
+                        "updated_at": chrono::Utc::now().to_rfc3339(),
+                    }),
+                )
+                .await
+                .ok()
+                .and_then(|v| v.as_array().map(|arr| !arr.is_empty()))
+                .unwrap_or(false);
+                if reopened {
+                    log::info!(
+                        "[auto-fix-sweep] parked task {} got a new push ({}); re-opening for review",
+                        task_id,
+                        current_head
+                    );
+                    agent_comment(
+                        config,
+                        &task_id,
+                        "A new commit was pushed to this PR after it was parked with no actionable blockers. Re-opening for a fresh review against the updated code.",
+                    )
+                    .await;
+                }
+                continue;
+            }
+            park_auto_fix_without_blockers(
+                config,
+                &task_id,
+                &pr_url,
+                &fix_repo_path,
+                &review_markdown,
+                failure_reason,
+            )
+            .await;
+            continue;
+        }
+
         log::info!(
             "[auto-fix-sweep] re-firing auto-fix for stale fixes_needed task {} (cycle {}/{}) in {}",
             task_id, cycle_count + 1, max_review_cycles, fix_repo_path
@@ -20016,6 +20780,35 @@ pub async fn sweep_pr_review_queue(
             continue;
         }
         if main_repo_path.is_empty() || !task_requires_pr_review(task) {
+            continue;
+        }
+        // AutoSam-coded tickets already ran /codex-fix. Do not drag them back
+        // into the OpenRouter $samwise-pr-review gate if they land in Review.
+        if !task_is_external_pr_review_request(task) {
+            let moved = supabase::update_task_if_status(
+                config,
+                &task_id,
+                "review",
+                &serde_json::json!({
+                    "status": "approved",
+                    "worker_id": serde_json::Value::Null,
+                    "claimed_at": serde_json::Value::Null,
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                }),
+            )
+            .await
+            .ok()
+            .and_then(|v| v.as_array().map(|arr| !arr.is_empty()))
+            .unwrap_or(false);
+            if moved {
+                agent_comment(
+                    config,
+                    &task_id,
+                    "This ticket already ran /codex-fix before the PR opened, so I am sending it to Ready to Merge instead of a second review gate.",
+                )
+                .await;
+                notify_callback(config, &task_id, "approved", Some(&pr_url), None);
+            }
             continue;
         }
         // Fire if never reviewed, OR updated_at > last_pr_review_at (card moved back in),
@@ -21146,7 +21939,13 @@ async fn summarize_pr_changes(
     const MAX_DIFF_BYTES: usize = 60_000;
     let truncated = diff.len() > MAX_DIFF_BYTES;
     if truncated {
-        diff.truncate(MAX_DIFF_BYTES);
+        // Walk back to a UTF-8 char boundary: String::truncate panics if the cut
+        // lands mid-character (diffs can contain arbitrary UTF-8).
+        let mut end = MAX_DIFF_BYTES;
+        while end > 0 && !diff.is_char_boundary(end) {
+            end -= 1;
+        }
+        diff.truncate(end);
         diff.push_str("\n\n...[diff truncated]...\n");
     }
     if diff.trim().is_empty() {
