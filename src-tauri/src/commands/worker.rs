@@ -11423,6 +11423,54 @@ pub fn spawn_pr_review_task(
                         e
                     );
                 }
+
+                // 2026-09-02: external Slack reviews with a clean verdict now
+                // auto-chain into the Review & Merge pipeline (the same path
+                // the board button uses) so the PR actually merges instead of
+                // parking in approved forever. The sweep re-verifies before
+                // merging --admin; blocked verdicts park in fixes_needed.
+                if matches!(&result.verdict, review::PrReviewVerdict::MergeNow) {
+                    let mut merged_ctx = task_row
+                        .get("context")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    if !merged_ctx.is_object() {
+                        merged_ctx = serde_json::json!({});
+                    }
+                    merged_ctx[REVIEW_MERGE_STATUS_KEY] = serde_json::json!("requested");
+                    merged_ctx["samwise_review_merge_requested_at"] =
+                        serde_json::json!(chrono::Utc::now().to_rfc3339());
+                    match supabase::update_task(
+                        &config,
+                        &task_id,
+                        &serde_json::json!({
+                            "context": merged_ctx,
+                            "updated_at": chrono::Utc::now().to_rfc3339(),
+                        }),
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            log::info!(
+                                "[pr-review] external review clean; queued Review & Merge for {}",
+                                pr_url
+                            );
+                            agent_comment(
+                                &config,
+                                &task_id,
+                                "Clean external review — auto-queuing Review & Merge (verify, merge --admin, deploy).",
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "[pr-review] failed to queue Review & Merge for external PR {}: {}",
+                                pr_url,
+                                e
+                            );
+                        }
+                    }
+                }
             }
         }
 
