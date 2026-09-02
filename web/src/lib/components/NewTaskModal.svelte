@@ -266,7 +266,7 @@
         <ul class="mt-2 grid grid-cols-3 gap-2">
           {#each attachments as a (a.url)}
             <li class="relative rounded-lg overflow-hidden border border-white/10 bg-white/5 aspect-square">
-              {#if a.mime.startsWith('image/')}
+              {#if a.mime?.startsWith('image/') || /\.(png|jpe?g|gif|webp|bmp|avif|svg)(\?|#|$)/i.test(a.url || '')}
                 <img src={a.url} alt={a.name} class="w-full h-full object-cover" loading="lazy" />
               {:else}
                 <div class="w-full h-full grid place-items-center text-xs text-slate-300 p-2 text-center">{a.name}</div>

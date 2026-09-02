@@ -31,6 +31,8 @@
   let before = $derived(task.screenshots_before ?? []);
   let after = $derived(task.screenshots_after ?? []);
   let attachments = $derived(task.attachments ?? []);
+  const isImageAttachment = (a: { url: string; mime?: string | null }) =>
+    !!a.mime?.startsWith('image/') || /\.(png|jpe?g|gif|webp|bmp|avif|svg)(\?|#|$)/i.test(a.url || '');
   let reviewPanel = $derived(extractReviewActionPanel(task, comments));
   let uiStamp = $derived(getUiStamp(task));
   let mergeDeployState = $derived(getMergeDeployState(task));
@@ -728,7 +730,7 @@
             {#each attachments as a (a.url)}
               <li class="rounded-lg overflow-hidden border border-white/10 bg-white/5 aspect-square">
                 <a href={a.url} target="_blank" rel="noopener" class="block w-full h-full">
-                  {#if a.mime.startsWith('image/')}
+                  {#if isImageAttachment(a)}
                     <img src={a.url} alt={a.name} class="w-full h-full object-cover" loading="lazy" />
                   {:else}
                     <div class="w-full h-full grid place-items-center text-xs text-slate-300 p-2 text-center">{a.name}</div>
