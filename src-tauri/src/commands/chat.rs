@@ -253,11 +253,7 @@ async fn chat_respond_inner(
     }
 
     // 8. Save agent response to Supabase
-    let response_text = if clean_text.trim().is_empty() {
-        raw_response.trim().to_string()
-    } else {
-        clean_text.trim().to_string()
-    };
+    let response_text = public_chat_reply(&clean_text, &raw_response);
 
     let message_id = match supabase::send_message(&config, &serde_json::json!({
         "role": "agent",
@@ -521,6 +517,7 @@ Pick the project and get moving. Don't ask for confirmation — Matt can course-
 
 Do NOT create tasks for simple questions, opinions, quick lookups, or general chat.
 When you create a task, mention it naturally in your response (e.g. "On it, I've queued that up.").
+The JSON block is for the worker only. Never put create_task JSON, markdown JSON fences, or tool dumps in the human-facing sentence that Slack or chat will show.
 
 ## Recent Conversation
 {recent_chat}
@@ -537,48 +534,204 @@ Respond naturally. Keep it brief and conversational."#,
 
 // ── Parse response for task creation blocks ─────────────────────────
 
+fn parse_json_object_at(s: &str, start: usize) -> Option<(usize, Value)> {
+    if s.as_bytes().get(start) != Some(&b'{') {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut i = start;
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_string {
+            if escape {
+                escape = false;
+            } else if c == b'\\' {
+                escape = true;
+            } else if c == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let slice = &s[start..=i];
+                    return serde_json::from_str::<Value>(slice).ok().map(|val| (i + 1, val));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn push_create_task(val: &Value, task_requests: &mut Vec<Value>) {
+    let Some(task_data) = val.get("create_task") else {
+        return;
+    };
+    let mut task = serde_json::json!({
+        "status": "queued",
+        "assignee": "agent",
+        "source": "chat",
+    });
+    if let Some(obj) = task_data.as_object() {
+        for (key, value) in obj {
+            task[key] = value.clone();
+        }
+    }
+    if task
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+    {
+        task_requests.push(task);
+    }
+}
+
+fn absorb_create_task_text(inner: &str, task_requests: &mut Vec<Value>) {
+    let trimmed = inner.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
+        push_create_task(&val, task_requests);
+        return;
+    }
+    if let Some(pos) = trimmed.find('{') {
+        if let Some((_, val)) = parse_json_object_at(trimmed, pos) {
+            push_create_task(&val, task_requests);
+        }
+    }
+}
+
+fn range_overlaps(skip: &[(usize, usize)], idx: usize) -> bool {
+    skip.iter().any(|&(a, b)| idx >= a && idx < b)
+}
+
+fn looks_like_task_json(s: &str) -> bool {
+    let t = s.trim();
+    t.contains("\"create_task\"") || t.starts_with("```json")
+}
+
+/// Human-facing chat/Slack text. Never return the create_task protocol dump.
+pub fn public_chat_reply(clean_text: &str, raw_response: &str) -> String {
+    let clean = clean_text.trim();
+    if !clean.is_empty() && !looks_like_task_json(clean) {
+        return clean.to_string();
+    }
+    let raw = raw_response.trim();
+    if !raw.is_empty() && !looks_like_task_json(raw) {
+        return raw.to_string();
+    }
+    "On it, I've queued that up.".to_string()
+}
+
 pub fn parse_chat_response(raw: &str) -> (String, Vec<Value>) {
-    let mut clean_text = raw.to_string();
     let mut task_requests = Vec::new();
+    let mut skip: Vec<(usize, usize)> = Vec::new();
 
-    let mut search_from = 0;
-    loop {
-        let Some(start) = clean_text[search_from..].find("```json") else { break; };
-        let start = search_from + start;
-        let json_start = start + 7;
+    let mut search = 0;
+    while let Some(rel) = raw[search..].find("```json") {
+        let start = search + rel;
+        let after = start + 7;
+        if let Some(end_rel) = raw[after..].find("```") {
+            let end = after + end_rel + 3;
+            absorb_create_task_text(&raw[after..after + end_rel], &mut task_requests);
+            skip.push((start, end));
+            search = end;
+        } else {
+            absorb_create_task_text(&raw[after..], &mut task_requests);
+            skip.push((start, raw.len()));
+            break;
+        }
+    }
 
-        let Some(end) = clean_text[json_start..].find("```") else { break; };
-        let end = json_start + end;
+    let mut search = 0;
+    while let Some(rel) = raw[search..].find("\"create_task\"") {
+        let key = search + rel;
+        if range_overlaps(&skip, key) {
+            search = key + 13;
+            continue;
+        }
+        let Some(brace) = raw[..key].rfind('{') else {
+            search = key + 13;
+            continue;
+        };
+        if !raw[brace + 1..key].trim().is_empty() {
+            search = key + 13;
+            continue;
+        }
+        if range_overlaps(&skip, brace) {
+            search = key + 13;
+            continue;
+        }
+        if let Some((end, val)) = parse_json_object_at(raw, brace) {
+            push_create_task(&val, &mut task_requests);
+            skip.push((brace, end));
+            search = end;
+        } else {
+            skip.push((brace, raw.len()));
+            break;
+        }
+    }
 
-        let json_str = clean_text[json_start..end].trim();
-
-        if let Ok(parsed) = serde_json::from_str::<Value>(json_str) {
-            if let Some(task_data) = parsed.get("create_task") {
-                let mut task = serde_json::json!({
-                    "status": "queued",
-                    "assignee": "agent",
-                    "source": "chat",
-                });
-
-                if let Some(obj) = task_data.as_object() {
-                    for (key, value) in obj {
-                        task[key] = value.clone();
-                    }
-                }
-
-                if task.get("title").and_then(|v| v.as_str()).map(|s| !s.is_empty()).unwrap_or(false) {
-                    task_requests.push(task);
-                }
-
-                let block_end = end + 3;
-                clean_text = format!("{}{}", &clean_text[..start], &clean_text[block_end..]);
-                search_from = start; // Reset to where the block was, since text was mutated
+    skip.sort_by_key(|&(a, _)| a);
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (a, b) in skip {
+        if let Some(last) = merged.last_mut() {
+            if a <= last.1 {
+                last.1 = last.1.max(b);
                 continue;
             }
         }
-
-        search_from = end + 3;
+        merged.push((a, b));
     }
+
+    let mut clean_text = String::new();
+    let mut cursor = 0;
+    for (a, b) in merged {
+        if cursor < a {
+            clean_text.push_str(&raw[cursor..a]);
+        }
+        cursor = b;
+    }
+    if cursor < raw.len() {
+        clean_text.push_str(&raw[cursor..]);
+    }
+
+    let clean_text = clean_text
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let clean_text = {
+        let mut out = String::new();
+        let mut blanks = 0;
+        for line in clean_text.lines() {
+            if line.trim().is_empty() {
+                blanks += 1;
+                if blanks <= 2 {
+                    out.push('\n');
+                }
+            } else {
+                blanks = 0;
+                if !out.is_empty() && !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str(line);
+            }
+        }
+        out.trim().to_string()
+    };
 
     (clean_text, task_requests)
 }
@@ -1244,11 +1397,7 @@ pub async fn chat_process_response(
     }
 
     // Save agent response to Supabase
-    let final_text = if clean_text.trim().is_empty() {
-        response_text.trim().to_string()
-    } else {
-        clean_text.trim().to_string()
-    };
+    let final_text = public_chat_reply(&clean_text, &response_text);
     let message_id = save_agent_message(&config, &final_text).await;
 
     Ok(ChatResponse {
@@ -1349,5 +1498,48 @@ async fn save_agent_message(config: &supabase::SupabaseConfig, content: &str) ->
             log::warn!("[chat] Failed to save agent message: {}", e);
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_chat_response, public_chat_reply};
+
+    #[test]
+    fn strips_fenced_create_task_json() {
+        let raw = "On it, queuing up for **operly**.\n\n```json\n{\"create_task\": {\"title\": \"Fix login\", \"description\": \"do it\", \"priority\": \"high\", \"task_type\": \"code\", \"project\": \"operly\", \"source\": \"slack\"}}\n```\n";
+        let (clean, tasks) = parse_chat_response(raw);
+        assert_eq!(clean, "On it, queuing up for **operly**.");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["title"], "Fix login");
+        assert_eq!(public_chat_reply(&clean, raw), "On it, queuing up for **operly**.");
+    }
+
+    #[test]
+    fn strips_unfenced_create_task_json() {
+        let raw = "On it, queuing up for **operly** with the screenshots attached.\n\n{\"create_task\": {\"title\": \"Enable multi-agent orchestration within routines\", \"description\": \"audit then implement\", \"priority\": \"high\", \"task_type\": \"code\", \"project\": \"operly\", \"source\": \"slack\"}}";
+        let (clean, tasks) = parse_chat_response(raw);
+        assert_eq!(clean, "On it, queuing up for **operly** with the screenshots attached.");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["title"], "Enable multi-agent orchestration within routines");
+        assert!(!public_chat_reply(&clean, raw).contains("create_task"));
+    }
+
+    #[test]
+    fn strips_unclosed_json_fence() {
+        let raw = "On it, queuing up for **operly**.\n\n```json\n{\"create_task\": {\"title\": \"Fix login\", \"description\": \"do it\", \"priority\": \"high\", \"task_type\": \"code\", \"project\": \"operly\"}}";
+        let (clean, tasks) = parse_chat_response(raw);
+        assert_eq!(clean, "On it, queuing up for **operly**.");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(public_chat_reply(&clean, raw), "On it, queuing up for **operly**.");
+    }
+
+    #[test]
+    fn json_only_reply_does_not_leak() {
+        let raw = "```json\n{\"create_task\": {\"title\": \"Fix login\", \"description\": \"do it\", \"task_type\": \"code\"}}\n```";
+        let (clean, tasks) = parse_chat_response(raw);
+        assert!(clean.is_empty());
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(public_chat_reply(&clean, raw), "On it, I've queued that up.");
     }
 }
