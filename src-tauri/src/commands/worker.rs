@@ -9243,11 +9243,7 @@ async fn process_remote_chat_message(
     }
 
     // 6. Save Sam's response to ae_messages
-    let response_text = if clean_text.trim().is_empty() {
-        raw_response.trim().to_string()
-    } else {
-        clean_text.trim().to_string()
-    };
+    let response_text = chat::public_chat_reply(&clean_text, &raw_response);
 
     send_remote_agent_message_or_requeue(
         config,
@@ -9527,19 +9523,18 @@ async fn process_telegram_message(config: &SupabaseConfig, user_message: &str, m
     // 7. Save Sam's response to ae_messages
     let response_text = if created_any {
         fallback_response.unwrap_or_else(|| {
-            if clean_text.trim().is_empty() {
+            let cleaned = chat::public_chat_reply(&clean_text, &raw_response);
+            if cleaned == "On it, I've queued that up." {
                 format!(
                     "Queued that for {}. I matched `{}` to the project registry.",
                     routed_project.project, routed_project.prefix
                 )
             } else {
-                clean_text.trim().to_string()
+                cleaned
             }
         })
-    } else if clean_text.trim().is_empty() {
-        raw_response.trim().to_string()
     } else {
-        clean_text.trim().to_string()
+        chat::public_chat_reply(&clean_text, &raw_response)
     };
 
     let _ = supabase::send_message(
