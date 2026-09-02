@@ -323,6 +323,75 @@ pub async fn update_task_if_status(
     .await
 }
 
+/// Update only while a context flag still holds a given value at the
+/// database. Context updates are fetch-modify-replace over the whole JSON
+/// document, so an unconditional write can clobber a concurrent stamp that
+/// landed between the read and the write; the `context->>key=eq.value`
+/// predicate makes the write atomic against that race.
+pub async fn update_task_if_context_flag(
+    config: &SupabaseConfig,
+    id: &str,
+    flag_key: &str,
+    flag_value: &str,
+    updates: &Value,
+) -> Result<Value, String> {
+    let client = build_client(config)?;
+    let url = format!(
+        "{}?id=eq.{}&context->>{}=eq.{}",
+        rest_url(config, "ae_tasks"),
+        urlencoding::encode(id),
+        urlencoding::encode(flag_key),
+        urlencoding::encode(flag_value)
+    );
+    handle_response(
+        client
+            .patch(&url)
+            .json(updates)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?,
+    )
+    .await
+}
+
+/// Update only when the status AND the current `failure_reason` both still
+/// match what the caller read. Automation that stamps dedupe markers into
+/// `failure_reason` needs this: a status-only predicate lets a concurrent
+/// writer slip a real diagnostic in between the read and the write, which the
+/// marker would then silently destroy. Pass `None` to require SQL NULL.
+pub async fn update_task_if_status_and_failure_reason(
+    config: &SupabaseConfig,
+    id: &str,
+    expected_status: &str,
+    expected_failure_reason: Option<&str>,
+    updates: &Value,
+) -> Result<Value, String> {
+    let client = build_client(config)?;
+    let reason_filter = match expected_failure_reason {
+        None => "failure_reason=is.null".to_string(),
+        Some(reason) => format!(
+            "failure_reason=eq.{}",
+            urlencoding::encode(reason)
+        ),
+    };
+    let url = format!(
+        "{}?id=eq.{}&status=eq.{}&{}",
+        rest_url(config, "ae_tasks"),
+        id,
+        expected_status,
+        reason_filter
+    );
+    handle_response(
+        client
+            .patch(&url)
+            .json(updates)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?,
+    )
+    .await
+}
+
 /// Update only when status still matches and the card is not held. This makes
 /// the hold gate atomic with automatic worker transitions instead of relying on
 /// an earlier, race-prone task-list snapshot.

@@ -13,32 +13,25 @@ use crate::process::async_cmd;
 
 const REVIEW_PROMPT: &str = include_str!("../../prompts/review.md");
 
-/// Model pin for every Codex CLI invocation Samwise makes. Kept in one
-/// place so upgrading the model is a single edit rather than a scavenger
-/// hunt across review.rs and worker.rs.
-///
-/// Reviews run through OpenRouter (see `CODEX_PROVIDER_ARGS`), so the slug has to
-/// carry the `openai/` provider prefix — a bare `gpt-5.6-sol` is not a valid
-/// OpenRouter model id.
-pub const CODEX_MODEL: &str = "openai/gpt-5.6-sol";
-/// `-c` config argument for Codex reasoning effort. `xhigh` is verified working
-/// against OpenRouter's `openai/gpt-5.6-sol`.
+/// Primary review model: local Codex CLI / ChatGPT plan (`~/.codex/auth.json`).
+/// Matches the host `~/.codex/config.toml` default so AutoSam reviews use the
+/// same account as interactive `codex` and `/codex-fix`.
+pub const CODEX_MODEL: &str = "gpt-5.5";
+/// OpenRouter fallback slug. Needs the `openai/` prefix; a bare `gpt-5.6-sol`
+/// is not a valid OpenRouter id.
+pub const CODEX_OPENROUTER_MODEL: &str = "openai/gpt-5.6-sol";
+/// `-c` config argument for Codex reasoning effort.
 pub const CODEX_REASONING_CONFIG: &str = "model_reasoning_effort=\"xhigh\"";
 
-/// Provider pin for every Codex CLI invocation Samwise makes. Reviews bill against
-/// the OpenRouter key in Doppler `agent-one/prd` (`OPENROUTER_API_KEY`, resolved per
-/// spawn by `resolve_openrouter_key` below), not this machine's ChatGPT login.
-///
-/// The provider is declared inline rather than read from `~/.codex/config.toml` for
-/// the same reason `sandbox_workspace_write.network_access` is pinned below: an edit
-/// to the machine-global Codex config (or a different `CODEX_HOME` on the spawning
-/// process) must not be able to silently repoint reviews at another model or account.
-/// Note this pins the *provider and model only* — Codex still loads the rest of the
-/// user config (trust levels, hooks, MCP servers) from whatever `CODEX_HOME` it
-/// inherits, since `--ignore-user-config` is not passed.
-///
-/// Codex 0.144 dropped `wire_api = "chat"`, so any provider swapped in here has to
-/// speak the OpenAI Responses API. OpenRouter does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodexBackend {
+    LocalCli,
+    OpenRouter,
+}
+
+/// OpenRouter is the fallback only. Direct Codex CLI (ChatGPT auth on this
+/// host) is the primary. These `-c` pins are applied only on the fallback
+/// spawn so a dead OpenRouter key cannot hijack the local CLI path.
 pub const CODEX_PROVIDER_ARGS: &[&str] = &[
     "-c",
     "model_providers.openrouter.name=\"OpenRouter\"",
@@ -51,6 +44,29 @@ pub const CODEX_PROVIDER_ARGS: &[&str] = &[
     "-c",
     "model_provider=\"openrouter\"",
 ];
+
+fn apply_codex_backend(
+    cmd: &mut tokio::process::Command,
+    backend: CodexBackend,
+    openrouter_key: Option<&str>,
+) {
+    match backend {
+        CodexBackend::LocalCli => {
+            cmd.args(["-m", CODEX_MODEL, "-c", CODEX_REASONING_CONFIG]);
+        }
+        CodexBackend::OpenRouter => {
+            cmd.args(CODEX_PROVIDER_ARGS);
+            if let Some(key) = openrouter_key {
+                cmd.env(OPENROUTER_KEY_ENV, key);
+            }
+            cmd.args(["-m", CODEX_OPENROUTER_MODEL, "-c", CODEX_REASONING_CONFIG]);
+        }
+    }
+}
+
+fn should_fallback_to_openrouter(success: bool, stdout: &str) -> bool {
+    !success || stdout.trim().is_empty()
+}
 
 /// Env var Codex reads for the OpenRouter key (the `env_key` above).
 const OPENROUTER_KEY_ENV: &str = "OPENROUTER_API_KEY";
@@ -862,7 +878,6 @@ async fn run_codex_review(
     task_description: &str,
     diff: &str,
 ) -> Result<Value, String> {
-    let openrouter_key = resolve_openrouter_key().await?;
     let tmp_path = std::env::temp_dir().join(format!("samwise-review-{}", uuid_like()));
     tokio::fs::create_dir_all(&tmp_path)
         .await
@@ -927,48 +942,71 @@ async fn run_codex_review(
 
     // Use spawn so we can actually kill the child on timeout, and pin a read-only
     // sandbox + no-approvals policy so the review can't mutate the repo.
-    let mut cmd = async_cmd("codex");
-    cmd.arg("exec");
-    cmd.args(CODEX_PROVIDER_ARGS);
-    cmd.env(OPENROUTER_KEY_ENV, &openrouter_key);
-    cmd.args([
-        "-m",
-        CODEX_MODEL,
-        "-c",
-        CODEX_REASONING_CONFIG,
-        "-s",
-        "read-only",
-        "-c",
-        "approval_policy=\"never\"",
-        "--output-schema",
-        &schema_path_str,
-        "-o",
-        &output_path_str,
-        "--skip-git-repo-check",
-        "-C",
-        repo_path,
-        &prompt,
-    ]);
-
-    cmd.stdin(std::process::Stdio::null());
-
-    let mut child = cmd.spawn().map_err(|e| format!("spawn codex: {}", e))?;
-    let wait_fut = child.wait();
-    let status = match tokio::time::timeout(Duration::from_secs(CODEX_TIMEOUT_SECS), wait_fut).await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return Err(format!("wait codex: {}", e)),
-        Err(_) => {
-            // Kill the stuck child so we don't leak a multi-minute process.
-            let _ = child.kill().await;
-            return Err(format!(
-                "codex review timed out after {}s",
-                CODEX_TIMEOUT_SECS
-            ));
+    // Direct Codex CLI first. OpenRouter only if that spawn dies or writes nothing.
+    let openrouter_key = resolve_openrouter_key().await.ok();
+    let backends = [
+        CodexBackend::LocalCli,
+        CodexBackend::OpenRouter,
+    ];
+    let mut last_err = String::from("codex review produced no output");
+    for (idx, backend) in backends.into_iter().enumerate() {
+        if backend == CodexBackend::OpenRouter && openrouter_key.is_none() {
+            last_err = format!(
+                "{last_err}; OpenRouter fallback unavailable (no OPENROUTER_API_KEY)"
+            );
+            break;
         }
-    };
-    if !status.success() {
-        return Err(format!("codex exec exited non-zero: {}", status));
+        if idx > 0 {
+            log::warn!(
+                "[review] local Codex CLI failed ({}); falling back to OpenRouter",
+                last_err
+            );
+            let _ = tokio::fs::remove_file(&output_path).await;
+        }
+        let mut cmd = async_cmd("codex");
+        cmd.arg("exec");
+        apply_codex_backend(&mut cmd, backend, openrouter_key.as_deref());
+        cmd.args([
+            "-s",
+            "read-only",
+            "-c",
+            "approval_policy=\"never\"",
+            "--output-schema",
+            &schema_path_str,
+            "-o",
+            &output_path_str,
+            "--skip-git-repo-check",
+            "-C",
+            repo_path,
+            &prompt,
+        ]);
+        cmd.stdin(std::process::Stdio::null());
+
+        let mut child = cmd.spawn().map_err(|e| format!("spawn codex: {}", e))?;
+        let wait_fut = child.wait();
+        let status = match tokio::time::timeout(Duration::from_secs(CODEX_TIMEOUT_SECS), wait_fut).await
+        {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                last_err = format!("wait codex: {}", e);
+                continue;
+            }
+            Err(_) => {
+                let _ = child.kill().await;
+                last_err = format!(
+                    "codex review timed out after {}s",
+                    CODEX_TIMEOUT_SECS
+                );
+                continue;
+            }
+        };
+        if status.success() && tokio::fs::try_exists(&output_path).await.unwrap_or(false) {
+            break;
+        }
+        last_err = format!("codex exec exited non-zero: {}", status);
+    }
+    if !tokio::fs::try_exists(&output_path).await.unwrap_or(false) {
+        return Err(last_err);
     }
 
     let body = tokio::fs::read_to_string(&output_path)
@@ -1196,7 +1234,7 @@ pub(crate) fn gh_checks_no_checks_reported(stderr: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::gh_checks_no_checks_reported;
+    use super::{gh_checks_no_checks_reported, should_fallback_to_openrouter};
 
     #[test]
     fn detects_gh_no_checks_reported_error() {
@@ -1207,6 +1245,69 @@ mod tests {
             "No checks reported on the 'main' branch"
         ));
         assert!(!gh_checks_no_checks_reported("HTTP 500 from GitHub"));
+    }
+
+    #[test]
+    fn openrouter_fallback_only_on_failed_or_empty_local_spawn() {
+        assert!(should_fallback_to_openrouter(false, "VERDICT: merge_now"));
+        assert!(should_fallback_to_openrouter(true, ""));
+        assert!(should_fallback_to_openrouter(true, "   \n"));
+        assert!(!should_fallback_to_openrouter(true, "VERDICT: merge_now"));
+    }
+
+    #[test]
+    fn delta_verify_parse_clean() {
+        let (verdict, body) = super::parse_delta_verify_output(
+            "VERDICT: clean\n\n## Blockers\n- <none>\n\n## Notes\n- retry loop looks right",
+        );
+        assert_eq!(verdict, super::PrReviewVerdict::MergeNow);
+        assert!(body.contains("## Blockers"));
+        assert!(body.contains("retry loop looks right"));
+        assert!(!body.contains("VERDICT"));
+        assert!(!super::has_substantive_blocker(&body));
+    }
+
+    #[test]
+    fn delta_verify_parse_regressions_with_p1() {
+        let (verdict, body) = super::parse_delta_verify_output(
+            "preamble\nVERDICT: regressions\n\n## Blockers\n- [P1] src/foo.rs:42 — the fix breaks pagination by clearing the cursor\n\n## Notes\n- n/a",
+        );
+        assert_eq!(verdict, super::PrReviewVerdict::FixIssues);
+        assert!(super::has_substantive_blocker(&body));
+    }
+
+    #[test]
+    fn delta_verify_parse_last_verdict_wins() {
+        let (verdict, _) = super::parse_delta_verify_output(
+            "VERDICT: regressions\nthinking out loud\nVERDICT: clean\n\n## Blockers\n- <none>\n",
+        );
+        assert_eq!(verdict, super::PrReviewVerdict::MergeNow);
+    }
+
+    #[test]
+    fn delta_verify_parse_no_verdict_is_inconclusive() {
+        let (verdict, body) = super::parse_delta_verify_output("the model rambled on");
+        assert_eq!(verdict, super::PrReviewVerdict::Inconclusive);
+        assert!(body.contains("no verdict line"));
+    }
+
+    #[test]
+    fn delta_verify_owner_repo_parse() {
+        assert_eq!(
+            super::pr_url_owner_repo("https://github.com/R-Link-LLC/operly/pull/984"),
+            Some("R-Link-LLC/operly".to_string())
+        );
+        assert_eq!(super::pr_url_owner_repo("https://evil.example.com/x"), None);
+    }
+
+    #[test]
+    fn delta_verify_parse_crlf_offsets() {
+        let (verdict, body) = super::parse_delta_verify_output(
+            "VERDICT: regressions\r\n\r\n## Blockers\r\n- [P1] src/foo.rs:1 — the fix breaks logout\r\n",
+        );
+        assert_eq!(verdict, super::PrReviewVerdict::FixIssues);
+        assert!(body.contains("## Blockers"));
+        assert!(super::has_substantive_blocker(&body));
     }
 }
 
@@ -1402,6 +1503,77 @@ async fn log_decision(
     }
 }
 
+struct CodexExecOutput {
+    success: bool,
+    status_display: String,
+    stdout: String,
+    stderr: String,
+}
+
+async fn run_codex_exec_once(
+    backend: CodexBackend,
+    openrouter_key: Option<&str>,
+    extra_prefix: &[&str],
+    extra_suffix: &[&str],
+    prompt: &str,
+    cwd: &str,
+    timeout_secs: u64,
+) -> Result<CodexExecOutput, String> {
+    let mut cmd = async_cmd("codex");
+    cmd.args(extra_prefix);
+    apply_codex_backend(&mut cmd, backend, openrouter_key);
+    cmd.args(extra_suffix)
+        .arg(prompt)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn codex: {}", e))?;
+    let stdout_pipe = child.stdout.take();
+    let stdout_handle = tokio::spawn(async move {
+        let mut output = String::new();
+        if let Some(mut reader) = stdout_pipe {
+            use tokio::io::AsyncReadExt;
+            let _ = reader.read_to_string(&mut output).await;
+        }
+        output
+    });
+    let stderr_pipe = child.stderr.take();
+    let stderr_handle = tokio::spawn(async move {
+        let mut output = String::new();
+        if let Some(mut reader) = stderr_pipe {
+            use tokio::io::AsyncReadExt;
+            let _ = reader.read_to_string(&mut output).await;
+        }
+        output
+    });
+
+    let status = match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(format!("codex wait failed: {}", e)),
+        Err(_) => {
+            let _ = child.kill().await;
+            let stdout = stdout_handle.await.unwrap_or_default();
+            let stderr = stderr_handle.await.unwrap_or_default();
+            return Err(format!(
+                "codex timed out after {}s. Stderr tail: {} Stdout tail: {}",
+                timeout_secs,
+                trim_to(stderr.trim(), 800),
+                trim_to(stdout.trim(), 800),
+            ));
+        }
+    };
+    Ok(CodexExecOutput {
+        success: status.success(),
+        status_display: status.to_string(),
+        stdout: stdout_handle.await.unwrap_or_default(),
+        stderr: stderr_handle.await.unwrap_or_default(),
+    })
+}
+
 // ── $samwise-pr-review (Codex CLI skill) ────────────────────────────
 //
 // Lightweight automated review used when auto-merge is disabled. Runs the
@@ -1440,7 +1612,6 @@ pub async fn run_samwise_pr_review(
             pr_url
         ));
     }
-    let openrouter_key = resolve_openrouter_key().await?;
     let cwd = resolve_codex_cwd(repo_path);
     let host_pr_context = collect_pr_review_context(pr_url, &cwd).await;
     let prompt = format!(
@@ -1461,82 +1632,57 @@ pub async fn run_samwise_pr_review(
     // `gh` from inside the sandbox, so without net it returns INCONCLUSIVE and
     // parks the card in Review forever. Pin it on here so we don't depend on
     // machine-global ~/.codex/config.toml being set on whatever host we run on.
-    let mut cmd = async_cmd("codex");
-    cmd.args(["--search", "exec"]);
-    cmd.args(CODEX_PROVIDER_ARGS);
-    cmd.env(OPENROUTER_KEY_ENV, &openrouter_key);
-    cmd.args([
-        "-m",
-        CODEX_MODEL,
-        "-c",
-        CODEX_REASONING_CONFIG,
+    // Direct Codex CLI first. OpenRouter only if that spawn dies or writes nothing.
+    let openrouter_key = resolve_openrouter_key().await.ok();
+    let extra_prefix = ["--search", "exec"];
+    let extra_suffix = [
         "-s",
         "workspace-write",
         "-c",
         "approval_policy=\"never\"",
         "-c",
         "sandbox_workspace_write.network_access=true",
-    ])
-    .arg(&prompt)
-    .current_dir(&cwd)
-    .stdin(std::process::Stdio::null())
-    .stdout(std::process::Stdio::piped())
-    .stderr(std::process::Stdio::piped());
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("failed to spawn codex: {}", e))?;
-
-    let stdout = child.stdout.take();
-    let stdout_handle = tokio::spawn(async move {
-        let mut output = String::new();
-        if let Some(mut reader) = stdout {
-            use tokio::io::AsyncReadExt;
-            let _ = reader.read_to_string(&mut output).await;
-        }
-        output
-    });
-
-    let stderr = child.stderr.take();
-    let stderr_handle = tokio::spawn(async move {
-        let mut output = String::new();
-        if let Some(mut reader) = stderr {
-            use tokio::io::AsyncReadExt;
-            let _ = reader.read_to_string(&mut output).await;
-        }
-        output
-    });
-
-    let status = match tokio::time::timeout(
-        Duration::from_secs(SAMWISE_PR_REVIEW_TIMEOUT_SECS),
-        child.wait(),
+    ];
+    let mut output = run_codex_exec_once(
+        CodexBackend::LocalCli,
+        None,
+        &extra_prefix,
+        &extra_suffix,
+        &prompt,
+        &cwd,
+        SAMWISE_PR_REVIEW_TIMEOUT_SECS,
     )
-    .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return Err(format!("codex wait failed: {}", e)),
-        Err(_) => {
-            let _ = child.kill().await;
-            let stdout = stdout_handle.await.unwrap_or_default();
-            let stderr = stderr_handle.await.unwrap_or_default();
-            return Err(format!(
-                "codex timed out after {}s. Stderr tail: {} Stdout tail: {}",
+    .await;
+    if match &output {
+        Ok(o) => should_fallback_to_openrouter(o.success, &o.stdout),
+        Err(_) => true,
+    } {
+        if let Some(key) = openrouter_key.as_deref() {
+            log::warn!(
+                "[review] local Codex CLI $samwise-pr-review failed; falling back to OpenRouter"
+            );
+            output = run_codex_exec_once(
+                CodexBackend::OpenRouter,
+                Some(key),
+                &extra_prefix,
+                &extra_suffix,
+                &prompt,
+                &cwd,
                 SAMWISE_PR_REVIEW_TIMEOUT_SECS,
-                trim_to(stderr.trim(), 800),
-                trim_to(stdout.trim(), 800),
-            ));
+            )
+            .await;
         }
-    };
-
-    let stdout = stdout_handle.await.unwrap_or_default();
-    let stderr = stderr_handle.await.unwrap_or_default();
+    }
+    let output = output?;
+    let stdout = output.stdout;
+    let stderr = output.stderr;
 
     // Login / rate-limit detection is only meaningful when Codex actually
     // failed. A successful exit (status 0) means Codex produced a real
     // review; the words "rate limit" can legitimately appear in that
     // review's prose or in Codex's usage-status lines on stderr, and
     // matching them would incorrectly kick a clean PR into Inconclusive.
-    if !status.success() {
+    if !output.success {
         let combined_lower = format!("{}\n{}", stdout.to_lowercase(), stderr.to_lowercase());
         // OpenRouter auth/credit failures. Reviews bill against the key in Doppler
         // agent-one/prd, so an expired key or an empty balance is an ops problem, not
@@ -1587,7 +1733,7 @@ pub async fn run_samwise_pr_review(
             verdict: PrReviewVerdict::Inconclusive,
             markdown: format!(
                 "Codex review exited with {}. Leaving the card in Review.\n\nStderr:\n```\n{}\n```\n\nStdout tail:\n```\n{}\n```",
-                status,
+                output.status_display,
                 trim_to(&stderr, 1500),
                 trim_to(&stdout, 1500),
             ),
@@ -1602,6 +1748,327 @@ pub async fn run_samwise_pr_review(
         verdict,
         markdown: body,
         requires_human,
+    })
+}
+
+// ── Delta verify (Pi-style review → fix → verify → done) ───────────
+//
+// After an auto-fix cycle pushes, the PR does NOT need another full cold
+// review of the whole diff. That was the old behavior, and it produced
+// sequential reviewer discovery: each fresh whole-PR review surfaced a NEW
+// adjacent blocker, so cards burned fix cycles all the way to the cap. Pi's
+// /codex-fix model is the fix: review once, fix once, then verify ONLY the
+// delta the fixer pushed (did it land, did it introduce P0/P1 regressions),
+// fix regressions once, done. Leftover low-severity material rides along as
+// notes instead of spending another cycle.
+
+const DELTA_VERIFY_TIMEOUT_SECS: u64 = 10 * 60;
+const DELTA_VERIFY_MAX_DIFF_BYTES: usize = 48_000;
+
+/// Extract "OWNER/REPO" from a github PR URL of the shape
+/// https://github.com/OWNER/REPO/pull/N. Callers run is_safe_pr_url first.
+fn pr_url_owner_repo(pr_url: &str) -> Option<String> {
+    let path = pr_url.trim().strip_prefix("https://github.com/")?;
+    let mut parts = path.split('/');
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some(format!("{}/{}", owner, repo))
+}
+
+/// Fetch the diff between the reviewed head and the current head via the
+/// GitHub compare API. Both SHAs live on origin (the pre-fix head and the
+/// just-pushed fix head), so `base...head` is exactly the fixer's commits —
+/// never the whole PR.
+///
+/// An INCOMPLETE delta is an error, not a smaller diff: a truncated or
+/// patch-omitted compare that still returned `clean` would approve code the
+/// verifier never saw. Callers fall back to a full review on Err.
+async fn fetch_compare_diff(
+    pr_url: &str,
+    repo_path: &str,
+    base_sha: &str,
+    head_sha: &str,
+) -> Result<String, String> {
+    let slug = pr_url_owner_repo(pr_url)
+        .ok_or_else(|| format!("could not parse owner/repo from {}", pr_url))?;
+    let endpoint = format!("repos/{}/compare/{}...{}", slug, base_sha, head_sha);
+    let cwd = resolve_codex_cwd(repo_path);
+    let out = async_cmd("gh")
+        .args([
+            "api",
+            &endpoint,
+            "--jq",
+            ".files[] | \"--- \" + .filename + \" (\" + .status + \")\\n\" + (.patch // \"[binary or too large - patch omitted]\")",
+        ])
+        .current_dir(&cwd)
+        .output()
+        .await
+        .map_err(|e| format!("spawn gh api compare: {}", e))?;
+    if !out.status.success() {
+        return Err(format!(
+            "gh api compare failed: {}",
+            trim_to(String::from_utf8_lossy(&out.stderr).trim(), 400)
+        ));
+    }
+    let diff = String::from_utf8_lossy(&out.stdout).to_string();
+    if diff.contains("[binary or too large - patch omitted]") {
+        return Err(
+            "compare diff omits at least one file patch (binary or oversized); cannot verify a partial delta"
+                .to_string(),
+        );
+    }
+    if diff.len() > DELTA_VERIFY_MAX_DIFF_BYTES {
+        return Err(format!(
+            "compare diff is {} bytes, over the {} cap; refusing to verify a truncated delta",
+            diff.len(),
+            DELTA_VERIFY_MAX_DIFF_BYTES
+        ));
+    }
+    // The compare API caps the files array at 300 entries WITHOUT any marker
+    // in the payload. At exactly 300 we cannot prove the delta is complete,
+    // so refuse it: the fixer is instructed to touch only blocker files, and
+    // a 300-file fix commit is already a runaway.
+    let file_count = diff.matches("\n--- ").count()
+        + usize::from(diff.starts_with("--- "));
+    if file_count >= 300 {
+        return Err(format!(
+            "compare diff lists {} files, at the GitHub compare cap; cannot prove the delta is complete",
+            file_count
+        ));
+    }
+    Ok(diff)
+}
+
+/// Parse the delta verifier's output. The verifier emits its regressions
+/// under a `## Blockers` heading on purpose: every downstream consumer
+/// (has_substantive_blocker, the fixer prompt's "address every item under
+/// ## Blockers") already speaks that schema, so a regression list feeds the
+/// standard fix funnel verbatim.
+fn parse_delta_verify_output(raw: &str) -> (PrReviewVerdict, String) {
+    let mut verdict_idx: Option<(usize, PrReviewVerdict)> = None;
+    // split_inclusive keeps the terminator in each slice, so byte offsets stay
+    // exact for both LF and CRLF output (str::lines() would hide the \r).
+    let mut byte_offset = 0usize;
+    for chunk in raw.split_inclusive('\n') {
+        let line = chunk.trim_end_matches(['\n', '\r']);
+        let trimmed = line.trim();
+        let upper = trimmed.to_ascii_uppercase();
+        if let Some(rest) = upper.strip_prefix("VERDICT:") {
+            let tag = rest.trim();
+            let v = if tag.starts_with("CLEAN") {
+                Some(PrReviewVerdict::MergeNow)
+            } else if tag.starts_with("REGRESSION") {
+                Some(PrReviewVerdict::FixIssues)
+            } else if tag.starts_with("INCONCLUSIVE") {
+                Some(PrReviewVerdict::Inconclusive)
+            } else {
+                None
+            };
+            if let Some(v) = v {
+                verdict_idx = Some((byte_offset, v));
+            }
+        }
+        byte_offset += chunk.len();
+    }
+    let Some((idx, verdict)) = verdict_idx else {
+        return (
+            PrReviewVerdict::Inconclusive,
+            format!("Delta verifier emitted no verdict line. Raw tail:\n```\n{}\n```", trim_to(raw, 1500)),
+        );
+    };
+    // Body = everything after the verdict line (that is where ## Blockers and
+    // ## Notes live).
+    let after = &raw[idx..];
+    let body = match after.find('\n') {
+        Some(nl) => after[nl + 1..].trim().to_string(),
+        None => String::new(),
+    };
+    (verdict, body)
+}
+
+/// Verify ONLY the delta an auto-fix cycle pushed. `base_sha` is the PR head
+/// the fixer started from (the reviewed head); the current head is fetched
+/// fresh. `orig_blockers` carries the `## Blockers` bullets from the review
+/// that triggered the fix, so the verifier can confirm each one was actually
+/// addressed — a regression-free delta that ignores the blockers is NOT
+/// clean. Returns:
+/// - MergeNow  — delta is clean (regression-free, blockers addressed). Notes
+///   ride along in the markdown; they never spend another cycle.
+/// - FixIssues — delta carries substantive P0/P1 regressions or unaddressed
+///   blockers, listed under `## Blockers` so the standard fix funnel consumes
+///   them unchanged.
+/// - Inconclusive/Err — the verifier could not judge (missing/ moved head,
+///   partial diff, no verdict). Callers fall back to a full
+///   `$samwise-pr-review` rather than trusting a blind verdict.
+pub async fn run_delta_verify_review(
+    pr_url: &str,
+    repo_path: &str,
+    base_sha: &str,
+    orig_blockers: &str,
+) -> Result<PrReviewResult, String> {
+    if !is_safe_pr_url(pr_url) {
+        return Err(format!(
+            "refusing pr_url that doesn't match the github shape: {}",
+            pr_url
+        ));
+    }
+    let head_sha = fetch_pr_head_sha(pr_url, repo_path).await?;
+    if head_sha == base_sha {
+        // The fix is ABSENT: head equals the reviewed base, so the blockers
+        // are still live (reverted, force-reset, or never landed). Never
+        // approve that — hand it to the full review.
+        return Err(
+            "PR head equals the reviewed base; the fix never landed or was reverted".to_string(),
+        );
+    }
+    let diff = fetch_compare_diff(pr_url, repo_path, base_sha, &head_sha).await?;
+    if diff.trim().is_empty() {
+        return Err("compare diff came back empty; cannot verify the delta".to_string());
+    }
+    let diff = sanitize_diff_for_prompt(&diff);
+    let blockers_section = if orig_blockers.trim().is_empty() {
+        "(the original review's blocker list was unavailable; judge the delta on regressions only)".to_string()
+    } else if orig_blockers.trim().len() > 4_000 {
+        // Every original blocker must be verified; silently truncating the
+        // list would let an incomplete fix pass. Refuse and let the caller
+        // fall back to a full review.
+        return Err(format!(
+            "original blocker list is {} bytes, over the 4000 cap; refusing to verify against a truncated blocker list",
+            orig_blockers.trim().len()
+        ));
+    } else {
+        orig_blockers.trim().to_string()
+    };
+    let prompt = format!(
+        "You are Samwise's delta verifier in a review -> fix -> verify pipeline. \
+A Codex review of PR {pr_url} flagged blockers at head {base_sha}. An automated fixer \
+pushed fix commits; the PR head is now {head_sha}. Your ONLY job is to verify the delta \
+between those two SHAs — the fixer's commits, shown below.\n\n\
+## Blockers the fixer was required to address (from the original review)\n\n\
+{blockers}\n\n\
+## Delta diff ({base}...{head}, complete)\n\n```diff\n{diff}\n```\n\n\
+## Rules\n\
+- Review ONLY the delta above. Never review or comment on unchanged code.\n\
+- For EACH blocker listed above: if the delta does not credibly address it, that is a \
+P1 bullet under ## Blockers, prefixed [unaddressed].\n\
+- Flag ONLY regressions INTRODUCED by this delta: severity P0 or P1 (breaks \
+functionality, data loss, security hole, crash, wrong logic). A practical P2 directly \
+caused by the delta may be included.\n\
+- Do NOT raise style nits, refactors, new-scope improvements, or pre-existing issues. \
+No scores. No summary of what the PR as a whole does.\n\
+- If the delta looks like it does not address anything or is empty, emit \
+VERDICT: inconclusive.\n\n\
+## Output template (emit exactly this shape, nothing else)\n\n\
+VERDICT: clean | regressions | inconclusive\n\n\
+## Blockers\n\
+- [P0|P1|P2] path:line — regression introduced by this delta, or [unaddressed] blocker \
+(write \"- <none>\" when clean)\n\n\
+## Notes\n\
+- non-blocking observations about the delta (optional)",
+        pr_url = pr_url,
+        base_sha = base_sha,
+        head_sha = head_sha,
+        base = &base_sha[..base_sha.len().min(10)],
+        head = &head_sha[..head_sha.len().min(10)],
+        blockers = blockers_section,
+        diff = diff,
+    );
+
+    // The diff is inline, so no GitHub access is needed — but keep the same
+    // workspace-write sandbox the full review uses so the verifier can poke
+    // at surrounding code in the worktree when a hunk needs context.
+    let openrouter_key = resolve_openrouter_key().await.ok();
+    let extra_prefix = ["--search", "exec"];
+    let extra_suffix = [
+        "-s",
+        "workspace-write",
+        "-c",
+        "approval_policy=\"never\"",
+        "-c",
+        "sandbox_workspace_write.network_access=true",
+    ];
+    let cwd = resolve_codex_cwd(repo_path);
+    let mut output = run_codex_exec_once(
+        CodexBackend::LocalCli,
+        None,
+        &extra_prefix,
+        &extra_suffix,
+        &prompt,
+        &cwd,
+        DELTA_VERIFY_TIMEOUT_SECS,
+    )
+    .await;
+    if match &output {
+        Ok(o) => should_fallback_to_openrouter(o.success, &o.stdout),
+        Err(_) => true,
+    } {
+        if let Some(key) = openrouter_key.as_deref() {
+            log::warn!("[review] local Codex CLI delta-verify failed; falling back to OpenRouter");
+            output = run_codex_exec_once(
+                CodexBackend::OpenRouter,
+                Some(key),
+                &extra_prefix,
+                &extra_suffix,
+                &prompt,
+                &cwd,
+                DELTA_VERIFY_TIMEOUT_SECS,
+            )
+            .await;
+        }
+    }
+    let output = output?;
+    if !output.success {
+        return Err(format!(
+            "delta verify exited with {}: {}",
+            output.status_display,
+            trim_to(output.stderr.trim(), 600)
+        ));
+    }
+
+    // The verify took up to ten minutes. If the PR head moved while Codex was
+    // running, the verdict describes code that is no longer at head — discard
+    // it and let the caller's full-review fallback judge the new head.
+    let head_after = fetch_pr_head_sha(pr_url, repo_path).await?;
+    if head_after != head_sha {
+        return Err(format!(
+            "PR head moved during delta verify ({} -> {}); discarding the stale verdict",
+            &head_sha[..head_sha.len().min(10)],
+            &head_after[..head_after.len().min(10)]
+        ));
+    }
+
+    let (verdict, body) = parse_delta_verify_output(&output.stdout);
+    // Cross-check the verdict against the body in BOTH directions. A
+    // `regressions` verdict with no substantive bullets is notes (below); a
+    // `clean` verdict that nonetheless lists substantive blockers is a
+    // contradiction, and the blockers win.
+    if matches!(verdict, PrReviewVerdict::MergeNow) && has_substantive_blocker(&body) {
+        let mut markdown = body;
+        markdown.push_str("\nSamwise note: delta verifier said `clean` but listed substantive blocker bullets. Treating as `regressions` so the listed work routes to the fix funnel.");
+        return Ok(PrReviewResult {
+            verdict: PrReviewVerdict::FixIssues,
+            markdown,
+            requires_human: false,
+        });
+    }
+    // Pi rule: a regressions verdict with no substantive P0/P1 bullet is
+    // notes, not another cycle.
+    if matches!(verdict, PrReviewVerdict::FixIssues) && !has_substantive_blocker(&body) {
+        let mut markdown = body;
+        markdown.push_str("\nSamwise note: delta verifier said `regressions` but listed no substantive P0/P1 bullets. Treating as clean; the notes above ride along for the record.");
+        return Ok(PrReviewResult {
+            verdict: PrReviewVerdict::MergeNow,
+            markdown,
+            requires_human: false,
+        });
+    }
+    Ok(PrReviewResult {
+        verdict,
+        markdown: body,
+        requires_human: false,
     })
 }
 
@@ -1623,8 +2090,6 @@ pub async fn run_full_pr_review(
             pr_url
         ));
     }
-    let openrouter_key = resolve_openrouter_key().await?;
-
     let cwd = resolve_codex_cwd(repo_path);
     let tmp_path = std::env::temp_dir().join(format!("samwise-full-pr-review-{}", uuid_like()));
     tokio::fs::create_dir_all(&tmp_path)
@@ -1650,14 +2115,9 @@ pub async fn run_full_pr_review(
 
     let mut cmd = async_cmd("codex");
     cmd.args(["--search", "exec"]);
-    cmd.args(CODEX_PROVIDER_ARGS);
-    cmd.env(OPENROUTER_KEY_ENV, &openrouter_key);
+    apply_codex_backend(&mut cmd, CodexBackend::LocalCli, None);
     cmd.args([
         "--json",
-        "-m",
-        CODEX_MODEL,
-        "-c",
-        CODEX_REASONING_CONFIG,
         "--dangerously-bypass-approvals-and-sandbox",
         "-C",
     ])
@@ -2257,9 +2717,25 @@ fn normalize_pr_review_result(
     (PrReviewVerdict::Inconclusive, true, markdown)
 }
 
-fn has_substantive_blocker(markdown: &str) -> bool {
+/// True when the review body carries at least one blocker bullet that names
+/// real work. Placeholders (`<none>`) and verification-only notes ("CI could
+/// not be confirmed") do not count. The verdict path uses this to keep
+/// non-actionable reviews in Review; the auto-fix sweep uses it to avoid
+/// spending a fix cycle on a review that has nothing to fix.
+pub(crate) fn has_substantive_blocker(markdown: &str) -> bool {
     let blockers = markdown_section_lines(markdown, "Blockers");
     blockers.iter().any(|line| is_substantive_blocker(line))
+}
+
+/// The substantive bullets of a review's `## Blockers` section, one per line.
+/// Stamped onto the task context at auto-fix push time so the delta verifier
+/// can confirm the fixer actually addressed each one.
+pub(crate) fn substantive_blockers_section(markdown: &str) -> String {
+    markdown_section_lines(markdown, "Blockers")
+        .into_iter()
+        .filter(|line| is_substantive_blocker(line))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn is_substantive_blocker(raw: &str) -> bool {
