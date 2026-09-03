@@ -11860,6 +11860,48 @@ pub fn spawn_pr_review_task(
                         e
                     );
                 }
+
+                // 2026-09-03 hardening (replaces the #7 auto-chain): clean
+                // external verdicts park the card in Ready to Merge for the
+                // SAMCHECK sweep to merge (re-verify + gh pr merge --admin).
+                // The worker no longer spawns its own review-merge agent for
+                // these — that path died silently on pi timeouts (exit 143)
+                // and orphaned mergeable PRs (1506/1547 on 09-03). We stamp
+                // `awaiting_samcheck` (NOT "requested") so the worker's own
+                // review-merge sweep at the requested-key check skips it.
+                // Context-only PATCH here, while the card is still `review`;
+                // the status flip below PATCHes no context — no overwrite.
+                if matches!(result.verdict, review::PrReviewVerdict::MergeNow) {
+                    let mut ctx = task_context_object(&task_row);
+                    ctx.insert(
+                        REVIEW_MERGE_STATUS_KEY.to_string(),
+                        Value::String("awaiting_samcheck".to_string()),
+                    );
+                    ctx.insert(
+                        "samcheck_merge_requested_at".to_string(),
+                        Value::String(chrono::Utc::now().to_rfc3339()),
+                    );
+                    ctx.insert(REVIEW_MERGE_ERROR_KEY.to_string(), Value::Null);
+                    let _ = supabase::update_task(
+                        &config,
+                        &task_id,
+                        &serde_json::json!({
+                            "context": Value::Object(ctx),
+                            "updated_at": chrono::Utc::now().to_rfc3339(),
+                        }),
+                    )
+                    .await;
+                    log::info!(
+                        "[pr-review] external review clean; parked in Ready to Merge for samcheck: {}",
+                        pr_url
+                    );
+                    agent_comment(
+                        &config,
+                        &task_id,
+                        "Clean external verdict — parked in Ready to Merge. The samcheck sweep will re-verify and merge to main (admin).",
+                    )
+                    .await;
+                }
             }
         }
 
