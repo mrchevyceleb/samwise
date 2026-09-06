@@ -381,7 +381,7 @@
                         <input
                           value={settingsStore.value.llmVisionAdapterModel}
                           oninput={(e: any) => updateSetting('llmVisionAdapterModel', e.target.value)}
-                          placeholder="qwen3-vl-4b-instruct"
+                          placeholder="qwen/qwen3.8-27b"
                           style="padding: 6px 8px; background: var(--bg-primary); border: 1px solid var(--border-default); border-radius: 4px; color: var(--text-primary); font-size: 11px; font-family: var(--font-mono); outline: none;"
                         />
                       </div>

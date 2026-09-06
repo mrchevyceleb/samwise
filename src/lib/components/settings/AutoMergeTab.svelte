@@ -128,10 +128,9 @@
   </div>
 
   <div style="font-size: 12px; color: var(--text-secondary); line-height: 1.5;">
-    When auto-merge is off, Sam runs <code>$samwise-pr-review</code> via the Codex CLI on every new PR
-    and moves the card to <strong>Ready to Merge</strong> or <strong>Fixes Needed</strong> based on the verdict.
-    Cards you drag back from Fixes Needed to Review get re-reviewed automatically.
-    If Codex can't produce a verdict (rate limit, logged out, timeout), the card stays in Review
+    Auto-merge stays off. AutoSam-coded tickets already ran <code>/codex-fix</code> before the PR opened, so those cards go straight to <strong>Ready to Merge</strong>.
+    Slack <code>#review</code> cards still run <code>$samwise-pr-review</code> because they never coded here.
+    If Codex can't produce a verdict on a Slack review (rate limit, logged out, timeout), that card stays in Review
     and Sam posts the raw output as a comment.
   </div>
 
@@ -141,8 +140,8 @@
     onmouseleave={() => hovered = null}
   >
     <div>
-      <div style="font-size: 13px; font-weight: 600; color: var(--text-primary);">Auto-run $samwise-pr-review on new PRs</div>
-      <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">Disabled while auto-merge is on (auto-merge already runs its own Codex review).</div>
+      <div style="font-size: 13px; font-weight: 600; color: var(--text-primary);">Auto-run $samwise-pr-review on Slack #review cards</div>
+      <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">AutoSam-coded PRs skip this and go to Ready to Merge after /codex-fix. Disabled while auto-merge is on.</div>
     </div>
     <button
       onclick={togglePrReviewEnabled}

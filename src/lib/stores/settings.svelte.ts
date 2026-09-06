@@ -206,7 +206,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   llmProxyBackend: 'fireworks-glm-5.1',
   llmVisionAdapterEnabled: true,
   llmVisionAdapterUrl: 'http://localhost:1234/v1',
-  llmVisionAdapterModel: 'qwen3-vl-4b-instruct',
+  llmVisionAdapterModel: 'qwen/qwen3.8-27b',
 };
 
 // ---- Svelte 5 Runes State ----
