@@ -52,12 +52,11 @@ No rebuild was needed for the Kimi setup: the model/effort label is baked into `
 
 **Linux host requirement (Spark):** Codex's PR-review sandbox uses bubblewrap, which needs unprivileged user namespaces. Ubuntu 24.04 blocks these by default via AppArmor, which silently breaks `$samwise-pr-review` (every review returns INCONCLUSIVE and cards stick in Review). Fix is `kernel.apparmor_restrict_unprivileged_userns=0` (persisted in `/etc/sysctl.d/60-unprivileged-userns.conf`). The sandbox also needs network for `gh`, set via `[sandbox_workspace_write] network_access = true` in `~/.codex/config.toml` and the `-c sandbox_workspace_write.network_access=true` flag in `review.rs`.
 
-**Codex auth: OpenRouter, since 2026-08-08.** `$samwise-pr-review` runs the Codex CLI pinned to `openai/gpt-5.6-sol` at `xhigh` reasoning through OpenRouter, billed from `OPENROUTER_API_KEY` in Doppler `agent-one/prd`. `~/.codex/auth.json` is no longer on the path for reviews at all — the provider, model, and key are pinned per spawn in `src-tauri/src/commands/review.rs` (`CODEX_PROVIDER_ARGS`, `resolve_openrouter_key`). Full detail in `CLAUDE.md` → **PR review backend**.
+**Codex auth: local CLI first, OpenRouter fallback (2026-08-14).** Reviews spawn the host Codex CLI (`gpt-5.5`, `~/.codex/auth.json` ChatGPT plan). OpenRouter (`openai/gpt-5.6-sol`, Doppler `agent-one/prd` `OPENROUTER_API_KEY`) is only used if that local spawn dies or writes empty stdout. Full `$pr-review` stays local-only because it can merge. Full detail in `CLAUDE.md` → **PR review backend**.
 
-- The key is resolved per review (agent-one's env first, else Doppler) and set on the codex child only. It is deliberately NOT exported into agent-one's environment, because every spawned child — including the coding harness running model-authored commands — would inherit it.
-- Codex 0.144 dropped `wire_api = "chat"`, so any replacement provider must speak the Responses API.
-- The model slug needs the `openai/` prefix on OpenRouter; a bare `gpt-5.6-sol` is not a valid id there.
-- Changing the review model is a `CODEX_MODEL` edit plus a rebuild+deploy, not a `codex login`.
+- The OpenRouter key is resolved per fallback spawn (agent-one's env first, else Doppler) and set on that child only. It is deliberately NOT exported into agent-one's environment.
+- Codex 0.144 dropped `wire_api = "chat"`, so the OpenRouter fallback must speak the Responses API.
+- Changing the local review model is a `CODEX_MODEL` edit plus a rebuild+deploy.
 
 Superseded (do not restore on the basis of these): the ChatGPT subscription (`auth_mode = "chatgpt"`) that ran until 2026-08-08, and the 2026-08-05 raw-OpenAI-API-key experiment whose account sat at a $0 balance (`docs/CODEX-AUTH-API-KEY.md`, historical). The ChatGPT plan hit its usage limit on 2026-08-08, which is part of why reviews moved to per-token OpenRouter billing.
 

@@ -55,13 +55,7 @@ Slack route metadata also carries a signed task callback route when a shared cal
 - `callback_url = https://matt-assistant-production.up.railway.app/webhook/slack/samwise-task-callback?...`
 - `callback_secret = <shared secret>`
 
-AutoSam copies these fields onto Slack-created `ae_tasks`. The existing `notify_callback()` path then fires on task status transitions. `ASSISTANT-HUB` verifies `X-Samwise-Signature` and posts important lifecycle updates back into the original Slack thread:
-
-- PR created / Review status
-- Review approved
-- Fixes needed
-- Done
-- Failed
+AutoSam copies these fields onto Slack-created `ae_tasks`. The existing `notify_callback()` path then fires on task status transitions. `ASSISTANT-HUB` verifies `X-Samwise-Signature`. Slack thread updates are only posted for real blockers (`failed`). Board moves (PR up, review passed, fixes needed, done) stay on the board and do not ping the thread. The first Slack reply and the later contextual reply are unchanged.
 
 ## Workflow Tags
 
