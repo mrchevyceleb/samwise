@@ -2065,7 +2065,7 @@ async fn worker_loop(
         }
     }
 
-    // Sweep merged/closed PR worktrees on startup, and periodically thereafter.
+    // Sweep hook retained; destructive worktree cleanup stays disabled.
     // Tick is ~5s; 4320 ticks = 6h cadence.
     const SWEEP_TICKS: u64 = 4320;
     {
@@ -6367,36 +6367,9 @@ from Matt, stop without making changes and explain specifically what you need cl
         let _ = dev_server::kill_dev_server(h).await;
     }
 
-    // Worktree persists on disk. If the PR opened successfully, it lives until merged
-    // or closed (daily sweep reaps it then). If no PR materialized, the sweep treats it
-    // as orphaned after 48h and removes it.
+    // Worktree persists on disk. Destructive sweeping stays disabled.
     let _ = &main_repo_path; // kept for sweep-side use; silence unused-warning if any
     task_result
-}
-
-/// Resolve the main repo path for a linked worktree by asking git.
-/// `git -C <wt> rev-parse --git-common-dir` points at <main>/.git; the parent is the main repo.
-async fn main_repo_for_worktree(wt_str: &str) -> Option<String> {
-    let common_dir = run_git(&["rev-parse", "--git-common-dir"], wt_str)
-        .await
-        .ok()?;
-    let common_dir = common_dir.trim();
-    let abs = if std::path::Path::new(common_dir).is_absolute() {
-        std::path::PathBuf::from(common_dir)
-    } else {
-        std::path::PathBuf::from(wt_str).join(common_dir)
-    };
-    abs.parent().map(|p| p.to_string_lossy().into_owned())
-}
-
-async fn current_worktree_branch(wt_str: &str) -> Option<String> {
-    let branch = run_git(&["branch", "--show-current"], wt_str).await.ok()?;
-    let branch = branch.trim();
-    if branch.is_empty() {
-        None
-    } else {
-        Some(branch.to_string())
-    }
 }
 
 #[derive(Debug)]
@@ -7022,240 +6995,21 @@ async fn recover_stuck_tasks(config: &SupabaseConfig) -> usize {
     recovered
 }
 
-/// Collect short-task-id → status map so the sweep can identify failed /
-/// vanished tasks whose worktrees should be cleaned up immediately (not
-/// waiting for the 48h orphan rule).
-///
-/// Keyed by `short_task_id` because worktree directories and branch names
-/// use the short form, not the full UUID. Previously this was keyed by the
-/// full UUID, which silently made every lookup miss and sent every worktree
-/// down the "task row gone" branch — the sweep then deleted remote branches
-/// and GitHub auto-closed the still-open PRs attached to them.
-async fn worktree_task_info(
-    config: &SupabaseConfig,
-) -> std::collections::HashMap<String, WorktreeTaskInfo> {
-    let mut out = std::collections::HashMap::new();
-    let Ok(all) = supabase::fetch_tasks(config, None).await else {
-        return out;
-    };
-    if let Some(arr) = all.as_array() {
-        for t in arr {
-            let id = t
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let status = t
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let head_ref = task_context_string(t, "head_ref");
-            let info = WorktreeTaskInfo { status, head_ref };
-            if !id.is_empty() {
-                out.insert(short_task_id(&id), info.clone());
-            }
-            if let Some(short) = t
-                .get("context")
-                .and_then(|v| v.as_object())
-                .and_then(|c| c.get("orphan_short_id"))
-                .and_then(|v| v.as_str())
-                .and_then(valid_short_id)
-            {
-                out.insert(short, info);
-            }
-        }
-    }
-    out
-}
-
-async fn sweep_merged_worktrees() -> (usize, usize) {
-    sweep_worktrees_inner(None).await
-}
-
 async fn sweep_worktrees_with_config(config: &SupabaseConfig) -> (usize, usize) {
     sweep_worktrees_inner(Some(config)).await
 }
 
-async fn sweep_worktrees_inner(config: Option<&SupabaseConfig>) -> (usize, usize) {
-    let root = worktrees_root();
-    if tokio::fs::metadata(&root).await.is_err() {
-        return (0, 0);
-    }
-
-    // Fetch task status map once. Lets us identify failed or vanished tasks
-    // whose worktrees should be cleaned up immediately, and delete them
-    // without waiting for the 48h orphan rule to fire.
-    let task_statuses = match config {
-        Some(c) => worktree_task_info(c).await,
-        None => std::collections::HashMap::new(),
-    };
-
-    let mut removed = 0usize;
-    let mut kept = 0usize;
-    let mut touched_main_repos: std::collections::HashSet<String> = Default::default();
-
-    let Ok(mut repos) = tokio::fs::read_dir(&root).await else {
-        return (0, 0);
-    };
-    while let Ok(Some(repo_entry)) = repos.next_entry().await {
-        let repo_dir = repo_entry.path();
-        if !repo_dir.is_dir() {
-            continue;
-        }
-        let Ok(mut wts) = tokio::fs::read_dir(&repo_dir).await else {
-            continue;
-        };
-        while let Ok(Some(wt_entry)) = wts.next_entry().await {
-            let wt_path = wt_entry.path();
-            if !wt_path.is_dir() {
-                continue;
-            }
-            let wt_str = wt_path.to_string_lossy().into_owned();
-            let short_id = wt_path
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let Some(main_repo) = main_repo_for_worktree(&wt_str).await else {
-                kept += 1;
-                continue;
-            };
-            touched_main_repos.insert(main_repo.clone());
-            let current_branch = current_worktree_branch(&wt_str).await;
-            let task_match = task_statuses.get(&short_id);
-            let branch_candidates =
-                worktree_pr_head_candidates(&short_id, current_branch.as_deref(), task_match);
-
-            // Task-status-driven removal. If the task row is failed OR the task
-            // is gone entirely (but we have a task map to check against), nuke
-            // the worktree immediately — no reason to keep a worktree for a
-            // task Matt will never revisit.
-            let task_based_removal = match (config.is_some(), task_match) {
-                (true, Some(info)) if info.status == "failed" || info.status == "cancelled" => {
-                    Some(format!("task {}", info.status))
-                }
-                (true, None) if !task_statuses.is_empty() => Some("task row gone".to_string()),
-                _ => None,
-            };
-
-            // Always check PR state first. Even a task flagged failed or
-            // missing can have a PR Matt is reviewing — never kill the remote
-            // branch under an OPEN PR, because GitHub auto-closes it.
-            let mut pr_state: Option<(String, String)> = None;
-            for branch in &branch_candidates {
-                let pr_state_raw = async_cmd("gh")
-                    .args([
-                        "pr", "list", "--head", branch, "--state", "all", "--json", "state",
-                        "--limit", "1",
-                    ])
-                    .current_dir(&main_repo)
-                    .output()
-                    .await;
-
-                let branch_state: Option<String> = match pr_state_raw {
-                    Ok(out) if out.status.success() => {
-                        let body = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                        if body.contains("\"state\":\"OPEN\"") {
-                            Some("OPEN".into())
-                        } else if body.contains("\"state\":\"MERGED\"") {
-                            Some("MERGED".into())
-                        } else if body.contains("\"state\":\"CLOSED\"") {
-                            Some("CLOSED".into())
-                        } else if body == "[]" {
-                            Some("NONE".into())
-                        } else {
-                            None
-                        }
-                    }
-                    Ok(out) => {
-                        log::warn!(
-                            "[sweep] gh pr list failed for {}: {}",
-                            branch,
-                            String::from_utf8_lossy(&out.stderr).trim()
-                        );
-                        None
-                    }
-                    Err(e) => {
-                        log::warn!("[sweep] gh invocation failed for {}: {}", branch, e);
-                        None
-                    }
-                };
-
-                match branch_state.as_deref() {
-                    Some("OPEN") => {
-                        pr_state = Some((branch.clone(), "OPEN".to_string()));
-                        break;
-                    }
-                    Some("MERGED" | "CLOSED")
-                        if pr_state.as_ref().map(|(_, state)| state.as_str()) != Some("MERGED") =>
-                    {
-                        pr_state = branch_state.map(|state| (branch.clone(), state));
-                    }
-                    Some("NONE") if pr_state.is_none() => {
-                        pr_state = Some((branch.clone(), "NONE".to_string()));
-                    }
-                    Some(_) => {}
-                    None if pr_state.is_none() => {}
-                    None => {}
-                }
-            }
-            let pr_state_label = pr_state.as_ref().map(|(_, state)| state.as_str());
-
-            // Hard gate: an open PR always keeps the worktree + branch alive.
-            if pr_state_label == Some("OPEN") {
-                kept += 1;
-                continue;
-            }
-
-            let (should_remove, reason) = match (task_based_removal, pr_state_label) {
-                (_, Some("MERGED")) => (true, "PR merged".to_string()),
-                (_, Some("CLOSED")) => (true, "PR closed".to_string()),
-                (Some(r), _) => (true, r),
-                (None, Some("NONE")) => {
-                    let age_secs = wt_entry
-                        .metadata()
-                        .await
-                        .ok()
-                        .and_then(|m| m.modified().ok())
-                        .and_then(|t| t.elapsed().ok())
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    if age_secs > 48 * 3600 {
-                        (true, "orphan (no PR, >48h)".to_string())
-                    } else {
-                        (false, "no PR yet".to_string())
-                    }
-                }
-                _ => (false, "gh failed".to_string()),
-            };
-
-            if should_remove {
-                log::info!("[sweep] removing worktree {} ({})", wt_str, reason);
-                let _ = run_git(&["worktree", "remove", "--force", &wt_str], &main_repo).await;
-                for branch in &branch_candidates {
-                    let _ = run_git(&["branch", "-D", branch], &main_repo).await;
-                }
-                // Only delete the remote branch when we're sure no open PR is
-                // attached. The open-PR guard above already returned early,
-                // and PR-merged / PR-closed states mean the branch is already
-                // detached from a live review.
-                for branch in &branch_candidates {
-                    let _ = run_git(&["push", "origin", "--delete", branch], &main_repo).await;
-                }
-                let _ = tokio::fs::remove_dir_all(&wt_path).await;
-                removed += 1;
-            } else {
-                kept += 1;
-            }
-        }
-    }
-
-    // Drop any dangling worktree entries whose directories went away outside our flow.
-    for main_repo in touched_main_repos {
-        let _ = run_git(&["worktree", "prune"], &main_repo).await;
-    }
-
-    (removed, kept)
+async fn sweep_worktrees_inner(_config: Option<&SupabaseConfig>) -> (usize, usize) {
+    // 2026-09-05: this sweeper listed children of real worktrees as worktrees,
+    // then `git worktree remove --force`, `git branch -D`, `git push origin
+    // --delete`, and `remove_dir_all`. That deleted Christina's partner
+    // command-center source tree and attempted remote branch deletion.
+    // Destructive sweeping stays off until eligibility is independently
+    // proven against AutoSam-owned registered roots only.
+    log::warn!(
+        "[sweep] destructive worktree sweeping disabled after 2026-09-05 data loss; no git or filesystem mutations"
+    );
+    (0, 0)
 }
 
 // Chat message processing has been moved to commands/chat.rs (direct API, no worker dependency)
