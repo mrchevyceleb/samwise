@@ -11376,6 +11376,27 @@ pub fn spawn_pr_review_task(
             return;
         }
 
+        let initial_task = match supabase::fetch_task(&config, &task_id).await {
+            Ok(Some(task)) => task,
+            _ => {
+                mark_pr_review_finished(&config, &task_id, Some("Could not read review task")).await;
+                return;
+            }
+        };
+        let external_review = task_is_external_pr_review_request(&initial_task);
+        // Capture BEFORE either review engine runs. A clean verdict cannot
+        // approve whatever happened to be pushed while the reviewer worked.
+        let reviewed_head = if external_review {
+            match review::fetch_pr_head_sha(&pr_url, &repo_path).await {
+                Ok(head) => Some(head),
+                Err(e) => {
+                    mark_pr_review_finished(&config, &task_id, Some(&e)).await;
+                    agent_comment(&config, &task_id, &format!("Cannot pin PR head: {}. Leaving in Review.", e)).await;
+                    return;
+                }
+            }
+        } else { None };
+
         // Pi-style delta verify: a card arriving here straight out of an
         // auto-fix push gets a scoped verify of just the fix delta, not a
         // full cold re-review of the whole PR.
@@ -11530,11 +11551,9 @@ pub fn spawn_pr_review_task(
             }
         };
 
-        let still_in_review = supabase::fetch_task(&config, &task_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|task| {
+        let task_before_verdict = supabase::fetch_task(&config, &task_id)
+            .await.ok().flatten();
+        let still_in_review = task_before_verdict.as_ref().map(|task| {
                 task.get("status").and_then(|v| v.as_str()) == Some("review")
                     && !task_is_on_hold(&task)
             })
@@ -11546,6 +11565,22 @@ pub fn spawn_pr_review_task(
             );
             mark_pr_review_finished(&config, &task_id, None).await;
             return;
+        }
+
+        let mut external_approval = None;
+        if external_review && matches!(result.verdict, review::PrReviewVerdict::MergeNow) {
+            let body = format!("**AutoSam review**\n\nNo blockers found in reviewed commit {}.\n\n{}",
+                reviewed_head.as_deref().unwrap_or_default(), result.markdown.trim());
+            match review::approve_external_review(&pr_url, &repo_path,
+                reviewed_head.as_deref().unwrap_or_default(), &body).await {
+                Ok(id) => external_approval = Some(id),
+                Err(e) => {
+                    mark_pr_review_finished(&config, &task_id, Some(&e)).await;
+                    agent_comment(&config, &task_id, &format!(
+                        "Code review found no blockers, but GitHub approval was not confirmed: {}. Card stays in Review; retry after resolving this.", e)).await;
+                    return;
+                }
+            }
         }
 
         // One-line headline so Matt can see the verdict at a glance without
@@ -11570,116 +11605,44 @@ pub fn spawn_pr_review_task(
             agent_comment(&config, &task_id, &result.markdown).await;
         }
 
-        // Mirror the finished review onto the GitHub PR itself when the card
-        // came from Slack: an external PR has no merge step as the deliverable,
-        // so the review IS the product and must land where the requester can
-        // see it. (2026-08-27 fix: three Slack reviews that day landed
-        // board-only and samcheck had to relay each one by hand.)
-        if let Some(task_row) = supabase::fetch_task(&config, &task_id)
-            .await
-            .ok()
-            .flatten()
-        {
-            let is_external_review =
-                task_row.get("source").and_then(|v| v.as_str()) == Some("slack")
-                    || task_row
-                        .get("title")
-                        .and_then(|v| v.as_str())
-                        .map(|t| t.starts_with("Review PR #"))
-                        .unwrap_or(false);
-            if is_external_review && !pr_url.is_empty() {
-                let verdict_line = match result.verdict {
-                    review::PrReviewVerdict::MergeNow => {
-                        "✅ Verdict: no blockers — ready to merge".to_string()
-                    }
-                    review::PrReviewVerdict::FixIssues => {
-                        "❌ Verdict: fixes requested — blockers below".to_string()
-                    }
-                    review::PrReviewVerdict::Inconclusive => {
-                        "⚠️ Verdict: inconclusive — needs a human look".to_string()
-                    }
-                };
-                let mut pr_body = format!("**AutoSam review**\n\n{}", verdict_line);
-                if !result.markdown.trim().is_empty() {
-                    pr_body.push_str("\n\n");
-                    pr_body.push_str(result.markdown.trim());
-                }
-                pr_body.push('\n');
-                if let Err(e) = async_cmd("gh")
-                    .args(["pr", "comment", &pr_url, "--body", &pr_body])
-                    .output()
-                    .await
-                {
-                    log::warn!(
-                        "[pr-review] failed to mirror review onto external PR {}: {}",
-                        pr_url,
-                        e
-                    );
-                }
-
-                // 2026-09-02: external Slack reviews with a clean verdict now
-                // auto-chain into the Review & Merge pipeline (the same path
-                // the board button uses) so the PR actually merges instead of
-                // parking in approved forever. The sweep re-verifies before
-                // merging --admin; blocked verdicts park in fixes_needed.
-                if matches!(&result.verdict, review::PrReviewVerdict::MergeNow) {
-                    let mut merged_ctx = task_row
-                        .get("context")
-                        .cloned()
-                        .unwrap_or_else(|| serde_json::json!({}));
-                    if !merged_ctx.is_object() {
-                        merged_ctx = serde_json::json!({});
-                    }
-                    merged_ctx[REVIEW_MERGE_STATUS_KEY] = serde_json::json!("requested");
-                    merged_ctx["samwise_review_merge_requested_at"] =
-                        serde_json::json!(chrono::Utc::now().to_rfc3339());
-                    match supabase::update_task(
-                        &config,
-                        &task_id,
-                        &serde_json::json!({
-                            "context": merged_ctx,
-                            "updated_at": chrono::Utc::now().to_rfc3339(),
-                        }),
-                    )
-                    .await
-                    {
-                        Ok(_) => {
-                            log::info!(
-                                "[pr-review] external review clean; queued Review & Merge for {}",
-                                pr_url
-                            );
-                            agent_comment(
-                                &config,
-                                &task_id,
-                                "Clean external review — auto-queuing Review & Merge (verify, merge --admin, deploy).",
-                            )
-                            .await;
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "[pr-review] failed to queue Review & Merge for external PR {}: {}",
-                                pr_url,
-                                e
-                            );
-                        }
-                    }
-                }
+        // Non-clean reviews still publish their findings, but never approve.
+        if external_review && external_approval.is_none() && !pr_url.is_empty() {
+            let pr_body = format!("**AutoSam review**\n\n{}\n\n{}", headline, result.markdown.trim());
+            match async_cmd("gh").args(["pr", "comment", &pr_url, "--body", &pr_body])
+                .output().await {
+                Ok(out) if out.status.success() => {},
+                _ => agent_comment(&config, &task_id,
+                    "Could not publish the review to GitHub. Findings remain on this card.").await,
             }
         }
 
         match result.verdict {
             review::PrReviewVerdict::MergeNow => {
-                mark_pr_review_finished(&config, &task_id, None).await;
+                if !external_review {
+                    mark_pr_review_finished(&config, &task_id, None).await;
+                }
+                let mut patch = serde_json::json!({
+                    "status": "approved", "completed_at": Value::Null,
+                    "worker_id": Value::Null, "claimed_at": Value::Null,
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                });
+                if let Some(approval_id) = external_approval {
+                    // Reuse the task checked immediately before submission. Persist
+                    // completion, receipt and approved status in the same guarded write.
+                    let mut ctx = task_context_object(task_before_verdict.as_ref().unwrap());
+                    ctx.insert(PR_REVIEW_STATUS_KEY.into(), serde_json::json!("succeeded"));
+                    ctx.insert(PR_REVIEW_COMPLETED_AT_KEY.into(), serde_json::json!(chrono::Utc::now().to_rfc3339()));
+                    ctx.remove(PR_REVIEW_ERROR_KEY);
+                    ctx.insert(REVIEW_MERGE_STATUS_KEY.into(), serde_json::json!("awaiting_samcheck"));
+                    ctx.insert("github_approval_id".into(), serde_json::json!(approval_id));
+                    ctx.insert("github_approval_head".into(), serde_json::json!(reviewed_head));
+                    ctx.insert(REVIEW_MERGE_ERROR_KEY.into(), Value::Null);
+                    // A previous request is not permission to merge this external review.
+                    ctx.remove(MERGE_DEPLOY_STATUS_KEY);
+                    patch["context"] = Value::Object(ctx);
+                }
                 let updated = supabase::update_task_if_status_not_held(
-                    &config,
-                    &task_id,
-                    "review",
-                    &serde_json::json!({
-                        "status": "approved",
-                        "worker_id": Value::Null,
-                        "claimed_at": Value::Null,
-                        "updated_at": chrono::Utc::now().to_rfc3339(),
-                    }),
+                    &config, &task_id, "review", &patch,
                 )
                 .await
                 .ok()
@@ -11709,7 +11672,7 @@ pub fn spawn_pr_review_task(
                             .await.ok()
                             .and_then(|s| serde_json::from_str(&s).ok())
                     };
-                    let merge_on_approved = settings_val
+                    let merge_on_approved = !external_review && settings_val
                         .as_ref()
                         .and_then(|s| s.get("autoMergeOnApproved"))
                         .and_then(|v| v.as_bool())
@@ -11812,6 +11775,8 @@ pub fn spawn_pr_review_task(
                 }
                 notify_callback(&config, &task_id, "fixes_needed", Some(&pr_url), None);
 
+                if external_review { return; }
+
                 // Kick the auto-fix loop if enabled, not flagged REQUIRES_HUMAN,
                 // and we're under the cycle cap. Runs detached so this callback
                 // returns fast. That path fires its own telegram on the
@@ -11838,6 +11803,12 @@ pub fn spawn_pr_review_task(
                     None,
                 )
                 .await;
+
+                if external_review {
+                    // No actionable verdict is not permission to edit an external PR.
+                    // The normal review sweep retries inconclusive reviews later.
+                    return;
+                }
 
                 // Treat like FixIssues: move to fixes_needed and re-fire
                 // NOTE: must move to fixes_needed (not in_progress) because
@@ -19398,6 +19369,9 @@ async fn maybe_spawn_auto_fix(
             task_id,
             current_status
         );
+        return;
+    }
+    if latest_task.as_ref().map(task_is_external_pr_review_request).unwrap_or(false) {
         return;
     }
     let cycle_count = latest_task
