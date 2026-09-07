@@ -1334,15 +1334,103 @@ pub async fn gh_pr_approve(pr_url: &str, repo_path: &str) -> Result<(), String> 
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         // Non-fatal: some repos don't require reviews, and the merge itself
         // will fail if a review truly is required and this somehow didn't stick.
-        log::warn!(
-            "[review] gh pr review --approve returned non-zero (non-fatal). stderr={} stdout={}",
-            stderr,
-            stdout
-        );
+        return Err(format!("GitHub approval rejected: {} {}", stderr, stdout));
     } else {
         log::info!("[review] posted APPROVED review on {}", pr_url);
     }
     Ok(())
+}
+
+/// Submit a real approval against the head that was reviewed, never a newly
+/// pushed head. Use Matt's saved gh account, isolated to these child processes.
+/// An inherited author/bot GH_TOKEN must not silently select the reviewer.
+pub async fn approve_external_review(
+    pr_url: &str,
+    repo_path: &str,
+    reviewed_head: &str,
+    body: &str,
+) -> Result<i64, String> {
+    if !is_safe_pr_url(pr_url) || reviewed_head.len() != 40
+        || !reviewed_head.bytes().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err("Invalid PR URL or reviewed commit".to_string());
+    }
+    let token_out = async_cmd("gh")
+        .args(["auth", "token", "--hostname", "github.com", "--user", "mrchevyceleb"])
+        .env_remove("GH_TOKEN").env_remove("GITHUB_TOKEN")
+        .kill_on_drop(true).output();
+    let token_out = tokio::time::timeout(Duration::from_secs(30), token_out)
+        .await.map_err(|_| "Reviewer credential lookup timed out")?
+        .map_err(|_| "Could not read Matt's saved GitHub credential")?;
+    let token = String::from_utf8_lossy(&token_out.stdout).trim().to_string();
+    if !token_out.status.success() || token.is_empty() {
+        return Err("Matt's saved GitHub credential is unavailable; approval not posted".into());
+    }
+    let slug = pr_url_owner_repo(pr_url).ok_or("Invalid GitHub PR")?;
+    let number = pr_url.trim_end_matches('/').rsplit('/').next().ok_or("Missing PR number")?;
+    let endpoint = format!("repos/{}/pulls/{}", slug, number);
+    let api = |args: Vec<String>| {
+        let mut cmd = async_cmd("gh");
+        cmd.args(args).current_dir(repo_path).env("GH_TOKEN", &token)
+            .env_remove("GITHUB_TOKEN").kill_on_drop(true);
+        cmd
+    };
+    let mut read = api(vec!["api".into(), endpoint.clone()]);
+    let out = tokio::time::timeout(Duration::from_secs(30), read.output())
+        .await.map_err(|_| "PR read timed out")?.map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err("Could not confirm PR state using Matt's credential".into());
+    }
+    let pr: Value = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
+    if pr["state"] != "open" || pr["draft"] != false || pr["head"]["sha"] != reviewed_head {
+        return Err("PR closed, became a draft, or changed head during review; review again".into());
+    }
+    if pr["user"]["login"].as_str().map(|s| s.eq_ignore_ascii_case("mrchevyceleb")).unwrap_or(true) {
+        return Err("Matt cannot approve his own PR; a different reviewer is required".into());
+    }
+    // The REST equivalent of gh pr review --approve also accepts commit_id.
+    // Pinning the event prevents a push between the read and POST from gaining
+    // an approval for code the reviewer never saw.
+    let mut post = api(vec!["api".into(), format!("{}/reviews", endpoint),
+        "--method".into(), "POST".into(), "--input".into(), "-".into()]);
+    post.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "event": "APPROVE", "commit_id": reviewed_head, "body": body,
+    })).map_err(|e| e.to_string())?;
+    let submission = async {
+        use tokio::io::AsyncWriteExt;
+        let mut child = post.spawn().map_err(|e| e.to_string())?;
+        let mut input = child.stdin.take().ok_or("Missing review stdin")?;
+        input.write_all(&payload).await.map_err(|e| e.to_string())?;
+        drop(input);
+        let out = child.wait_with_output().await.map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(format!("GitHub approval rejected: {}",
+                trim_to(String::from_utf8_lossy(&out.stderr).trim(), 500)));
+        }
+        let receipt: Value = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
+        if receipt["state"] != "APPROVED" || receipt["commit_id"] != reviewed_head
+            || receipt["user"]["login"].as_str() != Some("mrchevyceleb")
+        {
+            return Err("GitHub did not confirm Matt's approval on the reviewed commit".into());
+        }
+        receipt["id"].as_i64().filter(|id| *id > 0).ok_or("Missing approval ID".into())
+    };
+    let approval_id = tokio::time::timeout(Duration::from_secs(30), submission).await
+        .map_err(|_| "GitHub approval timed out; check reviews before retrying".to_string())??;
+    let mut read_after = api(vec!["api".into(), endpoint]);
+    let out = tokio::time::timeout(Duration::from_secs(30), read_after.output())
+        .await.map_err(|_| "Approval submitted, but final PR head check timed out")?
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err("Approval submitted, but final PR state could not be confirmed".into());
+    }
+    let current: Value = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
+    if current["state"] != "open" || current["draft"] != false || current["head"]["sha"] != reviewed_head {
+        return Err("PR changed during approval submission; card needs a fresh review".into());
+    }
+    Ok(approval_id)
 }
 
 pub async fn gh_merge(pr_url: &str, repo_path: &str, head_sha: &str) -> Result<(), String> {
