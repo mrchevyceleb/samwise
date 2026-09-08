@@ -2465,6 +2465,7 @@ async fn worker_loop(
                     None
                 };
             sweep_pr_review_queue(&config, &settings).await;
+            sweep_external_review_merges(&config).await;
         }
 
         // Re-fire auto-fix on `fixes_needed` cards idle for 8+ min. Fills the
@@ -11260,6 +11261,9 @@ async fn mark_pr_review_running(config: &SupabaseConfig, task_id: &str) -> bool 
             PR_REVIEW_STATUS_KEY.to_string(),
             Value::String("running".to_string()),
         );
+        // A new FIX/inconclusive review must never inherit an earlier approval.
+        context.remove("github_approval_id");
+        context.remove("github_approval_head");
         context.insert(
             PR_REVIEW_STARTED_AT_KEY.to_string(),
             Value::String(started_at),
@@ -11633,11 +11637,11 @@ pub fn spawn_pr_review_task(
                     ctx.insert(PR_REVIEW_STATUS_KEY.into(), serde_json::json!("succeeded"));
                     ctx.insert(PR_REVIEW_COMPLETED_AT_KEY.into(), serde_json::json!(chrono::Utc::now().to_rfc3339()));
                     ctx.remove(PR_REVIEW_ERROR_KEY);
-                    ctx.insert(REVIEW_MERGE_STATUS_KEY.into(), serde_json::json!("awaiting_samcheck"));
+                    ctx.insert(REVIEW_MERGE_STATUS_KEY.into(), serde_json::json!("awaiting_checks"));
                     ctx.insert("github_approval_id".into(), serde_json::json!(approval_id));
                     ctx.insert("github_approval_head".into(), serde_json::json!(reviewed_head));
                     ctx.insert(REVIEW_MERGE_ERROR_KEY.into(), Value::Null);
-                    // A previous request is not permission to merge this external review.
+                    // External reviews use their own head-pinned, staging-only continuation.
                     ctx.remove(MERGE_DEPLOY_STATUS_KEY);
                     patch["context"] = Value::Object(ctx);
                 }
@@ -11734,6 +11738,11 @@ pub fn spawn_pr_review_task(
                         }
                     }
                     notify_callback(&config, &task_id, "approved", Some(&pr_url), None);
+                    if external_review {
+                        agent_comment(&config, &task_id,
+                            "GitHub approval confirmed. Keeping this card in Ready to Merge while checks run. A behind branch will be updated and reviewed again before squash merge; Done requires a successful staging workflow.").await;
+                        return;
+                    }
                     if merge_on_approved {
                         send_terminal_telegram(
                             &config,
@@ -13059,6 +13068,10 @@ pub async fn sweep_merge_deploy_requests(config: &SupabaseConfig) {
     };
     let Some(arr) = tasks.as_array() else { return };
 
+    // External review cards never enter the generic deployment planner.
+    let filtered: Vec<Value> = arr.iter().filter(|t| !external_staging_task(t)).cloned().collect();
+    let arr = &filtered;
+
     // Pre-flight: if Matt requested Merge + Deploy on 2+ PRs in the same repo
     // (e.g. clearing a morning queue), have Sam scan the diffs once for
     // dependency / file-collision concerns before any merge starts. Result is
@@ -13593,6 +13606,8 @@ async fn start_merge_deploy_task(
     start_comment: &str,
     expected_head_sha: Option<String>,
 ) {
+    if external_staging_task(&task) { return; }
+
     let task_id = task
         .get("id")
         .and_then(|v| v.as_str())
@@ -16799,6 +16814,30 @@ mod merge_deploy_tests {
     }
 
     #[test]
+    fn external_merge_requires_clean_approval_and_unheld_card() {
+        let clean = serde_json::json!({
+            "status": "approved", "source": "slack", "title": "Review PR 123",
+            "pr_url": "https://github.com/R-Link-LLC/r-link-studio-rebuild/pull/123",
+            "context": {PR_REVIEW_STATUS_KEY: "succeeded", "github_approval_id": 42,
+                "github_approval_head": "a".repeat(40)}
+        });
+        assert!(external_merge_candidate(&clean));
+        for status in ["review", "fixes_needed", "done", "cancelled"] {
+            let mut task = clean.clone(); task["status"] = serde_json::json!(status);
+            assert!(!external_merge_candidate(&task), "{} must stay held", status);
+        }
+        let mut task = clean.clone(); task["on_hold"] = serde_json::json!(true);
+        assert!(!external_merge_candidate(&task));
+        let mut task = clean.clone(); task["context"]["github_approval_id"] = Value::Null;
+        assert!(!external_merge_candidate(&task), "comment-only is not approval");
+        let mut task = clean.clone(); task["context"][PR_REVIEW_STATUS_KEY] = serde_json::json!("failed");
+        assert!(!external_merge_candidate(&task));
+        let mut task = clean.clone(); task["context"][MERGE_DEPLOY_STATUS_KEY] = serde_json::json!("running");
+        assert!(external_merge_candidate(&task), "legacy stamps must not hijack staging continuation");
+        assert!(external_staging_task(&task));
+    }
+
+    #[test]
     fn human_ops_blocked_tasks_skip_pr_review_without_explicit_flag() {
         let task = serde_json::json!({
             "context": {
@@ -17984,6 +18023,110 @@ fn stale_in_progress_pr_card_for_reconcile(task: &Value) -> bool {
         > chrono::Duration::seconds(MERGED_PR_IN_PROGRESS_RECONCILE_SECS)
 }
 
+fn external_staging_task(task: &Value) -> bool {
+    task_is_external_pr_review_request(task)
+        && review::external_staging_repo(task["pr_url"].as_str().unwrap_or(""))
+}
+
+fn external_merge_monitor_candidate(task: &Value) -> bool {
+    external_staging_task(task) && !task_is_on_hold(task)
+        && matches!(task["status"].as_str(), Some("approved" | "review" | "fixes_needed"))
+        && pr_review_context_status(task) != Some("running")
+}
+
+fn external_merge_candidate(task: &Value) -> bool {
+    external_merge_monitor_candidate(task)
+        && task["status"] == "approved"
+        && pr_review_context_status(task) == Some("succeeded")
+        && task["context"]["github_approval_id"].as_i64().unwrap_or(0) > 0
+        && task["context"]["github_approval_head"].as_str().map(|s| s.len() == 40).unwrap_or(false)
+        && review::external_staging_repo(task["pr_url"].as_str().unwrap_or(""))
+}
+
+/// Poll clean external reviews without taking over the author's checkout or
+/// invoking the legacy deploy planner. The repo's main push deploys staging.
+async fn sweep_external_review_merges(config: &SupabaseConfig) {
+    let Ok(tasks) = supabase::fetch_tasks(config, None).await else { return };
+    let Some(rows) = tasks.as_array() else { return };
+    let mut by_repo: HashMap<String, Vec<String>> = HashMap::new();
+    for task in rows.iter().filter(|task| external_merge_monitor_candidate(task)) {
+        let repo = task["repo_path"].as_str().unwrap_or("");
+        let id = task["id"].as_str().unwrap_or("");
+        if !repo.is_empty() && !id.is_empty() {
+            by_repo.entry(repo.to_string()).or_default().push(id.to_string());
+        }
+    }
+    for (repo, ids) in by_repo {
+        let Ok(guard) = merge_deploy_lock_for(&repo).try_lock_owned() else { continue };
+        let config = config.clone();
+        tokio::spawn(async move {
+            let _guard = guard;
+            // Poll every card under one repo lock. A pending/FIX first card must
+            // not monopolize each sweep and starve all ready siblings forever.
+            for id in ids { advance_external_card(&config, &id).await; }
+        });
+    }
+}
+
+async fn advance_external_card(config: &SupabaseConfig, id: &str) {
+    // Recheck manual holds/verdicts after acquiring the existing repo lock.
+    let Ok(Some(task)) = supabase::fetch_task(&config, &id).await else { return };
+    if !external_merge_monitor_candidate(&task) { return; }
+    let pr = task["pr_url"].as_str().unwrap_or("");
+    let head = if external_merge_candidate(&task) { task["context"]["github_approval_head"].as_str().unwrap_or("") } else { "" };
+    let result = review::advance_external_merge(pr, task["repo_path"].as_str().unwrap_or(""),
+        head, task["context"]["github_approval_id"].as_i64().unwrap_or(0), || async {
+            supabase::fetch_task(&config, &id).await.ok().flatten().map(|live|
+                external_merge_candidate(&live) && live["pr_url"] == pr
+                    && live["context"]["github_approval_head"] == head
+                    && live["context"]["github_approval_id"] == task["context"]["github_approval_id"]
+            ).unwrap_or(false)
+        }).await;
+    let Ok(Some(latest)) = supabase::fetch_task(&config, &id).await else { return };
+    if !external_merge_monitor_candidate(&latest) || latest["pr_url"] != pr { return; }
+    let closing = matches!(result, Ok(review::ExternalMergeProgress::Staged | review::ExternalMergeProgress::Closed));
+    if !closing && (!external_merge_candidate(&latest) || latest["context"]["github_approval_head"] != head) { return; }
+    let mut context = task_context_object(&latest);
+    let (status, state, note) = match result {
+        Ok(review::ExternalMergeProgress::ReviewAgain) => {
+            context.remove("github_approval_id");
+            context.remove("github_approval_head");
+            context.insert(PR_REVIEW_STATUS_KEY.into(), serde_json::json!("pending"));
+            context.remove(PR_REVIEW_STARTED_AT_KEY);
+            context.remove(PR_REVIEW_COMPLETED_AT_KEY);
+            context.remove(PR_REVIEW_ERROR_KEY);
+            ("review", "review_again", "PR head changed or was updated from main. Fresh review and approval required before merge.".to_string())
+        }
+        Ok(review::ExternalMergeProgress::Closed) =>
+            ("failed", "closed", "PR was closed without merging; no deployment requested.".into()),
+        Ok(review::ExternalMergeProgress::Staged) =>
+            ("done", "staged", "PR is merged and its exact merge commit passed the staging workflow. No production deployment requested.".into()),
+        Ok(review::ExternalMergeProgress::Merged) =>
+            ("approved", "merged", "Squash merge confirmed. Keeping the card until its staging workflow succeeds.".into()),
+        Ok(review::ExternalMergeProgress::Waiting(note)) => ("approved", "waiting", note),
+        Err(error) => ("approved", "blocked", error),
+    };
+    // Only write/comment on a changed outcome; pending CI must not flood the card.
+    if latest["context"]["external_merge_note"] == note && latest["status"] == status { return; }
+    context.remove(MERGE_DEPLOY_STATUS_KEY);
+    context.insert("external_merge_note".into(), serde_json::json!(note));
+    context.insert("external_merge_status".into(), serde_json::json!(state));
+    context.insert(REVIEW_MERGE_STATUS_KEY.into(), serde_json::json!(state));
+    let mut patch = serde_json::json!({
+        "status": status, "context": context,
+        "completed_at": if status == "done" { serde_json::json!(chrono::Utc::now().to_rfc3339()) } else { Value::Null },
+        "updated_at": chrono::Utc::now().to_rfc3339(),
+        "worker_id": Value::Null, "claimed_at": Value::Null,
+    });
+    if status == "review" { patch["last_pr_review_at"] = Value::Null; }
+    let updated = supabase::update_task_if_status_not_held(&config, &id, latest["status"].as_str().unwrap_or("approved"), &patch)
+        .await.ok().and_then(|v| v.as_array().map(|a| !a.is_empty())).unwrap_or(false);
+    if updated {
+        agent_comment(&config, &id, &note).await;
+        if status == "done" { notify_callback(&config, &id, "done", Some(pr), None); }
+    }
+}
+
 pub async fn sweep_pr_merged_cards(config: &SupabaseConfig) {
     // Candidate statuses: any state where the card is "waiting on Matt" but
     // GitHub could have moved on. `review` is in scope for the case where
@@ -17997,6 +18140,11 @@ pub async fn sweep_pr_merged_cards(config: &SupabaseConfig) {
     let Some(arr) = tasks.as_array() else { return };
 
     for task in arr {
+        // These cards are closed by the read-only staging workflow check above,
+        // never by the generic planner (which can run production deploy commands).
+        if external_staging_task(task) {
+            continue;
+        }
         let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("");
         // A full `$pr-review` owns its own merge+deploy and can be quiet for a
         // long post-merge deploy, so don't let this generic reconciler fire a
@@ -20764,6 +20912,8 @@ pub async fn sweep_review_merge_requests(config: &SupabaseConfig) {
         .unwrap_or_else(|| arr.clone());
 
     for task in arr {
+        if external_staging_task(task) { continue; }
+
         let task_id = task
             .get("id")
             .and_then(|v| v.as_str())

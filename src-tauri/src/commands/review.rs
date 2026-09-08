@@ -1341,6 +1341,21 @@ pub async fn gh_pr_approve(pr_url: &str, repo_path: &str) -> Result<(), String> 
     Ok(())
 }
 
+async fn external_reviewer_token() -> Result<String, String> {
+    let token_out = async_cmd("gh")
+        .args(["auth", "token", "--hostname", "github.com", "--user", "mrchevyceleb"])
+        .env_remove("GH_TOKEN").env_remove("GITHUB_TOKEN")
+        .kill_on_drop(true).output();
+    let token_out = tokio::time::timeout(Duration::from_secs(30), token_out)
+        .await.map_err(|_| "Reviewer credential lookup timed out")?
+        .map_err(|_| "Could not read Matt's saved GitHub credential")?;
+    let token = String::from_utf8_lossy(&token_out.stdout).trim().to_string();
+    if !token_out.status.success() || token.is_empty() {
+        return Err("Matt's saved GitHub credential is unavailable; approval not posted".into());
+    }
+    Ok(token)
+}
+
 /// Submit a real approval against the head that was reviewed, never a newly
 /// pushed head. Use Matt's saved gh account, isolated to these child processes.
 /// An inherited author/bot GH_TOKEN must not silently select the reviewer.
@@ -1355,17 +1370,7 @@ pub async fn approve_external_review(
     {
         return Err("Invalid PR URL or reviewed commit".to_string());
     }
-    let token_out = async_cmd("gh")
-        .args(["auth", "token", "--hostname", "github.com", "--user", "mrchevyceleb"])
-        .env_remove("GH_TOKEN").env_remove("GITHUB_TOKEN")
-        .kill_on_drop(true).output();
-    let token_out = tokio::time::timeout(Duration::from_secs(30), token_out)
-        .await.map_err(|_| "Reviewer credential lookup timed out")?
-        .map_err(|_| "Could not read Matt's saved GitHub credential")?;
-    let token = String::from_utf8_lossy(&token_out.stdout).trim().to_string();
-    if !token_out.status.success() || token.is_empty() {
-        return Err("Matt's saved GitHub credential is unavailable; approval not posted".into());
-    }
+    let token = external_reviewer_token().await?;
     let slug = pr_url_owner_repo(pr_url).ok_or("Invalid GitHub PR")?;
     let number = pr_url.trim_end_matches('/').rsplit('/').next().ok_or("Missing PR number")?;
     let endpoint = format!("repos/{}/pulls/{}", slug, number);
@@ -1431,6 +1436,123 @@ pub async fn approve_external_review(
         return Err("PR changed during approval submission; card needs a fresh review".into());
     }
     Ok(approval_id)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ExternalMergeProgress {
+    ReviewAgain,
+    Waiting(String),
+    Merged,
+    Staged,
+    Closed,
+}
+
+/// Only these repositories have the verified main -> staging workflow contract.
+/// Other repositories keep their existing explicit merge/deploy path.
+pub fn external_staging_repo(pr_url: &str) -> bool {
+    matches!(pr_url_owner_repo(pr_url).as_deref(),
+        Some("R-Link-LLC/r-link-studio-rebuild" | "R-Link-LLC/operly"))
+}
+
+async fn external_gh(token: &str, repo_path: &str, args: &[&str]) -> Result<std::process::Output, String> {
+    let mut cmd = async_cmd("gh");
+    cmd.args(args).current_dir(repo_path).env("GH_TOKEN", token)
+        .env_remove("GITHUB_TOKEN").env_remove("GH_FORCE_TTY")
+        .env("NO_COLOR", "1").kill_on_drop(true);
+    tokio::time::timeout(Duration::from_secs(45), cmd.output()).await
+        .map_err(|_| "GitHub merge check timed out".to_string())?
+        .map_err(|e| e.to_string())
+}
+
+async fn external_gh_json(token: &str, repo_path: &str, args: &[&str]) -> Result<Value, String> {
+    let out = external_gh(token, repo_path, args).await?;
+    if !out.status.success() {
+        return Err(format!("GitHub refused merge continuation: {}",
+            trim_to(String::from_utf8_lossy(&out.stderr).trim(), 500)));
+    }
+    serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())
+}
+
+// gh 2.45 has no checks --json. Non-TTY output is tab-separated. Require
+// affirmative rows as well as exit success; empty/unknown output fails closed.
+fn external_required_checks_pass(text: &str) -> bool {
+    let rows: Vec<_> = text.lines().filter(|line| !line.trim().is_empty()).collect();
+    !rows.is_empty() && rows.iter().all(|line| {
+        matches!(line.split('\t').nth(1), Some("pass" | "skipping"))
+    })
+}
+
+/// One bounded poll, no worktree edits, force push, admin bypass or deploy.
+/// An update changes HEAD and must return through Codex + approval on that HEAD.
+pub async fn advance_external_merge<F, Fut>(
+    pr_url: &str, repo_path: &str, reviewed_head: &str, approval_id: i64,
+    still_authorized: F,
+) -> Result<ExternalMergeProgress, String>
+where F: Fn() -> Fut, Fut: std::future::Future<Output = bool> {
+    if !is_safe_pr_url(pr_url) || !external_staging_repo(pr_url) {
+        return Err("Unsupported staging repository".into());
+    }
+    let token = external_reviewer_token().await?;
+    let slug = pr_url_owner_repo(pr_url).ok_or("Invalid PR")?;
+    let number = pr_url.trim_end_matches('/').rsplit('/').next().ok_or("Missing number")?;
+    let endpoint = format!("repos/{}/pulls/{}", slug, number);
+    let fields = "state,isDraft,headRefOid,baseRefName,mergeable,mergeStateStatus,reviewDecision,mergeCommit";
+    let view = ["pr", "view", pr_url, "--json", fields];
+    let pr = external_gh_json(&token, repo_path, &view).await?;
+    if pr["baseRefName"] != "main" { return Err("Automatic external merges require staging main".into()); }
+    if pr["state"] == "MERGED" {
+        let sha = pr["mergeCommit"]["oid"].as_str().filter(|s| s.len() == 40)
+            .ok_or("Merged PR has no commit yet")?;
+        let runs = external_gh_json(&token, repo_path, &["api", &format!(
+            "repos/{}/actions/workflows/deploy-staging.yml/runs?head_sha={}&event=push&branch=main&per_page=100", slug, sha)]).await?;
+        let latest = runs["workflow_runs"].as_array().and_then(|rows| rows.iter()
+            .filter(|run| run["head_sha"] == sha && run["event"] == "push" && run["head_branch"] == "main")
+            .max_by_key(|run| run["id"].as_i64().unwrap_or(0)));
+        return Ok(if latest.map(|run| run["status"] == "completed" && run["conclusion"] == "success").unwrap_or(false) {
+            ExternalMergeProgress::Staged
+        } else { ExternalMergeProgress::Waiting("PR merged; waiting for its staging workflow to succeed".into()) });
+    }
+    if pr["state"] == "CLOSED" { return Ok(ExternalMergeProgress::Closed); }
+    if pr["state"] != "OPEN" || pr["isDraft"] != false {
+        return Err("PR is closed or draft; leaving card held".into());
+    }
+    if reviewed_head.len() != 40 || !reviewed_head.bytes().all(|c| c.is_ascii_hexdigit()) || approval_id <= 0 {
+        return Err("Awaiting a clean review and GitHub approval".into());
+    }
+    if pr["headRefOid"] != reviewed_head { return Ok(ExternalMergeProgress::ReviewAgain); }
+    let receipt = external_gh_json(&token, repo_path,
+        &["api", &format!("{}/reviews/{}", endpoint, approval_id)]).await?;
+    if receipt["state"] != "APPROVED" || receipt["commit_id"] != reviewed_head
+        || receipt["user"]["login"] != "mrchevyceleb" || pr["reviewDecision"] != "APPROVED" {
+        return Err("Current head does not have a valid clean GitHub approval".into());
+    }
+    let checks = external_gh(&token, repo_path, &["pr", "checks", pr_url, "--required"]).await?;
+    if !checks.status.success() || !external_required_checks_pass(&String::from_utf8_lossy(&checks.stdout)) {
+        return Ok(ExternalMergeProgress::Waiting("Required checks are missing, pending or failing".into()));
+    }
+    // Re-read after checks. Never retry a changed head with a new merge SHA.
+    let current = external_gh_json(&token, repo_path, &view).await?;
+    if current["headRefOid"] != reviewed_head { return Ok(ExternalMergeProgress::ReviewAgain); }
+    if current["state"] != "OPEN" || current["isDraft"] != false || current["baseRefName"] != "main"
+        || current["reviewDecision"] != "APPROVED" || current["mergeable"] != "MERGEABLE" {
+        return Ok(ExternalMergeProgress::Waiting("PR is not currently approved and mergeable".into()));
+    }
+    if current["mergeStateStatus"] == "BEHIND" {
+        if !still_authorized().await { return Err("Card held or review changed before branch update".into()); }
+        external_gh_json(&token, repo_path, &["api", &format!("{}/update-branch", endpoint),
+            "--method", "PUT", "-f", &format!("expected_head_sha={}", reviewed_head)]).await?;
+        return Ok(ExternalMergeProgress::ReviewAgain);
+    }
+    if current["mergeStateStatus"] != "CLEAN" {
+        return Ok(ExternalMergeProgress::Waiting("GitHub merge gate is not clean yet".into()));
+    }
+    // No --admin: GitHub enforces checks/reviews again atomically at merge.
+    if !still_authorized().await { return Err("Card held or review changed before merge".into()); }
+    let out = external_gh(&token, repo_path, &["pr", "merge", pr_url, "--squash",
+        "--match-head-commit", reviewed_head]).await?;
+    let after = external_gh_json(&token, repo_path, &view).await?;
+    if after["state"] == "MERGED" { return Ok(ExternalMergeProgress::Merged); }
+    Err(format!("Merge not confirmed; card retained: {}", trim_to(String::from_utf8_lossy(&out.stderr).trim(), 500)))
 }
 
 pub async fn gh_merge(pr_url: &str, repo_path: &str, head_sha: &str) -> Result<(), String> {

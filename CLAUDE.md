@@ -215,21 +215,16 @@ Secrets in Doppler project `agent-one`, config `prd`
 ### Sam's Persona
 Defined inline in `chat.rs::build_system_prompt()` (around line 427). Tone: proactive, competent, casual Slack. Asks clarifying questions, flags assumptions, pushes back when something seems wrong. Not a yes-machine. Eventually this will load from a Markdown character file under `~/samwise/` but for now it's a Rust string.
 
-### Task Lifecycle — Where Sam Stops
-**Sam's job ends at `approved` (Ready to Merge). Sam never merges or deploys himself.**
+### Task Lifecycle
 
-The full lifecycle is:
-1. Task picked up → Sam codes → opens PR (GitHub)
-2. `$samwise-pr-review` (Codex skill) runs automatically via `sweep_pr_review_queue`
-3. Verdict: `MergeNow` → card moves to **`approved`** (Ready to Merge) — **SAM STOPS HERE**
-   - A fix verdict can run up to **5** automatic review/fix cycles by default. Override with `AUTOSAM_MAX_REVIEW_CYCLES` or persisted `autoFixMaxReviewCycles`; values are bounded to 1–10.
-4. Merge + deploy is handled externally by one of:
-   - **`pr-review-batch` cron** at 12 past the hour — runs via Rivendell's Codex forge, does the full review → merge → deploy
-   - **"Merge and Deploy" button** in the AutoSam UI — Matt clicks it, which stamps `samwise_merge_deploy_status: "requested"` in context, and `sweep_merge_deploy_requests` in the worker executes it
+External Slack `#review` cards for `R-Link-LLC/r-link-studio-rebuild` and `R-Link-LLC/operly` targeting `main` use a dedicated staging-only continuation:
 
-Post-merge deploy (when triggered): Railway server deploy, Supabase migrations (`supabase db push`), Supabase Edge Functions (`supabase functions deploy` — requires `SUPABASE_ACCESS_TOKEN` in Doppler). **Vercel is NOT triggered by Sam** — Vercel auto-deploys from the repo's configured GitHub branch. Do not assume that branch is `main`; for protected Operly work, ordinary PRs target `dev`.
+1. A clean Codex verdict submits a real GitHub approval pinned to the reviewed head, using Matt's saved reviewer credential. FIX and inconclusive remain held; a new review clears any previous approval receipt.
+2. The card stays `approved` (Ready to Merge) while required checks finish. A mergeable BEHIND branch is updated using GitHub's expected-head fence, then goes back to Review for fresh Codex and approval on the new head.
+3. A clean, approved, non-draft head is squash-merged with `--match-head-commit`, without admin bypass. Changed heads are never retried as though already reviewed.
+4. Done requires the exact merge SHA's `deploy-staging.yml` push workflow to succeed. The continuation only reads deployment status. It never runs the generic deploy planner or production promotion.
 
-⚠️ **Critical**: Do NOT auto-stamp `samwise_merge_deploy_status: "requested"` at the `approved` transition in `spawn_pr_review_task`. Doing so bypasses the intended human/cron control point and causes Sam to merge PRs he shouldn't. The `sweep_merge_deploy_requests` gate is intentional and correct — it only fires when the button or cron explicitly requests it.
+Other cards retain their existing explicitly requested merge/deploy controls. Do not route external review cards through `samwise_merge_deploy_status: requested`; that is the broader legacy deploy path. Production remains a separately authorized promotion.
 
 ### Key Patterns
 - Stores use Svelte 5 runes and `safeInvoke` for Tauri IPC
