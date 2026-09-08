@@ -113,3 +113,7 @@ Required AutoSam behavior:
 - `slack.workflow = "pr_review"` must trigger deterministic PR review card creation/revival from PR links in the Slack turn, not a generic coding task.
 - `slack.task_type = "research"` or `"qa-verify"` must be enforced on created cards. `qa-verify` cards must be stamped with QA environment and preview URL when the project registry has one.
 - Remote chat processing must not be limited to the default desktop conversation UUID; Slack uses separate conversation IDs per channel/thread/DM route.
+
+### External review completion
+
+For Studio and Operly main, a clean Slack review continues through real approval, green required checks, expected-head branch update if behind, fresh review after any head change, and head-pinned squash merge. The card remains visible until the exact merged commit passes the existing staging workflow. FIX/inconclusive reviews never enter this merge path. Production promotion and generic deploy commands are excluded.
