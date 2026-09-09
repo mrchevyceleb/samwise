@@ -19435,6 +19435,19 @@ pub async fn sweep_adopt_orphan_prs(config: &SupabaseConfig) {
 /// Decide whether to fire the auto-fix loop after a `fix_issues` verdict.
 /// Gated by the `autoFixFromFixesNeededEnabled` setting, Codex's
 /// `REQUIRES_HUMAN` flag, and a configurable bounded cycle cap per card.
+/// Resolve the actual PR branch before spending a cycle or touching a checkout.
+/// A card id or the caller's checkout is not evidence of the PR's head branch.
+async fn auto_fix_pr_branch(pr_url: &str, repo_path: &str) -> Result<String, String> {
+    let (head, _) = fetch_pr_branch_info(pr_url, repo_path).await?;
+    if !is_automation_pr_head(&head) {
+        return Err(format!(
+            "PR head '{}' is not an automation branch; leaving its review for the assigned reviewer",
+            head
+        ));
+    }
+    Ok(head)
+}
+
 async fn maybe_spawn_auto_fix(
     config: SupabaseConfig,
     task_id: String,
@@ -19519,25 +19532,23 @@ async fn maybe_spawn_auto_fix(
         );
         return;
     }
-    if latest_task.as_ref().map(task_is_external_pr_review_request).unwrap_or(false) {
+    if latest_task.as_ref().map(|task| {
+        task_is_on_hold(task) || task_is_external_pr_review_request(task)
+    }).unwrap_or(false) {
         return;
     }
+    let expected_branch = match auto_fix_pr_branch(&pr_url, &repo_path).await {
+        Ok(branch) => branch,
+        Err(reason) => {
+            log::warn!("[auto-fix] task {} skipped before cycle claim: {}", task_id, reason);
+            return;
+        }
+    };
     let cycle_count = latest_task
         .as_ref()
         .and_then(|t| t.get("review_cycle_count"))
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
-    let expected_branch = run_git(&["rev-parse", "--abbrev-ref", "HEAD"], &repo_path)
-        .await
-        .ok()
-        .map(|branch| branch.trim().to_string())
-        .filter(|branch| !branch.is_empty() && branch != "HEAD")
-        .or_else(|| {
-            latest_task
-                .as_ref()
-                .and_then(|task| task_context_string(task, "head_ref"))
-        })
-        .unwrap_or_else(|| task_branch_name(&short_task_id(&task_id)));
     if auto_fix_cycle_is_capped(cycle_count, max_review_cycles) {
         // Cap reached. Before parking this PR for a human, attempt ONE final
         // merge at a relaxed score floor. The cycle cap most often fires on
@@ -20407,6 +20418,18 @@ async fn sweep_stale_fixes_needed_cards(
             .get("review_cycle_count")
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
+        // This sweep also spawns fixes directly, so it needs the same head and
+        // ownership gates as the review-verdict path, including capped cards.
+        if task_is_external_pr_review_request(task) {
+            continue;
+        }
+        let expected_branch = match auto_fix_pr_branch(&pr_url, &repo_path).await {
+            Ok(branch) => branch,
+            Err(reason) => {
+                log::warn!("[auto-fix-sweep] task {} skipped before cycle claim: {}", task_id, reason);
+                continue;
+            }
+        };
         // Capped cards do NOT just get skipped. Re-enter
         // maybe_spawn_auto_fix, whose cap branch attempts the relaxed cap-floor
         // merge (guarded by context.cap_merge_attempted so it runs at most once).
@@ -20415,7 +20438,8 @@ async fn sweep_stale_fixes_needed_cards(
         // and the cap-floor merge would otherwise never fire. Spawn it detached so
         // the up-to-15min CI poll never stalls the sweep loop.
         if auto_fix_cycle_is_capped(cycle_count, max_review_cycles) {
-            let cap_repo_path = task_worktree_path(&repo_path, &task_id)
+            let worktree_key = task_worktree_short_id(task, &task_id);
+            let cap_repo_path = task_worktree_path_for_key(&repo_path, &worktree_key)
                 .filter(|p| p.is_dir())
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|| repo_path.clone());
@@ -20435,7 +20459,6 @@ async fn sweep_stale_fixes_needed_cards(
             .await
             .unwrap_or_default();
 
-        let expected_branch = task_branch_name(&short_task_id(&task_id));
         // Run the fix in the card's own worktree, not the main checkout.
         // spawn_auto_fix_task's pre-flight does `git checkout <expected_branch>`
         // in whatever dir we hand it, and the PR head branch is checked out in
@@ -20444,7 +20467,8 @@ async fn sweep_stale_fixes_needed_cards(
         // (this is exactly how PR #378 cycle 3 died). Mirror the review->fix
         // path, which always operates in the worktree. Fall back to the main
         // checkout only when no worktree exists (older cards already cleaned up).
-        let fix_repo_path = task_worktree_path(&repo_path, &task_id)
+        let worktree_key = task_worktree_short_id(task, &task_id);
+        let fix_repo_path = task_worktree_path_for_key(&repo_path, &worktree_key)
             .filter(|p| p.is_dir())
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| repo_path.clone());
