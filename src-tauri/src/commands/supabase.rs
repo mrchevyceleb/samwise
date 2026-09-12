@@ -86,19 +86,142 @@ async fn handle_response(resp: reqwest::Response) -> Result<Value, String> {
 
 // ── Tasks (internal) ────────────────────────────────────────────────
 
+/// Page size for `fetch_tasks`. PostgREST caps a single response at the
+/// project's `max-rows` (1000 by default) and says nothing about it in the
+/// body, so a caller that wants "all tasks" must page.
+const FETCH_TASKS_PAGE_SIZE: usize = 1000;
+/// Hard ceiling on pages per call, so a runaway board cannot turn one poll
+/// into an unbounded request loop.
+const FETCH_TASKS_MAX_PAGES: usize = 50;
+
+/// The order every caller of `fetch_tasks` has always seen: priority, then
+/// created_at, then id, ascending, missing values last. Applied client-side
+/// after paging (see below), on the same lowercase ASCII words and ISO
+/// timestamps PostgREST sorted, so the result is what one ordered request
+/// would have returned.
+fn fetch_tasks_order(a: &Value, b: &Value) -> std::cmp::Ordering {
+    fn key<'a>(row: &'a Value, field: &str) -> Option<&'a str> {
+        row.get(field).and_then(|v| v.as_str())
+    }
+    fn cmp_field(a: &Value, b: &Value, field: &str) -> std::cmp::Ordering {
+        match (key(a, field), key(b, field)) {
+            (Some(x), Some(y)) => x.cmp(y),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+    }
+    cmp_field(a, b, "priority")
+        .then_with(|| cmp_field(a, b, "created_at"))
+        .then_with(|| cmp_field(a, b, "id"))
+}
+
+/// Percent-encodes one filter value for a PostgREST query string. Timestamps
+/// carry `+`, `:` and `.`, and the filter grammar reserves `,`, `(`, `)` and
+/// `"`, so everything outside the unreserved set is encoded.
+fn encode_filter_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 8);
+    for ch in value.chars() {
+        match ch {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => out.push(ch),
+            _ => {
+                let mut buf = [0u8; 4];
+                for byte in ch.encode_utf8(&mut buf).as_bytes() {
+                    out.push_str(&format!("%{:02X}", byte));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Every task row (or every row with `status_filter`), in the order above.
+///
+/// This used to be one request with no limit. PostgREST silently returned
+/// the first 1000 rows, and once the board passed that size (2,489 rows on
+/// 2026-09-12) every caller that dedups or reconciles against "all tasks"
+/// worked from a truncated list. The Kim PR adopter never saw the card it
+/// had just created and re-adopted the same PR on every poll: 21 duplicate
+/// `Full $pr-review` cards for PR #1624 in half an hour.
+///
+/// Pages walk a keyset cursor over `(created_at, id)`, which never change
+/// for a row: each page asks for rows strictly after the last row read, so
+/// an insert, a re-prioritisation, a deletion or a status change landing
+/// between pages cannot shift, skip or repeat a row (offset paging would).
+/// The loop stops on an EMPTY page, not merely a short one, so a project
+/// whose `max-rows` is below the page size still pages correctly. A
+/// non-array body is an error rather than an empty page, so a surprise never
+/// reads as "no tasks".
 pub async fn fetch_tasks(
     config: &SupabaseConfig,
     status_filter: Option<&str>,
 ) -> Result<Value, String> {
     let client = build_client(config)?;
-    let mut url = format!(
-        "{}?order=priority.asc,created_at.asc",
-        rest_url(config, "ae_tasks")
+    let mut base_url = format!(
+        "{}?order=created_at.asc,id.asc&limit={}",
+        rest_url(config, "ae_tasks"),
+        FETCH_TASKS_PAGE_SIZE
     );
     if let Some(status) = status_filter {
-        url.push_str(&format!("&status=eq.{}", status));
+        base_url.push_str(&format!("&status=eq.{}", status));
     }
-    handle_response(client.get(&url).send().await.map_err(|e| e.to_string())?).await
+    let mut all: Vec<Value> = Vec::new();
+    let mut cursor: Option<(String, String)> = None;
+    let mut pages = 0usize;
+    while pages < FETCH_TASKS_MAX_PAGES {
+        let url = match &cursor {
+            Some((created_at, id)) => format!(
+                "{}&or=(created_at.gt.{},and(created_at.eq.{},id.gt.{}))",
+                base_url,
+                encode_filter_value(created_at),
+                encode_filter_value(created_at),
+                encode_filter_value(id)
+            ),
+            None => base_url.clone(),
+        };
+        let page = handle_response(
+            client.get(&url).send().await.map_err(|e| e.to_string())?,
+        )
+        .await?;
+        let rows = match page {
+            Value::Array(rows) => rows,
+            other => {
+                return Err(format!(
+                    "fetch_tasks: expected a JSON array page after {} pages, got {}",
+                    pages,
+                    match other {
+                        Value::Object(_) => "an object",
+                        Value::Null => "null",
+                        _ => "a non-array value",
+                    }
+                ));
+            }
+        };
+        pages += 1;
+        if rows.is_empty() {
+            all.sort_by(fetch_tasks_order);
+            return Ok(Value::Array(all));
+        }
+        let last = &rows[rows.len() - 1];
+        let next = match (
+            last.get("created_at").and_then(|v| v.as_str()),
+            last.get("id").and_then(|v| v.as_str()),
+        ) {
+            (Some(created_at), Some(id)) => (created_at.to_string(), id.to_string()),
+            _ => {
+                return Err(
+                    "fetch_tasks: a task row has no created_at or id, cannot page past it".to_string(),
+                );
+            }
+        };
+        all.extend(rows);
+        cursor = Some(next);
+    }
+    Err(format!(
+        "fetch_tasks: gave up after {} pages ({} rows read) without reaching the end; refusing to return a possibly truncated task list",
+        pages,
+        all.len()
+    ))
 }
 
 pub async fn fetch_board_tasks(config: &SupabaseConfig) -> Result<Value, String> {
