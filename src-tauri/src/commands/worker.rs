@@ -2503,35 +2503,13 @@ async fn worker_loop(
             sweep_pr_merged_cards(&config).await;
         }
 
-        // Kim's rebuild PRs should skip the manual "Ready to Merge" stop and
-        // go straight through Codex's full `$pr-review` final gate. This poller
-        // adopts non-draft open PRs from her GitHub account and launches one
-        // full review/merge/deploy run per PR.
-        if tick % 12 == 3 {
-            let settings: Option<serde_json::Value> =
-                if let Ok(data_dir) = app.path().app_data_dir() {
-                    let settings_path = data_dir.join("settings.json");
-                    tokio::fs::read_to_string(&settings_path)
-                        .await
-                        .ok()
-                        .and_then(|s| serde_json::from_str(&s).ok())
-                } else {
-                    None
-                };
-            let enabled = settings
-                .as_ref()
-                .and_then(|s| s.get("kimFullPrReviewEnabled"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-            if enabled {
-                sweep_kim_full_pr_review_queue(&config).await;
-            }
-        }
+        // Author-based full-review adoption is retired. It bypassed the
+        // normal auto-merge switch and let the review subprocess admin-merge
+        // Kim's PRs. PR review/merge ownership stays with Sarina's batch.
 
         // Matt's `/plant` hand-offs: PRs he explicitly sent for the full
         // `$pr-review` (review/fix/merge/deploy). Repo-agnostic and driven by
-        // the task row /plant inserted, not a GitHub author poll. Offset from
-        // the Kim sweep so the two never run on the same tick.
+        // the task row /plant inserted, not a GitHub author poll.
         if tick % 12 == 6 {
             let settings: Option<serde_json::Value> =
                 if let Ok(data_dir) = app.path().app_data_dir() {
