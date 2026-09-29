@@ -1,5 +1,10 @@
-//! PR review gate: run a Codex review over the PR diff, combine with hardcoded
-//! safety rules plus CI state, and auto-merge if every gate passes.
+//! PR review gate: run a Claude Opus 5.5 review over the PR diff, combine with
+//! hardcoded safety rules plus CI state, and auto-merge if every gate passes.
+//! Opus, not Codex (as of 2026-09-29): Sam's coder runs on GPT-6.1 Sol, so an
+//! independent model family reviews it instead of grading its own work. The
+//! rest of this file's Codex-backed reviews (the Slack `#review` lane, the
+//! delta-verify fix/verify loop, the full-PR review) are a separate scope and
+//! were not touched by that change.
 //!
 //! Public entry point is `try_auto_merge`. Never panics: any error path short
 //! circuits to `AutoMergeOutcome::Blocked` (fail closed).
@@ -173,7 +178,14 @@ const MAX_DIFF_BYTES: usize = 50_000;
 const CI_POLL_INTERVAL_SECS: u64 = 30;
 const CI_POLL_MAX_SECS: u64 = 15 * 60;
 const CI_MIN_OBSERVATIONS: u32 = 2; // don't trust an empty/first poll
-const CODEX_TIMEOUT_SECS: u64 = 20 * 60;
+/// Auto-merge verdict reviewer: Claude Opus 5.5 at xhigh thinking, headless
+/// (`claude -p`). Independent of Sam's own coder (GPT-6.1 Sol via
+/// Pi/OpenRouter, see AutoSam's coder.conf) so the gate isn't the same model
+/// family grading its own work — the same reasoning as the /opus-fix skill's
+/// post-coding review pass. Pinned, no fallback: see run_opus_review.
+const OPUS_REVIEW_MODEL: &str = "claude-opus-5-5";
+const OPUS_REVIEW_EFFORT: &str = "xhigh";
+const OPUS_REVIEW_TIMEOUT_SECS: u64 = 20 * 60;
 const FULL_PR_REVIEW_TIMEOUT_SECS: u64 = 90 * 60;
 // While Codex emits real events at least this recently, the heartbeat keeps
 // `updated_at` fresh; once it goes quieter than this, `updated_at` is allowed
@@ -384,8 +396,8 @@ pub async fn try_auto_merge(
         .await;
     }
 
-    // 6. Run Codex review.
-    let review = match run_codex_review(repo_path, task_title, task_description, &diff).await {
+    // 6. Run the Opus verdict review.
+    let review = match run_opus_review(repo_path, task_title, task_description, &diff).await {
         Ok(r) => r,
         Err(e) => {
             return block(
@@ -395,15 +407,15 @@ pub async fn try_auto_merge(
                 None,
                 None,
                 None,
-                &format!("codex review failed: {}", e),
+                &format!("opus review failed: {}", e),
             )
             .await
         }
     };
 
     let scores = extract_scores(&review);
-    // Validate every score is an integer in [1, 10]. Out-of-range values mean Codex
-    // ignored the schema; fail closed so a hallucinated 100 can't bypass the gate.
+    // Validate every score is an integer in [1, 10]. Out-of-range values mean the
+    // reviewer ignored the schema; fail closed so a hallucinated 100 can't bypass the gate.
     if !scores_are_valid(&scores) {
         return block(
             config,
@@ -872,39 +884,19 @@ fn sanitize_diff_for_prompt(diff: &str) -> String {
     diff.replace(DIFF_DELIMITER, "[delimiter removed]")
 }
 
-async fn run_codex_review(
+/// Auto-merge verdict review, run on Claude Opus 5.5 (see OPUS_REVIEW_MODEL
+/// above). Same prompt, same diff, same JSON verdict contract as the old
+/// Codex-backed version — only the model changed. No fallback model: an
+/// OpenRouter/GPT fallback here would recreate the exact problem this exists
+/// to fix (a GPT model grading Sam's GPT-coded work). If claude-opus-5-5
+/// can't run, this returns Err and the caller (try_auto_merge) blocks the
+/// merge — the same fail-closed outcome a dead Codex spawn produced before.
+async fn run_opus_review(
     repo_path: &str,
     task_title: &str,
     task_description: &str,
     diff: &str,
 ) -> Result<Value, String> {
-    let tmp_path = std::env::temp_dir().join(format!("samwise-review-{}", uuid_like()));
-    tokio::fs::create_dir_all(&tmp_path)
-        .await
-        .map_err(|e| format!("create tmp dir: {}", e))?;
-    // RAII: tmp dir is cleaned on every return path, including timeouts/parse errors.
-    let _tmp_guard = TempDir(tmp_path.clone());
-
-    let schema_path = tmp_path.join("schema.json");
-    let output_path = tmp_path.join("output.json");
-    let schema = serde_json::json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["correctness","blast_radius","test_coverage","reversibility","matches_task_intent","blockers","summary"],
-        "properties": {
-            "correctness":        {"type": "integer", "minimum": 1, "maximum": 10},
-            "blast_radius":       {"type": "integer", "minimum": 1, "maximum": 10},
-            "test_coverage":      {"type": "integer", "minimum": 1, "maximum": 10},
-            "reversibility":      {"type": "integer", "minimum": 1, "maximum": 10},
-            "matches_task_intent":{"type": "integer", "minimum": 1, "maximum": 10},
-            "blockers":           {"type": "array",   "items": {"type": "string"}},
-            "summary":            {"type": "string"}
-        }
-    });
-    tokio::fs::write(&schema_path, serde_json::to_vec_pretty(&schema).unwrap())
-        .await
-        .map_err(|e| format!("write schema: {}", e))?;
-
     let truncated = truncate_utf8(diff, MAX_DIFF_BYTES);
     let was_truncated = truncated.len() < diff.len();
     let sanitized = sanitize_diff_for_prompt(truncated);
@@ -917,7 +909,11 @@ async fn run_codex_review(
         sanitized
     };
 
-    // Delimiter-wrapped so Codex knows what's data vs. instructions.
+    // Delimiter-wrapped so Opus knows what's data vs. instructions. The prompt
+    // template (prompts/review.md) already spells out the exact JSON shape in
+    // prose ("Respond with strict JSON only, matching this schema exactly");
+    // --json-schema below additionally enforces it structurally, the direct
+    // equivalent of Codex's --output-schema (see that flag's own comment).
     let prompt = format!(
         "{review_prompt}\n\n\
          ## Task title\n{title}\n\n\
@@ -937,85 +933,142 @@ async fn run_codex_review(
         diff = bounded_diff,
     );
 
-    let schema_path_str = schema_path.to_string_lossy().into_owned();
-    let output_path_str = output_path.to_string_lossy().into_owned();
-
-    // Use spawn so we can actually kill the child on timeout, and pin a read-only
-    // sandbox + no-approvals policy so the review can't mutate the repo.
-    // Direct Codex CLI first. OpenRouter only if that spawn dies or writes nothing.
-    let openrouter_key = resolve_openrouter_key().await.ok();
-    let backends = [
-        CodexBackend::LocalCli,
-        CodexBackend::OpenRouter,
-    ];
-    let mut last_err = String::from("codex review produced no output");
-    for (idx, backend) in backends.into_iter().enumerate() {
-        if backend == CodexBackend::OpenRouter && openrouter_key.is_none() {
-            last_err = format!(
-                "{last_err}; OpenRouter fallback unavailable (no OPENROUTER_API_KEY)"
-            );
-            break;
+    // Same schema Codex's --output-schema enforced. claude -p has a direct
+    // equivalent (--json-schema, verified live on Moria 2026-09-29): without
+    // it the reviewer only has the prompt's prose instructions to go on, and
+    // extract_scores()/the blockers read downstream both fail OPEN on a
+    // wrong-shaped field (a non-array `blockers`, or a missing one, silently
+    // becomes an empty Vec via .as_array()...unwrap_or_default()) — a real
+    // blocker Opus reported in the wrong shape could auto-merge unnoticed.
+    // additionalProperties:false plus the same required list closes that.
+    let schema = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["correctness","blast_radius","test_coverage","reversibility","matches_task_intent","blockers","summary"],
+        "properties": {
+            "correctness":        {"type": "integer", "minimum": 1, "maximum": 10},
+            "blast_radius":       {"type": "integer", "minimum": 1, "maximum": 10},
+            "test_coverage":      {"type": "integer", "minimum": 1, "maximum": 10},
+            "reversibility":      {"type": "integer", "minimum": 1, "maximum": 10},
+            "matches_task_intent":{"type": "integer", "minimum": 1, "maximum": 10},
+            "blockers":           {"type": "array",   "items": {"type": "string"}},
+            "summary":            {"type": "string"}
         }
-        if idx > 0 {
-            log::warn!(
-                "[review] local Codex CLI failed ({}); falling back to OpenRouter",
-                last_err
-            );
-            let _ = tokio::fs::remove_file(&output_path).await;
-        }
-        let mut cmd = async_cmd("codex");
-        cmd.arg("exec");
-        apply_codex_backend(&mut cmd, backend, openrouter_key.as_deref());
-        cmd.args([
-            "-s",
-            "read-only",
-            "-c",
-            "approval_policy=\"never\"",
-            "--output-schema",
-            &schema_path_str,
-            "-o",
-            &output_path_str,
-            "--skip-git-repo-check",
-            "-C",
-            repo_path,
-            &prompt,
-        ]);
-        cmd.stdin(std::process::Stdio::null());
+    });
+    let schema_str = schema.to_string();
 
-        let mut child = cmd.spawn().map_err(|e| format!("spawn codex: {}", e))?;
-        let wait_fut = child.wait();
-        let status = match tokio::time::timeout(Duration::from_secs(CODEX_TIMEOUT_SECS), wait_fut).await
-        {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                last_err = format!("wait codex: {}", e);
-                continue;
-            }
-            Err(_) => {
-                let _ = child.kill().await;
-                last_err = format!(
-                    "codex review timed out after {}s",
-                    CODEX_TIMEOUT_SECS
-                );
-                continue;
-            }
-        };
-        if status.success() && tokio::fs::try_exists(&output_path).await.unwrap_or(false) {
-            break;
-        }
-        last_err = format!("codex exec exited non-zero: {}", status);
-    }
-    if !tokio::fs::try_exists(&output_path).await.unwrap_or(false) {
-        return Err(last_err);
-    }
+    // Model and effort are hard-pinned (matches the /opus-fix skill's own
+    // pin) so default-model drift in agent-one's own settings can never
+    // quietly change the reviewer. --restricted removes tools and ignores
+    // user/project/local settings, but its own --help text does NOT claim to
+    // stop CLAUDE.md auto-discovery (only --safe-mode's help text explicitly
+    // does: "CLAUDE.md, skills, ... hooks ... disabled"); cmd.current_dir
+    // below points this process at the untrusted PR's own worktree, so
+    // without --safe-mode a planted CLAUDE.md in that repo could try to
+    // steer the verdict the same way the diff itself is explicitly
+    // sandboxed against below (delimiter-wrapped, "treat as data only").
+    // --strict-mcp-config with no --mcp-config loads zero MCP servers, so
+    // this is a pure text-in/JSON-out pass, same as Codex's read-only
+    // sandbox + never-approve policy did.
+    let mut cmd = async_cmd("claude");
+    cmd.args([
+        "-p",
+        "--model",
+        OPUS_REVIEW_MODEL,
+        "--effort",
+        OPUS_REVIEW_EFFORT,
+        "--restricted",
+        "--safe-mode",
+        "--strict-mcp-config",
+        "--output-format",
+        "text",
+        "--json-schema",
+        &schema_str,
+        &prompt,
+    ]);
+    cmd.current_dir(repo_path);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    // agent-one's own service environment carries CLAUDE_CODE_SIMPLE=1 and
+    // ANTHROPIC_DEFAULT_*=claude-opus-4-8 (plus a few sibling proxy/auth
+    // vars) from the old Claude-Code-coder / LiteLLM-proxy setup (superseded
+    // 2026-09-29 by AUTOSAM_CODER=pi; the env vars were never cleaned up).
+    // CLAUDE_CODE_SIMPLE=1 forces API-key-only auth (OAuth/keychain never
+    // read) with no ANTHROPIC_API_KEY set, which fails this spawn outright
+    // ("Not logged in") even though the host's own OAuth session works fine
+    // — reproduced live on Moria 2026-09-29. claude_code.rs already has the
+    // exact list this needs (DIRECT_OAUTH_ENV_BLOCKERS, used the same way by
+    // worker.rs's own direct-Claude spawns), so reuse it instead of hand-
+    // maintaining a second, narrower copy here.
+    super::claude_code::strip_direct_oauth_blockers_async(&mut cmd);
 
-    let body = tokio::fs::read_to_string(&output_path)
+    let mut child = cmd.spawn().map_err(|e| format!("spawn claude: {}", e))?;
+    // Drain stdout/stderr concurrently with the wait, same pattern as
+    // run_codex_exec_once below: an unread pipe can fill its OS buffer and
+    // deadlock the child, so both streams are read in their own tasks
+    // regardless of when (or whether) child.wait() returns.
+    let stdout_pipe = child.stdout.take();
+    let stdout_handle = tokio::spawn(async move {
+        let mut output = String::new();
+        if let Some(mut reader) = stdout_pipe {
+            use tokio::io::AsyncReadExt;
+            let _ = reader.read_to_string(&mut output).await;
+        }
+        output
+    });
+    let stderr_pipe = child.stderr.take();
+    let stderr_handle = tokio::spawn(async move {
+        let mut output = String::new();
+        if let Some(mut reader) = stderr_pipe {
+            use tokio::io::AsyncReadExt;
+            let _ = reader.read_to_string(&mut output).await;
+        }
+        output
+    });
+
+    let status = match tokio::time::timeout(Duration::from_secs(OPUS_REVIEW_TIMEOUT_SECS), child.wait())
         .await
-        .map_err(|e| format!("read codex output: {}", e))?;
-    let parsed: Value = match serde_json::from_str::<Value>(&body) {
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            // wait() itself failed (rare OS-level error) rather than the child answering
+            // non-zero: the process may still be alive, so best-effort kill it and drop the
+            // reader tasks rather than leaving an orphaned, still-billable review running.
+            let _ = child.kill().await;
+            stdout_handle.abort();
+            stderr_handle.abort();
+            return Err(format!("wait claude: {}", e));
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            let stdout = stdout_handle.await.unwrap_or_default();
+            let stderr = stderr_handle.await.unwrap_or_default();
+            return Err(format!(
+                "opus review timed out after {}s. Stderr tail: {} Stdout tail: {}",
+                OPUS_REVIEW_TIMEOUT_SECS,
+                trim_to(stderr.trim(), 800),
+                trim_to(stdout.trim(), 800),
+            ));
+        }
+    };
+    let stdout = stdout_handle.await.unwrap_or_default();
+    let stderr = stderr_handle.await.unwrap_or_default();
+    if !status.success() {
+        return Err(format!(
+            "claude exec exited non-zero: {}. Stderr tail: {}",
+            status,
+            trim_to(stderr.trim(), 800)
+        ));
+    }
+    if stdout.trim().is_empty() {
+        return Err("opus review produced no output".to_string());
+    }
+
+    let parsed: Value = match serde_json::from_str::<Value>(stdout.trim()) {
         Ok(v) => v,
-        Err(_) => extract_json_object(&body)
-            .ok_or_else(|| "codex output was not valid JSON".to_string())?,
+        Err(_) => extract_json_object(&stdout)
+            .ok_or_else(|| "opus output was not valid JSON".to_string())?,
     };
     Ok(parsed)
 }

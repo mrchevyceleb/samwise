@@ -5183,10 +5183,10 @@ from Matt, stop without making changes and explain specifically what you need cl
             .await;
 
             // Capture the structured commit message Claude Code just wrote, BEFORE
-            // codex-fix or build-repair can stack auto-generated commits on top.
+            // opus-fix or build-repair can stack auto-generated commits on top.
             // The card renders this so Matt can read Root Cause / Fixes Made / CS
             // Message at a glance without opening the PR. We grab HEAD's full body;
-            // any later codex-fix / merge-conflict commits live on the branch but
+            // any later opus-fix / merge-conflict commits live on the branch but
             // don't overwrite this field.
             if let Ok(msg) = run_git(&["log", "-1", "--pretty=%B", "HEAD"], &repo_path).await {
                 let trimmed = msg.trim_end().to_string();
@@ -5203,15 +5203,17 @@ from Matt, stop without making changes and explain specifically what you need cl
                 }
             }
 
-            // 5b. Run /codex-fix in the worktree to get a Codex review of the diff and auto-apply
-            // any must-fix/should-fix edits. Runs BEFORE screenshots + QA so QA validates the
-            // final state. Any edits codex-fix makes are committed separately so the PR shows
-            // a clear "task commit" + "codex-fix commit" history.
+            // 5b. Run /opus-fix in the worktree to get a Claude Opus 5.5 review of the diff and
+            // auto-apply any must-fix/should-fix edits. Sam's coder runs on GPT-6.1 Sol, so an
+            // independent-model reviewer (not Codex/GPT again) actually catches something the
+            // coder would miss. Runs BEFORE screenshots + QA so QA validates the final state.
+            // Any edits opus-fix makes are committed separately so the PR shows a clear
+            // "task commit" + "opus-fix commit" history.
 
             // Cancellation check before starting another long phase.
             if !task_is_live(config, &task_id).await {
                 log::info!(
-                    "[worker] Task {} cancelled before codex-fix; stopping",
+                    "[worker] Task {} cancelled before opus-fix; stopping",
                     task_id
                 );
                 if let Some(h) = dev_server_handle.take() {
@@ -5220,13 +5222,13 @@ from Matt, stop without making changes and explain specifically what you need cl
                 return Ok("Task was cancelled".to_string());
             }
 
-            // Pin codex-fix's review scope to *this task's* diff. Without explicit
+            // Pin opus-fix's review scope to *this task's* diff. Without explicit
             // flags the slash command's auto-detection misfires inside a headless
             // Claude Code session (no chat context to anchor "session start") and
             // can review commits well outside the ticket. We compute the merge-base
-            // with origin/<base> ourselves and hand it to codex-fix, which honors
+            // with origin/<base> ourselves and hand it to opus-fix, which honors
             // --base/--scope verbatim and skips its own scope inference.
-            let codex_base_arg = match resolved_base_branch.as_deref() {
+            let opus_base_arg = match resolved_base_branch.as_deref() {
                 Some(base) => {
                     match run_git(
                         &["merge-base", "HEAD", &format!("origin/{}", base)],
@@ -5243,28 +5245,28 @@ from Matt, stop without making changes and explain specifically what you need cl
                             }
                         }
                         Err(e) => {
-                            log::warn!("[worker] codex-fix merge-base lookup failed: {}", e);
+                            log::warn!("[worker] opus-fix merge-base lookup failed: {}", e);
                             None
                         }
                     }
                 }
                 None => None,
             };
-            let codex_prompt = match &codex_base_arg {
-                Some(sha) => format!("/codex-fix --base {} --scope branch", sha),
-                None => "/codex-fix".to_string(),
+            let opus_prompt = match &opus_base_arg {
+                Some(sha) => format!("/opus-fix --base {} --scope branch", sha),
+                None => "/opus-fix".to_string(),
             };
             agent_comment(
                 config,
                 &task_id,
-                "Running /codex-fix for a review pass before QA...",
+                "Running /opus-fix for a review pass before QA...",
             )
             .await;
             // 1800s: large diffs on slow backends regularly exceed 1200s; the timeout
             // path already degrades gracefully (proceed to QA with a comment).
-            let codex_result = run_claude_code_streaming(
+            let opus_result = run_claude_code_streaming(
                 &repo_path,
-                &codex_prompt,
+                &opus_prompt,
                 0,
                 1800,
                 config,
@@ -5276,10 +5278,10 @@ from Matt, stop without making changes and explain specifically what you need cl
                 let mut pid = process_id_slot.lock().await;
                 *pid = None;
             }
-            // If codex-fix itself was cancelled mid-run, bail out.
-            if matches!(&codex_result, Err(e) if e == "TASK_CANCELLED") {
+            // If opus-fix itself was cancelled mid-run, bail out.
+            if matches!(&opus_result, Err(e) if e == "TASK_CANCELLED") {
                 log::info!(
-                    "[worker] Task {} cancelled during codex-fix; stopping",
+                    "[worker] Task {} cancelled during opus-fix; stopping",
                     task_id
                 );
                 if let Some(h) = dev_server_handle.take() {
@@ -5287,17 +5289,17 @@ from Matt, stop without making changes and explain specifically what you need cl
                 }
                 return Ok("Task was cancelled".to_string());
             }
-            match codex_result {
+            match opus_result {
                 Ok(_) => {
                     let porcelain = run_git(&["status", "--porcelain"], &repo_path)
                         .await
                         .unwrap_or_default();
                     if porcelain.trim().is_empty() {
-                        agent_comment(config, &task_id, "codex-fix found nothing to change.").await;
+                        agent_comment(config, &task_id, "opus-fix found nothing to change.").await;
                     } else {
                         let _ = run_git(&["add", "-A"], &repo_path).await;
                         match run_git(
-                            &["commit", "-m", "codex-fix: apply review feedback"],
+                            &["commit", "-m", "opus-fix: apply review feedback"],
                             &repo_path,
                         )
                         .await
@@ -5306,24 +5308,24 @@ from Matt, stop without making changes and explain specifically what you need cl
                                 agent_comment(
                                     config,
                                     &task_id,
-                                    "Applied codex-fix suggestions in a follow-up commit.",
+                                    "Applied opus-fix suggestions in a follow-up commit.",
                                 )
                                 .await;
                             }
                             Err(e) => {
-                                log::warn!("[worker] codex-fix commit failed: {}", e);
-                                agent_comment(config, &task_id, &format!("codex-fix edited files but the commit failed ({}). Changes still staged.", e)).await;
+                                log::warn!("[worker] opus-fix commit failed: {}", e);
+                                agent_comment(config, &task_id, &format!("opus-fix edited files but the commit failed ({}). Changes still staged.", e)).await;
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    log::warn!("[worker] /codex-fix failed: {}", e);
+                    log::warn!("[worker] /opus-fix failed: {}", e);
                     agent_comment(
                         config,
                         &task_id,
                         &format!(
-                            "codex-fix didn't complete cleanly ({}). Proceeding to QA.",
+                            "opus-fix didn't complete cleanly ({}). Proceeding to QA.",
                             e
                         ),
                     )
@@ -5333,7 +5335,7 @@ from Matt, stop without making changes and explain specifically what you need cl
 
             // 5c. Build check. Runs the project's build command (npm run build / cargo
             // build, auto-detected) so logic bugs that break compilation or the bundle
-            // get caught before a PR is opened. One auto-fix pass with codex if the
+            // get caught before a PR is opened. One auto-fix pass with opus-fix if the
             // first build fails; if the second build still fails, bail out clearly
             // instead of pushing broken code.
             match run_build_check(&repo_path).await {
@@ -5345,10 +5347,10 @@ from Matt, stop without making changes and explain specifically what you need cl
                 }
                 Err((cmd, log_tail)) => {
                     agent_comment(config, &task_id, &format!(
-                        "Build failed ({}). Trying one codex-fix pass with the build output as context.", cmd
+                        "Build failed ({}). Trying one opus-fix pass with the build output as context.", cmd
                     )).await;
                     let fix_prompt = format!(
-                        "/codex-fix\n\nThe project's build just failed. Fix the build errors only. Don't refactor anything else.\n\nBuild command: {}\n\nBuild output (tail):\n{}",
+                        "/opus-fix\n\nThe project's build just failed. Fix the build errors only. Don't refactor anything else.\n\nBuild command: {}\n\nBuild output (tail):\n{}",
                         cmd, log_tail
                     );
                     let retry_fix = run_claude_code_streaming(
@@ -5363,7 +5365,7 @@ from Matt, stop without making changes and explain specifically what you need cl
                     .await;
                     if matches!(&retry_fix, Err(e) if e == "TASK_CANCELLED") {
                         log::info!(
-                            "[worker] Task {} cancelled during build-retry codex-fix; stopping",
+                            "[worker] Task {} cancelled during build-retry opus-fix; stopping",
                             task_id
                         );
                         if let Some(h) = dev_server_handle.take() {
@@ -5372,15 +5374,15 @@ from Matt, stop without making changes and explain specifically what you need cl
                         return Ok("Task was cancelled".to_string());
                     }
                     if let Err(e) = retry_fix {
-                        log::warn!("[worker] codex-fix (build retry) failed: {}", e);
+                        log::warn!("[worker] opus-fix (build retry) failed: {}", e);
                     }
-                    // Stage and commit whatever codex-fix produced, even if stream errored.
+                    // Stage and commit whatever opus-fix produced, even if stream errored.
                     let _ = run_git(&["add", "-A"], &repo_path).await;
                     let status_out = run_git(&["diff", "--cached", "--quiet"], &repo_path).await;
                     if matches!(status_out, Err(_)) {
                         // Exit non-zero from diff --quiet means there are staged changes.
                         let _ = run_git(
-                            &["commit", "-m", "codex-fix: repair failing build"],
+                            &["commit", "-m", "opus-fix: repair failing build"],
                             &repo_path,
                         )
                         .await;
@@ -5391,13 +5393,13 @@ from Matt, stop without making changes and explain specifically what you need cl
                             agent_comment(
                                 config,
                                 &task_id,
-                                "Build passed on second try after codex-fix. Proceeding.",
+                                "Build passed on second try after opus-fix. Proceeding.",
                             )
                             .await;
                         }
                         Err((cmd2, log_tail2)) => {
                             agent_comment(config, &task_id, &format!(
-                                "Build still failing ({}) after a codex-fix pass. Not opening a PR. Last output:\n\n```\n{}\n```",
+                                "Build still failing ({}) after an opus-fix pass. Not opening a PR. Last output:\n\n```\n{}\n```",
                                 cmd2, log_tail2
                             )).await;
 
