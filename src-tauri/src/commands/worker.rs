@@ -525,6 +525,22 @@ const MERGE_DEPLOY_MAX_RETRIES: i64 = 2;
 /// would otherwise pass `None` and merge whatever the PR head is at merge time).
 const MERGE_DEPLOY_EXPECTED_HEAD_SHA_KEY: &str = "samwise_merge_deploy_expected_head_sha";
 const MERGE_DEPLOY_RETRIES_KEY: &str = "samwise_merge_deploy_retries";
+/// Wall-clock budget for the POST-MERGE DEPLOY COMMAND LOOP (running each
+/// Supabase Edge Function / Railway / migration command in the plan) - not
+/// the green-check poll after it, which has its own
+/// POST_MERGE_DEPLOY_GREEN_TIMEOUT_SECS budget. Each individual command is
+/// already capped (20 min, run_deploy_shell), but a large plan (e.g. Operly's
+/// ~80 edge functions) had no OVERALL ceiling: a 2026-09-29 incident found
+/// the in-process per-repo MERGE_DEPLOY_LOCKS mutex wedged silently for hours
+/// with zero visibility until a service restart released it. 45 min is well
+/// above the ~12 min the full Operly sweep normally takes, with margin for a
+/// couple of transient-retry escalations, but still bounded and alertable.
+const MERGE_DEPLOY_COMMANDS_TIMEOUT_SECS: u64 = 45 * 60;
+/// Repos whose staging Kip/Rally can pin for QA via GitHub's `sud-test` label
+/// on an open PR. Real deploy commands (Supabase functions/migrations,
+/// Railway, Vercel) must not run against these while a holder exists.
+const SUD_TEST_STAGING_REPOS: &[(&str, &str)] =
+    &[("R-Link-LLC", "operly"), ("R-Link-LLC", "r-link-studio-rebuild")];
 
 /// Wall-clock budget for a single auto-fix Claude Code run (the pass that
 /// addresses Codex blockers on a PR). The old hardcoded 900s was too tight
@@ -7073,6 +7089,50 @@ async fn send_telegram(config: &SupabaseConfig, message: &str) {
     }
 }
 
+/// Post an alert to Rivendell's local Desk (Matt's Telegram is off, so that's
+/// dead as an alert channel - see the 2026-09-29 merge-deploy stale-lock
+/// incident). Rivendell runs on this same host at localhost:8091 with no
+/// auth on /api/desk (the same trust boundary /internal already documents as
+/// localhost-only), so this is a plain local POST, not a new credential to
+/// manage. `dedupe: true` means a repeat alert while the prior one is still
+/// open (undone, unarchived) 409s instead of spamming a duplicate card - best
+/// effort either way, never fails the caller's deploy flow over it.
+async fn alert_desk(title: &str, description: &str) {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let body = serde_json::json!({
+        "title": title,
+        "description": description,
+        "agent": "AutoSam",
+        "column": "in_progress",
+        "priority": "high",
+        "project": "AutoSam",
+        "dedupe": true,
+    });
+    match client
+        .post("http://localhost:8091/api/desk/cards")
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().as_u16() == 201 || resp.status().as_u16() == 409 => {}
+        Ok(resp) => {
+            log::warn!(
+                "[worker] Desk alert post returned unexpected status {}",
+                resp.status()
+            );
+        }
+        Err(e) => {
+            log::warn!("[worker] Desk alert post failed: {}", e);
+        }
+    }
+}
+
 // ── Attachments ─────────────────────────────────────────────────────
 
 /// Upload raw bytes to the `task-attachments` Supabase Storage bucket and
@@ -13018,14 +13078,40 @@ impl MergeDeployError {
 
     /// The pre-merge phase exceeded MERGE_DEPLOY_PREMERGE_TIMEOUT_SECS (a hung
     /// git/gh subprocess). pr_merged is always false here by construction. This
-    /// is the only error kind the Err handler auto-re-fires, because it is the
-    /// one signal that means "stuck, not refused". Every other failure (CI hard
-    /// fail, head-changed bail, preflight reject) should park for a human.
+    /// and DeployCommandsTimedOut/StagingLocked are the only error kinds the
+    /// Err handler auto-re-fires, because they are the signals that mean "stuck
+    /// or waiting, not refused". Every other failure (CI hard fail, head-changed
+    /// bail, preflight reject) should park for a human.
     fn premerge_timeout(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             pr_merged: false,
             kind: MergeDeployErrorKind::PremergeTimeout,
+        }
+    }
+
+    /// The post-merge deploy COMMAND LOOP (not the green-check poll, which has
+    /// its own POST_MERGE_DEPLOY_GREEN_TIMEOUT_SECS budget) ran past
+    /// MERGE_DEPLOY_COMMANDS_TIMEOUT_SECS. pr_merged is always true here: this
+    /// only fires after the merge, while running the deploy plan's commands.
+    fn deploy_commands_timed_out(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            pr_merged: true,
+            kind: MergeDeployErrorKind::DeployCommandsTimedOut,
+        }
+    }
+
+    /// A Sud staging lock (the sud-test label) holds Operly or Studio right
+    /// now, or the deploy checkout could not be proven to match the current
+    /// default-branch HEAD. Not a failure - re-fire without consuming the
+    /// shared retry budget so an hours-long QA lock never exhausts retries and
+    /// parks the card for a human.
+    fn staging_locked(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            pr_merged: true,
+            kind: MergeDeployErrorKind::StagingLocked,
         }
     }
 }
@@ -13036,6 +13122,8 @@ enum MergeDeployErrorKind {
     DeployFailed,
     DeployTimedOut,
     PremergeTimeout,
+    DeployCommandsTimedOut,
+    StagingLocked,
 }
 
 /// Pick up merge/deploy requests written by the desktop or web UI. The UI only
@@ -13783,14 +13871,24 @@ async fn start_merge_deploy_task(
                     .unwrap_or_else(|| task.clone());
 
                 // A pre-merge timeout means the merge step HUNG, not that the PR
-                // was refused (pr_merged is false by construction). This Err arm
-                // only runs after run_merge_deploy_workflow returned, so the
-                // per-repo lock guard has dropped and the slot is free. Auto
-                // re-fire the merge (capped) by writing a fresh pending request
-                // for the queue picker. The reviewed head SHA persisted in
-                // context carries the reviewed-head guard across the re-fire.
-                // Every OTHER failure kind falls through and parks for a human.
-                if err.kind == MergeDeployErrorKind::PremergeTimeout {
+                // was refused (pr_merged is false by construction). DeployCommandsTimedOut
+                // is the same "hung" signal for the post-merge command loop.
+                // StagingLocked means a Sud staging lock (or an unproven-fresh
+                // deploy checkout) is blocking right now - not a failure, so it
+                // re-fires WITHOUT consuming the shared retry budget, or an
+                // hours-long QA lock would exhaust retries and park the card.
+                // This Err arm only runs after run_merge_deploy_workflow
+                // returned, so the per-repo lock guard has dropped and the slot
+                // is free. The reviewed head SHA persisted in context carries
+                // the reviewed-head guard across the re-fire. Every OTHER
+                // failure kind falls through and parks for a human.
+                let is_stuck = matches!(
+                    err.kind,
+                    MergeDeployErrorKind::PremergeTimeout
+                        | MergeDeployErrorKind::DeployCommandsTimedOut
+                );
+                let is_staging_locked = err.kind == MergeDeployErrorKind::StagingLocked;
+                if is_stuck || is_staging_locked {
                     let retries = latest_task
                         .get("context")
                         .and_then(|c| c.get(MERGE_DEPLOY_RETRIES_KEY))
@@ -13807,7 +13905,10 @@ async fn start_merge_deploy_task(
                     // picker from the unchanged status).
                     let refireable =
                         matches!(current_status, "approved" | "fixes_needed" | "review");
-                    if retries < MERGE_DEPLOY_MAX_RETRIES && refireable {
+                    // A staging-lock wait is uncapped (not a failure); genuine
+                    // hangs still respect MERGE_DEPLOY_MAX_RETRIES.
+                    let retry_ok = is_staging_locked || retries < MERGE_DEPLOY_MAX_RETRIES;
+                    if retry_ok && refireable {
                         let mut context = task_context_object(&latest_task);
                         context.insert(
                             MERGE_DEPLOY_STATUS_KEY.to_string(),
@@ -13819,10 +13920,13 @@ async fn start_merge_deploy_task(
                         );
                         context.insert(MERGE_DEPLOY_STARTED_AT_KEY.to_string(), Value::Null);
                         context.insert(MERGE_DEPLOY_ERROR_KEY.to_string(), Value::Null);
-                        context.insert(
-                            MERGE_DEPLOY_RETRIES_KEY.to_string(),
-                            Value::Number((retries + 1).into()),
-                        );
+                        // Staging-lock waits don't count against the retry budget.
+                        if !is_staging_locked {
+                            context.insert(
+                                MERGE_DEPLOY_RETRIES_KEY.to_string(),
+                                Value::Number((retries + 1).into()),
+                            );
+                        }
                         // No "status" field: preserve the row status. The reviewed
                         // head SHA already lives in context (carried by
                         // task_context_object) so the re-fire keeps the guard.
@@ -13837,17 +13941,20 @@ async fn start_merge_deploy_task(
                         .await
                         {
                             Ok(_) => {
-                                agent_comment(
-                                    &config_clone,
-                                    &task_id,
-                                    &format!(
-                                        "Merge + Deploy went silent before merging (pre-merge step hung past {} minutes). The merge slot is free again, so auto-retrying: attempt {} of {}.",
-                                        MERGE_DEPLOY_PREMERGE_TIMEOUT_SECS / 60,
+                                let note = if is_staging_locked {
+                                    format!(
+                                        "Merge + Deploy is holding: {}. Will retry automatically once it clears.",
+                                        truncate(&err.message, 800)
+                                    )
+                                } else {
+                                    format!(
+                                        "Merge + Deploy went silent ({}). The merge slot is free again, so auto-retrying: attempt {} of {}.",
+                                        truncate(&err.message, 400),
                                         retries + 1,
                                         MERGE_DEPLOY_MAX_RETRIES
-                                    ),
-                                )
-                                .await;
+                                    )
+                                };
+                                agent_comment(&config_clone, &task_id, &note).await;
                                 return;
                             }
                             Err(e) => {
@@ -13857,7 +13964,8 @@ async fn start_merge_deploy_task(
                                 // Fall through to the normal failed-handling so it
                                 // parks visibly.
                                 log::error!(
-                                    "[merge-deploy] failed to persist pre-merge-timeout retry for {}: {}",
+                                    "[merge-deploy] failed to persist {} retry for {}: {}",
+                                    if is_staging_locked { "staging-locked" } else { "stuck-deploy" },
                                     task_id,
                                     e
                                 );
@@ -13880,7 +13988,9 @@ async fn start_merge_deploy_task(
                     Value::String(truncate(&err.message, 900)),
                 );
                 let next_status = match err.kind {
-                    MergeDeployErrorKind::DeployTimedOut => None,
+                    MergeDeployErrorKind::DeployTimedOut
+                    | MergeDeployErrorKind::DeployCommandsTimedOut
+                    | MergeDeployErrorKind::StagingLocked => None,
                     MergeDeployErrorKind::DeployFailed if err.pr_merged => Some("failed"),
                     _ => Some(if err.pr_merged {
                         "fixes_needed"
@@ -13912,6 +14022,17 @@ async fn start_merge_deploy_task(
                     MergeDeployErrorKind::DeployTimedOut => {
                         format!(
                             "Closeout deferred: deploy timed out.\n\nReason: {}",
+                            truncate(&err.message, 1800)
+                        )
+                    }
+                    MergeDeployErrorKind::DeployCommandsTimedOut | MergeDeployErrorKind::StagingLocked => {
+                        format!(
+                            "Closeout deferred: {} out of automatic retries for now.\n\nReason: {}",
+                            if err.kind == MergeDeployErrorKind::StagingLocked {
+                                "still waiting on the staging lock"
+                            } else {
+                                "the deploy commands ran"
+                            },
                             truncate(&err.message, 1800)
                         )
                     }
@@ -14226,10 +14347,124 @@ async fn run_merge_deploy_workflow(
         return Ok(summary);
     }
 
+    log::info!(
+        "[merge-deploy] starting {} deploy command(s) for task {} in {} (budget {}m)",
+        plan.commands.len(),
+        task_id,
+        repo_path,
+        MERGE_DEPLOY_COMMANDS_TIMEOUT_SECS / 60
+    );
+    let commands_started_at = std::time::Instant::now();
+    // Re-fetch persisted per-command status so a re-fire (timeout, staging
+    // lock, or a plain retry) never re-runs a command already marked
+    // succeeded, and treats one left "running" (the process died mid-command,
+    // outcome unknown) as needing a human rather than a silent re-run -
+    // mirrors recover_stale_merged_pr_deploy's existing skip logic.
+    // Fail closed on a fetch problem: silently defaulting to an empty context
+    // here would make every already-succeeded command look like it had never
+    // run, and re-run all of them (the replay-protection this fetch exists
+    // for would then protect nothing).
+    let commands_context = match supabase::fetch_task(config, task_id).await {
+        Ok(Some(latest)) => task_context_object(&latest),
+        Ok(None) => {
+            return Err(MergeDeployError::deploy_failed(
+                format!("task {} disappeared before the deploy command loop could start", task_id),
+                pr_merged,
+            ));
+        }
+        Err(e) => {
+            return Err(MergeDeployError::deploy_failed(
+                format!("could not confirm prior deploy command status before starting: {}", e),
+                pr_merged,
+            ));
+        }
+    };
     for command in &plan.commands {
+        match deploy_command_status_from_context(&commands_context, command).as_deref() {
+            Some("succeeded") => continue,
+            Some("running") => {
+                return Err(MergeDeployError::deploy_failed(
+                    format!(
+                        "Deploy command `{}` was already marked running when this attempt started; refusing to rerun it automatically because it may have completed externally.",
+                        command.label
+                    ),
+                    pr_merged,
+                ));
+            }
+            Some("failed") => {
+                return Err(MergeDeployError::deploy_failed(
+                    format!(
+                        "Deploy command `{}` already failed on this task's stored plan; re-request Merge + Deploy after reviewing the stored error instead of blindly retrying.",
+                        command.label
+                    ),
+                    pr_merged,
+                ));
+            }
+            _ => {}
+        }
+        // Budget is checked BETWEEN commands, never used to cancel one
+        // mid-flight: run_deploy_shell already owns a correct process-group
+        // kill on ITS OWN 20-min timeout, and forcibly cancelling this future
+        // while a child is running would bypass that (kill_on_drop only
+        // signals the immediate child, not the group), risking an orphaned
+        // process still deploying after the lock has been released.
+        if commands_started_at.elapsed() >= std::time::Duration::from_secs(MERGE_DEPLOY_COMMANDS_TIMEOUT_SECS) {
+            let held_for = commands_started_at.elapsed().as_secs() / 60;
+            let message = format!(
+                "deploy command loop exceeded {} minutes (held ~{}m) for task {} in {}",
+                MERGE_DEPLOY_COMMANDS_TIMEOUT_SECS / 60,
+                held_for,
+                task_id,
+                repo_path
+            );
+            log::error!("[merge-deploy] {}", message);
+            let repo_name = std::path::Path::new(repo_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| repo_path.to_string());
+            let task_id_alert = task_id.to_string();
+            let repo_path_alert = repo_path.to_string();
+            tokio::spawn(async move {
+                alert_desk(
+                    &format!("AutoSam: stale merge-deploy lock in {}", repo_name),
+                    &format!(
+                        "Task `{}` in `{}` ran deploy commands past the {}-minute budget. The repo lock was released and this auto-retries on its own - check the task's own comments/journalctl if it keeps happening.",
+                        task_id_alert,
+                        repo_path_alert,
+                        MERGE_DEPLOY_COMMANDS_TIMEOUT_SECS / 60
+                    ),
+                )
+                .await;
+            });
+            return Err(MergeDeployError::deploy_commands_timed_out(message));
+        }
+        match check_staging_lock_gate(pr_url, &deploy_path, &deploy_branch).await {
+            StagingGateOutcome::Clear => {}
+            StagingGateOutcome::Locked(message) => {
+                return Err(MergeDeployError::staging_locked(message));
+            }
+            StagingGateOutcome::CheckFailed(message) => {
+                return Err(MergeDeployError::deploy_failed(message, pr_merged));
+            }
+        }
         run_tracked_deploy_command(command, config, task_id)
             .await
             .map_err(|e| MergeDeployError::deploy_failed(e, pr_merged))?;
+    }
+    // The budget is only checked BEFORE each command, so a run whose last
+    // command started just under it (or whose only command ran long) can
+    // finish without ever tripping the check above. Log it anyway so a
+    // silent overrun is still visible - this never fails the task, since the
+    // work already completed successfully.
+    let total_elapsed_secs = commands_started_at.elapsed().as_secs();
+    if total_elapsed_secs > MERGE_DEPLOY_COMMANDS_TIMEOUT_SECS {
+        log::warn!(
+            "[merge-deploy] deploy commands for task {} in {} finished after {}m, over the {}m budget (no mid-command cancellation, by design)",
+            task_id,
+            repo_path,
+            total_elapsed_secs / 60,
+            MERGE_DEPLOY_COMMANDS_TIMEOUT_SECS / 60
+        );
     }
 
     if wait_for_deploy_green {
@@ -14299,6 +14534,200 @@ async fn prepare_deploy_checkout(
     let origin_ref = format!("origin/{}", base_branch);
     run_git(&["checkout", "--detach", &origin_ref], &deploy_path).await?;
     Ok(deploy_path)
+}
+
+/// If `pr_url` belongs to one of SUD_TEST_STAGING_REPOS, return its (owner,
+/// repo). Parsed straight from the PR URL (already validated upstream via
+/// review::is_safe_pr_url on every merge-deploy task), not from `git remote
+/// get-url` - a prior version sniffed the git remote and silently returned
+/// "not gated" on any git error or SSH-form remote it didn't recognize,
+/// which fails OPEN, the opposite of this gate's whole purpose.
+fn sud_test_staging_repo_for(pr_url: &str) -> Option<(&'static str, &'static str)> {
+    let parsed = github_pull_ref_from_url(pr_url)?;
+    SUD_TEST_STAGING_REPOS
+        .iter()
+        .find(|(owner, repo)| {
+            parsed.owner.eq_ignore_ascii_case(owner) && parsed.repo.eq_ignore_ascii_case(repo)
+        })
+        .copied()
+}
+
+/// Outcome of a staging-lock check. `Locked` means a real holder was
+/// confirmed and is safe to retry indefinitely (waiting is normal, not a
+/// failure). `CheckFailed` means the check itself could not run (gh/API/git
+/// error, or an unparseable/empty response) - fail closed by refusing to
+/// deploy, but as a NORMAL capped failure, not an uncapped retry, so a
+/// persistent auth/config problem surfaces to a human instead of looping
+/// gh api calls forever.
+enum StagingGateOutcome {
+    Clear,
+    Locked(String),
+    CheckFailed(String),
+}
+
+/// Fail-closed Sud staging-lock check: an OPEN PR carrying GitHub's `sud-test`
+/// label means Rally has this repo's staging pinned for QA. Real deploy
+/// commands must not run while a holder exists. Any read/parse/empty-response
+/// failure is treated as "could not confirm no lock" (CheckFailed), never
+/// silently as "no lock".
+async fn sud_test_lock_holder(owner: &str, repo: &str) -> Result<Option<String>, String> {
+    let output = async_cmd("gh")
+        .args([
+            "api",
+            &format!(
+                "repos/{}/{}/issues?labels=sud-test&state=open&per_page=100",
+                owner, repo
+            ),
+            "--paginate",
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("spawn gh api sud-test lookup: {}", e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh api sud-test lookup failed: {}",
+            truncate(String::from_utf8_lossy(&output.stderr).trim(), 500)
+        ));
+    }
+    // `--paginate` on an array response streams each page as its own JSON
+    // array (or the CLI may merge them into one); parse as a stream of JSON
+    // values so either shape works, rather than assuming a single top-level array.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.trim().is_empty() {
+        // A real "no PRs match" result is a JSON array `[]`, not empty stdout.
+        // Empty output on a zero-exit `gh api` call is unexpected/ambiguous -
+        // treat it as a check failure, not as "confirmed no holder".
+        return Err("gh api sud-test lookup returned no output".to_string());
+    }
+    let mut saw_any_value = false;
+    for value in serde_json::Deserializer::from_str(&stdout).into_iter::<Value>() {
+        let value = value.map_err(|e| format!("parse gh api sud-test response: {}", e))?;
+        saw_any_value = true;
+        let items: Vec<Value> = match value {
+            Value::Array(items) => items,
+            other => vec![other],
+        };
+        for item in items {
+            // GitHub's issues endpoint returns PRs too, flagged by a
+            // `pull_request` key; a plain issue never carries one.
+            if item.get("pull_request").is_some() {
+                let number = item.get("number").and_then(|v| v.as_i64()).unwrap_or(0);
+                return Ok(Some(format!("#{}", number)));
+            }
+        }
+    }
+    if !saw_any_value {
+        return Err("gh api sud-test lookup produced unparseable output".to_string());
+    }
+    Ok(None)
+}
+
+/// The live remote HEAD SHA for `branch`, fetched fresh (not from any local
+/// cache), so a staleness check can't be fooled by a checkout's own stale
+/// `origin/*` ref. `repo_path` only needs to be A valid checkout of the same
+/// remote (its own branch/HEAD state is irrelevant to this lookup).
+async fn remote_branch_head_sha(repo_path: &str, branch: &str) -> Result<String, String> {
+    let out = run_git(
+        &["ls-remote", "origin", &format!("refs/heads/{}", branch)],
+        repo_path,
+    )
+    .await?;
+    out.split_whitespace()
+        .next()
+        .filter(|sha| !sha.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("origin has no ref refs/heads/{}", branch))
+}
+
+/// Bound for each individual gh/git call inside check_staging_lock_gate. A
+/// hung call here would otherwise hold the per-repo deploy lock indefinitely
+/// (this gate runs before the command budget check even sees it) - short
+/// because these are single, cheap lookups, not deploy commands.
+const STAGING_GATE_CALL_TIMEOUT_SECS: u64 = 30;
+
+async fn with_gate_timeout<T>(
+    label: &str,
+    fut: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    match tokio::time::timeout(std::time::Duration::from_secs(STAGING_GATE_CALL_TIMEOUT_SECS), fut).await {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "{} did not respond within {}s",
+            label, STAGING_GATE_CALL_TIMEOUT_SECS
+        )),
+    }
+}
+
+/// Fail-closed staging gate for Operly/Studio. Call before starting the
+/// deploy-command loop AND again before each command in it (a long loop -
+/// e.g. Operly's ~80 edge functions, ~12 min normally - can outlast a lock
+/// that only appears partway through). Repos not in SUD_TEST_STAGING_REPOS
+/// are not gated at all (Clear immediately, no gh/git calls). This is a
+/// check-then-act gate, not a lease: the window between a Clear verdict and
+/// a single command's completion (each already capped, see run_deploy_shell)
+/// is not covered - closing that fully needs Sud's own QA tooling to publish
+/// an "active deploy" signal it waits on before taking the lock, which is
+/// cross-team scope beyond this gate.
+async fn check_staging_lock_gate(pr_url: &str, deploy_path: &str, base_branch: &str) -> StagingGateOutcome {
+    let Some((owner, repo)) = sud_test_staging_repo_for(pr_url) else {
+        return StagingGateOutcome::Clear;
+    };
+    let holder = match with_gate_timeout("sud-test lookup", sud_test_lock_holder(owner, repo)).await {
+        Ok(holder) => holder,
+        Err(e) => {
+            return StagingGateOutcome::CheckFailed(format!(
+                "staging lock check failed for {}/{}, failing closed: {}",
+                owner, repo, e
+            ))
+        }
+    };
+    if let Some(pr) = holder {
+        return StagingGateOutcome::Locked(format!(
+            "{}/{} staging is pinned by {} (sud-test label); deploy paused until it clears",
+            owner, repo, pr
+        ));
+    }
+    // No holder: still refuse to deploy a checkout that has drifted behind
+    // the current default branch (the exact gap a 2026-09-29 incident found -
+    // a deploy worktree left pointed at an older merged commit).
+    let checkout_head = match with_gate_timeout(
+        "deploy checkout HEAD read",
+        run_git(&["rev-parse", "HEAD"], deploy_path),
+    )
+    .await
+    {
+        Ok(sha) => sha,
+        Err(e) => {
+            return StagingGateOutcome::CheckFailed(format!(
+                "could not read deploy checkout HEAD, failing closed: {}",
+                e
+            ))
+        }
+    };
+    let remote_head = match with_gate_timeout(
+        "remote HEAD lookup",
+        remote_branch_head_sha(deploy_path, base_branch),
+    )
+    .await
+    {
+        Ok(sha) => sha,
+        Err(e) => {
+            return StagingGateOutcome::CheckFailed(format!(
+                "could not confirm current {} HEAD, failing closed: {}",
+                base_branch, e
+            ))
+        }
+    };
+    if checkout_head.trim() != remote_head.trim() {
+        return StagingGateOutcome::CheckFailed(format!(
+            "deploy checkout at {} ({}) is behind current {} ({}); refusing to deploy stale code",
+            deploy_path,
+            truncate(checkout_head.trim(), 12),
+            base_branch,
+            truncate(remote_head.trim(), 12)
+        ));
+    }
+    StagingGateOutcome::Clear
 }
 
 async fn preflight_railway_deploy_context(repo_path: &str, files: &[String]) -> Result<(), String> {
@@ -15510,6 +15939,34 @@ async fn recover_stale_merged_pr_deploy(
                 ));
             }
             _ => {}
+        }
+        // A confirmed staging-lock holder is normal waiting, not a failure:
+        // poll briefly instead of erroring straight into the caller's hard
+        // "failed" close-out, which has no re-fire path for stale recovery.
+        // Deliberately capped short (10 min, not the caller's full
+        // MERGE_DEPLOY_RUNNING_STALE_SECS budget): this whole call already
+        // runs under that outer timeout, which cancels via future drop - the
+        // same mid-command process-group-orphan risk just removed from the
+        // primary loop - so this must leave generous headroom for the
+        // deploy commands that run after it, not spend the budget waiting.
+        const STALE_RECOVERY_LOCK_POLL_MAX_SECS: u64 = 10 * 60;
+        let lock_wait_started = std::time::Instant::now();
+        loop {
+            match check_staging_lock_gate(pr_url, &deploy_path, &deploy_branch).await {
+                StagingGateOutcome::Clear => break,
+                StagingGateOutcome::Locked(message) => {
+                    if lock_wait_started.elapsed().as_secs() >= STALE_RECOVERY_LOCK_POLL_MAX_SECS {
+                        return Err(format!(
+                            "staging lock still held after {} minutes of stale-recovery waiting: {}",
+                            STALE_RECOVERY_LOCK_POLL_MAX_SECS / 60,
+                            message
+                        ));
+                    }
+                    log::info!("[merge-deploy] stale recovery waiting: {}", message);
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                }
+                StagingGateOutcome::CheckFailed(message) => return Err(message),
+            }
         }
         run_tracked_deploy_command(command, config, task_id).await?;
     }
