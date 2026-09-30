@@ -5607,7 +5607,7 @@ from Matt, stop without making changes and explain specifically what you need cl
                                 config,
                                 &task_id,
                                 &format!(
-                                    "Testing stage `/browse` was attempted but was not safe to use as an automatic blocker. Continuing to PR review; Codex remains the merge authority.\n\n{}\n\nSummary:\n{}\n\nIssues:\n{}{}",
+                                    "Testing stage `/browse` was attempted but was not safe to use as an automatic blocker. Continuing to PR review; the cross-model review remains the merge authority.\n\n{}\n\nSummary:\n{}\n\nIssues:\n{}{}",
                                     reason,
                                     browse_summary(&outcome.summary),
                                     issues_block,
@@ -5662,7 +5662,7 @@ from Matt, stop without making changes and explain specifically what you need cl
                                     config,
                                     &task_id,
                                     &format!(
-                                        "Testing repair pass did not complete cleanly ({}). Continuing to PR review with the browser finding attached; Codex remains the merge authority.",
+                                        "Testing repair pass did not complete cleanly ({}). Continuing to PR review with the browser finding attached; the cross-model review remains the merge authority.",
                                         truncate(&e, 300)
                                     ),
                                 )
@@ -5824,7 +5824,7 @@ from Matt, stop without making changes and explain specifically what you need cl
                                         config,
                                         &task_id,
                                         &format!(
-                                            "Testing stage `/browse` still reported issues after the repair pass. Captured the findings and continuing to PR review; Codex remains the merge authority.\n\n{}\n\nIssues:\n{}{}",
+                                            "Testing stage `/browse` still reported issues after the repair pass. Captured the findings and continuing to PR review; the cross-model review remains the merge authority.\n\n{}\n\nIssues:\n{}{}",
                                             browse_summary(&outcome.summary),
                                             format_browse_issues_block(
                                                 &outcome.issues,
@@ -5845,7 +5845,7 @@ from Matt, stop without making changes and explain specifically what you need cl
                         config,
                         &task_id,
                         &format!(
-                            "{}. Browser QA was required and attempted as far as possible, but no URL was available. Continuing to PR review; Codex remains the merge authority.",
+                            "{}. Browser QA was required and attempted as far as possible, but no URL was available. Continuing to PR review; the cross-model review remains the merge authority.",
                             reason
                         ),
                     )
@@ -6038,7 +6038,7 @@ from Matt, stop without making changes and explain specifically what you need cl
                             format!("PR's up: {}. Let me know if you want any changes.", pr_url)
                         } else {
                             format!(
-                                "PR's up: {}. /codex-fix already ran on this branch, so I am sending it to Ready to Merge instead of a second review gate.",
+                                "PR's up: {}. A cross-model review already ran on this branch, so I am sending it to Ready to Merge instead of a second review gate.",
                                 pr_url
                             )
                         },
@@ -21496,7 +21496,7 @@ pub async fn sweep_pr_review_queue(
         if main_repo_path.is_empty() || !task_requires_pr_review(task) {
             continue;
         }
-        // AutoSam-coded tickets already ran /codex-fix. Do not drag them back
+        // AutoSam-coded tickets already ran a cross-model review. Do not drag them back
         // into the OpenRouter $samwise-pr-review gate if they land in Review.
         if !task_is_external_pr_review_request(task) {
             let moved = supabase::update_task_if_status(
@@ -21518,7 +21518,7 @@ pub async fn sweep_pr_review_queue(
                 agent_comment(
                     config,
                     &task_id,
-                    "This ticket already ran /codex-fix before the PR opened, so I am sending it to Ready to Merge instead of a second review gate.",
+                    "This ticket already ran a cross-model review before the PR opened, so I am sending it to Ready to Merge instead of a second review gate.",
                 )
                 .await;
                 notify_callback(config, &task_id, "approved", Some(&pr_url), None);
