@@ -541,6 +541,19 @@ const MERGE_DEPLOY_COMMANDS_TIMEOUT_SECS: u64 = 45 * 60;
 /// Railway, Vercel) must not run against these while a holder exists.
 const SUD_TEST_STAGING_REPOS: &[(&str, &str)] =
     &[("R-Link-LLC", "operly"), ("R-Link-LLC", "r-link-studio-rebuild")];
+/// How soon the sweep may re-attempt a task deferred on a staging lock. Kept
+/// short (recheck cadence, not a real timeout) since the point is silence
+/// while genuinely waiting, not a slow poll - Kip: "~60s is fine".
+const STAGING_LOCK_RECHECK_BACKOFF_SECS: i64 = 60;
+/// The sweep's pending-task picker will not start a task before this time -
+/// set whenever a staging lock defers a task, so an hours-long Sud QA
+/// session is silent waiting (checked again every ~60s), not a hot loop of
+/// full checkout+plan-rebuild+gh-api cycles on every sweep tick.
+const MERGE_DEPLOY_NEXT_ATTEMPT_AT_KEY: &str = "samwise_merge_deploy_next_attempt_at";
+/// The last staging-lock reason/holder a task was deferred for. Only used to
+/// decide whether to post a fresh agent_comment (holder changed or cleared)
+/// versus staying silent (same holder, recheck ticked over again).
+const MERGE_DEPLOY_LOCK_REASON_KEY: &str = "samwise_merge_deploy_lock_reason";
 
 /// Wall-clock budget for a single auto-fix Claude Code run (the pass that
 /// addresses Codex blockers on a PR). The old hardcoded 900s was too tight
@@ -13332,10 +13345,10 @@ pub async fn sweep_merge_deploy_requests(config: &SupabaseConfig) {
                 )
                 .await
                 .map_err(|_| {
-                    format!(
+                    StaleRecoveryError::Other(format!(
                         "stale merged deploy recovery exceeded {} minutes",
                         MERGE_DEPLOY_RUNNING_STALE_SECS / 60
-                    )
+                    ))
                 })
                 .and_then(|result| result);
                 match recovery_result {
@@ -13392,7 +13405,18 @@ pub async fn sweep_merge_deploy_requests(config: &SupabaseConfig) {
                         )
                         .await;
                     }
-                    Err(e) => {
+                    Err(StaleRecoveryError::StagingLocked(reason)) => {
+                        // A healthy Sud QA lock is normal waiting, not a
+                        // failure. Release the repo mutex (this spawned task
+                        // is about to end, dropping it) and defer instead of
+                        // permanently failing the card - retaining whatever
+                        // per-command progress recover_stale_merged_pr_deploy
+                        // already persisted (deploy_command_status_from_context
+                        // skips those on the next attempt) rather than
+                        // discarding it via a "failed" close-out.
+                        defer_merge_deploy_for_staging_lock(&config_clone, &task_id, &reason).await;
+                    }
+                    Err(StaleRecoveryError::Other(e)) => {
                         let mut context = supabase::fetch_task(&config_clone, &task_id)
                             .await
                             .ok()
@@ -13910,6 +13934,15 @@ async fn start_merge_deploy_task(
                     let retry_ok = is_staging_locked || retries < MERGE_DEPLOY_MAX_RETRIES;
                     if retry_ok && refireable {
                         let mut context = task_context_object(&latest_task);
+                        // Same holder/reason as last defer -> stay quiet (no new
+                        // comment). Different reason, or first time -> comment.
+                        // Prevents a comment storm on every ~60s recheck of an
+                        // hours-long Sud QA lock.
+                        let previous_reason = context
+                            .get(MERGE_DEPLOY_LOCK_REASON_KEY)
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        let reason_changed = previous_reason.as_deref() != Some(err.message.as_str());
                         context.insert(
                             MERGE_DEPLOY_STATUS_KEY.to_string(),
                             Value::String("requested".to_string()),
@@ -13920,12 +13953,30 @@ async fn start_merge_deploy_task(
                         );
                         context.insert(MERGE_DEPLOY_STARTED_AT_KEY.to_string(), Value::Null);
                         context.insert(MERGE_DEPLOY_ERROR_KEY.to_string(), Value::Null);
-                        // Staging-lock waits don't count against the retry budget.
-                        if !is_staging_locked {
+                        // Staging-lock waits don't count against the retry budget,
+                        // but DO get a short backoff so the sweep's pending-picker
+                        // doesn't redo a full checkout+plan-rebuild+gh-api cycle on
+                        // every ~10s tick while genuinely just waiting.
+                        if is_staging_locked {
+                            context.insert(
+                                MERGE_DEPLOY_NEXT_ATTEMPT_AT_KEY.to_string(),
+                                Value::String(
+                                    (chrono::Utc::now()
+                                        + chrono::Duration::seconds(STAGING_LOCK_RECHECK_BACKOFF_SECS))
+                                    .to_rfc3339(),
+                                ),
+                            );
+                            context.insert(
+                                MERGE_DEPLOY_LOCK_REASON_KEY.to_string(),
+                                Value::String(err.message.clone()),
+                            );
+                        } else {
                             context.insert(
                                 MERGE_DEPLOY_RETRIES_KEY.to_string(),
                                 Value::Number((retries + 1).into()),
                             );
+                            context.remove(MERGE_DEPLOY_NEXT_ATTEMPT_AT_KEY);
+                            context.remove(MERGE_DEPLOY_LOCK_REASON_KEY);
                         }
                         // No "status" field: preserve the row status. The reviewed
                         // head SHA already lives in context (carried by
@@ -13941,20 +13992,31 @@ async fn start_merge_deploy_task(
                         .await
                         {
                             Ok(_) => {
-                                let note = if is_staging_locked {
-                                    format!(
-                                        "Merge + Deploy is holding: {}. Will retry automatically once it clears.",
-                                        truncate(&err.message, 800)
-                                    )
+                                if is_staging_locked {
+                                    if reason_changed {
+                                        agent_comment(
+                                            &config_clone,
+                                            &task_id,
+                                            &format!(
+                                                "Merge + Deploy is holding: {}. Will retry automatically once it clears.",
+                                                truncate(&err.message, 800)
+                                            ),
+                                        )
+                                        .await;
+                                    }
                                 } else {
-                                    format!(
-                                        "Merge + Deploy went silent ({}). The merge slot is free again, so auto-retrying: attempt {} of {}.",
-                                        truncate(&err.message, 400),
-                                        retries + 1,
-                                        MERGE_DEPLOY_MAX_RETRIES
+                                    agent_comment(
+                                        &config_clone,
+                                        &task_id,
+                                        &format!(
+                                            "Merge + Deploy went silent ({}). The merge slot is free again, so auto-retrying: attempt {} of {}.",
+                                            truncate(&err.message, 400),
+                                            retries + 1,
+                                            MERGE_DEPLOY_MAX_RETRIES
+                                        ),
                                     )
-                                };
-                                agent_comment(&config_clone, &task_id, &note).await;
+                                    .await;
+                                }
                                 return;
                             }
                             Err(e) => {
@@ -14438,6 +14500,11 @@ async fn run_merge_deploy_workflow(
             });
             return Err(MergeDeployError::deploy_commands_timed_out(message));
         }
+        // First-attempt check before even marking the command "running" (or
+        // doing dependency install work) for a command we may already know
+        // is blocked. run_tracked_deploy_command's own chain rechecks the
+        // gate again after dependency prep and before every retry/escalation
+        // attempt inside a single command's run.
         match check_staging_lock_gate(pr_url, &deploy_path, &deploy_branch).await {
             StagingGateOutcome::Clear => {}
             StagingGateOutcome::Locked(message) => {
@@ -14447,9 +14514,16 @@ async fn run_merge_deploy_workflow(
                 return Err(MergeDeployError::deploy_failed(message, pr_merged));
             }
         }
-        run_tracked_deploy_command(command, config, task_id)
-            .await
-            .map_err(|e| MergeDeployError::deploy_failed(e, pr_merged))?;
+        let gate = StagingGateContext { pr_url, deploy_path: &deploy_path, base_branch: &deploy_branch };
+        match run_tracked_deploy_command(command, config, task_id, &gate).await {
+            DeployStepOutcome::Succeeded => {}
+            DeployStepOutcome::StagingLocked(message) => {
+                return Err(MergeDeployError::staging_locked(message));
+            }
+            DeployStepOutcome::Failed(e) => {
+                return Err(MergeDeployError::deploy_failed(e, pr_merged));
+            }
+        }
     }
     // The budget is only checked BEFORE each command, so a run whose last
     // command started just under it (or whose only command ran long) can
@@ -14728,6 +14802,69 @@ async fn check_staging_lock_gate(pr_url: &str, deploy_path: &str, base_branch: &
         ));
     }
     StagingGateOutcome::Clear
+}
+
+/// Defer a merge-deploy task blocked on a staging lock: reset it back to
+/// "requested" with a short backoff (STAGING_LOCK_RECHECK_BACKOFF_SECS) that
+/// merge_deploy_request_is_pending respects, so the sweep waits quietly
+/// instead of hot-looping a full checkout+plan-rebuild+gh-api cycle. Never
+/// touches the row's overall "status" or per-command progress - an
+/// hours-long Sud QA lock is silent waiting, not a failure. Comments only
+/// when the lock reason changes or first appears (tracked via
+/// MERGE_DEPLOY_LOCK_REASON_KEY), never on every recheck.
+async fn defer_merge_deploy_for_staging_lock(config: &SupabaseConfig, task_id: &str, reason: &str) {
+    let latest = supabase::fetch_task(config, task_id).await.ok().flatten();
+    let mut context = latest
+        .as_ref()
+        .map(task_context_object)
+        .unwrap_or_default();
+    let previous_reason = context
+        .get(MERGE_DEPLOY_LOCK_REASON_KEY)
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let reason_changed = previous_reason.as_deref() != Some(reason);
+    context.insert(
+        MERGE_DEPLOY_STATUS_KEY.to_string(),
+        Value::String("requested".to_string()),
+    );
+    context.insert(
+        MERGE_DEPLOY_REQUESTED_AT_KEY.to_string(),
+        Value::String(chrono::Utc::now().to_rfc3339()),
+    );
+    context.insert(MERGE_DEPLOY_STARTED_AT_KEY.to_string(), Value::Null);
+    context.insert(MERGE_DEPLOY_ERROR_KEY.to_string(), Value::Null);
+    context.insert(
+        MERGE_DEPLOY_NEXT_ATTEMPT_AT_KEY.to_string(),
+        Value::String(
+            (chrono::Utc::now() + chrono::Duration::seconds(STAGING_LOCK_RECHECK_BACKOFF_SECS))
+                .to_rfc3339(),
+        ),
+    );
+    context.insert(
+        MERGE_DEPLOY_LOCK_REASON_KEY.to_string(),
+        Value::String(reason.to_string()),
+    );
+    let write_ok = supabase::update_task(
+        config,
+        task_id,
+        &serde_json::json!({
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+            "context": Value::Object(context),
+        }),
+    )
+    .await
+    .is_ok();
+    if write_ok && reason_changed {
+        agent_comment(
+            config,
+            task_id,
+            &format!(
+                "Merge + Deploy is holding: {}. Will retry automatically once it clears.",
+                reason
+            ),
+        )
+        .await;
+    }
 }
 
 async fn preflight_railway_deploy_context(repo_path: &str, files: &[String]) -> Result<(), String> {
@@ -15221,8 +15358,56 @@ fn manifest_rule_is_railway(rule: &SamwiseDeployRule) -> bool {
             .any(|path| path.to_ascii_lowercase().contains("railway"))
 }
 
-async fn run_deploy_command(command: &DeployCommand) -> Result<(), String> {
-    ensure_node_dependencies_for_deploy(command).await?;
+/// Bundles the 3 values check_staging_lock_gate needs, so the gate can be
+/// threaded through run_deploy_command's retry/escalation chain without
+/// repeating the same 3 parameters at every call site.
+struct StagingGateContext<'a> {
+    pr_url: &'a str,
+    deploy_path: &'a str,
+    base_branch: &'a str,
+}
+
+/// recover_stale_merged_pr_deploy's error type. A plain `String` (the type
+/// nearly every helper it calls already returns) converts automatically via
+/// `From`, so the existing `?`-heavy body needs no other changes - only the
+/// two staging-lock detection points construct StagingLocked explicitly. The
+/// caller must treat StagingLocked as waiting (defer, don't fail the card),
+/// never fold it into the generic error path.
+enum StaleRecoveryError {
+    StagingLocked(String),
+    Other(String),
+}
+
+impl From<String> for StaleRecoveryError {
+    fn from(message: String) -> Self {
+        StaleRecoveryError::Other(message)
+    }
+}
+
+/// A deploy command's outcome, distinguishing a real failure from a staging
+/// lock that appeared mid-attempt. StagingLocked is NOT a failure: the caller
+/// must not mark the command's persisted status "failed", and must clear any
+/// "running" stamp so a later resume doesn't refuse to ever run it (see
+/// run_tracked_deploy_command).
+enum DeployStepOutcome {
+    Succeeded,
+    StagingLocked(String),
+    Failed(String),
+}
+
+async fn run_deploy_command(command: &DeployCommand, gate: &StagingGateContext<'_>) -> DeployStepOutcome {
+    if let Err(e) = ensure_node_dependencies_for_deploy(command).await {
+        return DeployStepOutcome::Failed(e);
+    }
+
+    // Dependency install (npm ci/install) can itself take several minutes -
+    // recheck right after it, immediately before the actual mutating call,
+    // rather than trusting whatever the gate said before install started.
+    match check_staging_lock_gate(gate.pr_url, gate.deploy_path, gate.base_branch).await {
+        StagingGateOutcome::Clear => {}
+        StagingGateOutcome::Locked(message) => return DeployStepOutcome::StagingLocked(message),
+        StagingGateOutcome::CheckFailed(message) => return DeployStepOutcome::Failed(message),
+    }
 
     log::info!(
         "[merge-deploy] running {} in {}: {}",
@@ -15230,15 +15415,18 @@ async fn run_deploy_command(command: &DeployCommand) -> Result<(), String> {
         command.cwd,
         command.command
     );
-    let output = run_deploy_shell(&command.cwd, &command.command, &command.label, 20 * 60).await?;
+    let output = match run_deploy_shell(&command.cwd, &command.command, &command.label, 20 * 60).await {
+        Ok(output) => output,
+        Err(e) => return DeployStepOutcome::Failed(e),
+    };
 
     if output.status.success() {
-        return Ok(());
+        return DeployStepOutcome::Succeeded;
     }
 
     let stderr = redact_secrets(&String::from_utf8_lossy(&output.stderr));
     let stdout = redact_secrets(&String::from_utf8_lossy(&output.stdout));
-    Err(format!(
+    DeployStepOutcome::Failed(format!(
         "{} failed with {}. stderr: {} stdout: {}",
         command.label,
         output.status,
@@ -15253,14 +15441,24 @@ async fn run_deploy_command(command: &DeployCommand) -> Result<(), String> {
 /// hand the failure to Claude Code in the deploy checkout with a focused prompt
 /// and retry the command once more. Bounded to a single Claude escalation after
 /// the transient retries. On final failure, returns the error + Sam's summary.
+///
+/// `gate` is rechecked before EVERY mutating attempt in this chain (first
+/// attempt is inside run_deploy_command; here again before each transient
+/// retry, before the Claude escalation, and before the post-repair retry) -
+/// a single command's own retry/escalation sequence can span several
+/// 20-minute attempts, a much bigger window than one gate check up front
+/// would cover. A StagingLocked outcome anywhere in this chain stops
+/// immediately without another mutating attempt; it is not a failure.
 async fn run_deploy_command_with_escalation(
     command: &DeployCommand,
     config: &SupabaseConfig,
     task_id: &str,
-) -> Result<(), String> {
-    let first_err = match run_deploy_command(command).await {
-        Ok(()) => return Ok(()),
-        Err(e) => e,
+    gate: &StagingGateContext<'_>,
+) -> DeployStepOutcome {
+    let first_err = match run_deploy_command(command, gate).await {
+        DeployStepOutcome::Succeeded => return DeployStepOutcome::Succeeded,
+        DeployStepOutcome::StagingLocked(message) => return DeployStepOutcome::StagingLocked(message),
+        DeployStepOutcome::Failed(e) => e,
     };
 
     // Transient retry: deploy steps (Supabase Edge Function, Railway, etc.)
@@ -15284,8 +15482,8 @@ async fn run_deploy_command_with_escalation(
         )
         .await;
         tokio::time::sleep(std::time::Duration::from_secs(DEPLOY_RETRY_BACKOFF_SECS)).await;
-        match run_deploy_command(command).await {
-            Ok(()) => {
+        match run_deploy_command(command, gate).await {
+            DeployStepOutcome::Succeeded => {
                 agent_comment(
                     config,
                     task_id,
@@ -15296,12 +15494,24 @@ async fn run_deploy_command_with_escalation(
                     ),
                 )
                 .await;
-                return Ok(());
+                return DeployStepOutcome::Succeeded;
             }
-            Err(e) => last_err = e,
+            DeployStepOutcome::StagingLocked(message) => return DeployStepOutcome::StagingLocked(message),
+            DeployStepOutcome::Failed(e) => last_err = e,
         }
     }
     let first_err = last_err;
+
+    // Recheck before spawning the escalation agent: it runs in the deploy
+    // checkout for up to 1200s and, on gated repos, is now prohibited from
+    // re-running the mutating command itself (see deploy_failure_fix_prompt),
+    // but a lock landing during its own long diagnostic pass must still stop
+    // us from taking the post-repair retry below.
+    match check_staging_lock_gate(gate.pr_url, gate.deploy_path, gate.base_branch).await {
+        StagingGateOutcome::Clear => {}
+        StagingGateOutcome::Locked(message) => return DeployStepOutcome::StagingLocked(message),
+        StagingGateOutcome::CheckFailed(message) => return DeployStepOutcome::Failed(message),
+    }
 
     agent_comment(
         config,
@@ -15320,7 +15530,8 @@ async fn run_deploy_command_with_escalation(
     // surface the violation rather than reporting Done on phantom code.
     let head_before = run_git(&["rev-parse", "HEAD"], &command.cwd).await.ok();
 
-    let prompt = deploy_failure_fix_prompt(command, &first_err);
+    let gated = sud_test_staging_repo_for(gate.pr_url).is_some();
+    let prompt = deploy_failure_fix_prompt(command, &first_err, gated);
     let process_id_slot: Arc<tokio::sync::Mutex<Option<u32>>> =
         Arc::new(tokio::sync::Mutex::new(None));
     let claude_summary = match run_claude_code_streaming(
@@ -15336,7 +15547,7 @@ async fn run_deploy_command_with_escalation(
     {
         Ok(output) => truncate(output.trim(), 1800).to_string(),
         Err(e) => {
-            return Err(format!(
+            return DeployStepOutcome::Failed(format!(
                 "{}\n\nSam could not run a fix attempt: {}",
                 first_err, e
             ))
@@ -15350,7 +15561,7 @@ async fn run_deploy_command_with_escalation(
         let after = run_git(&["rev-parse", "HEAD"], &command.cwd).await.ok();
         let after_trim = after.as_deref().map(str::trim).unwrap_or("");
         if !before.is_empty() && before != after_trim {
-            return Err(format!(
+            return DeployStepOutcome::Failed(format!(
                 "{}\n\nSam committed in the deploy worktree (HEAD {} -> {}) which would not reach the default branch. Aborting deploy. Sam's notes:\n{}",
                 first_err, before, after_trim, claude_summary
             ));
@@ -15360,15 +15571,23 @@ async fn run_deploy_command_with_escalation(
         .await
         .unwrap_or_default();
     if !dirty.trim().is_empty() {
-        return Err(format!(
+        return DeployStepOutcome::Failed(format!(
             "{}\n\nSam left uncommitted changes in the deploy worktree:\n{}\n\nThis would not reach the default branch. Aborting deploy. Sam's notes:\n{}",
             first_err, truncate(dirty.trim(), 600), claude_summary
         ));
     }
 
+    // Recheck once more before the post-repair retry - Sam's diagnostic pass
+    // can itself run for up to 1200s.
+    match check_staging_lock_gate(gate.pr_url, gate.deploy_path, gate.base_branch).await {
+        StagingGateOutcome::Clear => {}
+        StagingGateOutcome::Locked(message) => return DeployStepOutcome::StagingLocked(message),
+        StagingGateOutcome::CheckFailed(message) => return DeployStepOutcome::Failed(message),
+    }
+
     // Retry the original command once after Sam's pass.
-    match run_deploy_command(command).await {
-        Ok(()) => {
+    match run_deploy_command(command, gate).await {
+        DeployStepOutcome::Succeeded => {
             agent_comment(
                 config,
                 task_id,
@@ -15378,16 +15597,26 @@ async fn run_deploy_command_with_escalation(
                     claude_summary
                 ),
             ).await;
-            Ok(())
+            DeployStepOutcome::Succeeded
         }
-        Err(retry_err) => Err(format!(
+        DeployStepOutcome::StagingLocked(message) => DeployStepOutcome::StagingLocked(message),
+        DeployStepOutcome::Failed(retry_err) => DeployStepOutcome::Failed(format!(
             "{}\n\nSam attempted a fix but `{}` still fails.\n\nRetry error:\n{}\n\nSam's notes:\n{}",
             first_err, command.label, retry_err, claude_summary
         )),
     }
 }
 
-fn deploy_failure_fix_prompt(command: &DeployCommand, error: &str) -> String {
+fn deploy_failure_fix_prompt(command: &DeployCommand, error: &str, gated: bool) -> String {
+    let allowed_actions = if gated {
+        "- Run read-only inspection commands (`gh`, `railway status`, `supabase status`, `cat`, `ls`).\n\
+- Fix EXTERNAL/environmental state when the cause is clearly there: relink a Supabase project, refresh a Railway login if obviously expired, restart a stuck CLI auth handshake. These mutate machine state, not the repo.\n\n\
+Do NOT re-run the deploy command yourself, not even for diagnostic output — this repo's staging is gated, and Samwise re-checks the gate and retries the command itself after your pass.".to_string()
+    } else {
+        "- Re-run the failed command in `{cwd}` once for fresh diagnostic output.\n\
+- Run read-only inspection commands (`gh`, `railway status`, `supabase status`, `cat`, `ls`).\n\
+- Fix EXTERNAL/environmental state when the cause is clearly there: relink a Supabase project, refresh a Railway login if obviously expired, restart a stuck CLI auth handshake. These mutate machine state, not the repo.".replace("{cwd}", &command.cwd)
+    };
     format!(
         "You are Sam investigating a deploy step that failed for an already-merged PR. \
 Samwise needs you to either fix the EXTERNAL state so the deploy can succeed on retry, or clearly explain why it cannot be fixed automatically.\n\n\
@@ -15400,9 +15629,7 @@ HARD RULES — read carefully:\n\
 - This checkout is the deploy worktree, not a PR branch. Anything you commit here will not reach the GitHub default branch and will be lost the next time Samwise prepares a deploy.\n\
 - If the failure is a CODE defect (build error, syntax error in a migration, schema mismatch, wrong import), STOP and report it. Do not try to patch the code yourself — that needs a real PR through normal review.\n\n\
 What you ARE allowed to do:\n\
-- Re-run the failed command in `{cwd}` once for fresh diagnostic output.\n\
-- Run read-only inspection commands (`gh`, `railway status`, `supabase status`, `cat`, `ls`).\n\
-- Fix EXTERNAL/environmental state when the cause is clearly there: relink a Supabase project, refresh a Railway login if obviously expired, restart a stuck CLI auth handshake. These mutate machine state, not the repo.\n\n\
+{allowed_actions}\n\n\
 End your response with a one-line verdict:\n\
 - `VERDICT: env fixed` (you fixed external state; deploy command should now succeed on retry)\n\
 - `VERDICT: needs Matt` (env problem you can't fix safely, OR a code defect — describe what Matt needs to do, including any code change needed)\n\
@@ -15411,7 +15638,8 @@ End your response with a one-line verdict:\n\
         category = command.category,
         cwd = command.cwd,
         command = command.command,
-        error = truncate(error, 2400)
+        error = truncate(error, 2400),
+        allowed_actions = allowed_actions
     )
 }
 
@@ -15699,20 +15927,66 @@ async fn mark_deploy_command_status(
     .map_err(|e| format!("persist deploy command status `{}` for {}: {}", status, command.label, e))
 }
 
+/// Remove a command's persisted status entirely (as opposed to marking it any
+/// status). Used when a staging lock aborts a command that was stamped
+/// "running": leaving that stamp in place would make a later resume's
+/// skip-logic (deploy_command_status_from_context) treat it as indeterminate
+/// and permanently refuse to ever run it. No status at all correctly means
+/// "not yet attempted" to that same skip-logic.
+async fn clear_deploy_command_status(
+    config: &SupabaseConfig,
+    task_id: &str,
+    command: &DeployCommand,
+) -> Result<(), String> {
+    let task = supabase::fetch_task(config, task_id)
+        .await
+        .map_err(|e| format!("fetch task before clearing deploy command status: {}", e))?
+        .ok_or_else(|| format!("task {} disappeared before clearing deploy command status", task_id))?;
+    let mut context = task_context_object(&task);
+    if let Some(statuses) = context
+        .get_mut(MERGE_DEPLOY_COMMAND_STATUS_KEY)
+        .and_then(|v| v.as_object_mut())
+    {
+        statuses.remove(&deploy_command_key(command));
+    } else {
+        return Ok(());
+    }
+    supabase::update_task(
+        config,
+        task_id,
+        &serde_json::json!({
+            "context": Value::Object(context),
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+        }),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| format!("clear deploy command status for {}: {}", command.label, e))
+}
+
 async fn run_tracked_deploy_command(
     command: &DeployCommand,
     config: &SupabaseConfig,
     task_id: &str,
-) -> Result<(), String> {
-    mark_deploy_command_status(config, task_id, command, "running", None).await?;
-    match run_deploy_command_with_escalation(command, config, task_id).await {
-        Ok(()) => {
-            mark_deploy_command_status(config, task_id, command, "succeeded", None).await?;
-            Ok(())
+    gate: &StagingGateContext<'_>,
+) -> DeployStepOutcome {
+    if let Err(e) = mark_deploy_command_status(config, task_id, command, "running", None).await {
+        return DeployStepOutcome::Failed(e);
+    }
+    match run_deploy_command_with_escalation(command, config, task_id, gate).await {
+        DeployStepOutcome::Succeeded => {
+            if let Err(e) = mark_deploy_command_status(config, task_id, command, "succeeded", None).await {
+                return DeployStepOutcome::Failed(e);
+            }
+            DeployStepOutcome::Succeeded
         }
-        Err(e) => {
+        DeployStepOutcome::StagingLocked(message) => {
+            let _ = clear_deploy_command_status(config, task_id, command).await;
+            DeployStepOutcome::StagingLocked(message)
+        }
+        DeployStepOutcome::Failed(e) => {
             let _ = mark_deploy_command_status(config, task_id, command, "failed", Some(&e)).await;
-            Err(e)
+            DeployStepOutcome::Failed(e)
         }
     }
 }
@@ -15888,7 +16162,7 @@ async fn recover_stale_merged_pr_deploy(
     task_id: &str,
     pr_url: &str,
     repo_path: &str,
-) -> Result<String, String> {
+) -> Result<String, StaleRecoveryError> {
     let files = review::fetch_pr_files(pr_url, repo_path)
         .await
         .map_err(|e| format!("fetch PR files for stale merged deploy recovery: {}", e))?;
@@ -15897,7 +16171,9 @@ async fn recover_stale_merged_pr_deploy(
         .await
         .map_err(|e| format!("read PR base branch for stale merged deploy recovery: {}", e))?;
     if deploy_branch.trim().is_empty() {
-        return Err("PR base branch was empty during stale merged deploy recovery".to_string());
+        return Err(StaleRecoveryError::Other(
+            "PR base branch was empty during stale merged deploy recovery".to_string(),
+        ));
     }
 
     let deploy_path = prepare_deploy_checkout(repo_path, task_id, &deploy_branch).await?;
@@ -15927,48 +16203,40 @@ async fn recover_stale_merged_pr_deploy(
         match deploy_command_status_from_context(&latest_context, command).as_deref() {
             Some("succeeded") => continue,
             Some("running") => {
-                return Err(format!(
+                return Err(StaleRecoveryError::Other(format!(
                     "Deploy command `{}` was already marked running when the previous worker died; refusing to rerun it automatically because it may have completed externally.",
                     command.label
-                ));
+                )));
             }
             Some("failed") => {
-                return Err(format!(
+                return Err(StaleRecoveryError::Other(format!(
                     "Deploy command `{}` was already marked failed before stale recovery; re-request Merge + Deploy after reviewing the stored error.",
                     command.label
-                ));
+                )));
             }
             _ => {}
         }
-        // A confirmed staging-lock holder is normal waiting, not a failure:
-        // poll briefly instead of erroring straight into the caller's hard
-        // "failed" close-out, which has no re-fire path for stale recovery.
-        // Deliberately capped short (10 min, not the caller's full
-        // MERGE_DEPLOY_RUNNING_STALE_SECS budget): this whole call already
-        // runs under that outer timeout, which cancels via future drop - the
-        // same mid-command process-group-orphan risk just removed from the
-        // primary loop - so this must leave generous headroom for the
-        // deploy commands that run after it, not spend the budget waiting.
-        const STALE_RECOVERY_LOCK_POLL_MAX_SECS: u64 = 10 * 60;
-        let lock_wait_started = std::time::Instant::now();
-        loop {
-            match check_staging_lock_gate(pr_url, &deploy_path, &deploy_branch).await {
-                StagingGateOutcome::Clear => break,
-                StagingGateOutcome::Locked(message) => {
-                    if lock_wait_started.elapsed().as_secs() >= STALE_RECOVERY_LOCK_POLL_MAX_SECS {
-                        return Err(format!(
-                            "staging lock still held after {} minutes of stale-recovery waiting: {}",
-                            STALE_RECOVERY_LOCK_POLL_MAX_SECS / 60,
-                            message
-                        ));
-                    }
-                    log::info!("[merge-deploy] stale recovery waiting: {}", message);
-                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                }
-                StagingGateOutcome::CheckFailed(message) => return Err(message),
-            }
+        // A confirmed staging-lock holder is normal waiting, not a failure -
+        // and NOT something to poll for here: this whole call runs under the
+        // caller's own outer timeout (MERGE_DEPLOY_RUNNING_STALE_SECS), which
+        // cancels via future drop - the same mid-command process-group-orphan
+        // risk already removed from the primary loop. So release immediately
+        // (return, dropping the repo lock the caller holds) and let the
+        // caller defer with a short backoff instead of holding the mutex
+        // while sleeping.
+        let gate = StagingGateContext { pr_url, deploy_path: &deploy_path, base_branch: &deploy_branch };
+        match check_staging_lock_gate(pr_url, &deploy_path, &deploy_branch).await {
+            StagingGateOutcome::Clear => {}
+            StagingGateOutcome::Locked(message) => return Err(StaleRecoveryError::StagingLocked(message)),
+            StagingGateOutcome::CheckFailed(message) => return Err(StaleRecoveryError::Other(message)),
         }
-        run_tracked_deploy_command(command, config, task_id).await?;
+        match run_tracked_deploy_command(command, config, task_id, &gate).await {
+            DeployStepOutcome::Succeeded => {}
+            DeployStepOutcome::StagingLocked(message) => {
+                return Err(StaleRecoveryError::StagingLocked(message));
+            }
+            DeployStepOutcome::Failed(e) => return Err(StaleRecoveryError::Other(e)),
+        }
     }
 
     if wait_for_deploy_green {
@@ -16371,11 +16639,23 @@ fn merge_deploy_request_is_pending(task: &Value) -> bool {
     if status == "running" || status == "succeeded" {
         return false;
     }
-    status == "requested"
-        && context
+    if status != "requested"
+        || context
             .get(MERGE_DEPLOY_REQUESTED_AT_KEY)
             .and_then(|v| v.as_str())
-            .is_some()
+            .is_none()
+    {
+        return false;
+    }
+    // A task deferred on a staging lock carries a short backoff so the sweep
+    // doesn't redo a full checkout+plan-rebuild+gh-api cycle on every tick
+    // while genuinely just waiting for the lock to clear.
+    let not_yet_eligible = context
+        .get(MERGE_DEPLOY_NEXT_ATTEMPT_AT_KEY)
+        .and_then(|v| v.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .is_some_and(|at| at.with_timezone(&chrono::Utc) > chrono::Utc::now());
+    !not_yet_eligible
 }
 
 fn merge_deploy_context_status(task: &Value) -> Option<&str> {
