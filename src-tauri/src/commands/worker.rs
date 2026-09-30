@@ -14813,11 +14813,30 @@ async fn check_staging_lock_gate(pr_url: &str, deploy_path: &str, base_branch: &
 /// when the lock reason changes or first appears (tracked via
 /// MERGE_DEPLOY_LOCK_REASON_KEY), never on every recheck.
 async fn defer_merge_deploy_for_staging_lock(config: &SupabaseConfig, task_id: &str, reason: &str) {
-    let latest = supabase::fetch_task(config, task_id).await.ok().flatten();
-    let mut context = latest
-        .as_ref()
-        .map(task_context_object)
-        .unwrap_or_default();
+    // Fail closed on a read problem: silently defaulting to an empty context
+    // here would ERASE whatever per-command progress and reviewed-head guard
+    // were already persisted (this writes context wholesale, not a merge), so
+    // a transient fetch blip would look identical to actually deferring, when
+    // it in fact discarded state. Log loudly instead of pretending it queued.
+    let latest = match supabase::fetch_task(config, task_id).await {
+        Ok(Some(task)) => task,
+        Ok(None) => {
+            log::error!(
+                "[merge-deploy] cannot defer task {} for a staging lock: task disappeared, not writing an empty context",
+                task_id
+            );
+            return;
+        }
+        Err(e) => {
+            log::error!(
+                "[merge-deploy] cannot defer task {} for a staging lock: fetch failed ({}), not writing an empty context",
+                task_id,
+                e
+            );
+            return;
+        }
+    };
+    let mut context = task_context_object(&latest);
     let previous_reason = context
         .get(MERGE_DEPLOY_LOCK_REASON_KEY)
         .and_then(|v| v.as_str())
@@ -14844,7 +14863,7 @@ async fn defer_merge_deploy_for_staging_lock(config: &SupabaseConfig, task_id: &
         MERGE_DEPLOY_LOCK_REASON_KEY.to_string(),
         Value::String(reason.to_string()),
     );
-    let write_ok = supabase::update_task(
+    match supabase::update_task(
         config,
         task_id,
         &serde_json::json!({
@@ -14853,17 +14872,31 @@ async fn defer_merge_deploy_for_staging_lock(config: &SupabaseConfig, task_id: &
         }),
     )
     .await
-    .is_ok();
-    if write_ok && reason_changed {
-        agent_comment(
-            config,
-            task_id,
-            &format!(
-                "Merge + Deploy is holding: {}. Will retry automatically once it clears.",
-                reason
-            ),
-        )
-        .await;
+    {
+        Ok(_) => {
+            if reason_changed {
+                agent_comment(
+                    config,
+                    task_id,
+                    &format!(
+                        "Merge + Deploy is holding: {}. Will retry automatically once it clears.",
+                        reason
+                    ),
+                )
+                .await;
+            }
+        }
+        Err(e) => {
+            // The defer did NOT persist - the task is still stamped
+            // "running"/whatever it was, and the sweep's own stale-recovery
+            // path will eventually catch it, but this attempt did not queue
+            // a clean retry. Log it so that's visible, not silent.
+            log::error!(
+                "[merge-deploy] failed to persist staging-lock defer for task {}: {}",
+                task_id,
+                e
+            );
+        }
     }
 }
 
@@ -15981,8 +16014,27 @@ async fn run_tracked_deploy_command(
             DeployStepOutcome::Succeeded
         }
         DeployStepOutcome::StagingLocked(message) => {
-            let _ = clear_deploy_command_status(config, task_id, command).await;
-            DeployStepOutcome::StagingLocked(message)
+            // The "running" stamp MUST clear before this can honestly be
+            // called "just waiting" - deploy_command_status_from_context's
+            // skip-logic refuses a persisted "running" status outright, so an
+            // unconfirmed clear would make the very next resume attempt fail
+            // instead of the clean retry StagingLocked promises. Don't return
+            // StagingLocked on a failed clear: that promise wouldn't hold.
+            match clear_deploy_command_status(config, task_id, command).await {
+                Ok(()) => DeployStepOutcome::StagingLocked(message),
+                Err(e) => {
+                    log::error!(
+                        "[merge-deploy] could not clear the running stamp on `{}` for task {} after a staging lock: {}",
+                        command.label,
+                        task_id,
+                        e
+                    );
+                    DeployStepOutcome::Failed(format!(
+                        "staging lock detected ({}), but clearing the in-progress stamp on `{}` failed ({}) - leaving this as a real failure instead of a clean retry, since resume would otherwise wrongly refuse to ever run it again",
+                        message, command.label, e
+                    ))
+                }
+            }
         }
         DeployStepOutcome::Failed(e) => {
             let _ = mark_deploy_command_status(config, task_id, command, "failed", Some(&e)).await;
