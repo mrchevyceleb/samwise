@@ -1,5 +1,7 @@
 # Code Context: Tauri desktop app (src/) vs web board viewer (web/) divergence
 
+> **Historical audit, not a current backlog.** The resolved items below were checked against commit `289029a697f6b146b602bc680d2577d7c019fcc6`. The remaining comparisons preserve an earlier audit and may be stale; re-check the target revision before implementing them.
+
 Two separate SvelteKit 5 apps sharing Supabase tables. `review-actions.ts` is byte-for-byte identical in both, and both route cards through the shared `displayColumnStatus()` helper, so column grouping logic is in sync. The divergence is almost entirely in the **rendering surfaces and the action affordances** built on top of that shared logic. Below, "Tauri" = `src/`, "web" = `web/`.
 
 Desktop-only surfaces (chat sidebar, settings, automation/cron editor, Tauri invoke commands, AppShell/TitleBar/StatusBar, CommandPalette) are intentionally excluded. Only shared board workflows are compared.
@@ -32,7 +34,7 @@ Enum unions are identical (`TaskStatus`, `TaskPriority`, `TaskType`, `OriginSyst
 - `last_pr_review_at?: string | null` — web-only.
 
 **`AeComment` shape differs (shared workflow — comments thread):**
-- Tauri `AeComment` has `mentions: string[]` (`src/lib/types.ts`). Web `AeComment` drops `mentions` entirely. The web comment renderer (`TaskDetail.svelte` `renderCommentHtml`) only auto-links URLs and does no @mention highlighting, so this is consistent with web's read-only display, but it means the types are out of sync for the same table.
+- The earlier type audit recorded `mentions: string[]` on Tauri `AeComment` but not web `AeComment`; re-check that shape separately. Its accompanying read-only/no-mention-rendering diagnosis is obsolete: web detail now supports comment posting and @mention rendering at the verification baseline (see §6).
 
 **`source`/`task_type` typing:**
 - Tauri: `source: TaskSource`, `task_type: TaskType` (narrow unions).
@@ -54,12 +56,14 @@ The two use **different color systems**: Tauri uses theme hex tokens; web uses T
 
 ## 3. KanbanCard divergence (`src/.../KanbanCard.svelte` vs `web/.../KanbanCard.svelte`)
 
-### CRITICAL (workflow-affecting)
+### Resolved (shared review/merge)
 
-- **`canMergeDeploy` retry divergence — fix implemented in [PR #18](https://github.com/mrchevyceleb/samwise/pull/18) (open, not yet merged).**
-  - Audited mismatch: `web/src/lib/components/KanbanCard.svelte` and `web/src/lib/components/TaskDetail.svelte` omit `|| reviewMergeState.status === 'failed'`, while `src/lib/components/kanban/KanbanCard.svelte` and `src/lib/components/kanban/TaskDetailModal.svelte` include it.
-  - Without that clause, when `samwise_review_merge_status === 'failed'` on a `review`/`fixes_needed` card, the web action falls back to **"Mark Done"** instead of **"Retry Review & Merge"**; Tauri shows the retry.
-  - PR #18 adds the clause to both web components on the PR branch, matching Tauri. The fix is not yet merged; it is pending merge, not further implementation.
+- **`canMergeDeploy` review-failure retry clause is already present at the verification baseline.**
+  - `web/src/lib/components/KanbanCard.svelte` and `web/src/lib/components/TaskDetail.svelte` both include `|| reviewMergeState.status === 'failed'`, matching the Tauri card and detail. Commit `7150ccd696149f5f0a75cb5207acbd0a88e3edd6` introduced it before the baseline.
+  - The earlier missing-clause diagnosis is obsolete; do not implement that clause again.
+  - The related [PR #18](https://github.com/mrchevyceleb/samwise/pull/18) contains additional blocked-state, queued-request recovery, and request-status changes across both surfaces, not simply the already-present clause. Consult its live status and diff separately; this audit is not a recommendation to merge or close it.
+
+### Historical workflow observation (not re-verified)
 
 - **Card drop sets raw status without clearing stale claim fields** (web only, by consequence of how web drag works).
   - Web `KanbanColumn.svelte` `handleDrop` calls `tasksStore.setStatus(taskId, status)` which only flips `status` (+ `completed_at` on done). It does NOT clear `worker_id`/`claimed_at`/`failure_reason`.
@@ -111,23 +115,22 @@ The Tauri card renders a rich bottom indicator row + working state; the web card
 
 ## 6. TaskDetail modal vs TaskDetail (`TaskDetailModal.svelte` vs `TaskDetail.svelte`)
 
-This is the largest functional gap. Tauri's modal is a full editor; web's is a read-mostly viewer.
+The earlier read-mostly-viewer diagnosis is obsolete: web detail already supports editing and commenting at the verification baseline. This is a source check, not a claim of complete visual or behavioral parity.
 
-### CRITICAL (workflow-affecting, shared review/merge)
-- **`canMergeDeploy` retry divergence — fix implemented in [PR #18](https://github.com/mrchevyceleb/samwise/pull/18) (open, not yet merged)** (same as §3). The PR adds `|| reviewMergeState.status === 'failed'` to web detail, matching Tauri and enabling the Retry-Review-&-Merge action when the review phase fails.
+### Resolved (shared review/merge)
+- **`canMergeDeploy` review-failure retry clause** — already present in both web card and detail; see §3 for the evidence and related PR scope.
 
-### HIGH (comment thread workflow)
-- **Comments are read-only on web.** Tauri `TaskDetailModal` embeds `CommentThread.svelte`, which is fully interactive: post as `matt`, Enter-to-send, @mention highlighting, markdown/code rendering, scroll-to-bottom. Web `TaskDetail.svelte` "Activity" section only **renders** existing comments (escaped text + URL autolinking via `renderCommentHtml`) — **there is no input box; you cannot post a comment from the web board.** This breaks the same "comment on a card" workflow that works on desktop.
+### Resolved (comment thread workflow)
+- **Web comments are interactive.** `TaskDetail.svelte` has a textarea, Post button, Enter-to-post/Shift+Enter handling, and `handlePostComment`; `web/src/lib/stores/tasks.svelte.ts` already provides `postComment`. The renderer supports code, bold text, links, and @mentions. Do not add a duplicate composer or store method.
 
-### HIGH (task editing workflow)
-- **Inline title editing** — Tauri: click title to edit (`editingTitle`). Web: title is static.
-- **Inline description editing** — Tauri: click to edit with markdown rendering. Web: description is read-only plain text.
-- **Priority selector** — Tauri: full priority button-list in the right sidebar (`changePriority`). Web: priority is a non-interactive badge only; no way to change priority.
+### Resolved (task editing workflow)
+- **Inline title and description editing** — web detail has `editingTitle`/`editingDesc`, edit controls, and `saveTitle`/`saveDescription` handlers.
+- **Priority selector** — web detail has an interactive selector wired to `changePriority`.
+- **Subtask interactivity** — web detail supports toggle, add, edit, delete, and drag-reorder, persisted via `updateTask`.
+- **Restart Task** — web detail exposes `handleRestart` and a Restart Task button for failed cards.
+
+### Historical comparisons (not re-verified)
 - **Status selector** — both can change status (Tauri sidebar button-list `changeStatus`→`moveTask`; web header `<select>`→`setStatus`). Parity here, though web's `setStatus('done')` has an extra side effect (see below).
-
-### MEDIUM
-- **Subtask interactivity** — Tauri embeds `SubtaskChecklist.svelte` (toggle/add/edit/drag-reorder, persists via `updateTask`). Web renders subtasks **read-only** (checkbox emoji + title, no toggle/add). You cannot manage subtasks from the web board.
-- **Restart Task action missing on web** — Tauri detail has a "Restart Task" button for `failed` (`isRestartable`, `handleRestart`). Web detail has only "Stop Task"; no Restart.
 - **Report tab missing on web** — Tauri detail has Details/Report tabs; the Report tab fetches the report artifact via `supabase_fetch_artifacts` and renders markdown (`renderMarkdown`). Web has no report tab (it links `report_url` externally via `LinkRow`, but does not render the artifact content inline).
 - **Mark-Done side-effect divergence:** web `setStatus('done')` calls `closeOriginTicket()` (`web/src/lib/stores/tasks.svelte.ts`), closing the Operly/Banana/etc. origin ticket via `/api/close-origin-ticket`. Tauri `moveTask('done')` does **not** close the origin ticket (`src/lib/stores/tasks.svelte.ts`). Same "Mark Done" gesture → different external behavior.
 
@@ -156,25 +159,23 @@ No shared-workflow gap in NewTaskModal itself.
 
 ---
 
-## Summary: ranked defects (web missing/different vs Tauri for the SAME shared workflow)
+## Summary: historical ranked findings (not a current backlog)
 
-**Critical / workflow-breaking**
-1. `canMergeDeploy` review-failure retry mismatch (web shows "Mark Done" instead of Retry Review & Merge) — **fix implemented in [PR #18](https://github.com/mrchevyceleb/samwise/pull/18) (open, not yet merged).** Both web components include `|| reviewMergeState.status === 'failed'` on the PR branch, matching Tauri; the fix is pending merge, not further implementation.
-2. Web comment thread is **read-only** — no way to post a comment on a card from the web board (`web/.../TaskDetail.svelte` Activity vs `src/.../CommentThread.svelte`).
+**Resolved at the verification baseline**
+1. `canMergeDeploy` review-failure clause is already present in both web components, matching Tauri (see §3).
+2. Web comment thread already supports posting (see §6).
+3. Web detail already supports inline title/description editing.
+4. Web detail already supports priority changes.
+5. Web subtasks already support toggle/add/edit/delete/reorder.
+6. Web detail already exposes Restart Task for failed cards.
 
-**High (workflow present on Tauri, absent on web)**
-3. No inline title/description editing in web detail.
-4. No priority change in web detail (badge only).
-5. Subtasks read-only on web (no toggle/add/edit/reorder).
-6. No "Restart Task" action on web detail.
-
-**Medium**
+**Historical medium findings — re-check before implementation**
 7. Mark-Done side-effect divergence: web closes origin ticket on done, Tauri does not.
 8. Card ordering within active columns differs (web alphabetical-priority + created_at-asc vs Tauri correct-priority + created_at-desc).
 9. Report tab (inline rendered report artifact) missing on web.
 10. Card indicators missing on web: Visual QA badge, working elapsed timer, latest-comment preview, comment count, report icon, screenshot icon, assignee icon.
 
-**Cosmetic**
+**Historical cosmetic findings — re-check before implementation**
 11. Column status-dot colors disagree between the two apps (Tauri KANBAN_COLUMNS hex vs web hardcoded Tailwind `statusDot`).
 12. Web has no drag ghost / Ctrl+N shortcut; web empty-state copy differs ("nothing here" vs "No tasks").
 13. Web has extras not on Tauri board: search, project filter, Refresh button, build-version auto-reload, attachments, failure-reason section, ScheduleModal board button.
@@ -185,4 +186,4 @@ No shared-workflow gap in NewTaskModal itself.
 - Tauri board has no search/project-filter; web does.
 
 ## Start Here
-The `canMergeDeploy` fix for both web components is already implemented in [PR #18](https://github.com/mrchevyceleb/samwise/pull/18) (open, not yet merged); do not duplicate it. The next step for this fix is maintainer review/merge of PR #18; AutoSam never merges its own PRs. For the next unresolved gap, the read-only comment thread, the work is in `web/src/lib/components/TaskDetail.svelte` (Activity section) plus adding a `postComment` to `web/src/lib/stores/tasks.svelte.ts`.
+Do not duplicate the review-failure clause, comment composer, inline editing, priority selector, subtask controls, or Restart Task action: all are already present at the verification baseline. Before choosing further work, re-audit the remaining historical comparisons against the intended target revision. See §3 for the related review/merge PR; evaluate its additional changes and live status independently rather than treating this audit as merge guidance.
