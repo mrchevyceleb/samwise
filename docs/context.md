@@ -56,11 +56,10 @@ The two use **different color systems**: Tauri uses theme hex tokens; web uses T
 
 ### CRITICAL (workflow-affecting)
 
-- **`canMergeDeploy` drops `reviewMergeState.status === 'failed'`.** This is the one behavioral bug in shared review/merge logic.
-  - Tauri card (`src/.../KanbanCard.svelte:70`): `... || mergeDeployState.status === 'failed' || reviewMergeState.status === 'failed'`.
-  - Web card (`web/.../KanbanCard.svelte:39`): `... || mergeDeployState.status === 'failed'` — **missing the `reviewMergeState.status === 'failed'` clause.**
-  - Same omission in web detail (`web/.../TaskDetail.svelte:63`) vs Tauri detail (`src/.../TaskDetailModal.svelte:166`).
-  - Effect: on web, when the "Review & Merge" pipeline fails at the **review phase** (`samwise_review_merge_status === 'failed'`) on a `review`/`fixes_needed` card, the action button falls back to **"Mark Done"** instead of the **"Retry Review & Merge"** label/button. Tauri shows the retry. Same data, different button. This is the single most concrete workflow divergence.
+- **`canMergeDeploy` retry divergence — fix implemented in [PR #18](https://github.com/mrchevyceleb/samwise/pull/18) (open, not yet merged).**
+  - Audited mismatch: `web/src/lib/components/KanbanCard.svelte` and `web/src/lib/components/TaskDetail.svelte` omit `|| reviewMergeState.status === 'failed'`, while `src/lib/components/kanban/KanbanCard.svelte` and `src/lib/components/kanban/TaskDetailModal.svelte` include it.
+  - Without that clause, when `samwise_review_merge_status === 'failed'` on a `review`/`fixes_needed` card, the web action falls back to **"Mark Done"** instead of **"Retry Review & Merge"**; Tauri shows the retry.
+  - PR #18 adds the clause to both web components on the PR branch, matching Tauri. The fix is not yet merged; it is pending merge, not further implementation.
 
 - **Card drop sets raw status without clearing stale claim fields** (web only, by consequence of how web drag works).
   - Web `KanbanColumn.svelte` `handleDrop` calls `tasksStore.setStatus(taskId, status)` which only flips `status` (+ `completed_at` on done). It does NOT clear `worker_id`/`claimed_at`/`failure_reason`.
@@ -115,7 +114,7 @@ The Tauri card renders a rich bottom indicator row + working state; the web card
 This is the largest functional gap. Tauri's modal is a full editor; web's is a read-mostly viewer.
 
 ### CRITICAL (workflow-affecting, shared review/merge)
-- **`canMergeDeploy` missing `reviewMergeState.status === 'failed'`** (same as §3) — `web/.../TaskDetail.svelte:63` vs `src/.../TaskDetailModal.svelte:166`. Retry-Review-&-Merge button mislabeled as Mark Done when review phase failed.
+- **`canMergeDeploy` retry divergence — fix implemented in [PR #18](https://github.com/mrchevyceleb/samwise/pull/18) (open, not yet merged)** (same as §3). The PR adds `|| reviewMergeState.status === 'failed'` to web detail, matching Tauri and enabling the Retry-Review-&-Merge action when the review phase fails.
 
 ### HIGH (comment thread workflow)
 - **Comments are read-only on web.** Tauri `TaskDetailModal` embeds `CommentThread.svelte`, which is fully interactive: post as `matt`, Enter-to-send, @mention highlighting, markdown/code rendering, scroll-to-bottom. Web `TaskDetail.svelte` "Activity" section only **renders** existing comments (escaped text + URL autolinking via `renderCommentHtml`) — **there is no input box; you cannot post a comment from the web board.** This breaks the same "comment on a card" workflow that works on desktop.
@@ -160,7 +159,7 @@ No shared-workflow gap in NewTaskModal itself.
 ## Summary: ranked defects (web missing/different vs Tauri for the SAME shared workflow)
 
 **Critical / workflow-breaking**
-1. `canMergeDeploy` drops `reviewMergeState.status === 'failed'` — Review-&-Merge retry button mislabeled as "Mark Done" on web when the review phase failed. `web/.../KanbanCard.svelte:39` + `web/.../TaskDetail.svelte:63` (Tauri: `src/.../KanbanCard.svelte:70` + `TaskDetailModal.svelte:166`).
+1. `canMergeDeploy` review-failure retry mismatch (web shows "Mark Done" instead of Retry Review & Merge) — **fix implemented in [PR #18](https://github.com/mrchevyceleb/samwise/pull/18) (open, not yet merged).** Both web components include `|| reviewMergeState.status === 'failed'` on the PR branch, matching Tauri; the fix is pending merge, not further implementation.
 2. Web comment thread is **read-only** — no way to post a comment on a card from the web board (`web/.../TaskDetail.svelte` Activity vs `src/.../CommentThread.svelte`).
 
 **High (workflow present on Tauri, absent on web)**
@@ -186,4 +185,4 @@ No shared-workflow gap in NewTaskModal itself.
 - Tauri board has no search/project-filter; web does.
 
 ## Start Here
-Open `web/src/lib/components/KanbanCard.svelte:39` and `web/src/lib/components/TaskDetail.svelte:63` and add the missing `|| reviewMergeState.status === 'failed'` clause to `canMergeDeploy` (mirroring `src/lib/components/kanban/KanbanCard.svelte:70`). That is the single highest-value, lowest-risk fix. For the read-only comment thread gap, the work is in `web/src/lib/components/TaskDetail.svelte` (Activity section) plus adding a `postComment` to `web/src/lib/stores/tasks.svelte.ts`.
+The `canMergeDeploy` fix for both web components is already implemented in [PR #18](https://github.com/mrchevyceleb/samwise/pull/18) (open, not yet merged); do not duplicate it. The next step for this fix is maintainer review/merge of PR #18; AutoSam never merges its own PRs. For the next unresolved gap, the read-only comment thread, the work is in `web/src/lib/components/TaskDetail.svelte` (Activity section) plus adding a `postComment` to `web/src/lib/stores/tasks.svelte.ts`.
