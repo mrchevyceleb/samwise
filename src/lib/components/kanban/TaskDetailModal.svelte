@@ -160,10 +160,23 @@
 	let uiStamp = $derived(getUiStamp(task));
 	let mergeDeployState = $derived(getMergeDeployState(task));
 	let reviewMergeState = $derived(getReviewMergeState(task));
+	let recoverReviewMergeRequest = $derived(
+		!!task.pr_url && (task.status === 'review' || task.status === 'fixes_needed') &&
+		reviewMergeState.status === 'requested' &&
+		mergeDeployState.status !== 'requested' && mergeDeployState.status !== 'running'
+	);
+	let reviewMergeBusy = $derived(requestingMergeDeploy ||
+		(isReviewMergeBusy(reviewMergeState, mergeDeployState) && !recoverReviewMergeRequest));
+	let reviewMergeLabel = $derived(requestingMergeDeploy ? 'Queueing...' :
+		recoverReviewMergeRequest ? 'Retry Review & Merge' : reviewMergeButtonLabel(reviewMergeState, mergeDeployState));
 	let mergeConflictFixState = $derived(getMergeConflictFixState(task));
 	let showReviewActions = $derived(isReviewActionStatus(task.status) && !!(reviewPanel || task.pr_url));
 	let canClosePr = $derived(!!task.pr_url && task.status !== 'done');
-	let canMergeDeploy = $derived(!!task.pr_url && (task.status === 'approved' || mergeDeployState.status === 'failed' || reviewMergeState.status === 'failed'));
+	let canMergeDeploy = $derived(!!task.pr_url && (
+		task.status === 'approved' || mergeDeployState.status === 'failed' ||
+		reviewMergeState.status === 'failed' || reviewMergeState.status === 'blocked' ||
+		isReviewMergeBusy(reviewMergeState, mergeDeployState)
+	));
 	let canRequestMergeConflictFix = $derived(
 		!!task.pr_url &&
 		mergeDeployState.status === 'failed' &&
@@ -249,11 +262,12 @@
 	}
 
 	async function handleRequestReviewMerge() {
-		if (!canMergeDeploy || requestingMergeDeploy || isReviewMergeBusy(reviewMergeState, mergeDeployState)) return;
+		if (!canMergeDeploy || reviewMergeBusy) return;
 		requestingMergeDeploy = true;
 		mergeDeployRequestError = null;
 		try {
-			const ok = await taskStore.updateTask(task.id, { context: requestReviewMergeContext(task) });
+			// The review/merge sweep only claims requests from Ready to Merge.
+			const ok = await taskStore.updateTask(task.id, { status: 'approved', context: requestReviewMergeContext(task) });
 			if (!ok) {
 				mergeDeployRequestError = taskStore.error || 'Could not queue Review & Merge.';
 			}
@@ -687,7 +701,7 @@
 									<button
 										type="button"
 										onclick={handleRequestReviewMerge}
-										disabled={requestingMergeDeploy || isReviewMergeBusy(reviewMergeState, mergeDeployState)}
+										disabled={reviewMergeBusy}
 										style="
 											display: inline-flex; align-items: center; gap: 7px;
 											padding: 8px 12px; border-radius: 9px;
@@ -695,11 +709,11 @@
 											border: 1px solid rgba(103, 232, 249, 0.32);
 											color: #67e8f9;
 											font-size: 12px; font-weight: 900;
-											cursor: {requestingMergeDeploy || isReviewMergeBusy(reviewMergeState, mergeDeployState) ? 'wait' : 'pointer'}; font-family: var(--font-ui);
-											opacity: {requestingMergeDeploy || isReviewMergeBusy(reviewMergeState, mergeDeployState) ? '0.68' : '1'};
+											cursor: {reviewMergeBusy ? 'wait' : 'pointer'}; font-family: var(--font-ui);
+											opacity: {reviewMergeBusy ? '0.68' : '1'};
 										"
 									>
-								{requestingMergeDeploy ? 'Queueing...' : reviewMergeButtonLabel(reviewMergeState, mergeDeployState)}
+								{reviewMergeLabel}
 							</button>
 							{#if canRequestMergeConflictFix || isMergeConflictFixBusy(mergeConflictFixState) || mergeConflictFixRequestError || mergeConflictFixState.error}
 								<button
@@ -1145,17 +1159,17 @@
 								background: {canMergeDeploy ? (mergeDeployHovered ? 'rgba(34, 211, 238, 0.16)' : 'rgba(34, 211, 238, 0.09)') : (markDoneHovered ? 'rgba(63, 185, 80, 0.14)' : 'rgba(63, 185, 80, 0.08)')};
 								border: 1px solid {canMergeDeploy ? 'rgba(103, 232, 249, 0.32)' : 'rgba(63, 185, 80, 0.25)'};
 								color: {canMergeDeploy ? '#67e8f9' : 'var(--accent-green)'}; font-size: 11px; font-weight: 800;
-								font-family: var(--font-ui); cursor: {markingDone || requestingMergeDeploy || isReviewMergeBusy(reviewMergeState, mergeDeployState) ? 'wait' : 'pointer'};
+								font-family: var(--font-ui); cursor: {markingDone || reviewMergeBusy ? 'wait' : 'pointer'};
 								transition: all 0.15s ease;
-								transform: {(canMergeDeploy ? mergeDeployHovered : markDoneHovered) && !markingDone && !requestingMergeDeploy && !isReviewMergeBusy(reviewMergeState, mergeDeployState) ? 'translateY(-1px)' : 'none'};
-								opacity: {markingDone || requestingMergeDeploy || isReviewMergeBusy(reviewMergeState, mergeDeployState) ? '0.6' : '1'};
+								transform: {(canMergeDeploy ? mergeDeployHovered : markDoneHovered) && !markingDone && !reviewMergeBusy ? 'translateY(-1px)' : 'none'};
+								opacity: {markingDone || reviewMergeBusy ? '0.6' : '1'};
 							"
 							onmouseenter={() => { markDoneHovered = true; mergeDeployHovered = true; }}
 							onmouseleave={() => { markDoneHovered = false; mergeDeployHovered = false; }}
 							onclick={canMergeDeploy ? handleRequestReviewMerge : handleMarkDone}
-							disabled={markingDone || requestingMergeDeploy || isReviewMergeBusy(reviewMergeState, mergeDeployState)}
+							disabled={markingDone || reviewMergeBusy}
 						>
-							{canMergeDeploy ? (requestingMergeDeploy ? 'Queueing...' : reviewMergeButtonLabel(reviewMergeState, mergeDeployState)) : (markingDone ? 'Marking Done...' : 'Mark Done')}
+							{canMergeDeploy ? reviewMergeLabel : (markingDone ? 'Marking Done...' : 'Mark Done')}
 						</button>
 						{#if canRequestMergeConflictFix || isMergeConflictFixBusy(mergeConflictFixState) || mergeConflictFixRequestError || mergeConflictFixState.error}
 							<button
