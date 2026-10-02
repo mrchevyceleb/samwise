@@ -150,6 +150,7 @@ Other cards retain their existing explicitly requested merge/deploy controls. Do
 - supabase.rs has public internal functions (for worker.rs) + Tauri command wrappers
 - Worker posts personality-driven comments as it works (casual, like a senior dev on Slack)
 - Visual QA: Playwright screenshots -> Claude Code vision eval -> JSON pass/fail
+- Browser QA (the `qa-verify` card run and the Testing-stage gate) runs on **local headless Chromium by default**: `src-tauri/scripts/qa-flow.mjs` is embedded in the binary, written to `~/.cache/autosam/qa-flow.mjs` at run time, and Sam writes a small flow file in `<temp dir>/autosam-qa/<task>/` and runs it with node (login with the staging test creds from `~/.claude/test-credentials.json`, snapshot, screenshots, and a `QA_FLOW_REPORT` of console errors, page errors, failed requests and 4xx/5xx). Browserbase (proxy off) is only for a required replay link or a site that blocks headless. Verdict formats are unchanged; `QA_SESSION_URL` is `none` for local runs.
 - `decorations: false` with custom TitleBar.svelte
 - Before any task: workspace is reset (fetch, checkout main, hard reset, clean -fdx, new `sam/task-{id}` branch) to prevent state leakage between tasks
 - Task prompt is explicit about committing, not just exploring. `max_turns` bounded low to prevent runaway reads.

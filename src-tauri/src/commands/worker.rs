@@ -3386,10 +3386,61 @@ fn extract_session_url(raw: &str) -> Option<String> {
     }
 }
 
+// ── Local browser QA runner ─────────────────────────────────────────
+//
+// Browser QA runs on a local headless Chromium by default (Playwright, on this
+// machine). Browserbase is only for a required replay link or a site that blocks
+// headless. Sam drives the runner by writing a small flow file and running it
+// with node; the script is embedded in the binary and written to a stable path
+// so both QA prompts can point at it.
+const QA_FLOW_SCRIPT: &str = include_str!("../../scripts/qa-flow.mjs");
+
+/// Writes the embedded runner to `~/.cache/autosam/qa-flow.mjs` (only when the content
+/// differs) and returns its path.
+fn ensure_qa_flow_script() -> Result<String, String> {
+    let dir = dirs::home_dir()
+        .ok_or_else(|| "no home dir to place the QA runner".to_string())?
+        .join(".cache")
+        .join("autosam");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {}", dir.display(), e))?;
+    let path = dir.join("qa-flow.mjs");
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(QA_FLOW_SCRIPT) {
+        std::fs::write(&path, QA_FLOW_SCRIPT)
+            .map_err(|e| format!("write {}: {}", path.display(), e))?;
+    }
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// The prompt section that tells Sam how to drive the local runner. The work dir is outside
+/// the repo so flow files and screenshots never land in a commit.
+fn local_browser_qa_setup(task_id: &str) -> Result<String, String> {
+    let script = ensure_qa_flow_script()?;
+    let short = short_task_id(task_id);
+    let work = std::env::temp_dir()
+        .join("autosam-qa")
+        .join(if short.is_empty() { "task" } else { short.as_str() })
+        .to_string_lossy()
+        .into_owned();
+    std::fs::create_dir_all(&work).map_err(|e| format!("create {}: {}", work, e))?;
+    Ok(format!(
+        r#"BROWSER SETUP (local headless Chromium on this machine, no Browserbase by default):
+- Drive the page by writing a small Playwright flow file in `{work}` (never inside the repo) and running it: `node {script} {work}/flow.mjs --out {work}/out`. Do not use the Browserbase `browser` tool or the `/browse` workflow unless the last bullet applies.
+- The flow is an ES module: `export default async function (page, ctx) {{ ... }}`. `page` is a Playwright Page. `ctx.login(url)` signs in with the stored staging test account (Operly or Studio, chosen from the URL) and returns `{{ok, reason}}`. `ctx.snapshot()` returns the page's accessibility tree, your primary page reader. `ctx.shot(name)` saves a full-page screenshot to the out dir (open the PNGs when pixels matter). `ctx.note(text)` records what you exercised. `console.log` whatever you need to read back.
+- Each run starts a fresh browser, so call `ctx.login(targetUrl)` first (skip it and use `page.goto` for a page that needs no sign-in, such as a local or public URL) and put as much of the flow as you can into one run (happy path, unhappy paths, reload, back button, a narrow `page.setViewportSize`). Refine across runs. Each run must finish inside 100 seconds.
+- The last stdout line of every run is `QA_FLOW_REPORT: <json>` with every console error and warning, uncaught page error, failed request, and HTTP 4xx/5xx seen across the whole run. Read it after every run and once more before your verdict, exactly like DevTools. Real app errors or 4xx/5xx in it are a FAIL even if the UI looked fine. A `truncated` field means the report hit its cap and later entries were dropped, so say so in your summary. Exit code 2 means your flow threw (the report has the error and a failure screenshot), exit code 3 means Chromium could not launch.
+- If `ctx.login` returns `needs_2fa`, redo that login with the Browserbase `browser` tool (it completes TOTP/email 2FA); only SMS/push 2FA is a blocker, report that and do NOT guess. If it returns `no_credentials_for_host` (the runner only logs in on hosts that have stored credentials, and only on that exact host), use the Browserbase `browser` tool for that site instead. Any other `ok: false` (`login_failed`, `login_form_not_found`, `login_host_mismatch`, `login_requires_https`) means you are NOT signed in: say so, never test as if you were. Credentials are never printed; do not read `~/.claude/test-credentials.json` yourself.
+- Use the Browserbase `browser` tool (the `/browse` workflow, proxy OFF) only when a recorded replay link is genuinely required, or the site blocks headless Chromium (bot wall, captcha) and a local run cannot get past it. Say which in your summary.
+"#,
+        work = work,
+        script = script,
+    ))
+}
+
 // ── QA Verify ───────────────────────────────────────────────────────
 //
 // A `qa-verify` task replaces a human QA tester. Instead of writing code,
-// Sam drives Matt's `/browse` workflow against the card's preview URL,
+// Sam drives a local headless browser (Browserbase only when required)
+// against the card's preview URL,
 // exercises the feature against the acceptance criteria, captures console
 // errors and a screenshot, then emits a strict verdict:
 //   PASS -> card moves to `approved` (the merge/deploy + auto-merge sweep
@@ -3484,8 +3535,16 @@ async fn run_qa_verify(
     // Heavily prescriptive prompt: the model gets exact tool flow, exact
     // verdict format, and explicit failure handling so the output is
     // machine-parseable.
+    let browser_setup = match local_browser_qa_setup(task_id) {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!("QA run could not complete: {}", truncate(&e, 300));
+            route_browse_qa_blocked(config, task_id, &msg, None).await;
+            return Ok(msg);
+        }
+    };
     let prompt = format!(
-        r#"/browse You are an automated QA tester. You are NOT writing or changing any code. Your only job is to verify a feature in a real browser and return a strict verdict.
+        r#"You are an automated QA tester. You are NOT writing or changing any code. Your only job is to verify a feature in a real browser and return a strict verdict.
 
 FEATURE UNDER TEST: {title}
 
@@ -3494,12 +3553,7 @@ TARGET URL: {target_url}
 ACCEPTANCE CRITERIA / WHAT TO VERIFY:
 {acceptance}
 
-SESSION SETUP:
-- Follow the `/browse` workflow exactly. Identify the site from the target URL, call `start`, save the returned `liveViewUrl`, call `login` if auth is required, use `snapshot` as your primary page reader, use `screenshot` when pixels matter, and always call `end`.
-- The `start` result includes a `liveViewUrl`. SAVE that exact string, you must report it at the end because it is the recorded replay of this whole QA run. Stored credentials plus TOTP/email 2FA are handled automatically. If `login` returns needs_2fa for SMS/push, report that as a blocker and do NOT guess.
-- CONSOLE/NETWORK IS NOW READABLE. The browser tool captures every console message, uncaught JS error, failed request, and HTTP 4xx/5xx continuously from `start` onward across navigations and popups. Call action `console` at the natural checkpoints: after the main flow, after each unhappy path, and once more right before your verdict. `console` returns `clean` plus counts and entries; treat it exactly like having DevTools open. A non-clean console with real errors/4xx/5xx is a FAIL even if the UI looked fine. Use `console` with includeAll only if you need the full log. Inability to read the console is no longer a valid blocker; you have the tool, use it.
-- Always call action `end` before you finish.
-
+{browser_setup}
 TEST HOLISTICALLY — do not just tick the acceptance list. Make zero assumptions about the codebase. Cover all of:
 1. FUNCTIONAL: exercise the real flow for every acceptance item. Actually click, type, submit, navigate — don't judge from the landing page. Try the unhappy paths too (empty input, invalid input, double-submit, back button, reload mid-flow).
 2. REGRESSIONS: the change can break things it didn't touch. Exercise the screens/flows adjacent to this feature and the obvious shared surfaces (nav, auth, the page the user lands on before/after, anything the feature links to). Flag anything that used to plausibly work and now looks broken.
@@ -3507,12 +3561,12 @@ TEST HOLISTICALLY — do not just tick the acceptance list. Make zero assumption
 4. BLIND SPOTS / EXPLORATORY: spend real effort poking at things NOT in the acceptance criteria — edge cases, states the author likely didn't consider, anything that smells off. This is the most valuable part; be adversarial.
 
 VERDICT RULES:
-- PASS only if every acceptance item is satisfied, you found no regressions, the `console` action came back with no real errors/warnings/4xx/5xx, and no UI/UX problems worse than trivial polish.
-- FAIL if any acceptance item is unmet, OR `console` reported real errors/network failures, OR you found a regression, OR the UI/UX is broken or notably poor, OR you could not complete the test (blocked by SMS/push 2FA, page unreachable). When unsure, FAIL.
-- Every problem you list must also be reflected in `issues` (that is what gets routed back for fixing). Tag each issue with its category, e.g. "[regression] ...", "[ux] ...", "[functional] ...", "[console] ...". For console/network issues, quote the actual message and URL/status from the `console` result.
+- PASS only if every acceptance item is satisfied, you found no regressions, the console/network report (`QA_FLOW_REPORT`, or the Browserbase `console` action if you used it) came back with no real errors/warnings/4xx/5xx, and no UI/UX problems worse than trivial polish.
+- FAIL if any acceptance item is unmet, OR the console/network report showed real errors/network failures, OR you found a regression, OR the UI/UX is broken or notably poor, OR you could not complete the test (blocked by SMS/push 2FA, page unreachable). When unsure, FAIL.
+- Every problem you list must also be reflected in `issues` (that is what gets routed back for fixing). Tag each issue with its category, e.g. "[regression] ...", "[ux] ...", "[functional] ...", "[console] ...". For console/network issues, quote the actual message and URL/status from the report.
 
 OUTPUT (this must be the LAST thing you output, exactly this shape, nothing after it). First the replay line, then the verdict, then the json block:
-QA_SESSION_URL: <the exact liveViewUrl string the `start` action returned>
+QA_SESSION_URL: <the Browserbase liveViewUrl if you used Browserbase, otherwise the word none>
 QA_VERDICT: PASS
 or
 QA_VERDICT: FAIL
@@ -3525,6 +3579,7 @@ followed immediately by a fenced json block:
         target_url = target_url,
         pr_line = pr_line,
         acceptance = acceptance,
+        browser_setup = browser_setup,
     );
 
     let raw = match run_claude_code_streaming(
@@ -6785,8 +6840,9 @@ async fn run_browse_validation_gate(
     } else {
         description.trim().to_string()
     };
+    let browser_setup = local_browser_qa_setup(task_id)?;
     let prompt = format!(
-        r#"/browse Validate Sam's just-finished code changes in a real Browserbase browser. This is the Samwise Testing stage after code work and before PR creation.
+        r#"Validate Sam's just-finished code changes in a real browser (local headless Chromium by default). This is the Samwise Testing stage after code work and before PR creation.
 
 Task: {title}
 
@@ -6799,16 +6855,16 @@ Changed files:
 {changed_files_block}
 
 Rules:
-- Do not edit files, stage, commit, push, or open a PR in this run. This is a browser validation gate only.
-- Follow the `/browse` workflow exactly: identify the site, call `start`, save the `liveViewUrl`, call `login` if auth is required, use `snapshot` as the primary page reader, use `screenshot` when pixels matter, and always call `end`.
-- If the changed files are clearly not browser-visible, do not start a browser session. Return BROWSE_QA_VERDICT: SKIP with a short reason.
+- Do not edit files, stage, commit, push, or open a PR in this run. This is a browser validation gate only. Flow files and screenshots go in the work dir below, never in the repo.
+- If the changed files are clearly not browser-visible, do not start a browser. Return BROWSE_QA_VERDICT: SKIP with a short reason.
 - If a browser-visible change was made, actually drive the changed user flow at {verify_url}. Click, type, submit, navigate, reload, and exercise obvious unhappy paths. Do not judge from the landing page.
-- Run the browser `console` action after the main flow and once more before the verdict. Real app-origin console errors, uncaught exceptions, failed requests, or HTTP 4xx/5xx responses are a FAIL.
+- Read the console/network report (`QA_FLOW_REPORT`, or the Browserbase `console` action if you used it) after the main flow and once more before the verdict. Real app-origin console errors, uncaught exceptions, failed requests, or HTTP 4xx/5xx responses are a FAIL.
 - Check UX quality: overlap, overflow, clipped text, broken responsive behavior, confusing labels, missing feedback, dead ends, and anything that feels unfinished.
-- BLOCKED means the browser session cannot start, the page is unreachable, SMS/push 2FA is required, or the flow cannot be accessed. BLOCKED is not product evidence: report it clearly so Samwise can pause for confirmation instead of attempting a code repair.
+- BLOCKED means the browser cannot start (runner exit code 3), the page is unreachable, SMS/push 2FA is required, or the flow cannot be accessed. BLOCKED is not product evidence: report it clearly so Samwise can pause for confirmation instead of attempting a code repair.
 
+{browser_setup}
 OUTPUT (this must be the last thing you output, exactly this shape, nothing after it):
-BROWSE_QA_SESSION_URL: <the exact liveViewUrl from start, or none if skipped before start>
+BROWSE_QA_SESSION_URL: <the Browserbase liveViewUrl if you used Browserbase, otherwise none>
 BROWSE_QA_VERDICT: PASS
 or
 BROWSE_QA_VERDICT: FAIL
@@ -6825,6 +6881,7 @@ followed immediately by a fenced json block:
         verify_url = verify_url,
         acceptance = acceptance,
         changed_files_block = changed_files_block,
+        browser_setup = browser_setup,
     );
 
     let raw =
