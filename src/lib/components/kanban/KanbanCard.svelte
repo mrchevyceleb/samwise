@@ -59,6 +59,16 @@
 	let reviewMergeState = $derived(getReviewMergeState(task));
 	let mergeConflictFixState = $derived(getMergeConflictFixState(task));
 	let mergeDeployRequestError = $state<string | null>(null);
+	let requestingMergeDeploy = $state(false);
+	let recoverReviewMergeRequest = $derived(
+		!!task.pr_url && (task.status === 'review' || task.status === 'fixes_needed') &&
+		reviewMergeState.status === 'requested' &&
+		mergeDeployState.status !== 'requested' && mergeDeployState.status !== 'running'
+	);
+	let reviewMergeBusy = $derived(requestingMergeDeploy ||
+		(isReviewMergeBusy(reviewMergeState, mergeDeployState) && !recoverReviewMergeRequest));
+	let reviewMergeLabel = $derived(requestingMergeDeploy ? 'Queueing...' :
+		recoverReviewMergeRequest ? 'Retry Review & Merge' : reviewMergeButtonLabel(reviewMergeState, mergeDeployState));
 	let mergeConflictFixRequestError = $state<string | null>(null);
 	let showTesterPicker = $state(false);
 	let testers = $state<{ name: string; role: string }[]>([]);
@@ -67,7 +77,11 @@
 	let sendToQaError = $state<string | null>(null);
 	const SAMWISE_API_BASE = 'https://samwise-board.vercel.app';
 	let showReviewActions = $derived(isReviewActionStatus(task.status) && !!(reviewPanel || task.pr_url));
-	let canMergeDeploy = $derived(!!task.pr_url && (task.status === 'approved' || mergeDeployState.status === 'failed' || reviewMergeState.status === 'failed'));
+	let canMergeDeploy = $derived(!!task.pr_url && (
+		task.status === 'approved' || mergeDeployState.status === 'failed' ||
+		reviewMergeState.status === 'failed' || reviewMergeState.status === 'blocked' ||
+		isReviewMergeBusy(reviewMergeState, mergeDeployState)
+	));
 	let canRequestMergeConflictFix = $derived(
 		!!task.pr_url &&
 		mergeDeployState.status === 'failed' &&
@@ -185,11 +199,17 @@
 	async function requestReviewMerge(e: MouseEvent) {
 		e.preventDefault();
 		e.stopPropagation();
-		if (!canMergeDeploy || isReviewMergeBusy(reviewMergeState, mergeDeployState)) return;
+		if (!canMergeDeploy || reviewMergeBusy) return;
+		requestingMergeDeploy = true;
 		mergeDeployRequestError = null;
-		const ok = await taskStore.updateTask(task.id, { context: requestReviewMergeContext(task) });
-		if (!ok) {
-			mergeDeployRequestError = taskStore.error || 'Could not queue Review & Merge.';
+		try {
+			// The review/merge sweep only claims requests from Ready to Merge.
+			const ok = await taskStore.updateTask(task.id, { status: 'approved', context: requestReviewMergeContext(task) });
+			if (!ok) {
+				mergeDeployRequestError = taskStore.error || 'Could not queue Review & Merge.';
+			}
+		} finally {
+			requestingMergeDeploy = false;
 		}
 	}
 
@@ -565,14 +585,14 @@
 					border: 1px solid {canMergeDeploy ? 'rgba(103, 232, 249, 0.32)' : 'rgba(63, 185, 80, 0.24)'};
 					color: {canMergeDeploy ? '#67e8f9' : 'var(--accent-green)'};
 					font-size: 10px; font-weight: 900; font-family: var(--font-ui);
-					cursor: {isReviewMergeBusy(reviewMergeState, mergeDeployState) ? 'wait' : 'pointer'}; transition: all 0.15s ease;
-					opacity: {isReviewMergeBusy(reviewMergeState, mergeDeployState) ? '0.72' : '1'};
+					cursor: {reviewMergeBusy ? 'wait' : 'pointer'}; transition: all 0.15s ease;
+					opacity: {reviewMergeBusy ? '0.72' : '1'};
 				"
 				onmousedown={(e) => e.stopPropagation()}
 				onclick={canMergeDeploy ? requestReviewMerge : markDone}
-				disabled={isReviewMergeBusy(reviewMergeState, mergeDeployState)}
+				disabled={reviewMergeBusy}
 			>
-				{canMergeDeploy ? reviewMergeButtonLabel(reviewMergeState, mergeDeployState) : 'Mark Done'}
+				{canMergeDeploy ? reviewMergeLabel : 'Mark Done'}
 			</button>
 		</div>
 		{#if mergeDeployRequestError || reviewMergeState.error || mergeDeployState.error}

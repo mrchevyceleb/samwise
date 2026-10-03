@@ -173,7 +173,7 @@ export function reviewMergeButtonLabel(review: ReviewMergeState, deploy: MergeDe
 	if (review.status === 'requested') return 'Sam Queued';
 	if (deploy.status === 'running') return 'Deploying...';
 	if (deploy.status === 'requested') return 'Merge Queued';
-	if (review.status === 'failed' || deploy.status === 'failed') return 'Retry Review & Merge';
+	if (review.status === 'failed' || review.status === 'blocked' || deploy.status === 'failed') return 'Retry Review & Merge';
 	return 'Review & Merge';
 }
 
