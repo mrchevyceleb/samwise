@@ -10287,6 +10287,10 @@ async fn run_claude_code_streaming_impl(
         cmd.arg(arg);
     }
 
+    // Same single-review contract as the pi harness (card-febb8d): the spawned
+    // agent skips its own post-task review pass; the worker runs the one review.
+    cmd.env("AUTOSAM_REVIEW_BY_WORKER", "1");
+
     cmd.arg("-p")
         .arg(prompt)
         .arg("--output-format")
@@ -10830,6 +10834,10 @@ async fn run_pi_streaming_impl(
     for arg in pi_command_args(&pi_cfg) {
         cmd.arg(arg);
     }
+    // The worker orchestrates exactly one cross-model review per task
+    // (card-febb8d): the spawned agent skips its own post-task review pass
+    // instead of double-running one (the global AGENTS.md rule keys on this).
+    cmd.env("AUTOSAM_REVIEW_BY_WORKER", "1");
 
     // pi authenticates itself (~/.pi/agent/auth.json). agent-one's LiteLLM vars
     // would hijack pi's own `anthropic` provider, so scrub them.
