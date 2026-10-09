@@ -49,7 +49,7 @@ export const POST: RequestHandler = async ({ request }) => {
   const supabase = getSupabaseAdmin();
   const { data: taskRow, error: lookupErr } = await supabase
     .from('ae_tasks')
-    .select('id,status,context')
+    .select('id,status,context,on_hold,failure_reason')
     .eq('id', taskId)
     .single();
   if (lookupErr || !taskRow) throw error(404, 'autosam task not found');
@@ -85,8 +85,56 @@ export const POST: RequestHandler = async ({ request }) => {
     });
   }
 
+  // A QA fail must start a real fix cycle on the same branch/PR, not just park
+  // the card. The worker's fixes_needed sweep only re-fires when the newest
+  // "## Blockers"-bearing comment carries a substantive blocker, so mirror the
+  // QA findings into a review-format comment. Fail-closed on human ownership:
+  // nothing is posted for on_hold tasks or tasks reserved for a person
+  // (failure_reason "Reserved for ..." convention).
+  let fix_cycle_armed = false;
+  if (outcome === 'still_broken') {
+    const reserved = (taskRow.failure_reason || '')
+      .trimStart()
+      .toLowerCase()
+      .startsWith('reserved for');
+    const bullets = findings
+      .split(/\r?\n/)
+      .map((line) => line.trim().replace(/^[-*]\s*/, ''))
+      .filter((line) => line.length > 0)
+      .slice(0, 15)
+      .map((line) => line.slice(0, 400));
+    if (taskRow.on_hold !== true && !reserved && bullets.length > 0) {
+      const marker = qaTicketId ? `Sud QA ticket ${qaTicketId}` : null;
+      let alreadyPosted = false;
+      if (marker) {
+        const { data: recent } = await supabase
+          .from('ae_comments')
+          .select('content')
+          .eq('task_id', taskId)
+          .order('created_at', { ascending: false })
+          .limit(10);
+        alreadyPosted = (recent || []).some(
+          (row) => typeof row?.content === 'string' && row.content.includes(marker as string)
+        );
+      }
+      if (!alreadyPosted) {
+        const content = [
+          '## Summary',
+          `Sud QA failed this PR: QA marked Still Broken${marker ? ` (${marker})` : ''}`,
+          '',
+          '## Blockers',
+          ...bullets.map((line) => `- ${line}`)
+        ].join('\n');
+        const { error: fixCommentErr } = await supabase
+          .from('ae_comments')
+          .insert({ task_id: taskId, author: 'system', content });
+        fix_cycle_armed = !fixCommentErr;
+      }
+    }
+  }
+
   return json(
-    { ok: true, new_status: nextStatus, autosam_task_id: taskId },
+    { ok: true, new_status: nextStatus, autosam_task_id: taskId, fix_cycle_armed },
     { headers: CORS_HEADERS }
   );
 };
