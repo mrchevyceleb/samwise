@@ -49,7 +49,7 @@ export const POST: RequestHandler = async ({ request }) => {
   const supabase = getSupabaseAdmin();
   const { data: taskRow, error: lookupErr } = await supabase
     .from('ae_tasks')
-    .select('id,status,context,on_hold,failure_reason')
+    .select('id,status,context,on_hold,failure_reason,pr_url')
     .eq('id', taskId)
     .single();
   if (lookupErr || !taskRow) throw error(404, 'autosam task not found');
