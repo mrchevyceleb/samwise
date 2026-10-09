@@ -133,20 +133,28 @@ export const POST: RequestHandler = async ({ request }) => {
             }
           }
           if (!alreadyPosted) {
-            // Atomic claim: the guards are re-evaluated at write time, so a
-            // hold/reservation that landed after the read above still blocks.
+            // Atomic claim: status and on_hold are re-evaluated at write time,
+            // so a hold or status change that landed after the read above still
+            // blocks. The claim returns the row as of the write, so the human-
+            // reservation check is re-run on that snapshot too.
             const { data: claimed, error: claimErr } = await supabase
               .from('ae_tasks')
               .update({ updated_at: new Date().toISOString() })
               .eq('id', taskId)
               .eq('status', 'fixes_needed')
               .eq('on_hold', false)
-              .or('failure_reason.is.null,not.failure_reason.like.Reserved for*')
-              .select('id');
+              .select('id,failure_reason');
             if (claimErr) {
               fix_cycle_error = `guard claim failed: ${claimErr.message}`;
             } else if (!claimed || claimed.length === 0) {
               fix_cycle_error = 'task no longer eligible (claimed by a human or moved on)';
+            } else if (
+              String(claimed[0]?.failure_reason ?? '')
+                .trimStart()
+                .toLowerCase()
+                .startsWith('reserved for')
+            ) {
+              fix_cycle_error = 'task is reserved for a human';
             } else {
               const prUrl = typeof taskRow?.pr_url === 'string' ? taskRow.pr_url : null;
               const content = [
