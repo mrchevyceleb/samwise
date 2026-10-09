@@ -141,7 +141,7 @@ export const POST: RequestHandler = async ({ request }) => {
               .eq('id', taskId)
               .eq('status', 'fixes_needed')
               .eq('on_hold', false)
-              .not('failure_reason', 'like', 'Reserved for%')
+              .or('failure_reason.is.null,not.failure_reason.like.Reserved for*')
               .select('id');
             if (claimErr) {
               fix_cycle_error = `guard claim failed: ${claimErr.message}`;
