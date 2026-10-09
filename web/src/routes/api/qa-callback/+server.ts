@@ -49,7 +49,7 @@ export const POST: RequestHandler = async ({ request }) => {
   const supabase = getSupabaseAdmin();
   const { data: taskRow, error: lookupErr } = await supabase
     .from('ae_tasks')
-    .select('id,status,context')
+    .select('id,status,context,on_hold,failure_reason,pr_url')
     .eq('id', taskId)
     .single();
   if (lookupErr || !taskRow) throw error(404, 'autosam task not found');
@@ -85,8 +85,103 @@ export const POST: RequestHandler = async ({ request }) => {
     });
   }
 
+  // A QA fail must start a real fix cycle on the same branch/PR, not just park
+  // the card. The worker's fixes_needed sweep only re-fires when the newest
+  // "## Blockers"-bearing comment carries a substantive blocker, so mirror the
+  // QA findings into a review-format comment. Fail-closed on human ownership:
+  // an atomic conditional claim on the task row (status fixes_needed, not
+  // on_hold, failure_reason not 'Reserved for ...') must succeed before
+  // anything is posted, and the new capability only arms when the route's
+  // auth secret is configured (blocker text drives an autonomous agent).
+  let fix_cycle_armed = false;
+  let fix_cycle_error: string | null = null;
+  if (outcome === 'still_broken') {
+    if (!env.QA_CALLBACK_SECRET) {
+      fix_cycle_error = 'fix-cycle arming requires QA_CALLBACK_SECRET';
+    } else {
+      const failureReason = typeof taskRow?.failure_reason === 'string' ? taskRow.failure_reason : '';
+      const reserved = failureReason.trimStart().toLowerCase().startsWith('reserved for');
+      if (taskRow?.on_hold === true || reserved) {
+        fix_cycle_error = taskRow?.on_hold === true ? 'task is on hold' : 'task is reserved for a human';
+      } else {
+        const bullets = findings
+          .split(/\r?\n/)
+          .map((line) => line.trim().replace(/^[-*]\s*/, ''))
+          .filter((line) => line.length > 0)
+          .slice(0, 15)
+          .map((line) => line.slice(0, 400));
+        if (bullets.length === 0) {
+          fix_cycle_error = 'no parseable findings';
+        } else {
+          const marker = qaTicketId ? `Sud QA ticket ${qaTicketId}` : null;
+          let alreadyPosted = false;
+          if (marker) {
+            const { data: recent, error: scanErr } = await supabase
+              .from('ae_comments')
+              .select('content')
+              .eq('task_id', taskId)
+              .order('created_at', { ascending: false })
+              .limit(50);
+            if (scanErr) {
+              alreadyPosted = true; // fail closed: an unreadable dup scan never re-arms
+              fix_cycle_error = `dup scan failed: ${scanErr.message}`;
+            } else {
+              alreadyPosted = (recent || []).some(
+                (row) => typeof row?.content === 'string' && row.content.includes(marker as string)
+              );
+              if (alreadyPosted) fix_cycle_error = 'fix comment already posted for this QA ticket';
+            }
+          }
+          if (!alreadyPosted) {
+            // Atomic claim: status and on_hold are re-evaluated at write time,
+            // so a hold or status change that landed after the read above still
+            // blocks. The claim returns the row as of the write, so the human-
+            // reservation check is re-run on that snapshot too.
+            const { data: claimed, error: claimErr } = await supabase
+              .from('ae_tasks')
+              .update({ updated_at: new Date().toISOString() })
+              .eq('id', taskId)
+              .eq('status', 'fixes_needed')
+              .eq('on_hold', false)
+              .select('id,failure_reason');
+            if (claimErr) {
+              fix_cycle_error = `guard claim failed: ${claimErr.message}`;
+            } else if (!claimed || claimed.length === 0) {
+              fix_cycle_error = 'task no longer eligible (claimed by a human or moved on)';
+            } else if (
+              String(claimed[0]?.failure_reason ?? '')
+                .trimStart()
+                .toLowerCase()
+                .startsWith('reserved for')
+            ) {
+              fix_cycle_error = 'task is reserved for a human';
+            } else {
+              const prUrl = typeof taskRow?.pr_url === 'string' ? taskRow.pr_url : null;
+              const content = [
+                '## Summary',
+                `Sud QA failed this PR${prUrl ? ` (${prUrl})` : ''}: QA marked Still Broken${marker ? ` (${marker})` : ''}`,
+                '',
+                '## Blockers',
+                ...bullets.map((line) => `- ${line}`)
+              ].join('\n');
+              const { error: fixCommentErr } = await supabase
+                .from('ae_comments')
+                .insert({ task_id: taskId, author: 'system', content });
+              if (fixCommentErr) {
+                fix_cycle_error = `blockers comment failed: ${fixCommentErr.message}`;
+                console.error('qa-callback fix-cycle insert failed:', fixCommentErr);
+              } else {
+                fix_cycle_armed = true;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
   return json(
-    { ok: true, new_status: nextStatus, autosam_task_id: taskId },
+    { ok: true, new_status: nextStatus, autosam_task_id: taskId, fix_cycle_armed, ...(fix_cycle_error ? { fix_cycle_error } : {}) },
     { headers: CORS_HEADERS }
   );
 };
