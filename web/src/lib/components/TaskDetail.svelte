@@ -42,6 +42,16 @@
   let mergeDeployRequestError = $state<string | null>(null);
   let mergeConflictFixRequestError = $state<string | null>(null);
   let reviewMergeRequestError = $state<string | null>(null);
+  let requestingMergeDeploy = $state(false);
+  let recoverReviewMergeRequest = $derived(
+    !!task.pr_url && (task.status === 'review' || task.status === 'fixes_needed') &&
+    reviewMergeState.status === 'requested' &&
+    mergeDeployState.status !== 'requested' && mergeDeployState.status !== 'running'
+  );
+  let reviewMergeBusy = $derived(requestingMergeDeploy ||
+    (isReviewMergeBusy(reviewMergeState, mergeDeployState) && !recoverReviewMergeRequest));
+  let reviewMergeLabel = $derived(requestingMergeDeploy ? 'Queueing...' :
+    recoverReviewMergeRequest ? 'Retry Review & Merge' : reviewMergeButtonLabel(reviewMergeState, mergeDeployState));
   let stopping = $state(false);
   let restarting = $state(false);
   let confirmDelete = $state(false);
@@ -49,7 +59,11 @@
   let isStoppable = $derived(task.status === 'in_progress' || task.status === 'testing');
   let visualQA = $derived(task.visual_qa_result);
   let visualQaVerdict = $derived((visualQA?.verdict || (visualQA?.pass ? 'PASS' : 'FAIL')).toUpperCase());
-  let canMergeDeploy = $derived(!!task.pr_url && (task.status === 'approved' || mergeDeployState.status === 'failed' || reviewMergeState.status === 'failed'));
+  let canMergeDeploy = $derived(!!task.pr_url && (
+    task.status === 'approved' || mergeDeployState.status === 'failed' ||
+    reviewMergeState.status === 'failed' || reviewMergeState.status === 'blocked' ||
+    isReviewMergeBusy(reviewMergeState, mergeDeployState)
+  ));
   let canRequestMergeConflictFix = $derived(
     !!task.pr_url &&
     mergeDeployState.status === 'failed' &&
@@ -305,11 +319,17 @@
     await tasksStore.updateTask(task.id, { context: nextManualInProgressStampContext(task) });
   }
   async function requestReviewMerge() {
-    if (!canMergeDeploy || isReviewMergeBusy(reviewMergeState, mergeDeployState)) return;
+    if (!canMergeDeploy || reviewMergeBusy) return;
+    requestingMergeDeploy = true;
     reviewMergeRequestError = null;
-    const ok = await tasksStore.updateTask(task.id, { context: requestReviewMergeContext(task) });
-    if (!ok) {
-      reviewMergeRequestError = tasksStore.error || 'Could not queue Review & Merge.';
+    try {
+      // The review/merge sweep only claims requests from Ready to Merge.
+      const ok = await tasksStore.updateTask(task.id, { status: 'approved', context: requestReviewMergeContext(task) });
+      if (!ok) {
+        reviewMergeRequestError = tasksStore.error || 'Could not queue Review & Merge.';
+      }
+    } finally {
+      requestingMergeDeploy = false;
     }
   }
   async function handleStop() {
@@ -471,28 +491,30 @@
         <pre class="max-h-[420px] overflow-y-auto whitespace-pre-wrap break-words rounded-xl border-l-4 border-indigo-400/55 bg-indigo-500/5 px-3 py-3 font-mono text-xs leading-relaxed text-slate-200">{task.commit_message}</pre>
       {/if}
 
-      {#if reviewPanel && isReviewActionStatus(task.status)}
+      {#if (reviewPanel || task.pr_url) && isReviewActionStatus(task.status)}
         <section
           class="rounded-2xl border p-3 shadow-inner"
-          style="border-color: {verdictColor(reviewPanel.verdict)}66; background: linear-gradient(135deg, {verdictColor(reviewPanel.verdict)}22, rgba(14, 165, 233, 0.08));"
+          style="border-color: {verdictColor(reviewPanel?.verdict)}66; background: linear-gradient(135deg, {verdictColor(reviewPanel?.verdict)}22, rgba(14, 165, 233, 0.08));"
         >
-          <div class="flex items-start gap-3">
-            <div class="min-w-0 flex-1">
-              <div class="text-[10px] font-black uppercase tracking-wide" style="color: {verdictColor(reviewPanel.verdict)};">
-                {reviewPanel.label}
+          {#if reviewPanel}
+            <div class="flex items-start gap-3">
+              <div class="min-w-0 flex-1">
+                <div class="text-[10px] font-black uppercase tracking-wide" style="color: {verdictColor(reviewPanel.verdict)};">
+                  {reviewPanel.label}
+                </div>
+                <p class="mt-1 text-sm font-semibold leading-snug text-slate-100">{reviewPanel.why}</p>
               </div>
-              <p class="mt-1 text-sm font-semibold leading-snug text-slate-100">{reviewPanel.why}</p>
+              {#if uiStamp}
+                <span class="shrink-0 rounded-full border border-orange-400/40 bg-orange-400/15 px-2 py-0.5 text-[10px] font-black uppercase tracking-wide text-orange-200">
+                  Manual In Progress
+                </span>
+              {/if}
             </div>
-            {#if uiStamp}
-              <span class="shrink-0 rounded-full border border-orange-400/40 bg-orange-400/15 px-2 py-0.5 text-[10px] font-black uppercase tracking-wide text-orange-200">
-                Manual In Progress
-              </span>
-            {/if}
-          </div>
 
-          <div class="mt-3 rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-xs font-bold leading-snug {reviewPanel.hasDeploymentCallout ? 'text-amber-200' : 'text-slate-400'}">
-            Deployment: {reviewPanel.deployment}
-          </div>
+            <div class="mt-3 rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-xs font-bold leading-snug {reviewPanel.hasDeploymentCallout ? 'text-amber-200' : 'text-slate-400'}">
+              Deployment: {reviewPanel.deployment}
+            </div>
+          {/if}
 
           <div class="mt-3 flex flex-wrap gap-2">
             {#if task.pr_url}
@@ -514,11 +536,12 @@
               </button>
               <button
                 type="button"
+                data-review-action="primary"
                 onclick={canMergeDeploy ? requestReviewMerge : markDone}
-                disabled={isReviewMergeBusy(reviewMergeState, mergeDeployState)}
-                class="rounded-lg border px-3 py-2 text-xs font-black {canMergeDeploy ? 'border-cyan-300/35 bg-cyan-400/10 text-cyan-100 hover:bg-cyan-400/15' : 'border-emerald-300/30 bg-emerald-400/10 text-emerald-100 hover:bg-emerald-400/15'} {isReviewMergeBusy(reviewMergeState, mergeDeployState) ? 'opacity-70 cursor-wait' : ''}"
+                disabled={reviewMergeBusy}
+                class="rounded-lg border px-3 py-2 text-xs font-black {canMergeDeploy ? 'border-cyan-300/35 bg-cyan-400/10 text-cyan-100 hover:bg-cyan-400/15' : 'border-emerald-300/30 bg-emerald-400/10 text-emerald-100 hover:bg-emerald-400/15'} {reviewMergeBusy ? 'opacity-70 cursor-wait' : ''}"
               >
-                {canMergeDeploy ? reviewMergeButtonLabel(reviewMergeState, mergeDeployState) : 'Mark Done'}
+                {canMergeDeploy ? reviewMergeLabel : 'Mark Done'}
               </button>
               {#if canRequestMergeConflictFix || isMergeConflictFixBusy(mergeConflictFixState) || mergeConflictFixRequestError || mergeConflictFixState.error}
                 <button
