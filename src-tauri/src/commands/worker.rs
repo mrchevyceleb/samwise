@@ -3443,9 +3443,10 @@ fn local_browser_qa_setup(task_id: &str) -> Result<String, String> {
 // against the card's preview URL,
 // exercises the feature against the acceptance criteria, captures console
 // errors and a screenshot, then emits a strict verdict:
-//   PASS -> card moves to `approved` (Ready to Merge; Kip or Christina
-//           review and merge it under the staging-first process, same as a
-//           clean Codex review).
+//   PASS -> card moves to `approved` (Ready to Merge). Under the staging-first
+//           process Kip or Christina review and merge it; the automated
+//           QA-pass merge stamp below only fires when auto-merge is explicitly
+//           enabled in settings (auto-merge is off).
 //   FAIL -> card moves to `fixes_needed` with the findings, so the
 //           existing fix loop (or Matt) picks it back up.
 async fn run_qa_verify(
@@ -11859,7 +11860,7 @@ pub fn spawn_pr_review_task(
                     notify_callback(&config, &task_id, "approved", Some(&pr_url), None);
                     if external_review {
                         agent_comment(&config, &task_id,
-                            "GitHub approval confirmed. Keeping this card in Ready to Merge while checks run. A behind branch will be updated and reviewed again before squash merge; Done requires a successful staging workflow.").await;
+                            "GitHub approval confirmed. Clean review parked: staging-first process, Kip or Christina review and merge this PR to staging — the worker never merges it. If the branch goes behind main they handle the update (a changed head gets a fresh review), and the card closes once the exact merged commit passes the staging workflow.").await;
                         return;
                     }
                     if merge_on_approved {

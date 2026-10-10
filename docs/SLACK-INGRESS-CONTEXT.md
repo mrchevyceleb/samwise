@@ -122,4 +122,4 @@ Required AutoSam behavior:
 
 ### External review completion
 
-For Studio and Operly main, a clean Slack review continues through real approval, green required checks, expected-head branch update if behind, fresh review after any head change, and head-pinned squash merge. The card remains visible until the exact merged commit passes the existing staging workflow. FIX/inconclusive reviews never enter this merge path. Production promotion and generic deploy commands are excluded.
+For Studio and Operly main, a clean Slack review posts the real approval and then parks: staging-first (locked Oct 10 2026), Kip or Christina review and merge every PR to staging. The worker never merges and never updates a behind branch (a changed head gets a fresh review). The card remains visible until the exact human-merged commit passes the existing staging workflow, and a closed PR fails it. FIX/inconclusive reviews never enter this path. Production promotion and generic deploy commands are excluded.

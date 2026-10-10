@@ -139,9 +139,8 @@ Defined inline in `chat.rs::build_system_prompt()` (around line 427). Tone: proa
 External Slack `#review` cards for `R-Link-LLC/r-link-studio-rebuild` and `R-Link-LLC/operly` targeting `main` use a dedicated staging-only continuation:
 
 1. A clean Codex verdict submits a real GitHub approval pinned to the reviewed head, using Matt's saved reviewer credential. FIX and inconclusive remain held; a new review clears any previous approval receipt.
-2. The card stays `approved` (Ready to Merge) while required checks finish. A mergeable BEHIND branch is updated using GitHub's expected-head fence, then goes back to Review for fresh Codex and approval on the new head.
-3. A clean, approved, non-draft head is squash-merged with `--match-head-commit`, without admin bypass. Changed heads are never retried as though already reviewed.
-4. Done requires the exact merge SHA's `deploy-staging.yml` push workflow to succeed. The continuation only reads deployment status. It never runs the generic deploy planner or production promotion.
+2. Staging-first (locked Oct 10 2026): nothing merges on its own. The clean review parks the card in `approved` (Ready to Merge) and Kip or Christina reviews and merges the PR to staging. The worker never merges these PRs, never updates a behind branch (a human handles it; a changed head goes back to Review for fresh Codex and approval on the new head), and never routes these cards through `samwise_merge_deploy_status: requested`.
+3. The continuation only observes the human merge: Done requires the exact merge SHA's `deploy-staging.yml` push workflow to succeed, and a closed PR fails the card. It never runs the generic deploy planner or production promotion.
 
 Other cards retain their existing explicitly requested merge/deploy controls. Do not route external review cards through `samwise_merge_deploy_status: requested`; that is the broader legacy deploy path. Production remains a separately authorized promotion.
 
