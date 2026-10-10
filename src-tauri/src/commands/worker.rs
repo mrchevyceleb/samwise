@@ -3443,8 +3443,10 @@ fn local_browser_qa_setup(task_id: &str) -> Result<String, String> {
 // against the card's preview URL,
 // exercises the feature against the acceptance criteria, captures console
 // errors and a screenshot, then emits a strict verdict:
-//   PASS -> card moves to `approved` (the merge/deploy + auto-merge sweep
-//           can take it from there, same as a clean Codex review).
+//   PASS -> card moves to `approved` (Ready to Merge). Under the staging-first
+//           process Kip or Christina review and merge it; the automated
+//           QA-pass merge stamp below only fires when auto-merge is explicitly
+//           enabled in settings (auto-merge is off).
 //   FAIL -> card moves to `fixes_needed` with the findings, so the
 //           existing fix loop (or Matt) picks it back up.
 async fn run_qa_verify(
@@ -4829,11 +4831,11 @@ async fn execute_task(
         };
 
         // When routing through the LLM proxy (GLM), explicitly request tests.
-        // GLM tends to skip test coverage, which blocks auto-merge (min score 7).
+        // GLM tends to skip test coverage, which sends the PR back for fixes.
         let proxy = load_llm_proxy();
         let test_instruction_section = if proxy.is_some() {
             String::from(
-                "## Test Coverage\nWrite tests for your changes. Even a basic smoke test or rendering test is better than none. The code review will score test_coverage, and a score below 7 blocks auto-merge. If the project has no test framework, add a comment in the commit explaining why tests are not feasible.\n\n"
+                "## Test Coverage\nWrite tests for your changes. Even a basic smoke test or rendering test is better than none. The code review will score test_coverage, and weak coverage sends the PR back for fixes. If the project has no test framework, add a comment in the commit explaining why tests are not feasible.\n\n"
             )
         } else {
             String::new()
@@ -11858,7 +11860,7 @@ pub fn spawn_pr_review_task(
                     notify_callback(&config, &task_id, "approved", Some(&pr_url), None);
                     if external_review {
                         agent_comment(&config, &task_id,
-                            "GitHub approval confirmed. Keeping this card in Ready to Merge while checks run. A behind branch will be updated and reviewed again before squash merge; Done requires a successful staging workflow.").await;
+                            "GitHub approval confirmed. Clean review parked: staging-first process, Kip or Christina review and merge this PR to staging — the worker never merges it. If the branch goes behind main they handle the update (a changed head gets a fresh review), and the card closes once the exact merged commit passes the staging workflow.").await;
                         return;
                     }
                     if merge_on_approved {
@@ -18878,7 +18880,9 @@ fn external_merge_candidate(task: &Value) -> bool {
 }
 
 /// Poll clean external reviews without taking over the author's checkout or
-/// invoking the legacy deploy planner. The repo's main push deploys staging.
+/// invoking the legacy deploy planner. Staging-first: this never merges — a
+/// clean review parks on the card for Kip or Christina to merge, and the
+/// poll only observes the human merge and its staging workflow.
 async fn sweep_external_review_merges(config: &SupabaseConfig) {
     let Ok(tasks) = supabase::fetch_tasks(config, None).await else { return };
     let Some(rows) = tasks.as_array() else { return };
