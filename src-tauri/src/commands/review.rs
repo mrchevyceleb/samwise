@@ -1543,11 +1543,11 @@ fn external_high_risk_reason(files: &Value) -> Option<String> {
     if rows.is_empty() { return Some("changed files could not be read".into()); }
     if rows.len() >= 100 { return Some("100+ changed files".into()); }
     let Ok(risky) = regex::Regex::new(concat!(
-        r"(?i)(migration|\.sql$|supabase/|/models?/|",
+        r"(?i)(migration|\.sql$|supabase/|/models?/|prisma|drizzle|(^|/)(db|database)/|",
         r"(^|[/_.-])(auth|otp|totp|mfa|2fa|jwt|rls)|(?-i:Auth|Otp|Totp|Mfa|Jwt)|",
         r"oauth|login|sign-?in|sign-?up|password|passkey|",
         r"stripe|billing|payment|checkout|subscription|invoice|payout|commission|refund|",
-        r"security|permission|polic(y|ies)|csrf|cors|secret|credential|webhook|",
+        r"security|permission|polic(y|ies)|rbac|cookie|csrf|cors|secret|credential|webhook|",
         r"\.github/|deploy|dockerfile|railway|vercel\.json)"
     )) else { return Some("risk check unavailable".into()) };
     rows.iter().filter_map(|f| f["path"].as_str()).find(|path| risky.is_match(path))
