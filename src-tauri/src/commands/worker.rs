@@ -8720,9 +8720,8 @@ async fn handle_slack_pr_review_workflow(
         }
 
         match supabase::create_task(config, &task).await {
-            Ok(row) => {
-                let id = first_returned_id(&row).unwrap_or_else(|| "?".to_string());
-                created.push(format!("{} ({})", pr_url, short_task_id(&id)));
+            Ok(_row) => {
+                created.push(pr_url);
             }
             Err(e) => {
                 log::warn!("[worker] Slack #review task create failed for {}: {}", pr_url, e);
@@ -8732,20 +8731,36 @@ async fn handle_slack_pr_review_workflow(
     }
 
     let mut lines = Vec::new();
-    if !created.is_empty() {
-        lines.push(format!("Queued PR review for {}: {}", if created.len() == 1 { "this PR" } else { "these PRs" }, created.join(", ")));
-    }
     if !revived.is_empty() {
-        lines.push(format!("Moved existing completed card(s) back to Review: {}", revived.join(", ")));
+        lines.push(format!(
+            "I picked {} back up for review: {}",
+            if revived.len() == 1 { "this PR" } else { "these PRs" },
+            revived.join(", ")
+        ));
     }
     if !already.is_empty() {
-        lines.push(format!("Already had active card(s) for: {}", already.join(", ")));
+        lines.push(format!(
+            "I already have {} in review: {}",
+            if already.len() == 1 { "this PR" } else { "these PRs" },
+            already.join(", ")
+        ));
     }
     if !missing_project.is_empty() {
-        lines.push(format!("Could not match project/repo for: {}. Add a project hashtag like `#studio` or make sure the repo is registered in AutoSam.", missing_project.join(", ")));
+        lines.push(format!(
+            "I couldn't match {} to a project: {}. Add a project hashtag like `#studio` and tag me again.",
+            if missing_project.len() == 1 { "this PR" } else { "these PRs" },
+            missing_project.join(", ")
+        ));
     }
     if lines.is_empty() {
-        "I saw `#review`, but nothing was queued. Add a PR link and project hashtag, then tag me again.".to_string()
+        if created.is_empty() {
+            "I saw `#review`, but I couldn't queue anything. Add a PR link and a project hashtag, then tag me again.".to_string()
+        } else {
+            // Everything queued cleanly. The ack in the thread already said
+            // I'm on it, and a bare "queued" echo right after it adds
+            // nothing, so return empty and let the caller stay quiet.
+            String::new()
+        }
     } else {
         lines.join("\n")
     }
@@ -8906,14 +8921,19 @@ async fn process_remote_chat_message(
             &slack_callback,
         )
         .await;
-        send_remote_agent_message_or_requeue(
-            config,
-            message_id,
-            conversation_id,
-            &response_text,
-            &reply_attachments,
-        )
-        .await;
+        // Empty summary (everything queued cleanly) = stay quiet: the ack in
+        // the thread already said I'm on it, and a bare "queued" echo right
+        // after it would double-post.
+        if !response_text.is_empty() {
+            send_remote_agent_message_or_requeue(
+                config,
+                message_id,
+                conversation_id,
+                &response_text,
+                &reply_attachments,
+            )
+            .await;
+        }
         log::info!(
             "[worker] Slack #review workflow handled for message {}",
             message_id
