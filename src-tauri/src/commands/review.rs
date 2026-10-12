@@ -1535,9 +1535,29 @@ fn external_required_checks_pass(text: &str) -> bool {
     })
 }
 
-/// One bounded poll, no worktree edits, force push, admin bypass, merge or deploy.
-/// Staging-first (locked Oct 10 2026): nothing merges on its own. A clean review
-/// parks for Kip or Christina to merge; this only observes the human merge.
+/// High-risk changes (sign-in, payments, security, database) are never merged by
+/// the worker; Kip or Christina review and merge them. Returns the first matching
+/// changed path, or a reason when the file list cannot be fully seen.
+fn external_high_risk_reason(files: &Value) -> Option<String> {
+    let Some(rows) = files.as_array() else { return Some("changed files could not be read".into()) };
+    if rows.is_empty() { return Some("changed files could not be read".into()); }
+    if rows.len() >= 100 { return Some("100+ changed files".into()); }
+    let Ok(risky) = regex::Regex::new(concat!(
+        r"(?i)(migration|\.sql$|supabase/|/models?/|prisma|drizzle|(^|/)(db|database)/|",
+        r"(^|[/_.-])(auth|otp|totp|mfa|2fa|jwt|rls)|(?-i:Auth|Otp|Totp|Mfa|Jwt)|",
+        r"oauth|login|sign-?in|sign-?up|password|passkey|",
+        r"stripe|billing|payment|checkout|subscription|invoice|payout|commission|refund|",
+        r"security|permission|polic(y|ies)|rbac|cookie|csrf|cors|secret|credential|webhook|",
+        r"\.github/|deploy|dockerfile|railway|vercel\.json)"
+    )) else { return Some("risk check unavailable".into()) };
+    rows.iter().filter_map(|f| f["path"].as_str()).find(|path| risky.is_match(path))
+        .map(|path| format!("touches {}", path))
+}
+
+/// One bounded poll, no worktree edits, force push or admin bypass.
+/// Matt, Oct 12 2026: when a dev tags Sam for review, Sam merges a clean,
+/// approved, green PR to main (= staging) himself. High-risk PRs park for Kip
+/// or Christina. Production stays a separate, human ship.
 /// An update changes HEAD and must return through Codex + approval on that HEAD.
 pub async fn advance_external_merge<F, Fut>(
     pr_url: &str, repo_path: &str, reviewed_head: &str, approval_id: i64,
@@ -1592,24 +1612,28 @@ where F: Fn() -> Fut, Fut: std::future::Future<Output = bool> {
         || current["reviewDecision"] != "APPROVED" || current["mergeable"] != "MERGEABLE" {
         return Ok(ExternalMergeProgress::Waiting("PR is not currently approved and mergeable".into()));
     }
+    let files = external_gh_json(&token, repo_path, &["pr", "view", pr_url, "--json", "files"]).await?;
+    if let Some(reason) = external_high_risk_reason(&files["files"]) {
+        if !still_authorized().await { return Err("Card held or review changed".into()); }
+        return Ok(ExternalMergeProgress::Waiting(format!(
+            "Clean review passed. High-risk change ({}): sign-in, payments, security and database PRs are merged to staging by Kip or Christina, not the worker.", reason)));
+    }
     if current["mergeStateStatus"] == "BEHIND" {
-        // Staging-first: never touch the author's branch either. Kip or
-        // Christina updates and merges; a changed head re-enters review above.
-        return Ok(ExternalMergeProgress::Waiting(
-            "PR is behind main. Kip or Christina update and merge it under the staging-first process.".into(),
-        ));
+        if !still_authorized().await { return Err("Card held or review changed before branch update".into()); }
+        external_gh_json(&token, repo_path, &["api", &format!("{}/update-branch", endpoint),
+            "--method", "PUT", "-f", &format!("expected_head_sha={}", reviewed_head)]).await?;
+        return Ok(ExternalMergeProgress::ReviewAgain);
     }
     if current["mergeStateStatus"] != "CLEAN" {
         return Ok(ExternalMergeProgress::Waiting("GitHub merge gate is not clean yet".into()));
     }
-    // Staging-first (locked Oct 10 2026): nothing merges on its own. Sam's
-    // clean review stops here; Kip or Christina reviews and merges every PR
-    // to staging. This poll only observes: once a human merges, the MERGED
-    // branch above waits for the staging workflow and then closes the card.
-    if !still_authorized().await { return Err("Card held or review changed".into()); }
-    Ok(ExternalMergeProgress::Waiting(
-        "Clean review passed. Staging-first process: Kip or Christina review and merge this PR to staging; the worker never merges.".into(),
-    ))
+    // No --admin: GitHub enforces checks/reviews again atomically at merge.
+    if !still_authorized().await { return Err("Card held or review changed before merge".into()); }
+    let out = external_gh(&token, repo_path, &["pr", "merge", pr_url, "--squash",
+        "--match-head-commit", reviewed_head]).await?;
+    let after = external_gh_json(&token, repo_path, &view).await?;
+    if after["state"] == "MERGED" { return Ok(ExternalMergeProgress::Merged); }
+    Err(format!("Merge not confirmed; card retained: {}", trim_to(String::from_utf8_lossy(&out.stderr).trim(), 500)))
 }
 
 pub async fn gh_merge(pr_url: &str, repo_path: &str, head_sha: &str) -> Result<(), String> {

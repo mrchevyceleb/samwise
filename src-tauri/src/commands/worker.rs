@@ -11862,7 +11862,7 @@ pub fn spawn_pr_review_task(
                     notify_callback(&config, &task_id, "approved", Some(&pr_url), None);
                     if external_review {
                         agent_comment(&config, &task_id,
-                            "GitHub approval confirmed. Clean review parked: staging-first process, Kip or Christina review and merge this PR to staging — the worker never merges it. If the branch goes behind main they handle the update (a changed head gets a fresh review), and the card closes once the exact merged commit passes the staging workflow.").await;
+                            "GitHub approval confirmed. Once required checks pass, Sam squash-merges this PR to staging (main). A behind branch is updated and reviewed again first. High-risk changes (sign-in, payments, security, database) park for Kip or Christina instead. Done requires a successful staging workflow; production is a separate ship.").await;
                         return;
                     }
                     if merge_on_approved {
@@ -18882,9 +18882,9 @@ fn external_merge_candidate(task: &Value) -> bool {
 }
 
 /// Poll clean external reviews without taking over the author's checkout or
-/// invoking the legacy deploy planner. Staging-first: this never merges — a
-/// clean review parks on the card for Kip or Christina to merge, and the
-/// poll only observes the human merge and its staging workflow.
+/// invoking the legacy deploy planner. The repo's main push deploys staging.
+/// Clean, approved, green, low-risk PRs are squash-merged here (Matt, Oct 12
+/// 2026); high-risk ones park for Kip or Christina.
 async fn sweep_external_review_merges(config: &SupabaseConfig) {
     let Ok(tasks) = supabase::fetch_tasks(config, None).await else { return };
     let Some(rows) = tasks.as_array() else { return };
