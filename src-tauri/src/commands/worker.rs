@@ -3566,6 +3566,7 @@ VERDICT RULES:
 - PASS only if every acceptance item is satisfied, you found no regressions, the console/network report (`QA_FLOW_REPORT`, or the Browserbase `console` action if you used it) came back with no real errors/warnings/4xx/5xx, and no UI/UX problems worse than trivial polish.
 - FAIL if any acceptance item is unmet, OR the console/network report showed real errors/network failures, OR you found a regression, OR the UI/UX is broken or notably poor, OR you could not complete the test (blocked by SMS/push 2FA, page unreachable). When unsure, FAIL.
 - Every problem you list must also be reflected in `issues` (that is what gets routed back for fixing). Tag each issue with its category, e.g. "[regression] ...", "[ux] ...", "[functional] ...", "[console] ...". For console/network issues, quote the actual message and URL/status from the report.
+- Report only in the output block below. Never call Slack, email, Zendesk, or any external send. A Slack permalink in the task text is source context, not a reply target. QA results stay on the task record for internal review.
 
 OUTPUT (this must be the LAST thing you output, exactly this shape, nothing after it). First the replay line, then the verdict, then the json block:
 QA_SESSION_URL: <the Browserbase liveViewUrl if you used Browserbase, otherwise the word none>
