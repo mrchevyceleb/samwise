@@ -446,6 +446,47 @@ pub async fn update_task_if_status(
     .await
 }
 
+/// Recover the exact stale review snapshot only while it still has no PR.
+/// A concurrent PR attachment, hold or progress update makes this a no-op.
+pub async fn requeue_review_without_pr(
+    config: &SupabaseConfig,
+    id: &str,
+    updated_at: &str,
+    context: &Value,
+) -> Result<Value, String> {
+    let mut context = match context {
+        Value::Null => serde_json::Map::new(),
+        Value::Object(context) => context.clone(),
+        _ => return Err("Invalid no-PR review context".to_string()),
+    };
+    context.insert(
+        "no_pr_requeued_at".to_string(),
+        Value::String(chrono::Utc::now().to_rfc3339()),
+    );
+    let client = build_client(config)?;
+    let url = format!(
+        "{}?id=eq.{}&status=eq.review&updated_at=eq.{}&pr_number=is.null&or=(pr_url.is.null,pr_url.eq.)&on_hold=eq.false",
+        rest_url(config, "ae_tasks"),
+        urlencoding::encode(id),
+        urlencoding::encode(updated_at)
+    );
+    handle_response(
+        client
+            .patch(&url)
+            .json(&serde_json::json!({
+                "status": "queued",
+                "worker_id": Value::Null,
+                "claimed_at": Value::Null,
+                "context": context,
+                "updated_at": chrono::Utc::now().to_rfc3339(),
+            }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?,
+    )
+    .await
+}
+
 /// Update only while a context flag still holds a given value at the
 /// database. Context updates are fetch-modify-replace over the whole JSON
 /// document, so an unconditional write can clobber a concurrent stamp that
