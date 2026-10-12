@@ -9734,39 +9734,50 @@ async fn handle_wedged_review_card(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let worker_id = task
-        .get("worker_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-
     if pr_url.is_empty() {
-        if worker_id.is_empty() {
+        // No-PR operations have their own completion path in the review sweep.
+        if task_is_on_hold(task)
+            || !task_requires_pr_review(task)
+            || !task.get("pr_number").unwrap_or(&Value::Null).is_null()
+            || task.get("task_type").and_then(Value::as_str) == Some("research")
+            || matches!(
+                task_context_value(task, "repo_mode").and_then(Value::as_str),
+                Some("none" | "multiple")
+            )
+            || is_direct_cron_execution(&cron_execution_mode_from_task(task))
+            || task_context_value(task, "no_pr_requeued_at").is_some()
+        {
             return;
         }
-        log::warn!(
-            "[wedge-sweep] review task {} stale {} min with worker_id but no PR URL; clearing worker_id",
-            task_id,
-            age_min
-        );
-        agent_comment(
+        let updated_at = task.get("updated_at").and_then(Value::as_str).unwrap_or("");
+        if updated_at.is_empty() {
+            return;
+        }
+        match supabase::requeue_review_without_pr(
             config,
             task_id,
-            &format!(
-                "Card has been in `review` for {} min and is claimed by a worker but no PR URL is recorded. Clearing worker so the review queue can re-claim or you can triage.",
-                age_min
+            updated_at,
+            task.get("context").unwrap_or(&Value::Null),
+        )
+        .await
+        {
+            Ok(rows) if rows.as_array().is_some_and(|rows| !rows.is_empty()) => {
+                log::warn!(
+                    "[wedge-sweep] review task {} stale {} min with no PR; requeued",
+                    task_id,
+                    age_min
+                );
+                agent_comment(config, task_id, &format!(
+                    "Card stalled in `review` for {} min without a PR. Returned it to `queued` with its old claim cleared so a fresh worker can finish it.", age_min
+                )).await;
+            }
+            Err(error) => log::warn!(
+                "[wedge-sweep] no-PR review recovery failed for {}: {}",
+                task_id,
+                error
             ),
-        )
-        .await;
-        let _ = supabase::update_task(
-            config,
-            task_id,
-            &serde_json::json!({
-                "worker_id": serde_json::Value::Null,
-                "updated_at": chrono::Utc::now().to_rfc3339(),
-            }),
-        )
-        .await;
+            _ => {}
+        }
         return;
     }
 
