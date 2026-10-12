@@ -6858,6 +6858,7 @@ Changed files:
 
 Rules:
 - Do not edit files, stage, commit, push, or open a PR in this run. This is a browser validation gate only. Flow files and screenshots go in the work dir below, never in the repo.
+- Report only in the output block below. Never call Slack, email, Zendesk, or any external send. A Slack permalink in the task text is source context, not a reply target. QA results stay on the task record for internal review.
 - If the changed files are clearly not browser-visible, do not start a browser. Return BROWSE_QA_VERDICT: SKIP with a short reason.
 - If a browser-visible change was made, actually drive the changed user flow at {verify_url}. Click, type, submit, navigate, reload, and exercise obvious unhappy paths. Do not judge from the landing page.
 - Read the console/network report (`QA_FLOW_REPORT`, or the Browserbase `console` action if you used it) after the main flow and once more before the verdict. Real app-origin console errors, uncaught exceptions, failed requests, or HTTP 4xx/5xx responses are a FAIL.
