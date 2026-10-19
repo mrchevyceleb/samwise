@@ -23469,8 +23469,15 @@ async fn create_pr(
     }
 
     // A seeded env file the branch no longer ignores would be swept up by
-    // `git add -A`; it is only a local build helper, so drop it first.
+    // `git add -A`; it is only a local build helper, so drop it first. A path
+    // the branch tracks is the branch's own file (a reset put it there), so
+    // leave it alone, exactly as strip_seeded_env_files does.
     for rel in seeded_env_paths(repo_path).await? {
+        if seeded_path_tracked(repo_path, &rel).await
+            || !seeded_parent_inside_checkout(repo_path, &rel).await
+        {
+            continue;
+        }
         if run_git(&["check-ignore", "-q", "--", &rel], repo_path).await.is_err() {
             let _ = tokio::fs::remove_file(Path::new(repo_path).join(&rel)).await;
         }
