@@ -1979,8 +1979,9 @@ async fn strip_seeded_env_files(checkout_path: &str) -> Result<usize, String> {
 }
 
 /// Fail if any env file AutoSam seeded is touched by a commit in
-/// `base_ref..HEAD` or sits in the index, so a seeded file can never be pushed
-/// even if the branch stopped ignoring it.
+/// `base_ref..HEAD` or has a staged change, so a seeded file can never be
+/// pushed even if the branch stopped ignoring it. A path the branch already
+/// tracks unchanged (a reset put the branch's own file there) is not a leak.
 async fn ensure_no_seeded_env_committed(checkout_path: &str, base_ref: &str) -> Result<(), String> {
     let range = format!("{}..HEAD", base_ref);
     for rel in seeded_env_paths(checkout_path).await? {
@@ -1988,9 +1989,11 @@ async fn ensure_no_seeded_env_committed(checkout_path: &str, base_ref: &str) -> 
             .await
             .map_err(|e| format!("cannot check branch history for {}: {}", rel, e))?
             .is_empty();
-        let staged = run_git(&["ls-files", "--error-unmatch", "--", &rel], checkout_path)
+        // Non-zero exit means a staged change at this path (or git failed,
+        // which fails closed).
+        let staged = run_git(&["diff", "--cached", "--quiet", "--", &rel], checkout_path)
             .await
-            .is_ok();
+            .is_err();
         if in_branch || staged {
             return Err(format!(
                 "{} is a local env file AutoSam seeded for builds and it is now tracked on this branch; refusing to push it",
@@ -23469,8 +23472,15 @@ async fn create_pr(
     }
 
     // A seeded env file the branch no longer ignores would be swept up by
-    // `git add -A`; it is only a local build helper, so drop it first.
+    // `git add -A`; it is only a local build helper, so drop it first. A path
+    // the branch tracks is the branch's own file (a reset put it there), so
+    // leave it alone, exactly as strip_seeded_env_files does.
     for rel in seeded_env_paths(repo_path).await? {
+        if seeded_path_tracked(repo_path, &rel).await
+            || !seeded_parent_inside_checkout(repo_path, &rel).await
+        {
+            continue;
+        }
         if run_git(&["check-ignore", "-q", "--", &rel], repo_path).await.is_err() {
             let _ = tokio::fs::remove_file(Path::new(repo_path).join(&rel)).await;
         }
