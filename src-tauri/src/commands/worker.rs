@@ -1575,6 +1575,7 @@ async fn create_task_worktree(
                 .await?;
             }
             let _ = run_git(&["fetch", "origin", "--prune"], &worktree_str).await;
+            seed_worktree_env_files(main_repo_path, &worktree_str).await;
             return Ok((worktree_str, base_branch, task_branch));
         }
         // Directory is there but it isn't a worktree (stale junk). Blow it away.
@@ -1597,8 +1598,100 @@ async fn create_task_worktree(
         main_repo_path,
     )
     .await?;
+    seed_worktree_env_files(main_repo_path, &worktree_str).await;
 
     Ok((worktree_str, base_branch, task_branch))
+}
+
+/// Copy the base clone's gitignored env files (`.env`, `.env.local`,
+/// `server/.env`, ...) into a task worktree. `git worktree add` never brings
+/// ignored files along, so without this a fresh worktree builds with no local
+/// env and any app that reads public values at build time (a Next.js
+/// prerender, for one) fails the verify build. A file the worktree already has
+/// is left alone, and a file the worktree's own .gitignore does not ignore is
+/// skipped so it can never ride into a commit. Best effort: failures only log.
+/// Deploy checkouts are deliberately not seeded, so no local env file can ride
+/// along with an upload.
+async fn seed_worktree_env_files(main_repo_path: &str, worktree_path: &str) -> usize {
+    let listing = match run_git(
+        &[
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+        ],
+        main_repo_path,
+    )
+    .await
+    {
+        Ok(out) => out,
+        Err(e) => {
+            log::warn!(
+                "[worker] env seed: cannot list ignored files in {}: {}",
+                main_repo_path,
+                e
+            );
+            return 0;
+        }
+    };
+    let mut copied = 0;
+    for rel in listing.split('\0') {
+        if rel.is_empty() || rel.ends_with('/') {
+            continue;
+        }
+        let rel_path = Path::new(rel);
+        let is_env_file = rel_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with(".env"))
+            .unwrap_or(false);
+        if !is_env_file
+            || rel_path.is_absolute()
+            || rel_path.components().any(|c| {
+                matches!(c, std::path::Component::ParentDir) || c.as_os_str() == "node_modules"
+            })
+        {
+            continue;
+        }
+        let src = Path::new(main_repo_path).join(rel_path);
+        let dst = Path::new(worktree_path).join(rel_path);
+        match tokio::fs::symlink_metadata(&src).await {
+            Ok(meta) if meta.file_type().is_file() => {}
+            _ => continue,
+        }
+        if tokio::fs::symlink_metadata(&dst).await.is_ok() {
+            continue;
+        }
+        if !dst.parent().map(|p| p.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        if run_git(&["check-ignore", "-q", "--", rel], worktree_path)
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        match tokio::fs::copy(&src, &dst).await {
+            Ok(_) => copied += 1,
+            Err(e) => log::warn!(
+                "[worker] env seed: copy {} into {} failed: {}",
+                rel,
+                worktree_path,
+                e
+            ),
+        }
+    }
+    if copied > 0 {
+        log::info!(
+            "[worker] env seed: copied {} gitignored env file(s) from {} into {}",
+            copied,
+            main_repo_path,
+            worktree_path
+        );
+    }
+    copied
 }
 
 // ── Event Payloads ──────────────────────────────────────────────────
@@ -12696,6 +12789,7 @@ async fn prepare_conflict_fix_worktree(
         run_git(&["checkout", "-b", &head_branch, &origin_head], &path_str).await?;
     }
     run_git(&["reset", "--hard", &origin_head], &path_str).await?;
+    seed_worktree_env_files(main_repo_path, &path_str).await;
 
     Ok((path_str, head_branch, base_branch))
 }
@@ -12901,6 +12995,7 @@ async fn ensure_pr_review_worktree(
             }
             run_git(&["reset", "--hard", &origin_head], &worktree_str).await?;
             ensure_clean_review_worktree(&worktree_str).await?;
+            seed_worktree_env_files(main_repo_path, &worktree_str).await;
             return Ok(worktree_str);
         }
         tokio::fs::remove_dir_all(&worktree_path)
@@ -12956,6 +13051,7 @@ async fn ensure_pr_review_worktree(
     }
     run_git(&["reset", "--hard", &origin_head], &worktree_str).await?;
     ensure_clean_review_worktree(&worktree_str).await?;
+    seed_worktree_env_files(main_repo_path, &worktree_str).await;
 
     Ok(worktree_str)
 }
@@ -21880,7 +21976,14 @@ pub async fn sweep_review_merge_requests(config: &SupabaseConfig) {
             }
         };
 
-        spawn_review_merge_task(config.clone(), task_id, pr_url, repo_path, task.clone());
+        spawn_review_merge_task(
+            config.clone(),
+            task_id,
+            pr_url,
+            main_repo_path,
+            repo_path,
+            task.clone(),
+        );
     }
 }
 
@@ -21893,6 +21996,7 @@ fn spawn_review_merge_task(
     config: SupabaseConfig,
     task_id: String,
     pr_url: String,
+    main_repo_path: String,
     repo_path: String,
     task_row: Value,
 ) {
@@ -22171,6 +22275,8 @@ fn spawn_review_merge_task(
                     .await;
                     return;
                 }
+                // `clean -fdx` just removed the seeded env files; put them back.
+                seed_worktree_env_files(&main_repo_path, &repo_path).await;
                 // Loop back: re-run the review on the freshly fetched head.
                 continue;
             }
