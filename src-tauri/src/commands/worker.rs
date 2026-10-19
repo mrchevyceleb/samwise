@@ -1603,16 +1603,203 @@ async fn create_task_worktree(
     Ok((worktree_str, base_branch, task_branch))
 }
 
-/// Copy the base clone's gitignored env files (`.env`, `.env.local`,
-/// `server/.env`, ...) into a task worktree. `git worktree add` never brings
-/// ignored files along, so without this a fresh worktree builds with no local
-/// env and any app that reads public values at build time (a Next.js
-/// prerender, for one) fails the verify build. A file the worktree already has
-/// is left alone, and a file the worktree's own .gitignore does not ignore is
-/// skipped so it can never ride into a commit. Best effort: failures only log.
-/// Deploy checkouts are deliberately not seeded, so no local env file can ride
-/// along with an upload.
+/// First line of every env file AutoSam seeds, so a person reading the file
+/// knows where it came from. Ownership itself is tracked in the git-dir
+/// manifest (seeded_env_manifest_path), never by this marker.
+const SEEDED_ENV_MARKER: &str =
+    "# Seeded by AutoSam from the base clone: public build values only. Stripped before deploys.";
+
+/// Variable prefixes that frameworks bake into client bundles, so their values
+/// are public by design. Only these ever leave the base clone's env files.
+const PUBLIC_ENV_PREFIXES: &[&str] = &[
+    "NEXT_PUBLIC_",
+    "VITE_",
+    "EXPO_PUBLIC_",
+    "REACT_APP_",
+    "NUXT_PUBLIC_",
+    "PUBLIC_",
+    "GATSBY_",
+];
+
+/// `.env` or `.env.<anything>`, but not `.envrc` (a direnv shell script) and
+/// not the tracked templates.
+fn is_seedable_env_name(name: &str) -> bool {
+    (name == ".env" || name.starts_with(".env."))
+        && !matches!(name, ".env.example" | ".env.sample" | ".env.template")
+}
+
+/// The single-line `KEY=value` entries of an env file whose key carries a
+/// public prefix. Server secrets, comments and multi-line values are dropped.
+fn public_env_lines(contents: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in contents.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let body = line.strip_prefix("export ").unwrap_or(line).trim_start();
+        let Some((key, value)) = body.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let valid_key = !key.is_empty()
+            && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && PUBLIC_ENV_PREFIXES.iter().any(|p| key.starts_with(p) && key.len() > p.len());
+        if !valid_key {
+            continue;
+        }
+        let value = value.trim();
+        let single_line = match value.chars().next() {
+            Some(q @ ('"' | '\'' | '`')) => value.len() >= 2 && value.ends_with(q),
+            _ => true,
+        };
+        if single_line {
+            out.push(format!("{}={}", key, value));
+        }
+    }
+    out
+}
+
+/// Where AutoSam records the env files it seeded into a checkout: relative
+/// paths separated by NUL (git's own -z form, so any legal path round-trips),
+/// kept in the checkout's own git dir so it is never part of the working
+/// tree, a commit, or an upload.
+async fn seeded_env_manifest_path(checkout_path: &str) -> Result<PathBuf, String> {
+    let git_dir = run_git(&["rev-parse", "--absolute-git-dir"], checkout_path)
+        .await
+        .map_err(|e| format!("cannot find the git dir of {}: {}", checkout_path, e))?;
+    Ok(PathBuf::from(git_dir).join("autosam-seeded-env"))
+}
+
+/// A manifest entry is only trusted as a plain relative path inside the
+/// checkout with a seedable env file name.
+fn valid_seeded_rel_path(rel: &str) -> bool {
+    let rel_path = Path::new(rel);
+    !rel.is_empty()
+        && rel_path
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+        && rel_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(is_seedable_env_name)
+            .unwrap_or(false)
+}
+
+/// The relative paths AutoSam seeded into this checkout (empty if none). A
+/// manifest entry that is not a valid seeded path means the manifest cannot
+/// be trusted, so this fails instead of quietly skipping it.
+async fn seeded_env_paths(checkout_path: &str) -> Result<Vec<String>, String> {
+    let manifest = seeded_env_manifest_path(checkout_path).await?;
+    let text = match tokio::fs::read_to_string(&manifest).await {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("cannot read {}: {}", manifest.display(), e)),
+    };
+    let mut paths = Vec::new();
+    for rel in text.split('\0').filter(|rel| !rel.is_empty()) {
+        if !valid_seeded_rel_path(rel) {
+            return Err(format!(
+                "{} holds an entry that is not a seeded env path ({:?}); fix or remove it by hand",
+                manifest.display(),
+                rel
+            ));
+        }
+        paths.push(rel.to_string());
+    }
+    Ok(paths)
+}
+
+async fn write_seeded_env_manifest(manifest: &Path, paths: &[String]) -> std::io::Result<()> {
+    let mut body = String::new();
+    for rel in paths {
+        body.push_str(rel);
+        body.push('\0');
+    }
+    tokio::fs::write(manifest, body).await
+}
+
+/// True when `rel`'s parent directory, with every symlink resolved, is still
+/// inside `checkout_path`, so a symlinked directory anywhere on the way can
+/// never send a seed write or a strip delete outside the checkout.
+async fn seeded_parent_inside_checkout(checkout_path: &str, rel: &str) -> bool {
+    let Ok(root) = tokio::fs::canonicalize(checkout_path).await else {
+        return false;
+    };
+    let Some(parent) = Path::new(checkout_path).join(rel).parent().map(Path::to_path_buf) else {
+        return false;
+    };
+    match tokio::fs::canonicalize(&parent).await {
+        Ok(real) => real.starts_with(&root),
+        Err(_) => false,
+    }
+}
+
+/// True when git tracks `rel` in this checkout (index or HEAD), meaning the
+/// path is now the branch's own file and not something AutoSam may delete or
+/// let be pushed as a seed.
+async fn seeded_path_tracked(checkout_path: &str, rel: &str) -> bool {
+    let in_index = run_git(&["ls-files", "--error-unmatch", "--", rel], checkout_path)
+        .await
+        .is_ok();
+    let in_head = run_git(&["cat-file", "-e", &format!("HEAD:{}", rel)], checkout_path)
+        .await
+        .is_ok();
+    in_index || in_head
+}
+
+/// Create `dst` fresh (never following or replacing an existing file or
+/// symlink) with mode 0600 and the marker plus public lines.
+async fn write_seeded_env_file(dst: &Path, lines: &[String]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut body = String::with_capacity(SEEDED_ENV_MARKER.len() + 1 + lines.len() * 64);
+    body.push_str(SEEDED_ENV_MARKER);
+    body.push('\n');
+    for line in lines {
+        body.push_str(line);
+        body.push('\n');
+    }
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    let mut file = opts.open(dst).await?;
+    file.write_all(body.as_bytes()).await?;
+    file.flush().await?;
+    Ok(())
+}
+
+/// Give a task worktree the public build values from the base clone's
+/// gitignored env files (`.env`, `.env.local`, `server/.env.local`, ...).
+/// `git worktree add` never brings ignored files along, so without this a
+/// fresh worktree builds with no local env and any app that reads public
+/// values at build time (a Next.js prerender, for one) fails the verify build.
+///
+/// Only public-prefixed keys are written (see PUBLIC_ENV_PREFIXES); server
+/// secrets never leave the base clone, because PR code builds and runs in
+/// these worktrees. Every call first removes what AutoSam seeded last time
+/// (tracked in the git-dir manifest), then writes fresh copies, so values
+/// never go stale and a path the checked-out branch no longer ignores is
+/// dropped. A file is only created where nothing exists (a person's own env
+/// file is never touched) and only where the worktree's .gitignore ignores
+/// it. create_pr refuses to push a seeded path, and deploy checkouts strip
+/// them first (strip_seeded_env_files). Best effort: failures only log.
 async fn seed_worktree_env_files(main_repo_path: &str, worktree_path: &str) -> usize {
+    if let Err(e) = strip_seeded_env_files(worktree_path).await {
+        log::warn!(
+            "[worker] env seed: cannot clear earlier seeded files in {}, skipping: {}",
+            worktree_path,
+            e
+        );
+        return 0;
+    }
+    let manifest = match seeded_env_manifest_path(worktree_path).await {
+        Ok(path) => path,
+        Err(e) => {
+            log::warn!("[worker] env seed: {}", e);
+            return 0;
+        }
+    };
     let listing = match run_git(
         &[
             "ls-files",
@@ -1636,35 +1823,30 @@ async fn seed_worktree_env_files(main_repo_path: &str, worktree_path: &str) -> u
             return 0;
         }
     };
-    let mut copied = 0;
+    let mut planned: Vec<(String, Vec<String>)> = Vec::new();
     for rel in listing.split('\0') {
-        if rel.is_empty() || rel.ends_with('/') {
-            continue;
-        }
-        let rel_path = Path::new(rel);
-        let is_env_file = rel_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.starts_with(".env"))
-            .unwrap_or(false);
-        if !is_env_file
-            || rel_path.is_absolute()
-            || rel_path.components().any(|c| {
-                matches!(c, std::path::Component::ParentDir) || c.as_os_str() == "node_modules"
-            })
+        if rel.ends_with('/')
+            || !valid_seeded_rel_path(rel)
+            || Path::new(rel)
+                .components()
+                .any(|c| c.as_os_str() == "node_modules")
         {
             continue;
         }
-        let src = Path::new(main_repo_path).join(rel_path);
-        let dst = Path::new(worktree_path).join(rel_path);
+        let src = Path::new(main_repo_path).join(rel);
+        let dst = Path::new(worktree_path).join(rel);
         match tokio::fs::symlink_metadata(&src).await {
-            Ok(meta) if meta.file_type().is_file() => {}
+            Ok(meta) if meta.file_type().is_file() && meta.len() <= 256 * 1024 => {}
             _ => continue,
         }
         if tokio::fs::symlink_metadata(&dst).await.is_ok() {
             continue;
         }
-        if !dst.parent().map(|p| p.is_dir()).unwrap_or(false) {
+        match dst.parent().map(std::fs::symlink_metadata) {
+            Some(Ok(meta)) if meta.file_type().is_dir() => {}
+            _ => continue,
+        }
+        if !seeded_parent_inside_checkout(worktree_path, rel).await {
             continue;
         }
         if run_git(&["check-ignore", "-q", "--", rel], worktree_path)
@@ -1673,25 +1855,169 @@ async fn seed_worktree_env_files(main_repo_path: &str, worktree_path: &str) -> u
         {
             continue;
         }
-        match tokio::fs::copy(&src, &dst).await {
-            Ok(_) => copied += 1,
+        let lines = match tokio::fs::read_to_string(&src).await {
+            Ok(text) => public_env_lines(&text),
+            Err(_) => continue,
+        };
+        if lines.is_empty() {
+            continue;
+        }
+        planned.push((rel.to_string(), lines));
+    }
+    if planned.is_empty() {
+        return 0;
+    }
+    // Journal first: the manifest names every file before it exists, so a
+    // crash or failed write can never leave a seeded file nothing will strip.
+    let planned_paths: Vec<String> = planned.iter().map(|(rel, _)| rel.clone()).collect();
+    if let Err(e) = write_seeded_env_manifest(&manifest, &planned_paths).await {
+        log::warn!(
+            "[worker] env seed: cannot record seeded files in {}, seeding nothing: {}",
+            manifest.display(),
+            e
+        );
+        return 0;
+    }
+    let mut written: Vec<String> = Vec::new();
+    for (rel, lines) in &planned {
+        match write_seeded_env_file(&Path::new(worktree_path).join(rel), lines).await {
+            Ok(()) => written.push(rel.clone()),
             Err(e) => log::warn!(
-                "[worker] env seed: copy {} into {} failed: {}",
+                "[worker] env seed: writing {} into {} failed: {}",
                 rel,
                 worktree_path,
                 e
             ),
         }
     }
-    if copied > 0 {
+    // Narrow the journal to what was really created, so a path someone else
+    // created in the meantime is never treated as ours.
+    if written.len() != planned_paths.len() {
+        let narrowed = if written.is_empty() {
+            match tokio::fs::remove_file(&manifest).await {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            }
+        } else {
+            write_seeded_env_manifest(&manifest, &written).await
+        };
+        if let Err(e) = narrowed {
+            log::error!(
+                "[worker] env seed: cannot narrow {}, removing the seeded files: {}",
+                manifest.display(),
+                e
+            );
+            for rel in &written {
+                if let Err(e) = tokio::fs::remove_file(Path::new(worktree_path).join(rel)).await {
+                    log::error!(
+                        "[worker] env seed: could not remove seeded {} from {}: {}",
+                        rel,
+                        worktree_path,
+                        e
+                    );
+                }
+            }
+            return 0;
+        }
+    }
+    if written.is_empty() {
+        return 0;
+    }
+    log::info!(
+        "[worker] env seed: wrote public build values for {} env file(s) from {} into {}",
+        written.len(),
+        main_repo_path,
+        worktree_path
+    );
+    written.len()
+}
+
+/// Remove every env file AutoSam seeded into a checkout (per the git-dir
+/// manifest, whatever the files now contain), then the manifest. Deploy
+/// checkouts call this so a local build value can never override the deploy
+/// target's own environment or ride along with an upload. Fails closed: any
+/// error other than a file already being gone is returned, and the deploy
+/// must stop.
+async fn strip_seeded_env_files(checkout_path: &str) -> Result<usize, String> {
+    let manifest = seeded_env_manifest_path(checkout_path).await?;
+    let paths = seeded_env_paths(checkout_path).await?;
+    let mut removed = 0;
+    for rel in &paths {
+        // A path the checked-out branch now tracks is the branch's own file
+        // (a checkout or reset put it there), and a path that resolves outside
+        // the checkout was never written by us: leave both alone.
+        if seeded_path_tracked(checkout_path, rel).await {
+            log::warn!(
+                "[worker] env seed: {} is tracked in {} now, leaving it in place",
+                rel,
+                checkout_path
+            );
+            continue;
+        }
+        if !seeded_parent_inside_checkout(checkout_path, rel).await {
+            continue;
+        }
+        match tokio::fs::remove_file(Path::new(checkout_path).join(rel)).await {
+            Ok(()) => removed += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("cannot remove seeded env file {}: {}", rel, e)),
+        }
+    }
+    match tokio::fs::remove_file(&manifest).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("cannot remove {}: {}", manifest.display(), e)),
+    }
+    if removed > 0 {
         log::info!(
-            "[worker] env seed: copied {} gitignored env file(s) from {} into {}",
-            copied,
-            main_repo_path,
-            worktree_path
+            "[worker] env seed: stripped {} seeded env file(s) from {}",
+            removed,
+            checkout_path
         );
     }
-    copied
+    Ok(removed)
+}
+
+/// Fail if any env file AutoSam seeded is touched by a commit in
+/// `base_ref..HEAD` or sits in the index, so a seeded file can never be pushed
+/// even if the branch stopped ignoring it.
+async fn ensure_no_seeded_env_committed(checkout_path: &str, base_ref: &str) -> Result<(), String> {
+    let range = format!("{}..HEAD", base_ref);
+    for rel in seeded_env_paths(checkout_path).await? {
+        let in_branch = !run_git(&["rev-list", "-1", &range, "--", &rel], checkout_path)
+            .await
+            .map_err(|e| format!("cannot check branch history for {}: {}", rel, e))?
+            .is_empty();
+        let staged = run_git(&["ls-files", "--error-unmatch", "--", &rel], checkout_path)
+            .await
+            .is_ok();
+        if in_branch || staged {
+            return Err(format!(
+                "{} is a local env file AutoSam seeded for builds and it is now tracked on this branch; refusing to push it",
+                rel
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The guard for every other worker push (subtask, conflict fix, auto-fix,
+/// Review & Merge), which have no base ref to hand: a seeded path in the
+/// index or in HEAD's tree blocks the push. Returns the reason when blocked.
+async fn seeded_env_push_blocker(checkout_path: &str) -> Option<String> {
+    let paths = match seeded_env_paths(checkout_path).await {
+        Ok(paths) => paths,
+        Err(e) => return Some(format!("cannot read the seeded env manifest: {}", e)),
+    };
+    for rel in paths {
+        if seeded_path_tracked(checkout_path, &rel).await {
+            return Some(format!(
+                "{} is a local env file AutoSam seeded for builds and it is now tracked on this branch; refusing to push it",
+                rel
+            ));
+        }
+    }
+    None
 }
 
 // ── Event Payloads ──────────────────────────────────────────────────
@@ -5362,6 +5688,36 @@ from Matt, stop without making changes and explain specifically what you need cl
             )
             .await;
 
+            // Review, tests and the PR all key off the task branch; if the coder
+            // committed on its own branch, bring the task branch onto that work now.
+            if let Some(ref task_branch) = branch {
+                match adopt_coder_head_onto_task_branch(&repo_path, task_branch).await {
+                    Ok(true) => {
+                        agent_comment(
+                            config,
+                            &task_id,
+                            &format!(
+                                "The coder committed on a branch of its own, so I moved `{}` onto that work.",
+                                task_branch
+                            ),
+                        )
+                        .await;
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        // Stop here: later stages would keep committing on a
+                        // branch the task does not own.
+                        if let Some(h) = dev_server_handle.take() {
+                            let _ = dev_server::kill_dev_server(h).await;
+                        }
+                        return Err(format!(
+                            "cannot move {} onto the coder's work: {}",
+                            task_branch, e
+                        ));
+                    }
+                }
+            }
+
             // Capture the structured commit message Claude Code just wrote, BEFORE
             // opus-fix or build-repair can stack auto-generated commits on top.
             // The card renders this so Matt can read Root Cause / Fixes Made / CS
@@ -6081,11 +6437,20 @@ from Matt, stop without making changes and explain specifically what you need cl
                     if remaining {
                         // Push branch so next iteration has the commits
                         if let Some(ref b) = branch {
-                            let _ = async_cmd("git")
-                                .args(["push", "-u", "origin", b])
-                                .current_dir(&repo_path)
-                                .output()
-                                .await;
+                            if let Some(reason) = seeded_env_push_blocker(&repo_path).await {
+                                log::warn!(
+                                    "[worker] task {}: not pushing {} between subtasks: {}",
+                                    task_id,
+                                    b,
+                                    reason
+                                );
+                            } else {
+                                let _ = async_cmd("git")
+                                    .args(["push", "-u", "origin", b])
+                                    .current_dir(&repo_path)
+                                    .output()
+                                    .await;
+                            }
                         }
 
                         // Kill dev server before early return
@@ -12706,6 +13071,9 @@ async fn run_merge_conflict_fix_workflow(
         .await
         .unwrap_or_default();
     let pushed = if head_sha.trim() != origin_sha.trim() {
+        if let Some(reason) = seeded_env_push_blocker(&repo_path).await {
+            return Err(reason);
+        }
         let dst = format!("HEAD:refs/heads/{}", head_branch);
         run_git(&["push", "origin", &dst], &repo_path).await?;
         true
@@ -12978,6 +13346,9 @@ async fn ensure_pr_review_worktree(
             .await
             .is_ok()
         {
+            // Seeded env files come back after the reset; clear them first so a
+            // head that stops ignoring one can't make the worktree look dirty.
+            strip_seeded_env_files(&worktree_str).await?;
             ensure_clean_review_worktree(&worktree_str).await?;
             let _ = run_git(&["fetch", "origin", "--prune"], &worktree_str).await;
             let local_branch_ref = format!("refs/heads/{}", expected_branch);
@@ -14793,6 +15164,9 @@ async fn prepare_deploy_checkout(
         } else {
             ensure_temp_deploy_worktree(repo_path, task_id, base_branch).await?
         };
+    // A reused task worktree carries env files AutoSam seeded for local builds;
+    // they must never reach a deploy.
+    strip_seeded_env_files(&deploy_path).await?;
 
     let dirty = run_git(&["status", "--porcelain"], &deploy_path).await?;
     if !dirty.trim().is_empty() {
@@ -21182,6 +21556,14 @@ making any other changes.",
                     );
                     return;
                 }
+                if let Some(reason) = seeded_env_push_blocker(&repo_path).await {
+                    log::warn!(
+                        "[auto-fix] task {}: not pushing, preserving local work: {}",
+                        task_id,
+                        reason
+                    );
+                    return;
+                }
 
                 let push = async_cmd("git")
                     .args(["push", "origin", &branch])
@@ -22424,6 +22806,11 @@ async fn push_review_merge_commits(
         return true;
     }
 
+    if let Some(reason) = seeded_env_push_blocker(repo_path).await {
+        fail_review_merge(config, task_id, pr_url, &reason).await;
+        return false;
+    }
+
     match async_cmd("git")
         .args(["push", "origin", &branch])
         .current_dir(repo_path)
@@ -22956,6 +23343,81 @@ Field rules:\n\
     Some(md)
 }
 
+/// Put the task branch on the coder's work. A coder sometimes makes its own
+/// branch (`git checkout -b fix/...`) or detaches HEAD and commits there. The
+/// review and test stages run on HEAD, but the PR is opened from the task
+/// branch, so that work used to be left behind and the task died with "No
+/// changes on branch vs base". When HEAD is not on the task branch and the
+/// task branch's tip is an ancestor of HEAD, fast-forward the task branch to
+/// HEAD and check it out (uncommitted changes come along). If the two have
+/// diverged, or HEAD carries commits already on a remote branch (someone
+/// else's work), fail loudly instead of guessing which one is the work.
+/// Returns true when it moved the task branch.
+async fn adopt_coder_head_onto_task_branch(
+    repo_path: &str,
+    task_branch: &str,
+) -> Result<bool, String> {
+    let current = run_git(&["rev-parse", "--abbrev-ref", "HEAD"], repo_path).await?;
+    if current == task_branch {
+        return Ok(false);
+    }
+    let head_sha = run_git(&["rev-parse", "HEAD"], repo_path).await?;
+    let branch_ref = format!("refs/heads/{}", task_branch);
+    match run_git(&["rev-parse", "--verify", "--quiet", &branch_ref], repo_path).await {
+        Ok(tip_sha) if tip_sha == head_sha => {
+            run_git(&["checkout", task_branch], repo_path).await?;
+        }
+        Ok(tip_sha) => {
+            if run_git(&["merge-base", "--is-ancestor", &tip_sha, &head_sha], repo_path)
+                .await
+                .is_err()
+            {
+                return Err(format!(
+                    "the work is on {} ({}), which has diverged from {} ({}); reconcile them before opening a PR",
+                    current,
+                    head_sha.chars().take(8).collect::<String>(),
+                    task_branch,
+                    tip_sha.chars().take(8).collect::<String>()
+                ));
+            }
+            // Only adopt commits made here: if HEAD carries commits that already
+            // sit on a remote branch, the coder checked out someone else's work.
+            let not_tip = format!("^{}", tip_sha);
+            let new_commits = run_git(&["rev-list", "--count", &head_sha, &not_tip], repo_path).await?;
+            let local_only = run_git(
+                &["rev-list", "--count", &head_sha, &not_tip, "--not", "--remotes"],
+                repo_path,
+            )
+            .await?;
+            if new_commits != local_only {
+                return Err(format!(
+                    "{} carries commits that are already on a remote branch, so it is not this task's work; not moving {}",
+                    current, task_branch
+                ));
+            }
+            // Compare-and-swap: the ref only moves if it still sits at the tip
+            // checked above, so a concurrent update is never overwritten.
+            run_git(&["update-ref", &branch_ref, &head_sha, &tip_sha], repo_path).await?;
+            run_git(&["checkout", task_branch], repo_path).await?;
+        }
+        Err(_) => {
+            // The worker created this branch when it made the worktree; if it
+            // is gone, nothing proves which commits are this task's work.
+            return Err(format!(
+                "the task branch {} no longer exists, so the work on {} cannot be proven to be this task's; not opening a PR",
+                task_branch, current
+            ));
+        }
+    }
+    log::info!(
+        "[worker] moved {} onto the coder's work from {} at {}",
+        task_branch,
+        current,
+        head_sha
+    );
+    Ok(true)
+}
+
 /// Create a PR from the worktree branch. Visual verification verdicts now
 /// land in the commit body itself (from the inline self-verification phase),
 /// so this function no longer manages screenshots or out-of-band QA notes.
@@ -22978,13 +23440,21 @@ async fn create_pr(
         _ => detect_base_branch(repo_path).await,
     };
 
-    // We should already be on branch_name from prepare_workspace; checkout (not -B)
-    // so we fail loudly if somehow we're not, instead of blowing away the branch ref.
-    let _ = async_cmd("git")
-        .args(["checkout", &branch_name])
-        .current_dir(repo_path)
-        .output()
-        .await;
+    // We should already be on branch_name from prepare_workspace. If the coder
+    // committed on a branch of its own, move branch_name onto that work (a
+    // fast-forward only) rather than checking out branch_name and leaving the
+    // work behind; a diverged pair fails loudly.
+    if branch.is_some() {
+        adopt_coder_head_onto_task_branch(repo_path, &branch_name)
+            .await
+            .map_err(|e| format!("could not put the work on {}: {}", branch_name, e))?;
+    } else {
+        let _ = async_cmd("git")
+            .args(["checkout", &branch_name])
+            .current_dir(repo_path)
+            .output()
+            .await;
+    }
 
     // Add .agent-one to .gitignore if not already there
     let gitignore_path = join_path(repo_path, ".gitignore");
@@ -22995,6 +23465,14 @@ async fn create_pr(
                 format!("{}\n.agent-one/\n", contents.trim_end()),
             )
             .await;
+        }
+    }
+
+    // A seeded env file the branch no longer ignores would be swept up by
+    // `git add -A`; it is only a local build helper, so drop it first.
+    for rel in seeded_env_paths(repo_path).await? {
+        if run_git(&["check-ignore", "-q", "--", &rel], repo_path).await.is_err() {
+            let _ = tokio::fs::remove_file(Path::new(repo_path).join(&rel)).await;
         }
     }
 
@@ -23056,6 +23534,8 @@ async fn create_pr(
         return Err("No changes on branch vs base".to_string());
     }
     // else: Claude already committed, nothing staged -> just push what's on the branch.
+
+    ensure_no_seeded_env_committed(repo_path, &format!("origin/{}", base_branch)).await?;
 
     // Push
     let push = async_cmd("git")
