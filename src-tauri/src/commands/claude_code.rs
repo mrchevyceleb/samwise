@@ -120,8 +120,30 @@ const DIRECT_OAUTH_ENV_BLOCKERS: &[&str] = &[
     "AUTOSAM_DEFAULT_MODEL",
 ];
 
+/// Secrets that must never reach a child process env. The worker agent's own
+/// diagnostic commands (e.g. `printenv | grep -E '^(SAM|AUTO|PI_MODEL)'`, plain
+/// `env` dumps) print its env lines straight into the pi session transcript,
+/// so any secret left in the child env lands in ~/.pi/agent/sessions (the
+/// LiteLLM master key surfaced in ~45 historical session files this way, Oct
+/// 16 2026). No child needs these: pi authenticates itself from
+/// ~/.pi/agent/auth.json, and the Claude path injects proxy credentials
+/// explicitly (ANTHROPIC_BASE_URL/ANTHROPIC_API_KEY) when a proxy is
+/// configured. The user-session keys land here because the systemd user unit
+/// passes the desktop session env through; a task that genuinely needs one
+/// of these secrets must be handed it explicitly.
+const WORKER_SECRET_ENV_BLOCKERS: &[&str] = &[
+    "AUTOSAM_LLM_PROXY_URL",
+    "AUTOSAM_LLM_PROXY_API_KEY",
+    "SAM_CALLBACK_SECRET",
+    "DOPPLER_TOKEN",
+    "FIREWORKS_PERSONAL_API_KEY",
+    "GROK_API_KEY",
+    "META_PERSONAL_API_KEY",
+    "Z_AI_API_KEY",
+];
+
 fn strip_direct_oauth_blockers(cmd: &mut std::process::Command) {
-    for key in DIRECT_OAUTH_ENV_BLOCKERS {
+    for key in DIRECT_OAUTH_ENV_BLOCKERS.iter().chain(WORKER_SECRET_ENV_BLOCKERS) {
         cmd.env_remove(key);
     }
 }
@@ -133,7 +155,7 @@ fn strip_direct_oauth_blockers(cmd: &mut std::process::Command) {
 /// values in the environment would quietly route pi through the very proxy the
 /// pi backend exists to remove.
 pub fn strip_direct_oauth_blockers_async(cmd: &mut tokio::process::Command) {
-    for key in DIRECT_OAUTH_ENV_BLOCKERS {
+    for key in DIRECT_OAUTH_ENV_BLOCKERS.iter().chain(WORKER_SECRET_ENV_BLOCKERS) {
         cmd.env_remove(key);
     }
 }
