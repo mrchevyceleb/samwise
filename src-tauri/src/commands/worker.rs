@@ -1096,6 +1096,41 @@ fn task_pr_review_skip_reason(task: &Value) -> Option<&'static str> {
     None
 }
 
+/// Terminal close reason for a `review` card with NO PR attached. Beyond the
+/// explicit policy flags above, whole ticket classes legitimately finish
+/// without a PR and used to strand in Review forever because nothing ever
+/// moved them: research tickets (findings land as comments) and deploy
+/// rescues (resolved by a rerun or superseded by another fix), plus any
+/// ticket whose context records its own resolution. Only consulted when
+/// pr_url is empty, so PR-bearing cards are unaffected.
+fn no_pr_terminal_reason(task: &Value) -> Option<&'static str> {
+    if let Some(reason) = task_pr_review_skip_reason(task) {
+        return Some(reason);
+    }
+    let task_type = task
+        .get("task_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if task_type == "research" {
+        return Some("this is a research ticket: the findings were posted as comments, no PR was ever expected");
+    }
+    let title = task
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if title.starts_with("$pipeline-rescue") {
+        return Some("the deploy rescue completed without a code PR (transient rerun or superseded by another fix)");
+    }
+    if task_context_value(task, "resolved_at").is_some() {
+        return Some("the ticket records its own resolution and no PR was attached");
+    }
+    None
+}
+
 fn task_requires_pr_review(task: &Value) -> bool {
     task_pr_review_skip_reason(task).is_none()
 }
@@ -9719,6 +9754,11 @@ const WEDGE_IN_PROGRESS_MIN: i64 = 60;
 const WEDGE_TESTING_MIN: i64 = 45;
 const WEDGE_REVIEW_MIN: i64 = 45;
 const WEDGE_PR_CHECK_STUCK_MIN: i64 = 30;
+/// A `review` card with no PR must be this old (minutes since updated_at)
+/// before the review-queue sweep may close it as finished-without-a-PR.
+/// Freshly-minted review cards get a grace window for the worker to attach
+/// a PR or post its findings comments.
+const NO_PR_CLOSE_MIN: i64 = 30;
 
 /// Periodic sweep that catches cards stuck in a non-terminal status with no
 /// progress for too long. Three classes:
@@ -20773,7 +20813,19 @@ pub async fn sweep_pr_review_queue(
             continue;
         }
         if pr_url.is_empty() {
-            if let Some(skip_reason) = task_pr_review_skip_reason(task) {
+            // Terminal close for no-PR review cards (policy flags, research
+            // tickets, resolved deploy rescues). Age-gated so a card that
+            // just entered Review is never closed while its worker is still
+            // attaching a PR or posting findings.
+            let updated_at = task
+                .get("updated_at")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let age_min = chrono::DateTime::parse_from_rfc3339(updated_at)
+                .map(|t| (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_minutes())
+                .unwrap_or(i64::MAX);
+            if age_min >= NO_PR_CLOSE_MIN {
+                if let Some(skip_reason) = no_pr_terminal_reason(task) {
                 let now = chrono::Utc::now().to_rfc3339();
                 let updated = supabase::update_task_if_status(
                     config,
@@ -20812,6 +20864,7 @@ pub async fn sweep_pr_review_queue(
                         ),
                     ).await;
                     notify_callback(config, &task_id, "done", None, None);
+                }
                 }
             }
             continue;
@@ -22072,6 +22125,85 @@ Field rules:\n\
 /// Create a PR from the worktree branch. Visual verification verdicts now
 /// land in the commit body itself (from the inline self-verification phase),
 /// so this function no longer manages screenshots or out-of-band QA notes.
+/// Best-effort pre-push regeneration of generated i18n artifacts. If the repo
+/// defines `i18n:extract` / `i18n:bundles` npm scripts, run them and commit any
+/// resulting changes to the generated paths so CI currency gates stay green.
+/// Never returns an error: any failure just logs and skips.
+async fn i18n_hygiene_gate(repo_path: &str) {
+    let pkg_path = join_path(repo_path, "package.json");
+    let pkg = match tokio::fs::read_to_string(&pkg_path).await {
+        Ok(c) => c,
+        Err(_) => return, // not a node repo; nothing to do
+    };
+    let has_script = |name: &str| pkg.contains(&format!("\"i18n:{}\"", name));
+
+    if has_script("extract") {
+        let out = async_cmd("npm").args(["run", "i18n:extract"])
+            .current_dir(repo_path).output().await;
+        if let Ok(o) = out {
+            if !o.status.success() {
+                log::warn!("[worker] i18n:extract failed in hygiene gate: {}",
+                    String::from_utf8_lossy(&o.stderr));
+            }
+        }
+    }
+    if has_script("bundles") {
+        let out = async_cmd("npm").args(["run", "i18n:bundles"])
+            .current_dir(repo_path).output().await;
+        if let Ok(o) = out {
+            if !o.status.success() {
+                log::warn!("[worker] i18n:bundles failed in hygiene gate: {}",
+                    String::from_utf8_lossy(&o.stderr));
+            }
+        }
+    }
+
+    // Commit regenerated artifacts if any of the generated paths changed.
+    let gen_paths = ["src/i18n", "public/locales", "src/lib/i18n/locale-version.ts"];
+    let mut changed = false;
+    for p in gen_paths {
+        let check = async_cmd("git")
+            .args(["diff", "--quiet", "HEAD", "--", p])
+            .current_dir(repo_path)
+            .output()
+            .await;
+        if let Ok(o) = check {
+            if !o.status.success() {
+                changed = true;
+                break;
+            }
+        }
+    }
+    if !changed {
+        return;
+    }
+    let _ = async_cmd("git").args(["add", "--"])
+        .args(gen_paths)
+        .current_dir(repo_path).output().await;
+    let commit = async_cmd("git")
+        .args([
+            "commit",
+            "-m",
+            "chore(i18n): sync generated locale artifacts (pre-push gate)",
+        ])
+        .current_dir(repo_path)
+        .output()
+        .await;
+    match commit {
+        Ok(o) if o.status.success() => {
+            log::info!("[worker] i18n hygiene gate committed regenerated locale artifacts");
+        }
+        Ok(o) => {
+            // Empty-diff commit races are fine; anything else is logged.
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            if !stderr.contains("nothing to commit") {
+                log::warn!("[worker] i18n hygiene gate commit failed: {}", stderr);
+            }
+        }
+        Err(e) => log::warn!("[worker] i18n hygiene gate commit spawn failed: {}", e),
+    }
+}
+
 async fn create_pr(
     _config: &super::supabase::SupabaseConfig,
     repo_path: &str,
@@ -22169,6 +22301,11 @@ async fn create_pr(
         return Err("No changes on branch vs base".to_string());
     }
     // else: Claude already committed, nothing staged -> just push what's on the branch.
+
+    // Pre-push i18n hygiene gate: regenerate generated locale artifacts so CI
+    // gates (catalog-current, bundles-current, coverage) don't fail on stale
+    // generated files. Best-effort: failures are logged, never block the push.
+    i18n_hygiene_gate(repo_path).await;
 
     // Push
     let push = async_cmd("git")

@@ -84,7 +84,7 @@ unauthenticated file fetch with `200` + its sign-in page, and an upstream
 uploader that only checks `res.ok` will store that as `image/png`.
 
 **Routing mechanism (lives in systemd env + a second service, NOT in the repo):**
-- `samwise-agent-one.service` sets `AUTOSAM_LLM_PROXY_URL=http://127.0.0.1:9876` and `AUTOSAM_LLM_PROXY_API_KEY=sk-litellm-autosam-master`. The worker's `load_llm_proxy()` reads these and injects them as `ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY` per Claude Code spawn. `CLAUDE_CODE_SIMPLE=1` is set (fine here — auth is the proxy master key, not OAuth; see the gotcha below).
+- `samwise-agent-one.service` sets `AUTOSAM_LLM_PROXY_URL=http://127.0.0.1:9876` and `AUTOSAM_LLM_PROXY_API_KEY=<the proxy master key, from ~/.config/autosam/litellm_config.yaml general_settings.master_key>`. The worker's `load_llm_proxy()` reads these and injects them as `ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY` per Claude Code spawn. `CLAUDE_CODE_SIMPLE=1` is set (fine here — auth is the proxy master key, not OAuth; see the gotcha below).
 - **`autosam-litellm.service`** runs LiteLLM on port 9876, config `~/.config/autosam/litellm_config.yaml`. It maps `claude-opus-4-8` (plus `glm-5.2`, `claude-sonnet-4-6`, `claude-3-5-sonnet` aliases) → `fireworks_ai/accounts/fireworks/routers/kimi-k3-fast`, `api_base https://api.fireworks.ai/inference/v1`, Fireworks key inline. The repo copy under `litellm/` (`proxy_config.yaml`, `setup.sh`, unit file) is a reference/scaffold; the **live** config is the one under `~/.config/autosam/`.
 
 ⚠️ **`drop_params: true` is REQUIRED** in the LiteLLM config's `litellm_settings`. Without it, LiteLLM translates Claude Code's `thinking` param into `reasoning_effort`, which the Fireworks provider rejects for the Kimi router, 400-ing *every* request (`litellm.UnsupportedParamsError`). drop_params discards the Anthropic-only params the Fireworks provider doesn't accept instead of erroring.
@@ -93,45 +93,26 @@ uploader that only checks `res.ok` will store that as `image/png`.
 
 ⚠️ **CLAUDE_CODE_SIMPLE gotcha:** with `CLAUDE_CODE_SIMPLE=1` set, Claude Code forces API-key auth and REJECTS OAuth subscription login, dying with `Not logged in · Please run /login`. That flag is correct for any API-key/proxy setup (GLM, Kimi) but is incompatible with the OAuth-direct Opus path below, where it must be removed.
 
-### PR review backend: Codex CLI → OpenRouter (2026-08-08)
+### PR review backend: local Codex CLI first, OpenRouter fallback (2026-08-14)
 
-The coder and the reviewer are billed to different accounts on purpose. Sam **codes** with pi
-on Fireworks kimi-k3 (above); he **reviews** with the Codex CLI pointed at OpenRouter
-`openai/gpt-5.6-sol` at `model_reasoning_effort="xhigh"`, paid from `OPENROUTER_API_KEY` in
-Doppler `agent-one/prd` rather than this machine's ChatGPT login.
+Sam **codes** with pi on Fireworks kimi-k3 (above). He **reviews** with the host Codex CLI
+(`gpt-5.5`, ChatGPT plan via `~/.codex/auth.json`), same account as interactive `codex` and
+`/codex-fix`. OpenRouter (`openai/gpt-5.6-sol`, Doppler `agent-one/prd` `OPENROUTER_API_KEY`)
+is fallback only: used when the local spawn dies or writes empty stdout. Full `$pr-review`
+stays local-only because that skill can merge.
 
-- Wiring is `CODEX_MODEL` / `CODEX_REASONING_CONFIG` / `CODEX_PROVIDER_ARGS` in
-  `src-tauri/src/commands/review.rs`, applied to all three codex spawns (the scored auto-merge
-  review, `$samwise-pr-review`, and the full `$pr-review` merge/deploy run).
-- The provider and model are pinned **inline via `-c`**, not in `~/.codex/config.toml`, so a
-  host-config edit cannot silently repoint reviews at another model or account. This pins the
-  provider/model only — `--ignore-user-config` is not passed, so Codex still reads trust levels,
-  hooks and MCP servers from whatever `CODEX_HOME` it inherits.
-  (`~/.codex/config.toml` carries the same block for manual debug runs only. agent-one sets no
-  `CODEX_HOME`, so a hand-run `codex` reproduces it; an interactive shell here exports
-  `CODEX_HOME=~/.codex-personal` and does not.)
-- ⚠️ **Codex 0.144 dropped `wire_api = "chat"`.** Any provider swapped in here must speak the
-  OpenAI **Responses** API. OpenRouter does; a chat-completions-only endpoint needs a LiteLLM
-  bridge.
-- The model slug must carry the `openai/` prefix. A bare `gpt-5.6-sol` is a valid ChatGPT-plan
-  model but not a valid OpenRouter id.
-- `resolve_openrouter_key()` resolves the key per spawn — agent-one's env first, then
-  `doppler secrets get ... --project agent-one --config prd --scope $HOME` — and sets it on the
-  **codex child only** via `cmd.env`. It is deliberately NOT exported into agent-one's
-  environment: every child inherits that env, including the coding harness running
-  model-authored shell commands against untrusted task text. (`--scope` is required; a bare
-  `doppler secrets get` resolves its token from the cwd, and per-task worktrees carry their own
-  scoped tokens that 404 this project.) A resolution failure fails that one review with a
-  readable message rather than blocking the service from starting.
+- Wiring is `CODEX_MODEL` (local) / `CODEX_OPENROUTER_MODEL` / `CODEX_PROVIDER_ARGS` in
+  `src-tauri/src/commands/review.rs`. Local `-c` pins do **not** force `model_provider=openrouter`.
+- `--ignore-user-config` is not passed, so Codex still reads trust levels, hooks and MCP
+  servers from whatever `CODEX_HOME` it inherits.
+- ⚠️ **Codex 0.144 dropped `wire_api = "chat"`.** The OpenRouter fallback must speak the
+  OpenAI **Responses** API.
+- `resolve_openrouter_key()` is only used on the fallback spawn and sets the key on that
+  child only. It is deliberately NOT exported into agent-one's environment.
 - An OpenRouter 401/402 (dead key, no credits) is classified as Inconclusive + requires-human,
   not as a verdict on the PR.
-- Cost note: a codex turn ships ~78K tokens of system prompt + tools and a real review lands
-  around 125-160K, so at $5/Mtok in / $30 out a full review is dollars, not cents — and
-  OpenRouter doubles the rate above a 272K-token prompt. This is per-token billing now, not a
-  flat plan, and there is no local spend cap beyond the wall-clock timeouts.
 - Unaffected and still on the ChatGPT OAuth account: interactive `codex`, the `/codex-fix` pass
-  inside the worker (that runs through the *coder* harness, `worker.rs`), and Rivendell's
-  `pr-review-batch` forge cron.
+  inside the worker (coder harness), and Rivendell's `pr-review-batch` forge cron.
 
 ### History (superseded)
 - **2026-08-06:** added the pluggable `AUTOSAM_CODER` harness (pi alongside Claude Code) so model choice no longer depends on what survives a proxy rewrite.
