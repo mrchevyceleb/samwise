@@ -5568,6 +5568,11 @@ from Matt, stop without making changes and explain specifically what you need cl
                     };
 
 
+                    let tested_head = run_git(&["rev-parse", "HEAD"], &repo_path)
+                        .await
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or_default();
                     let mut visual_result = serde_json::json!({
                         "pass": outcome.pass,
                         "tool": "browse",
@@ -5577,6 +5582,7 @@ from Matt, stop without making changes and explain specifically what you need cl
                         "raw_issue_count": outcome.raw_issue_count,
                         "duplicate_issue_count": outcome.duplicate_issue_count,
                         "score": outcome.score,
+                        "head": tested_head,
                     });
                     if let Some(u) = &outcome.session_url {
                         visual_result["session_url"] = serde_json::json!(u);
@@ -5591,7 +5597,12 @@ from Matt, stop without making changes and explain specifically what you need cl
                     )
                     .await;
 
-                    if outcome.pass || outcome.skip {
+                    // A PASS below the bar with fixable issues is not a
+                    // success: it gets the one repair pass like a FAIL, so the
+                    // loop can reach 9 before the merge step holds the card.
+                    let below_bar = outcome.verdict == "PASS"
+                        && outcome.score.map(|s| s < MERGE_MIN_QA_SCORE).unwrap_or(true);
+                    if (outcome.pass || outcome.skip) && !below_bar {
                         let replay = outcome
                             .session_url
                             .as_deref()
@@ -5806,6 +5817,11 @@ from Matt, stop without making changes and explain specifically what you need cl
                                     }
                                 };
 
+                                let tested_head = run_git(&["rev-parse", "HEAD"], &repo_path)
+                                    .await
+                                    .ok()
+                                    .map(|s| s.trim().to_string())
+                                    .unwrap_or_default();
                                 let mut visual_result = serde_json::json!({
                                     "pass": outcome.pass,
                                     "tool": "browse",
@@ -5815,6 +5831,7 @@ from Matt, stop without making changes and explain specifically what you need cl
                                     "raw_issue_count": outcome.raw_issue_count,
                                     "duplicate_issue_count": outcome.duplicate_issue_count,
                                     "score": outcome.score,
+                                    "head": tested_head,
                                     "advisory": true,
                                 });
                                 if let Some(u) = &outcome.session_url {
@@ -6460,7 +6477,11 @@ const MERGE_MIN_QA_SCORE: i64 = 9;
 /// Why a browser-visible change has no passing real run behind it, or None
 /// when the merge may proceed. A diff the pipeline determined is not
 /// browser-visible has no browser run to require.
-pub(crate) fn merge_run_evidence_missing(task: &Value, browser_visible: bool) -> Option<String> {
+pub(crate) fn merge_run_evidence_missing(
+    task: &Value,
+    browser_visible: bool,
+    current_head: Option<&str>,
+) -> Option<String> {
     if !browser_visible {
         return None;
     }
@@ -6477,10 +6498,28 @@ pub(crate) fn merge_run_evidence_missing(task: &Value, browser_visible: bool) ->
             if verdict.is_empty() { "missing" } else { verdict }
         ));
     }
+    // The run must be tied to the commit being merged: a later push (a review
+    // fix, a conflict resolution) invalidates the evidence it inherits.
+    let tested = qa.get("head").and_then(|v| v.as_str()).unwrap_or("");
+    if tested.is_empty() {
+        return Some(
+            "the browser validation does not record which commit it tested, so it cannot be tied to this PR head. The merge step requires a run against the commit being merged.".to_string(),
+        );
+    }
+    if let Some(head) = current_head.filter(|h| !h.is_empty()) {
+        if tested != head {
+            let short = |s: &str| s.chars().take(10).collect::<String>();
+            return Some(format!(
+                "the browser validation tested {}, but this PR head is {} — the change moved after the run. The merge step holds this card until a real run passes on the current head.",
+                short(tested),
+                short(head)
+            ));
+        }
+    }
     match qa.get("score").and_then(|v| v.as_i64()) {
-        Some(score) if score >= MERGE_MIN_QA_SCORE => None,
+        Some(score) if (MERGE_MIN_QA_SCORE..=10).contains(&score) => None,
         Some(score) => Some(format!(
-            "the browser validation scored {}/10, below the {}/10 bar. The merge step holds this card until a real run passes.",
+            "the browser validation scored {}/10, outside the {}/10 bar. The merge step holds this card until a real run passes.",
             score, MERGE_MIN_QA_SCORE
         )),
         None => Some(
@@ -6793,21 +6832,24 @@ fn parse_browse_validation_outcome(raw: &str) -> BrowseValidationOutcome {
 /// or quoted instructions cannot promote a score. Anything unparseable is None,
 /// and None can never pass the merge gate.
 fn extract_browse_score(raw: &str) -> Option<i64> {
-    raw.lines().rev().find_map(|line| {
-        let trimmed = line.trim();
-        let rest = trimmed
-            .strip_prefix("BROWSE_QA_SCORE:")
-            .or_else(|| trimmed.strip_prefix("Browse_QA_Score:"))?;
-        let token = rest.trim();
-        if token.eq_ignore_ascii_case("none") {
-            return Some(None);
-        }
-        let digits: String = token.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if digits.is_empty() {
-            return None;
-        }
-        digits.parse::<i64>().ok().filter(|n| (0..=10).contains(n)).map(Some)
-    }).flatten()
+    // Strict footer only. The LAST score line wins; a malformed one is a
+    // failure, never a fallback to an earlier (possibly quoted) value. Shape:
+    // `BROWSE_QA_SCORE: <n>/10` with n an integer 0-10, or `BROWSE_QA_SCORE: none`.
+    let line = raw
+        .lines()
+        .rev()
+        .find(|line| line.trim().to_ascii_uppercase().starts_with("BROWSE_QA_SCORE:"))?;
+    let trimmed = line.trim();
+    let rest = trimmed[trimmed.find(':')? + 1..].trim();
+    if rest.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    let (num, denom) = rest.split_once('/')?;
+    if denom.trim() != "10" {
+        return None;
+    }
+    let n: i64 = num.trim().parse().ok()?;
+    (0..=10).contains(&n).then_some(n)
 }
 
 async fn changed_files_for_testing(repo_path: &str, base_branch: Option<&str>) -> Vec<String> {
@@ -6862,6 +6904,13 @@ async fn changed_files_for_testing(repo_path: &str, base_branch: Option<&str>) -
 pub(crate) fn changed_files_look_browser_visible(files: &[String]) -> bool {
     files.iter().any(|file| {
         let f = file.to_lowercase();
+        // The Rust backend is not what a browser shows; everything else under
+        // a frontend source root is. Stores, utilities and root static assets
+        // change what the customer sees just as much as a component does, so
+        // the roots count, not only known component paths and extensions.
+        if f.starts_with("src-tauri/") {
+            return false;
+        }
         f.ends_with(".svelte")
             || f.ends_with(".tsx")
             || f.ends_with(".jsx")
@@ -6869,12 +6918,12 @@ pub(crate) fn changed_files_look_browser_visible(files: &[String]) -> bool {
             || f.ends_with(".css")
             || f.ends_with(".scss")
             || f.ends_with(".html")
-            || f.starts_with("src/routes/")
-            || f.starts_with("web/src/routes/")
-            || f.starts_with("src/lib/components/")
-            || f.starts_with("web/src/lib/components/")
-            || f.starts_with("public/")
+            || f.starts_with("src/")
+            || f.starts_with("web/src/")
+            || f.starts_with("static/")
             || f.starts_with("web/static/")
+            || f.starts_with("public/")
+            || f.starts_with("web/public/")
     })
 }
 
@@ -14422,7 +14471,7 @@ async fn run_merge_deploy_workflow(
         let latest_for_gate = supabase::fetch_task(config, task_id).await.ok().flatten();
         let browser_visible = changed_files_look_browser_visible(&files);
         let evidence_reason = match latest_for_gate.as_ref() {
-            Some(row) => merge_run_evidence_missing(row, browser_visible),
+            Some(row) => merge_run_evidence_missing(row, browser_visible, Some(&head_sha)),
             None => Some(
                 "the task record could not be read to verify the real-run evidence".to_string(),
             ),
@@ -17442,6 +17491,13 @@ mod merge_deploy_tests {
         assert_eq!(extract_browse_score("BROWSE_QA_SCORE: none"), None);
         assert_eq!(extract_browse_score("BROWSE_QA_SCORE: 11/10"), None);
         assert_eq!(extract_browse_score("no footer here"), None);
+        // Lax shapes never pass: the shape must be exactly <n>/10.
+        assert_eq!(extract_browse_score("BROWSE_QA_SCORE: 9/100"), None);
+        assert_eq!(extract_browse_score("BROWSE_QA_SCORE: 9.5/10"), None);
+        assert_eq!(extract_browse_score("BROWSE_QA_SCORE: 9 garbage"), None);
+        assert_eq!(extract_browse_score("BROWSE_QA_SCORE: 9/10 extra"), None);
+        // A malformed final marker is a failure, not a fallback to an earlier value.
+        assert_eq!(extract_browse_score("BROWSE_QA_SCORE: 9/10\nBROWSE_QA_SCORE: broken"), None);
         // The last marker wins, so page text quoting the shape cannot promote a score.
         assert_eq!(
             extract_browse_score("BROWSE_QA_SCORE: 3/10\nBROWSE_QA_SCORE: 9/10"),
@@ -17451,20 +17507,25 @@ mod merge_deploy_tests {
 
     #[test]
     fn merge_gate_requires_a_passing_real_run_for_browser_visible_changes() {
+        let head = "abc1234567890";
         let with_qa = |qa: Value| serde_json::json!({ "visual_qa_result": qa });
         // Not browser-visible: no browser run to require.
-        assert!(merge_run_evidence_missing(&with_qa(serde_json::json!({"verdict": "SKIP"})), false).is_none());
+        assert!(merge_run_evidence_missing(&with_qa(serde_json::json!({"verdict": "SKIP"})), false, None).is_none());
         // Browser-visible with no evidence at all.
-        assert!(merge_run_evidence_missing(&serde_json::json!({}), true).is_some());
+        assert!(merge_run_evidence_missing(&serde_json::json!({}), true, Some(head)).is_some());
         // Blocked or failed runs never pass.
-        assert!(merge_run_evidence_missing(&with_qa(serde_json::json!({"verdict": "BLOCKED"})), true).is_some());
-        assert!(merge_run_evidence_missing(&with_qa(serde_json::json!({"verdict": "FAIL", "score": 8})), true).is_some());
-        // A pass below the bar, or a pass with no score, still holds.
-        assert!(merge_run_evidence_missing(&with_qa(serde_json::json!({"verdict": "PASS", "score": 8})), true).is_some());
-        assert!(merge_run_evidence_missing(&with_qa(serde_json::json!({"verdict": "PASS"})), true).is_some());
-        // 9 or 10 passes.
-        assert!(merge_run_evidence_missing(&with_qa(serde_json::json!({"verdict": "PASS", "score": 9})), true).is_none());
-        assert!(merge_run_evidence_missing(&with_qa(serde_json::json!({"verdict": "PASS", "score": 10})), true).is_none());
+        assert!(merge_run_evidence_missing(&with_qa(serde_json::json!({"verdict": "BLOCKED"})), true, Some(head)).is_some());
+        assert!(merge_run_evidence_missing(&with_qa(serde_json::json!({"verdict": "FAIL", "score": 8, "head": head})), true, Some(head)).is_some());
+        // A pass below the bar, out of range, or with no score, still holds.
+        assert!(merge_run_evidence_missing(&with_qa(serde_json::json!({"verdict": "PASS", "score": 8, "head": head})), true, Some(head)).is_some());
+        assert!(merge_run_evidence_missing(&with_qa(serde_json::json!({"verdict": "PASS", "score": 100, "head": head})), true, Some(head)).is_some());
+        assert!(merge_run_evidence_missing(&with_qa(serde_json::json!({"verdict": "PASS", "head": head})), true, Some(head)).is_some());
+        // Evidence with no tested commit, or for a different commit, holds.
+        assert!(merge_run_evidence_missing(&with_qa(serde_json::json!({"verdict": "PASS", "score": 9})), true, Some(head)).is_some());
+        assert!(merge_run_evidence_missing(&with_qa(serde_json::json!({"verdict": "PASS", "score": 9, "head": "other9999"})), true, Some(head)).is_some());
+        // 9 or 10 on the current head passes.
+        assert!(merge_run_evidence_missing(&with_qa(serde_json::json!({"verdict": "PASS", "score": 9, "head": head})), true, Some(head)).is_none());
+        assert!(merge_run_evidence_missing(&with_qa(serde_json::json!({"verdict": "PASS", "score": 10, "head": head})), true, Some(head)).is_none());
     }
 
     #[tokio::test]

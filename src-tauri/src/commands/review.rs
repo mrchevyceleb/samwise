@@ -486,7 +486,7 @@ pub async fn try_auto_merge(
     let latest_task = supabase::fetch_task(config, task_id).await.ok().flatten();
     let browser_visible = crate::commands::worker::changed_files_look_browser_visible(&files);
     let evidence_reason = match latest_task.as_ref() {
-        Some(row) => crate::commands::worker::merge_run_evidence_missing(row, browser_visible),
+        Some(row) => crate::commands::worker::merge_run_evidence_missing(row, browser_visible, Some(&head_sha)),
         None => Some(
             "the task record could not be read to verify the real-run evidence".to_string(),
         ),
@@ -2112,6 +2112,26 @@ pub async fn run_full_pr_review(
             "refusing pr_url that doesn't match the github shape: {}",
             pr_url
         ));
+    }
+    // This path is authorized to fix, merge and deploy on its own, so the
+    // merge step's real-run gate applies before it can launch at all: a
+    // browser-visible PR without a passing run on its current head never
+    // starts a merge-capable review. Fail closed when the PR cannot be
+    // classified (an unreadable file list is not evidence of a clean diff).
+    let files = fetch_pr_files(pr_url, repo_path)
+        .await
+        .map_err(|e| format!("full PR review held: could not list the PR files to classify the change: {}", e))?;
+    let browser_visible = crate::commands::worker::changed_files_look_browser_visible(&files);
+    let head = fetch_pr_head_sha(pr_url, repo_path).await.unwrap_or_default();
+    let latest = supabase::fetch_task(config, task_id).await.ok().flatten();
+    let evidence_reason = match latest.as_ref() {
+        Some(row) => crate::commands::worker::merge_run_evidence_missing(row, browser_visible, Some(&head)),
+        None => Some(
+            "the task record could not be read to verify the real-run evidence".to_string(),
+        ),
+    };
+    if let Some(reason) = evidence_reason {
+        return Err(format!("full PR review held: {}", reason));
     }
     let cwd = resolve_codex_cwd(repo_path);
     let tmp_path = std::env::temp_dir().join(format!("samwise-full-pr-review-{}", uuid_like()));
