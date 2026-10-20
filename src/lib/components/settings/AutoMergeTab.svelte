@@ -46,8 +46,10 @@
   <div style="font-size: 12px; color: var(--text-secondary); line-height: 1.5;">
     After Sam opens a PR, run a Codex review (gpt-5.6-sol via OpenRouter, xhigh reasoning) and auto-merge only when every gate passes.
     Gates: feature toggle on, no blocker paths touched (migrations, worker.rs, chat.rs, auth/secret/token files, dep manifests),
-    diff under the line cap, the lowest review dimension at or above the minimum score, no review-flagged blockers, and CI green.
-    If any gate fails, the PR stays in review with a comment explaining why.
+    diff under the line cap, the lowest review dimension at or above the minimum score, no review-flagged blockers, CI green,
+    and — for every browser-visible change — a passing real browser run at 9/10 or better from the Testing stage's gate.
+    If any gate fails, the PR stays in review with a comment explaining why. A browser-visible change with no passing run
+    (blocked, failed, or unscored) never merges; it waits for a real run.
   </div>
 
   <!-- Master toggle -->

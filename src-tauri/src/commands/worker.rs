@@ -5555,13 +5555,14 @@ from Matt, stop without making changes and explain specifically what you need cl
                                 pass: false,
                                 skip: true,
                                 summary: format!(
-                                    "{}. Browser QA was attempted and logged, but this gate is advisory; continuing to PR review.",
+                                    "{}. Browser QA could not complete, so this card carries no real-run evidence; the merge step will hold it until a browser run passes.",
                                     reason
                                 ),
                                 issues: Vec::new(),
                                 raw_issue_count: 0,
                                 duplicate_issue_count: 0,
                                 session_url: None,
+                                score: None,
                             }
                         }
                     };
@@ -5575,6 +5576,7 @@ from Matt, stop without making changes and explain specifically what you need cl
                         "issues": capped_browse_issues(&outcome.issues, BROWSE_QA_MAX_STORED_ISSUES),
                         "raw_issue_count": outcome.raw_issue_count,
                         "duplicate_issue_count": outcome.duplicate_issue_count,
+                        "score": outcome.score,
                     });
                     if let Some(u) = &outcome.session_url {
                         visual_result["session_url"] = serde_json::json!(u);
@@ -5631,7 +5633,7 @@ from Matt, stop without making changes and explain specifically what you need cl
                                 config,
                                 &task_id,
                                 &format!(
-                                    "Testing stage `/browse` was attempted but was not safe to use as an automatic blocker. Continuing to PR review; Codex remains the merge authority.\n\n{}\n\nSummary:\n{}\n\nIssues:\n{}{}",
+                                    "Testing stage `/browse` could not produce a passing real run. The merge step will hold this card until a browser run passes at 9/10 or better.\n\n{}\n\nSummary:\n{}\n\nIssues:\n{}{}",
                                     reason,
                                     browse_summary(&outcome.summary),
                                     issues_block,
@@ -5686,7 +5688,7 @@ from Matt, stop without making changes and explain specifically what you need cl
                                     config,
                                     &task_id,
                                     &format!(
-                                        "Testing repair pass did not complete cleanly ({}). Continuing to PR review with the browser finding attached; Codex remains the merge authority.",
+                                        "Testing repair pass did not complete cleanly ({}). The browser finding is attached; the merge step will hold this card until a browser run passes.",
                                         truncate(&e, 300)
                                     ),
                                 )
@@ -5712,7 +5714,7 @@ from Matt, stop without making changes and explain specifically what you need cl
                                         config,
                                         &task_id,
                                         &format!(
-                                            "Testing repair commit failed ({}). I reverted the repair attempt where possible and will continue to PR review with the original browser finding attached.",
+                                            "Testing repair commit failed ({}). I reverted the repair attempt where possible; the merge step will hold this card until a browser run passes.",
                                             truncate(&e, 300)
                                         ),
                                     )
@@ -5740,7 +5742,7 @@ from Matt, stop without making changes and explain specifically what you need cl
                                             config,
                                             &task_id,
                                             &format!(
-                                                "Testing repair made the build fail ({}), so I reverted that repair attempt where possible and will continue to PR review with the original browser finding attached.\n\n```\n{}\n```",
+                                                "Testing repair made the build fail ({}), so I reverted that repair attempt where possible; the merge step will hold this card until a browser run passes.\n\n```\n{}\n```",
                                                 cmd,
                                                 log_tail
                                             ),
@@ -5792,13 +5794,14 @@ from Matt, stop without making changes and explain specifically what you need cl
                                             pass: false,
                                             skip: true,
                                             summary: format!(
-                                                "{}. Browser QA was attempted and logged, but this gate is advisory; continuing to PR review.",
+                                                "{}. Browser QA could not complete, so this card carries no real-run evidence; the merge step will hold it until a browser run passes.",
                                                 reason
                                             ),
                                             issues: Vec::new(),
                                             raw_issue_count: 0,
                                             duplicate_issue_count: 0,
                                             session_url: None,
+                                            score: None,
                                         }
                                     }
                                 };
@@ -5811,6 +5814,7 @@ from Matt, stop without making changes and explain specifically what you need cl
                                     "issues": capped_browse_issues(&outcome.issues, BROWSE_QA_MAX_STORED_ISSUES),
                                     "raw_issue_count": outcome.raw_issue_count,
                                     "duplicate_issue_count": outcome.duplicate_issue_count,
+                                    "score": outcome.score,
                                     "advisory": true,
                                 });
                                 if let Some(u) = &outcome.session_url {
@@ -5848,7 +5852,7 @@ from Matt, stop without making changes and explain specifically what you need cl
                                         config,
                                         &task_id,
                                         &format!(
-                                            "Testing stage `/browse` still reported issues after the repair pass. Captured the findings and continuing to PR review; Codex remains the merge authority.\n\n{}\n\nIssues:\n{}{}",
+                                            "Testing stage `/browse` still reported issues after the repair pass. Captured the findings; the merge step will hold this card until a browser run passes at 9/10 or better.\n\n{}\n\nIssues:\n{}{}",
                                             browse_summary(&outcome.summary),
                                             format_browse_issues_block(
                                                 &outcome.issues,
@@ -5869,7 +5873,7 @@ from Matt, stop without making changes and explain specifically what you need cl
                         config,
                         &task_id,
                         &format!(
-                            "{}. Browser QA was required and attempted as far as possible, but no URL was available. Continuing to PR review; Codex remains the merge authority.",
+                            "{}. Browser QA was required and attempted as far as possible, but no URL was available. The merge step will hold this card until a reachable build is validated.",
                             reason
                         ),
                     )
@@ -6444,6 +6448,45 @@ struct BrowseValidationOutcome {
     raw_issue_count: usize,
     duplicate_issue_count: usize,
     session_url: Option<String>,
+    /// The real-run quality score (0-10), present only when the gate actually
+    /// exercised the changed flow. None on SKIP/BLOCKED or malformed output.
+    score: Option<i64>,
+}
+
+/// The merge step's real-run bar: a browser-visible change may only reach main
+/// behind a browser run that passed at this score or better.
+const MERGE_MIN_QA_SCORE: i64 = 9;
+
+/// Why a browser-visible change has no passing real run behind it, or None
+/// when the merge may proceed. A diff the pipeline determined is not
+/// browser-visible has no browser run to require.
+pub(crate) fn merge_run_evidence_missing(task: &Value, browser_visible: bool) -> Option<String> {
+    if !browser_visible {
+        return None;
+    }
+    let qa = task.get("visual_qa_result").filter(|v| !v.is_null());
+    let Some(qa) = qa else {
+        return Some(
+            "no browser validation ran for this browser-visible change, so nothing real was ever exercised. The merge step requires a passing browser run at 9/10 or better.".to_string(),
+        );
+    };
+    let verdict = qa.get("verdict").and_then(|v| v.as_str()).unwrap_or("");
+    if verdict != "PASS" {
+        return Some(format!(
+            "the browser validation did not pass (verdict {}), so the change was never shown working for real. The merge step requires a passing browser run at 9/10 or better.",
+            if verdict.is_empty() { "missing" } else { verdict }
+        ));
+    }
+    match qa.get("score").and_then(|v| v.as_i64()) {
+        Some(score) if score >= MERGE_MIN_QA_SCORE => None,
+        Some(score) => Some(format!(
+            "the browser validation scored {}/10, below the {}/10 bar. The merge step holds this card until a real run passes.",
+            score, MERGE_MIN_QA_SCORE
+        )),
+        None => Some(
+            "the browser validation left no quality score, so there is no 9+/10 behind this change. The merge step holds this card until a scored real run passes.".to_string(),
+        ),
+    }
 }
 
 const BROWSE_QA_SUMMARY_CAP: usize = 1500;
@@ -6525,7 +6568,12 @@ fn browse_issue_count_note(outcome: &BrowseValidationOutcome) -> String {
 }
 
 fn browse_can_attempt_repair(outcome: &BrowseValidationOutcome) -> bool {
-    outcome.verdict == "FAIL" && !outcome.issues.is_empty()
+    // FAIL, or a pass that scored below the merge bar, both mean fixable
+    // findings when issues were listed.
+    (outcome.verdict == "FAIL"
+        || (outcome.verdict == "PASS"
+            && outcome.score.map(|s| s < MERGE_MIN_QA_SCORE).unwrap_or(false)))
+        && !outcome.issues.is_empty()
 }
 
 fn browse_needs_confirmation(outcome: &BrowseValidationOutcome) -> bool {
@@ -6725,6 +6773,7 @@ fn parse_browse_validation_outcome(raw: &str) -> BrowseValidationOutcome {
         parse_json_string_array(detail.as_ref().and_then(|d| d.get("issues"))),
     );
     let session_url = extract_session_url(raw);
+    let score = extract_browse_score(raw);
 
     BrowseValidationOutcome {
         verdict,
@@ -6735,7 +6784,30 @@ fn parse_browse_validation_outcome(raw: &str) -> BrowseValidationOutcome {
         raw_issue_count,
         duplicate_issue_count,
         session_url,
+        score,
     }
+}
+
+/// The gate's real-run quality score footer, shaped like `BROWSE_QA_SCORE: 9/10`
+/// or `BROWSE_QA_SCORE: none`. Scanned bottom-up like the verdict so page text
+/// or quoted instructions cannot promote a score. Anything unparseable is None,
+/// and None can never pass the merge gate.
+fn extract_browse_score(raw: &str) -> Option<i64> {
+    raw.lines().rev().find_map(|line| {
+        let trimmed = line.trim();
+        let rest = trimmed
+            .strip_prefix("BROWSE_QA_SCORE:")
+            .or_else(|| trimmed.strip_prefix("Browse_QA_Score:"))?;
+        let token = rest.trim();
+        if token.eq_ignore_ascii_case("none") {
+            return Some(None);
+        }
+        let digits: String = token.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            return None;
+        }
+        digits.parse::<i64>().ok().filter(|n| (0..=10).contains(n)).map(Some)
+    }).flatten()
 }
 
 async fn changed_files_for_testing(repo_path: &str, base_branch: Option<&str>) -> Vec<String> {
@@ -6787,7 +6859,7 @@ async fn changed_files_for_testing(repo_path: &str, base_branch: Option<&str>) -
         .collect()
 }
 
-fn changed_files_look_browser_visible(files: &[String]) -> bool {
+pub(crate) fn changed_files_look_browser_visible(files: &[String]) -> bool {
     files.iter().any(|file| {
         let f = file.to_lowercase();
         f.ends_with(".svelte")
@@ -6853,6 +6925,8 @@ Rules:
 - Follow the `/browse` workflow exactly: identify the site, call `start`, save the `liveViewUrl`, call `login` if auth is required, use `snapshot` as the primary page reader, use `screenshot` when pixels matter, and always call `end`.
 - If the changed files are clearly not browser-visible, do not start a browser session. Return BROWSE_QA_VERDICT: SKIP with a short reason.
 - If a browser-visible change was made, actually drive the changed user flow at {verify_url}. Click, type, submit, navigate, reload, and exercise obvious unhappy paths. Do not judge from the landing page.
+- The deployed page may serve a build that does not contain the change yet. Do not stop there and do not judge it: build and run the candidate from this checkout (a local build of this branch is a real build) and drive the changed flow against the real backend and real data at that build, then judge THAT run. A stale deployment is not a reason for BLOCKED.
+- Score the run you actually made: BROWSE_QA_SCORE is an integer 0-10 when PASS or FAIL, and none when SKIP or BLOCKED. 9 or 10 means the change works as the customer meets it and ships proudly (10 means it would impress); below 9 means something a customer would notice. Never score a flow you did not exercise, and never score from the diff.
 - Run the browser `console` action after the main flow and once more before the verdict. Real app-origin console errors, uncaught exceptions, failed requests, or HTTP 4xx/5xx responses are a FAIL.
 - Check UX quality: overlap, overflow, clipped text, broken responsive behavior, confusing labels, missing feedback, dead ends, and anything that feels unfinished.
 - BLOCKED means the browser session cannot start, the page is unreachable, SMS/push 2FA is required, or the flow cannot be accessed. BLOCKED is not product evidence: report it clearly so Samwise can pause for confirmation instead of attempting a code repair.
@@ -6866,6 +6940,8 @@ or
 BROWSE_QA_VERDICT: SKIP
 or
 BROWSE_QA_VERDICT: BLOCKED
+BROWSE_QA_SCORE: <n>/10
+(the score line above is one of: `<n>/10` with an integer 0-10 when the verdict is PASS or FAIL, or `none` when it is SKIP or BLOCKED)
 followed immediately by a fenced json block:
 ```json
 {{"summary": "two or three sentence plain-English summary including console health", "issues": ["every concrete problem as its own string; empty only on PASS or SKIP"], "checked": ["each thing you actually exercised, including console checks"]}}
@@ -14338,6 +14414,34 @@ async fn run_merge_deploy_workflow(
                 ));
             }
         }
+        // The merge step's real-run gate, enforced here for EVERY path that
+        // reaches this executor: auto-merge, the Review & Merge button, and
+        // stamped merge requests. A browser-visible change never reaches main
+        // without a passing browser run at 9/10 or better behind it; missing
+        // evidence holds the PR instead of merging it.
+        let latest_for_gate = supabase::fetch_task(config, task_id).await.ok().flatten();
+        let browser_visible = changed_files_look_browser_visible(&files);
+        let evidence_reason = match latest_for_gate.as_ref() {
+            Some(row) => merge_run_evidence_missing(row, browser_visible),
+            None => Some(
+                "the task record could not be read to verify the real-run evidence".to_string(),
+            ),
+        };
+        if let Some(reason) = evidence_reason {
+            agent_comment(
+                config,
+                task_id,
+                &format!(
+                    "Merge stopped: {}\n\nThis card stays out of main until a real browser run passes at 9/10 or better; rerun the Testing stage against a reachable build, then merge again.",
+                    reason
+                ),
+            )
+            .await;
+            return Err(MergeDeployError::new(
+                format!("merge step held this PR: {}", reason),
+                false,
+            ));
+        }
         match review::wait_for_ci(pr_url, repo_path).await {
             Ok(true) => {}
             Ok(false) => {
@@ -17316,6 +17420,7 @@ mod merge_deploy_tests {
             raw_issue_count: 1,
             duplicate_issue_count: 0,
             session_url: None,
+            score: None,
         };
 
         assert!(browse_needs_confirmation(&outcome));
@@ -17328,6 +17433,38 @@ mod merge_deploy_tests {
             .issues
             .push("[functional] button is broken".to_string());
         assert!(!browse_needs_confirmation(&outcome));
+    }
+
+    #[test]
+    fn browse_score_parses_only_a_real_footer() {
+        assert_eq!(extract_browse_score("BROWSE_QA_VERDICT: PASS\nBROWSE_QA_SCORE: 9/10"), Some(9));
+        assert_eq!(extract_browse_score("BROWSE_QA_SCORE: 10/10"), Some(10));
+        assert_eq!(extract_browse_score("BROWSE_QA_SCORE: none"), None);
+        assert_eq!(extract_browse_score("BROWSE_QA_SCORE: 11/10"), None);
+        assert_eq!(extract_browse_score("no footer here"), None);
+        // The last marker wins, so page text quoting the shape cannot promote a score.
+        assert_eq!(
+            extract_browse_score("BROWSE_QA_SCORE: 3/10\nBROWSE_QA_SCORE: 9/10"),
+            Some(9)
+        );
+    }
+
+    #[test]
+    fn merge_gate_requires_a_passing_real_run_for_browser_visible_changes() {
+        let with_qa = |qa: Value| serde_json::json!({ "visual_qa_result": qa });
+        // Not browser-visible: no browser run to require.
+        assert!(merge_run_evidence_missing(&with_qa(serde_json::json!({"verdict": "SKIP"})), false).is_none());
+        // Browser-visible with no evidence at all.
+        assert!(merge_run_evidence_missing(&serde_json::json!({}), true).is_some());
+        // Blocked or failed runs never pass.
+        assert!(merge_run_evidence_missing(&with_qa(serde_json::json!({"verdict": "BLOCKED"})), true).is_some());
+        assert!(merge_run_evidence_missing(&with_qa(serde_json::json!({"verdict": "FAIL", "score": 8})), true).is_some());
+        // A pass below the bar, or a pass with no score, still holds.
+        assert!(merge_run_evidence_missing(&with_qa(serde_json::json!({"verdict": "PASS", "score": 8})), true).is_some());
+        assert!(merge_run_evidence_missing(&with_qa(serde_json::json!({"verdict": "PASS"})), true).is_some());
+        // 9 or 10 passes.
+        assert!(merge_run_evidence_missing(&with_qa(serde_json::json!({"verdict": "PASS", "score": 9})), true).is_none());
+        assert!(merge_run_evidence_missing(&with_qa(serde_json::json!({"verdict": "PASS", "score": 10})), true).is_none());
     }
 
     #[tokio::test]

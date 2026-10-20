@@ -480,6 +480,29 @@ pub async fn try_auto_merge(
     }
 
     // Persist scores + summary now, even before CI, so Matt can see them.
+    // 8b. Real-run gate: a browser-visible change only auto-merges behind a
+    // passing browser run at 9/10 or better. Without it the card parks for a
+    // human instead of reaching main unrun and unscored.
+    let latest_task = supabase::fetch_task(config, task_id).await.ok().flatten();
+    let browser_visible = crate::commands::worker::changed_files_look_browser_visible(&files);
+    let evidence_reason = match latest_task.as_ref() {
+        Some(row) => crate::commands::worker::merge_run_evidence_missing(row, browser_visible),
+        None => Some(
+            "the task record could not be read to verify the real-run evidence".to_string(),
+        ),
+    };
+    if let Some(reason) = evidence_reason {
+        return block(
+            config,
+            task_id,
+            pr_url,
+            Some(scores),
+            Some(blockers_val),
+            None,
+            &reason,
+        )
+        .await;
+    }
     let _ = supabase::update_task(
         config,
         task_id,
