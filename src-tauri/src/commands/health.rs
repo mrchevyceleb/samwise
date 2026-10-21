@@ -26,7 +26,9 @@ pub async fn check_claude_code() -> Result<String, String> {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    Ok(combined.trim().to_string())
+    super::claude_code::prepare_team_claude_async(&mut cmd).await
+        .map_err(|_| "Claude CLI is installed, but the approved team login needs attention. Claude work is paused.".to_string())?;
+    Ok(format!("{} (team account verified)", combined.trim()))
 }
 
 /// Check if GitHub CLI (gh) is authenticated.

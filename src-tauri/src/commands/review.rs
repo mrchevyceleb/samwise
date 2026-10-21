@@ -970,7 +970,9 @@ async fn run_opus_review(
     // --strict-mcp-config with no --mcp-config loads zero MCP servers, so
     // this is a pure text-in/JSON-out pass, same as Codex's read-only
     // sandbox + never-approve policy did.
-    let mut cmd = async_cmd("claude");
+    let (claude_exe, claude_prefix) = super::claude_code::find_claude_command();
+    let mut cmd = async_cmd(&claude_exe);
+    cmd.args(claude_prefix);
     cmd.args([
         "-p",
         "--model",
@@ -1001,7 +1003,7 @@ async fn run_opus_review(
     // exact list this needs (DIRECT_OAUTH_ENV_BLOCKERS, used the same way by
     // worker.rs's own direct-Claude spawns), so reuse it instead of hand-
     // maintaining a second, narrower copy here.
-    super::claude_code::strip_direct_oauth_blockers_async(&mut cmd);
+    super::claude_code::prepare_team_claude_async(&mut cmd).await?;
 
     let mut child = cmd.spawn().map_err(|e| format!("spawn claude: {}", e))?;
     // Drain stdout/stderr concurrently with the wait, same pattern as

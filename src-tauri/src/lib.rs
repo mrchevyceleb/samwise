@@ -52,6 +52,23 @@ fn normalize_path_env() {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     normalize_path_env();
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref() == Some(std::ffi::OsStr::new("--team-claude-subprocess")) {
+        commands::claude_code::run_team_claude_shell(args.collect());
+    }
+    if let Err(error) = commands::claude_code::initialize_team_claude_account() {
+        eprintln!("{}", error);
+        std::process::exit(78);
+    }
+    // Read-only operational check: no UI, database connection, or task pickup.
+    if std::env::args().any(|arg| arg == "--check-claude-account") {
+        println!("TEAM_ACCOUNT_VERIFIED");
+        return;
+    }
+
+    if let Err(error) = commands::claude_code::team_shell_guard_ready() {
+        eprintln!("{}", error); std::process::exit(78);
+    }
 
     // ── Crash-loop guard ──────────────────────────────────────────────
     // When systemd restarts this process after a SIGKILL (force close),

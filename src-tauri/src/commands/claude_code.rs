@@ -1,8 +1,9 @@
 use serde::Serialize;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, Mutex};
+use sha2::{Digest, Sha256};
 use tauri::{Emitter, Manager};
 use crate::process::cmd;
 
@@ -230,156 +231,278 @@ pub fn find_claude_command() -> (String, Vec<String>) {
     }
     // Last resort: resolve via PATH.
     if let Ok(path) = which::which("claude") {
-        return (path.to_string_lossy().into_owned(), vec![]);
+        // The managed shell shim calls us. Never resolve back to it when the
+        // real CLI disappears, or an auth probe would recursively spawn itself.
+        if path != std::path::Path::new("/home/mrchevyceleb/.local/lib/autosam/bin/claude") {
+            return (path.to_string_lossy().into_owned(), vec![]);
+        }
     }
-    ("claude".to_string(), vec![])
+    ("/home/mrchevyceleb/.local/bin/claude".to_string(), vec![])
 }
 
-const CLAUDE_CREDENTIALS_FILE: &str = ".credentials.json";
-
-fn home_dir() -> Option<PathBuf> {
-    #[cfg(target_os = "windows")]
-    {
-        std::env::var_os("USERPROFILE").map(PathBuf::from)
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        std::env::var_os("HOME").map(PathBuf::from)
-    }
+/// AutoSam never reads or copies the personal Claude profile. An inherited
+/// override cannot redirect either the auth probe or the actual child.
+tokio::task_local! {
+    static AUTH_TASK: AuthTask;
 }
 
-fn canonical_claude_credentials_path() -> Option<PathBuf> {
-    home_dir().map(|home| home.join(".claude").join(CLAUDE_CREDENTIALS_FILE))
+struct AuthTask {
+    config: super::supabase::SupabaseConfig,
+    id: String,
+    failure: std::sync::Mutex<Option<String>>,
 }
 
-fn configured_claude_credentials_path() -> Option<PathBuf> {
-    std::env::var_os("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .map(|dir| dir.join(CLAUDE_CREDENTIALS_FILE))
-}
-
-fn same_path(a: &Path, b: &Path) -> bool {
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => a == b,
+pub fn team_auth_task_status() -> Result<(), String> {
+    match AUTH_TASK.try_with(|task| task.failure.lock().unwrap_or_else(|p| p.into_inner()).clone()).ok().flatten() {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }
 
-fn credential_sync_lock() -> &'static StdMutex<()> {
-    static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| StdMutex::new(()))
-}
-
-fn credentials_need_sync(source: &Path, target: &Path, force: bool) -> Result<bool, String> {
-    if force || !target.exists() {
-        return Ok(true);
+/// Secondary calls can be handled by their caller without losing this failure.
+/// The task stays held even if a summary/repair caller uses a fallback result.
+async fn note_team_auth_failure(error: &str) {
+    let context = AUTH_TASK.try_with(|task| {
+        let mut failure = task.failure.lock().unwrap_or_else(|p| p.into_inner());
+        if failure.is_some() { return None; }
+        *failure = Some(error.to_string());
+        Some((task.config.clone(), task.id.clone()))
+    }).ok().flatten();
+    if let Some((config, id)) = context {
+        if super::supabase::update_task(&config, &id, &serde_json::json!({
+            "on_hold": true, "updated_at": chrono::Utc::now().to_rfc3339(),
+        })).await.is_err() {
+            log::error!("[worker] could not save team-auth hold for task {}", id);
+        }
     }
-    let source_bytes = std::fs::read(source)
-        .map_err(|e| format!("read source Claude credentials: {}", e))?;
-    let target_bytes = std::fs::read(target)
-        .map_err(|e| format!("read worker Claude credentials: {}", e))?;
-    Ok(source_bytes != target_bytes)
 }
 
-fn atomic_copy_credentials(source: &Path, target: &Path) -> Result<(), String> {
-    let parent = target
-        .parent()
-        .ok_or_else(|| format!("Claude credentials target has no parent: {}", target.display()))?;
-    std::fs::create_dir_all(parent)
-        .map_err(|e| format!("create Claude config dir {}: {}", parent.display(), e))?;
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    let tmp = parent.join(format!(
-        ".{}.tmp-{}-{}",
-        CLAUDE_CREDENTIALS_FILE,
-        std::process::id(),
-        nonce
-    ));
-    std::fs::copy(source, &tmp).map_err(|e| {
-        format!(
-            "copy Claude credentials {} -> {}: {}",
-            source.display(),
-            tmp.display(),
-            e
-        )
-    })?;
-    lock_down_credentials_permissions(&tmp);
-    std::fs::rename(&tmp, target).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!(
-            "replace Claude credentials {} -> {}: {}",
-            tmp.display(),
-            target.display(),
-            e
-        )
-    })?;
-    lock_down_credentials_permissions(target);
+pub async fn with_team_auth_task<T, F>(config: &super::supabase::SupabaseConfig, id: &str, future: F) -> Result<T, String>
+where F: std::future::Future<Output = Result<T, String>> {
+    if AUTH_TASK.try_with(|task| task.id == id).unwrap_or(false) { return future.await; }
+    AUTH_TASK.scope(AuthTask { config: config.clone(), id: id.to_string(), failure: std::sync::Mutex::new(None) }, async {
+        let result = future.await;
+        let failure = AUTH_TASK.with(|task| task.failure.lock().unwrap_or_else(|p| p.into_inner()).clone());
+        if let Some(error) = failure {
+            super::supabase::update_task(config, id, &serde_json::json!({
+                "status": "queued", "on_hold": true,
+                "worker_id": serde_json::Value::Null, "claimed_at": serde_json::Value::Null,
+                "updated_at": chrono::Utc::now().to_rfc3339(),
+            })).await.map_err(|_| team_auth_error("Work is preserved, but saving its account hold needs attention"))?;
+            return Err(error);
+        }
+        result
+    }).await
+}
+
+pub async fn guard_pi_provider(provider: &str) -> Result<(), String> {
+    if provider.eq_ignore_ascii_case("anthropic") {
+        let error = team_auth_error("Direct pi Anthropic login is disabled; use the guarded Claude coder");
+        note_team_auth_failure(&error).await;
+        return Err(error);
+    }
     Ok(())
 }
 
-#[cfg(unix)]
-fn lock_down_credentials_permissions(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+const TEAM_AUTH_BLOCKED: &str = "TEAM_AUTH_BLOCKED";
+const TEAM_ACCOUNT_SHA256: &str = "a0c253a7ea9f80b2e4ba9cd2131e690d5de903a6661ef5bf84da3b27e3dc8723";
+static TEAM_AUTH_CHECK: Mutex<()> = Mutex::new(());
+
+fn team_auth_error(reason: &str) -> String {
+    format!("{}: {}. Refusing to use another Claude account.", TEAM_AUTH_BLOCKED, reason)
 }
 
-#[cfg(not(unix))]
-fn lock_down_credentials_permissions(_path: &Path) {}
+pub fn is_team_auth_blocked(error: &str) -> bool { error.starts_with(TEAM_AUTH_BLOCKED) }
 
-/// Keep AutoSam's isolated Claude config fresh from the canonical Claude Code
-/// login without pointing the worker directly at Matt's live config dir. This
-/// fixes the stale-copy OAuth 401 outage while preserving the separate
-/// `CLAUDE_CONFIG_DIR` the service already uses.
-pub fn sync_claude_oauth_credentials_if_needed(force: bool) -> Result<bool, String> {
-    let _guard = credential_sync_lock()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Some(target) = configured_claude_credentials_path() else {
-        return Ok(false);
-    };
-    let Some(source) = canonical_claude_credentials_path() else {
-        return Ok(false);
-    };
-    if same_path(&source, &target) || !source.exists() {
-        return Ok(false);
+fn team_claude_profile() -> Result<PathBuf, String> {
+    let profile = PathBuf::from("/home/mrchevyceleb/.claude-tardis");
+    let credentials = profile.join(".credentials.json");
+    if !profile.is_dir() || !credentials.is_file()
+        || std::fs::symlink_metadata(&profile).map(|m| m.file_type().is_symlink()).unwrap_or(true)
+        || std::fs::symlink_metadata(&credentials).map(|m| m.file_type().is_symlink()).unwrap_or(true) {
+        return Err(team_auth_error("Team profile is missing or symlinked"));
     }
-    if !credentials_need_sync(&source, &target, force)? {
-        return Ok(false);
-    }
-    atomic_copy_credentials(&source, &target)?;
-    Ok(true)
+    Ok(profile)
 }
 
-pub async fn sync_claude_oauth_credentials_if_needed_async(force: bool) -> Result<bool, String> {
-    tokio::task::spawn_blocking(move || sync_claude_oauth_credentials_if_needed(force))
-        .await
-        .map_err(|e| format!("join Claude credentials sync task: {}", e))?
+fn is_claude_auth_override(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    name.starts_with("ANTHROPIC_") || name.starts_with("CLAUDE_CODE_OAUTH_")
+        || name.starts_with("CLAUDE_CODE_USE_")
+        || matches!(name.as_str(), "CLAUDE_CODE_SIMPLE" | "CLAUDECODE")
+        || TEAM_CLAUDE_NETWORK_ENV.iter().any(|key| key.eq_ignore_ascii_case(&name))
+}
+
+const TEAM_CLAUDE_NETWORK_ENV: &[&str] = &[
+    "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy",
+    "NODE_EXTRA_CA_CERTS", "NODE_TLS_REJECT_UNAUTHORIZED",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "CLAUDE_CODE_CLIENT_CERT", "CLAUDE_CODE_CLIENT_KEY",
+    "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE", "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+    "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+];
+
+fn team_claude_env(command: &mut std::process::Command, profile: &std::path::Path) {
+    let keys: Vec<_> = std::env::vars_os().map(|(key, _)| key)
+        .chain(command.get_envs().map(|(key, _)| key.to_os_string())).collect();
+    for key in keys {
+        if is_claude_auth_override(&key.to_string_lossy()) { command.env_remove(key); }
+    }
+    strip_direct_oauth_blockers(command);
+    command.env("CLAUDE_CONFIG_DIR", profile);
+}
+
+/// Keep native global, project and local instructions while CLI settings
+/// override authentication. Filtering settings sources also hides their rules.
+fn team_claude_settings(command: &mut std::process::Command, profile: &std::path::Path) {
+    let mut env = serde_json::Map::new();
+    for key in [
+        "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_CUSTOM_HEADERS", "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN_FILE", "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_SIMPLE",
+    ] { env.insert(key.to_string(), serde_json::json!("")); }
+    for key in TEAM_CLAUDE_NETWORK_ENV { env.insert((*key).to_string(), serde_json::json!("")); }
+    // Keep the worker's build/runtime options, while file settings cannot
+    // inject a Node preload or replace its memory allowance.
+    env.insert("NODE_OPTIONS".into(), serde_json::json!(std::env::var("NODE_OPTIONS").unwrap_or_default()));
+    env.insert("NODE_TLS_REJECT_UNAUTHORIZED".into(), serde_json::json!("1"));
+    // Empty OpenSSL paths suppress its system trust store in Bash children.
+    // Pin Moria's normal OpenSSL defaults while refusing repo CA replacement.
+    env.insert("SSL_CERT_FILE".into(), serde_json::json!("/usr/lib/ssl/cert.pem"));
+    env.insert("SSL_CERT_DIR".into(), serde_json::json!("/usr/lib/ssl/certs"));
+    env.insert("CLAUDE_CONFIG_DIR".into(), serde_json::json!(profile));
+    command.args(["--setting-sources", "user,project,local", "--settings"])
+        .arg(serde_json::json!({
+            "env": env, "apiKeyHelper": "", "awsAuthRefresh": "",
+            "awsCredentialExport": "", "forceLoginMethod": "claudeai",
+            // Keep Matt's team-profile guards even when a repo disables hooks.
+            "disableAllHooks": false, "enableAllProjectMcpServers": false,
+            "otelHeadersHelper": "", "statusLine": { "type": "command", "command": "" },
+        }).to_string());
+}
+
+fn checked_team_claude_profile(cwd: Option<PathBuf>) -> Result<PathBuf, String> {
+    // Serialize checks because the CLI may refresh its shared subscription token.
+    let _check = TEAM_AUTH_CHECK.lock().map_err(|_| team_auth_error("Team auth check is blocked"))?;
+    let profile = team_claude_profile()?;
+    let (exe, prefix) = find_claude_command();
+    let mut probe = cmd(&exe);
+    team_claude_env(&mut probe, &profile);
+    probe.args(prefix);
+    team_claude_settings(&mut probe, &profile);
+    if let Some(cwd) = cwd { probe.current_dir(cwd); }
+    let mut child = probe.args(["auth", "status"])
+        .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null()).spawn()
+        .map_err(|_| team_auth_error("Cannot verify team authentication"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(50)),
+            _ => {
+                let _ = child.kill(); let _ = child.wait();
+                return Err(team_auth_error("Team auth check timed out"));
+            }
+        }
+    }
+    let output = child.wait_with_output().map_err(|_| team_auth_error("Cannot read team auth status"))?;
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| team_auth_error("Team auth status is invalid"))?;
+    if !output.status.success() || status["loggedIn"].as_bool() != Some(true)
+        || status["authMethod"].as_str() != Some("claude.ai")
+        || status["apiProvider"].as_str() != Some("firstParty") {
+        return Err(team_auth_error("Team subscription is not authenticated"));
+    }
+    let email = status["email"].as_str().ok_or_else(|| team_auth_error("Team identity is missing"))?;
+    let org = status["orgId"].as_str().ok_or_else(|| team_auth_error("Team organization is missing"))?;
+    let identity = format!("{:x}", Sha256::digest(format!("{}|{}", email, org).as_bytes()));
+    if identity != TEAM_ACCOUNT_SHA256 { return Err(team_auth_error("Profile belongs to a different account")); }
+    Ok(profile)
+}
+
+/// Called before any worker or UI thread starts. Shell descendants inherit the
+/// same team profile even when their immediate parent is the pi harness.
+pub fn initialize_team_claude_account() -> Result<(), String> {
+    let profile = checked_team_claude_profile(None)?;
+    let keys: Vec<_> = std::env::vars_os().map(|(key, _)| key).collect();
+    for key in keys {
+        if is_claude_auth_override(&key.to_string_lossy()) { std::env::remove_var(key); }
+    }
+    std::env::set_var("CLAUDE_CONFIG_DIR", profile);
+    let current_path = std::env::var("PATH").unwrap_or_default();
+    std::env::set_var("PATH", format!("/home/mrchevyceleb/.local/lib/autosam/bin:{}", current_path));
+    Ok(())
+}
+
+pub fn prepare_team_claude(command: &mut std::process::Command) -> Result<(), String> {
+    let profile = checked_team_claude_profile(command.get_current_dir().map(PathBuf::from))?;
+    team_claude_env(command, &profile);
+    team_claude_settings(command, &profile);
+    Ok(())
+}
+
+pub async fn prepare_team_claude_async(command: &mut tokio::process::Command) -> Result<(), String> {
+    team_auth_task_status()?;
+    let cwd = command.as_std().get_current_dir().map(PathBuf::from);
+    let checked = tokio::task::spawn_blocking(move || checked_team_claude_profile(cwd)).await
+        .map_err(|_| team_auth_error("Team auth check failed")).and_then(|result| result);
+    let profile = match checked {
+        Ok(profile) => profile,
+        Err(error) => { note_team_auth_failure(&error).await; return Err(error); }
+    };
+    team_claude_env(command.as_std_mut(), &profile);
+    team_claude_settings(command.as_std_mut(), &profile);
+    Ok(())
+}
+
+pub fn team_shell_guard_ready() -> Result<(), String> {
+    let path = std::path::Path::new("/home/mrchevyceleb/.local/lib/autosam/bin/claude");
+    let valid = std::fs::symlink_metadata(path).map(|m| {
+        #[cfg(unix)]
+        { use std::os::unix::fs::PermissionsExt; m.is_file() && m.permissions().mode() & 0o111 != 0 }
+        #[cfg(not(unix))]
+        { m.is_file() }
+    }).unwrap_or(false);
+    if !valid || std::fs::read_to_string(path).ok().as_deref() != Some(include_str!("../../../ops/bin/claude")) {
+        return Err(team_auth_error("Team Claude shell launcher is missing or changed"));
+    }
+    Ok(())
+}
+
+/// Entry point used by the shell shim. Project rules load, but auth stays pinned.
+pub fn run_team_claude_shell(args: Vec<std::ffi::OsString>) -> ! {
+    if args.iter().filter_map(|a| a.to_str()).any(|a| matches!(a.split('=').next(), Some("--settings" | "--setting-sources"))) {
+        eprintln!("{}", team_auth_error("Shell arguments cannot override account settings"));
+        std::process::exit(78);
+    }
+    let (exe, prefix) = find_claude_command();
+    let mut command = cmd(&exe);
+    command.args(prefix).args(args);
+    if let Err(error) = prepare_team_claude(&mut command) {
+        eprintln!("{}", error); std::process::exit(78);
+    }
+    #[cfg(unix)]
+    { use std::os::unix::process::CommandExt; let _ = command.exec(); }
+    #[cfg(not(unix))]
+    if let Ok(status) = command.status() { std::process::exit(status.code().unwrap_or(1)); }
+    eprintln!("{}", team_auth_error("Cannot launch the verified team Claude CLI"));
+    std::process::exit(78);
 }
 
 // ── Commands ─────────────────────────────────────────────────────────
 
 /// Spawn a persistent Claude Code process with stream-json on stdin/stdout.
 #[tauri::command]
-pub fn spawn_claude_code(
+pub async fn spawn_claude_code(
     id: String,
     cwd: String,
     args: Vec<String>,
     state: tauri::State<'_, ClaudeCodeState>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
-    // Kill any existing process for this session
-    {
-        let mut processes = state.processes.lock();
-        if let Some(mut old) = processes.remove(&id) {
-            old.alive.store(false, Ordering::Relaxed);
-            drop(old.stdin.take());
-            let _ = old.child.kill();
-            let _ = old.child.wait();
-        }
-    }
-
     let (claude_exe, prefix_args) = find_claude_command();
     let mut command = cmd(&claude_exe);
     for arg in &prefix_args {
@@ -396,30 +519,40 @@ pub fn spawn_claude_code(
         .arg("--model").arg(CLAUDE_MODEL)
         .arg("--effort").arg(CLAUDE_EFFORT);
 
-    // Inject LLM proxy env vars if configured. In direct OAuth mode, refresh
-    // AutoSam's isolated Claude credentials from the canonical Claude Code
-    // login before spawning so the worker cannot drift into stale 401s.
+    // The team subscription policy wins over saved legacy proxy settings.
     let proxy = LlmProxyConfig::load(&app);
-    if proxy.is_none() {
-        match sync_claude_oauth_credentials_if_needed(false) {
-            Ok(true) => log::info!("[claude-code] refreshed worker Claude OAuth credentials before spawn"),
-            Ok(false) => {}
-            Err(e) => log::warn!("[claude-code] could not refresh worker Claude OAuth credentials: {}", e),
-        }
-    }
     inject_proxy_env(&mut command, &proxy);
 
     // Add extra args from the frontend (e.g. --resume). Note: --model is already
     // pinned above to CLAUDE_MODEL; frontend args take precedence if they set it again.
-    for arg in &args {
-        command.arg(arg);
+    if args.iter().any(|arg| matches!(arg.split('=').next(), Some("--settings" | "--setting-sources"))) {
+        return Err("Claude account settings cannot be overridden by session arguments".into());
     }
+    for arg in &args { command.arg(arg); }
 
     // Set working directory
     let cwd_path = PathBuf::from(&cwd);
     if cwd_path.exists() && cwd_path.is_dir() {
         command.current_dir(&cwd_path);
     }
+
+    let mut command = tokio::task::spawn_blocking(move || {
+        prepare_team_claude(&mut command)?;
+        Ok::<_, String>(command)
+    }).await.map_err(|_| team_auth_error("Team auth check failed"))??;
+
+    // Kill any existing process for this session
+    {
+        let mut processes = state.processes.lock();
+        if let Some(mut old) = processes.remove(&id) {
+            old.alive.store(false, Ordering::Relaxed);
+            drop(old.stdin.take());
+            let _ = old.child.kill();
+            let _ = old.child.wait();
+        }
+    }
+
+
 
     command.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -528,13 +661,13 @@ pub fn spawn_claude_code(
 
 /// Run a one-shot Claude Code prompt and return the text output.
 #[tauri::command]
-pub fn claude_code_prompt(
+pub async fn claude_code_prompt(
     prompt: String,
     cwd: String,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
     let (claude_exe, prefix_args) = find_claude_command();
-    let mut command = cmd(&claude_exe);
+    let mut command = crate::process::async_cmd(&claude_exe);
     for arg in &prefix_args {
         command.arg(arg);
     }
@@ -547,25 +680,19 @@ pub fn claude_code_prompt(
         .arg("--model").arg(CLAUDE_MODEL)
         .arg("--effort").arg(CLAUDE_EFFORT);
 
-    // Inject LLM proxy env vars if configured. In direct OAuth mode, refresh
-    // AutoSam's isolated Claude credentials first.
+    // The team subscription policy wins over saved legacy proxy settings.
     let proxy = LlmProxyConfig::load(&app);
-    if proxy.is_none() {
-        match sync_claude_oauth_credentials_if_needed(false) {
-            Ok(true) => log::info!("[claude-code] refreshed worker Claude OAuth credentials before prompt"),
-            Ok(false) => {}
-            Err(e) => log::warn!("[claude-code] could not refresh worker Claude OAuth credentials: {}", e),
-        }
-    }
-    inject_proxy_env(&mut command, &proxy);
+    inject_proxy_env_async(&mut command, &proxy);
 
     let cwd_path = std::path::PathBuf::from(&cwd);
     if cwd_path.exists() && cwd_path.is_dir() {
         command.current_dir(&cwd_path);
     }
 
+    prepare_team_claude_async(&mut command).await?;
+
     let output = command
-        .output()
+        .output().await
         .map_err(|e| format!("Claude Code not available: {}", e))?;
 
     if !output.status.success() {
