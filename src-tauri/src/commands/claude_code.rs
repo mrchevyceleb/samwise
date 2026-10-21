@@ -351,8 +351,8 @@ fn team_claude_env(command: &mut std::process::Command, profile: &std::path::Pat
     command.env("CLAUDE_CONFIG_DIR", profile);
 }
 
-/// Keep native project instructions while CLI settings override the project's
-/// authentication fields. Disabling the project source also hides CLAUDE.md.
+/// Keep native global, project and local instructions while CLI settings
+/// override authentication. Filtering settings sources also hides their rules.
 fn team_claude_settings(command: &mut std::process::Command, profile: &std::path::Path) {
     let mut env = serde_json::Map::new();
     for key in [
@@ -365,8 +365,12 @@ fn team_claude_settings(command: &mut std::process::Command, profile: &std::path
     ] { env.insert(key.to_string(), serde_json::json!("")); }
     for key in TEAM_CLAUDE_NETWORK_ENV { env.insert((*key).to_string(), serde_json::json!("")); }
     env.insert("NODE_TLS_REJECT_UNAUTHORIZED".into(), serde_json::json!("1"));
+    // Empty OpenSSL paths suppress its system trust store in Bash children.
+    // Pin Moria's normal OpenSSL defaults while refusing repo CA replacement.
+    env.insert("SSL_CERT_FILE".into(), serde_json::json!("/usr/lib/ssl/cert.pem"));
+    env.insert("SSL_CERT_DIR".into(), serde_json::json!("/usr/lib/ssl/certs"));
     env.insert("CLAUDE_CONFIG_DIR".into(), serde_json::json!(profile));
-    command.args(["--setting-sources", "project", "--settings"])
+    command.args(["--setting-sources", "user,project,local", "--settings"])
         .arg(serde_json::json!({
             "env": env, "apiKeyHelper": "", "awsAuthRefresh": "",
             "awsCredentialExport": "", "forceLoginMethod": "claudeai",
