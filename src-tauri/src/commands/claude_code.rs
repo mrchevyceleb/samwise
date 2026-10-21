@@ -330,7 +330,16 @@ fn is_claude_auth_override(name: &str) -> bool {
     name.starts_with("ANTHROPIC_") || name.starts_with("CLAUDE_CODE_OAUTH_")
         || name.starts_with("CLAUDE_CODE_USE_")
         || matches!(name.as_str(), "CLAUDE_CODE_SIMPLE" | "CLAUDECODE")
+        || TEAM_CLAUDE_NETWORK_ENV.iter().any(|key| key.eq_ignore_ascii_case(&name))
 }
+
+const TEAM_CLAUDE_NETWORK_ENV: &[&str] = &[
+    "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy",
+    "NODE_EXTRA_CA_CERTS", "NODE_TLS_REJECT_UNAUTHORIZED", "NODE_OPTIONS",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "CLAUDE_CODE_CLIENT_CERT", "CLAUDE_CODE_CLIENT_KEY",
+    "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE", "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+    "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+];
 
 fn team_claude_env(command: &mut std::process::Command, profile: &std::path::Path) {
     let keys: Vec<_> = std::env::vars_os().map(|(key, _)| key)
@@ -342,6 +351,30 @@ fn team_claude_env(command: &mut std::process::Command, profile: &std::path::Pat
     command.env("CLAUDE_CONFIG_DIR", profile);
 }
 
+/// Keep native project instructions while CLI settings override the project's
+/// authentication fields. Disabling the project source also hides CLAUDE.md.
+fn team_claude_settings(command: &mut std::process::Command, profile: &std::path::Path) {
+    let mut env = serde_json::Map::new();
+    for key in [
+        "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_CUSTOM_HEADERS", "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN_FILE", "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_SIMPLE",
+    ] { env.insert(key.to_string(), serde_json::json!("")); }
+    for key in TEAM_CLAUDE_NETWORK_ENV { env.insert((*key).to_string(), serde_json::json!("")); }
+    env.insert("NODE_TLS_REJECT_UNAUTHORIZED".into(), serde_json::json!("1"));
+    env.insert("CLAUDE_CONFIG_DIR".into(), serde_json::json!(profile));
+    command.args(["--setting-sources", "project", "--settings"])
+        .arg(serde_json::json!({
+            "env": env, "apiKeyHelper": "", "awsAuthRefresh": "",
+            "awsCredentialExport": "", "forceLoginMethod": "claudeai",
+            "disableAllHooks": true, "enableAllProjectMcpServers": false,
+            "otelHeadersHelper": "", "statusLine": { "type": "command", "command": "" },
+        }).to_string());
+}
+
 fn checked_team_claude_profile(cwd: Option<PathBuf>) -> Result<PathBuf, String> {
     // Serialize checks because the CLI may refresh its shared subscription token.
     let _check = TEAM_AUTH_CHECK.lock().map_err(|_| team_auth_error("Team auth check is blocked"))?;
@@ -349,8 +382,10 @@ fn checked_team_claude_profile(cwd: Option<PathBuf>) -> Result<PathBuf, String> 
     let (exe, prefix) = find_claude_command();
     let mut probe = cmd(&exe);
     team_claude_env(&mut probe, &profile);
+    probe.args(prefix);
+    team_claude_settings(&mut probe, &profile);
     if let Some(cwd) = cwd { probe.current_dir(cwd); }
-    let mut child = probe.args(prefix).args(["--setting-sources", "", "auth", "status"])
+    let mut child = probe.args(["auth", "status"])
         .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null()).spawn()
         .map_err(|_| team_auth_error("Cannot verify team authentication"))?;
@@ -397,7 +432,7 @@ pub fn initialize_team_claude_account() -> Result<(), String> {
 pub fn prepare_team_claude(command: &mut std::process::Command) -> Result<(), String> {
     let profile = checked_team_claude_profile(command.get_current_dir().map(PathBuf::from))?;
     team_claude_env(command, &profile);
-    command.args(["--setting-sources", ""]);
+    team_claude_settings(command, &profile);
     Ok(())
 }
 
@@ -411,7 +446,7 @@ pub async fn prepare_team_claude_async(command: &mut tokio::process::Command) ->
         Err(error) => { note_team_auth_failure(&error).await; return Err(error); }
     };
     team_claude_env(command.as_std_mut(), &profile);
-    command.args(["--setting-sources", ""]);
+    team_claude_settings(command.as_std_mut(), &profile);
     Ok(())
 }
 
@@ -429,7 +464,7 @@ pub fn team_shell_guard_ready() -> Result<(), String> {
     Ok(())
 }
 
-/// Entry point used by the shell shim. It cannot load project auth overrides.
+/// Entry point used by the shell shim. Project rules load, but auth stays pinned.
 pub fn run_team_claude_shell(args: Vec<std::ffi::OsString>) -> ! {
     if args.iter().filter_map(|a| a.to_str()).any(|a| matches!(a.split('=').next(), Some("--settings" | "--setting-sources"))) {
         eprintln!("{}", team_auth_error("Shell arguments cannot override account settings"));

@@ -35,6 +35,8 @@ Dispatch lives in `src-tauri/src/commands/coder.rs`. `run_claude_code_streaming`
 
 **Claude account:** On Moria every launch pins `/home/mrchevyceleb/.claude-tardis`, verifies the approved subscription identity, and refuses missing or invalid authentication. AutoSam never copies credentials from `~/.claude` or the retired `~/.config/autosam/claude-config` directory. See `docs/team-claude-account.md` for deployment and refusal checks. Do not restore the old credential-copying binary as a rollback.
 
+Repo `CLAUDE.md` instructions must still load. Keep the project settings source enabled and override only authentication with the launcher's CLI policy. Never disable all settings sources to lock the account.
+
 **Vision:** `AUTOSAM_CODER_HANDLES_VISION` is **derived**, not hand-set — `coder::coder_handles_vision()` infers it from the active harness and model. It used to be a manual flag and drifted: set for vision-capable Kimi on 07-23, the model was reverted to text-only GLM the next day, and it stayed on for 13 days while Sam went blind on every screenshot. Set it explicitly only to override the inference. When the coder can't see, images are described by the local model at `AUTOSAM_VISION_MODEL_URL` (LM Studio) and pasted into the prompt. Playwright screenshot QA is separate and never went through the proxy.
 
 **Attachments are validated on download.** Bytes that claim to be an image but sniff as HTML are rejected instead of reaching the model. Slack answers an unauthorized file fetch with `200` + its sign-in page, so from 2026-06-25 until 2026-08-06 *every* Slack screenshot was stored as a login page and nothing errored — the bot token was missing the `files:read` scope. The Telegram fetch path carries the same guard.
