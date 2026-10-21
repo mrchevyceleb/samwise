@@ -30,11 +30,9 @@ Dispatch lives in `src-tauri/src/commands/coder.rs`. `run_claude_code_streaming`
 - pi has **no `--max-turns`**; the cap is enforced by counting `turn_start` events in the parser and SIGTERMing.
 - LiteLLM env is scrubbed from pi spawns (`strip_direct_oauth_blockers_async`) — pi's own `anthropic` provider reads `ANTHROPIC_API_KEY` and would otherwise route back through the proxy.
 - `AUTOSAM_PI_PROVIDER` / `AUTOSAM_PI_MODEL` / `AUTOSAM_PI_THINKING` tune it; `AUTOSAM_PI_NO_EXTENSIONS=1` disables pi extension loading.
-- Rollback: set `AUTOSAM_CODER=claude` in `~/.config/systemd/user/samwise-agent-one.service.d/coder.conf` and restart. The Claude Code path is untouched and `autosam-litellm.service` still runs.
+- The Claude coder and independent Opus reviewer always use the approved team subscription. A saved proxy setting cannot change that account.
 
-**Claude Code path (fallback), if re-enabled:** routes through `autosam-litellm.service` on `127.0.0.1:9876`, config `~/.config/autosam/litellm_config.yaml`, currently mapping the Anthropic aliases to Fireworks **GLM 5.2** (Kimi K3 Fast ran 07-23 → 07-24 and was reverted over a 78% zero-edit session rate). `drop_params: true` is REQUIRED or Fireworks 400s every request. `CLAUDE_CODE_SIMPLE=1` must STAY set on this path (it forces API-key auth); removing it makes Claude Code attempt OAuth against the proxy and die with `Not logged in · Please run /login`. ⚠️ GLM 5.2 is text-only and rejects image blocks outright.
-
-**Account (dormant):** KG Claude Max OAuth creds remain at `CLAUDE_CONFIG_DIR=/home/mrchevyceleb/.config/autosam/claude-config/.credentials.json` (`mtjohnston42@gmail.com`, NOT Personal `mjohnst@gmail.com`). Only relevant if reverting to Anthropic-direct.
+**Claude account:** On Moria every launch pins `/home/mrchevyceleb/.claude-tardis`, verifies the approved subscription identity, and refuses missing or invalid authentication. AutoSam never copies credentials from `~/.claude` or the retired `~/.config/autosam/claude-config` directory. See `docs/team-claude-account.md` for deployment and refusal checks. Do not restore the old credential-copying binary as a rollback.
 
 **Vision:** `AUTOSAM_CODER_HANDLES_VISION` is **derived**, not hand-set — `coder::coder_handles_vision()` infers it from the active harness and model. It used to be a manual flag and drifted: set for vision-capable Kimi on 07-23, the model was reverted to text-only GLM the next day, and it stayed on for 13 days while Sam went blind on every screenshot. Set it explicitly only to override the inference. When the coder can't see, images are described by the local model at `AUTOSAM_VISION_MODEL_URL` (LM Studio) and pasted into the prompt. Playwright screenshot QA is separate and never went through the proxy.
 

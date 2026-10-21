@@ -6778,6 +6778,18 @@ from Matt, stop without making changes and explain specifically what you need cl
             }
         }
         Err(e) => {
+            if super::claude_code::is_team_auth_blocked(&e) {
+                // Preserve the task and worktree without a model fallback or a
+                // tight requeue loop. The owner can release this hold after login.
+                supabase::update_task(config, &task_id, &serde_json::json!({
+                    "status": "queued", "on_hold": true,
+                    "worker_id": Value::Null, "claimed_at": Value::Null,
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                })).await.map_err(|_| "Team auth blocked; could not place task on hold".to_string())?;
+                agent_comment(config, &task_id,
+                    "Paused before Claude launch: the approved team account could not be verified. Work is preserved. Restore team login, then release this hold.").await;
+                return Err(e);
+            }
             // Transient Claude Code failures (exit 1 with a "success" detail)
             // should be re-queued, not hard-failed. The CLI sometimes exits
             // nonzero on rate-limit echoes or credit pauses while its own
@@ -10523,17 +10535,7 @@ async fn run_claude_code_opts_impl(
         cmd.arg("--max-turns").arg(max_turns.to_string());
     }
 
-    // Inject LLM proxy env vars if configured. In direct OAuth mode, refresh
-    // AutoSam's isolated Claude credentials before every spawn so stale copied
-    // credentials cannot silently 401 the worker.
     let proxy = load_llm_proxy();
-    if proxy.is_none() {
-        match super::claude_code::sync_claude_oauth_credentials_if_needed_async(false).await {
-            Ok(true) => log::info!("[worker] refreshed Claude OAuth credentials before one-shot spawn"),
-            Ok(false) => {}
-            Err(e) => log::warn!("[worker] could not refresh Claude OAuth credentials: {}", e),
-        }
-    }
     super::claude_code::inject_proxy_env_async(&mut cmd, &proxy);
 
     // Resolve cwd. Callers pass "." for "no particular repo" chat calls, but
@@ -10545,6 +10547,8 @@ async fn run_claude_code_opts_impl(
     cmd.current_dir(&resolved_cwd)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+
+    super::claude_code::prepare_team_claude_async(&mut cmd).await?;
 
     let mut child = cmd
         .spawn()
@@ -10802,23 +10806,15 @@ async fn run_claude_code_streaming_impl(
         cmd.arg("--max-turns").arg(max_turns.to_string());
     }
 
-    // Inject LLM proxy env vars if configured. In direct OAuth mode, refresh
-    // AutoSam's isolated Claude credentials before every spawn so stale copied
-    // credentials cannot silently 401 the worker.
     let proxy = load_llm_proxy();
-    if proxy.is_none() {
-        match super::claude_code::sync_claude_oauth_credentials_if_needed_async(false).await {
-            Ok(true) => log::info!("[worker] refreshed Claude OAuth credentials before streaming spawn"),
-            Ok(false) => {}
-            Err(e) => log::warn!("[worker] could not refresh Claude OAuth credentials: {}", e),
-        }
-    }
     super::claude_code::inject_proxy_env_async(&mut cmd, &proxy);
 
     let resolved_cwd = resolve_chat_cwd(cwd);
     cmd.current_dir(&resolved_cwd)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+
+    super::claude_code::prepare_team_claude_async(&mut cmd).await?;
 
     let mut child = cmd
         .spawn()

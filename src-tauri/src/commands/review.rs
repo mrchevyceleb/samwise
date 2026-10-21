@@ -1001,7 +1001,7 @@ async fn run_opus_review(
     // exact list this needs (DIRECT_OAUTH_ENV_BLOCKERS, used the same way by
     // worker.rs's own direct-Claude spawns), so reuse it instead of hand-
     // maintaining a second, narrower copy here.
-    super::claude_code::strip_direct_oauth_blockers_async(&mut cmd);
+    super::claude_code::prepare_team_claude_async(&mut cmd).await?;
 
     let mut child = cmd.spawn().map_err(|e| format!("spawn claude: {}", e))?;
     // Drain stdout/stderr concurrently with the wait, same pattern as
