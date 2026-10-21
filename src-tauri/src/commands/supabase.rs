@@ -583,6 +583,20 @@ pub async fn update_task_if_status_not_held(
     .await
 }
 
+/// Terminal PR reconciliation must not overwrite a requeue, new PR, manual
+/// edit or hold that happened while GitHub evidence was being read.
+pub async fn update_task_if_snapshot_not_held(
+    config: &SupabaseConfig,
+    task: &Value,
+    updates: &Value,
+) -> Result<Value, String> {
+    let field = |name: &str| task[name].as_str().map(urlencoding::encode)
+        .map(|s| s.into_owned()).ok_or_else(|| format!("Missing task {}", name));
+    let url = format!("{}?id=eq.{}&status=eq.{}&pr_url=eq.{}&updated_at=eq.{}&on_hold=eq.false",
+        rest_url(config, "ae_tasks"), field("id")?, field("status")?, field("pr_url")?, field("updated_at")?);
+    handle_response(build_client(config)?.patch(url).json(updates).send().await.map_err(|e| e.to_string())?).await
+}
+
 pub async fn claim_task(
     config: &SupabaseConfig,
     task_id: &str,

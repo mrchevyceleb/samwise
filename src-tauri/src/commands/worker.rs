@@ -19385,8 +19385,23 @@ fn external_staging_task(task: &Value) -> bool {
 
 fn external_merge_monitor_candidate(task: &Value) -> bool {
     external_staging_task(task) && !task_is_on_hold(task)
-        && matches!(task["status"].as_str(), Some("approved" | "review" | "fixes_needed"))
+        && (matches!(task["status"].as_str(), Some("approved" | "review" | "fixes_needed"))
+            || closed_pr_failure(task))
         && pr_review_context_status(task) != Some("running")
+}
+
+fn closed_pr_failure(task: &Value) -> bool {
+    task["status"] == "failed" && task["context"]["closure_checked_at"].is_null()
+        && (task["context"]["external_merge_status"] == "closed"
+        || task["failure_reason"].as_str().map(|reason|
+            reason.starts_with("PR was closed without merging") || reason == "PR closed without merging") == Some(true))
+}
+
+async fn mark_closure_checked(config: &SupabaseConfig, task: &Value) {
+    let mut context = task_context_object(task);
+    context.insert("closure_checked_at".into(), serde_json::json!(chrono::Utc::now().to_rfc3339()));
+    let _ = supabase::update_task_if_snapshot_not_held(config, task,
+        &serde_json::json!({"context":context,"updated_at":chrono::Utc::now().to_rfc3339()})).await;
 }
 
 fn external_merge_candidate(task: &Value) -> bool {
@@ -19430,6 +19445,15 @@ async fn advance_external_card(config: &SupabaseConfig, id: &str) {
     let Ok(Some(task)) = supabase::fetch_task(&config, &id).await else { return };
     if !external_merge_monitor_candidate(&task) { return; }
     let pr = task["pr_url"].as_str().unwrap_or("");
+    if closed_pr_failure(&task) {
+        // Recovery only classifies closures. It must never merge, deploy or
+        // repeatedly poll a historically failed PR that was later reopened.
+        match review::external_unmerged_closed(pr).await {
+            Ok(true) => {},
+            Ok(false) => { mark_closure_checked(config, &task).await; return; },
+            Err(error) => { log::warn!("[pr-close] task {}: {}", id, error); return; },
+        }
+    }
     let head = if external_merge_candidate(&task) { task["context"]["github_approval_head"].as_str().unwrap_or("") } else { "" };
     let result = review::advance_external_merge(pr, task["repo_path"].as_str().unwrap_or(""),
         head, task["context"]["github_approval_id"].as_i64().unwrap_or(0), || async {
@@ -19443,7 +19467,21 @@ async fn advance_external_card(config: &SupabaseConfig, id: &str) {
     if !external_merge_monitor_candidate(&latest) || latest["pr_url"] != pr { return; }
     let closing = matches!(result, Ok(review::ExternalMergeProgress::Staged | review::ExternalMergeProgress::Closed));
     if !closing && (!external_merge_candidate(&latest) || latest["context"]["github_approval_head"] != head) { return; }
+    let superseded = if matches!(result, Ok(review::ExternalMergeProgress::Closed)) {
+        match review::external_superseding_pr(pr).await {
+            Ok(successor) => successor,
+            Err(error) => { log::warn!("[external-merge] task {}: {}", id, error); return; }
+        }
+    } else { None };
     let mut context = task_context_object(&latest);
+    if matches!(result, Ok(review::ExternalMergeProgress::Closed)) {
+        context.insert("closure_checked_at".into(), serde_json::json!(chrono::Utc::now().to_rfc3339()));
+        if latest["status"] == "failed" && superseded.is_none() {
+            let _ = supabase::update_task_if_snapshot_not_held(config, &latest,
+                &serde_json::json!({"context":context,"updated_at":chrono::Utc::now().to_rfc3339()})).await;
+            return;
+        }
+    }
     let (status, state, note) = match result {
         Ok(review::ExternalMergeProgress::ReviewAgain) => {
             context.remove("github_approval_id");
@@ -19454,8 +19492,12 @@ async fn advance_external_card(config: &SupabaseConfig, id: &str) {
             context.remove(PR_REVIEW_ERROR_KEY);
             ("review", "review_again", "PR head changed or was updated from main. Fresh review and approval required before merge.".to_string())
         }
-        Ok(review::ExternalMergeProgress::Closed) =>
-            ("failed", "closed", "PR was closed without merging; no deployment requested.".into()),
+        Ok(review::ExternalMergeProgress::Closed) => if let Some(successor) = &superseded {
+            context.insert("superseded_by".into(), successor.receipt());
+            ("done", "superseded", successor.note())
+        } else {
+            ("failed", "closed", "PR was closed without merging and no verified successor was found; no deployment requested.".into())
+        },
         Ok(review::ExternalMergeProgress::Staged) =>
             ("done", "staged", "PR is merged and its exact merge commit passed the staging workflow. No production deployment requested.".into()),
         Ok(review::ExternalMergeProgress::Merged) =>
@@ -19475,12 +19517,17 @@ async fn advance_external_card(config: &SupabaseConfig, id: &str) {
         "updated_at": chrono::Utc::now().to_rfc3339(),
         "worker_id": Value::Null, "claimed_at": Value::Null,
     });
+    if closing { patch["failure_reason"] = if status == "failed" { serde_json::json!(note) } else { Value::Null }; }
     if status == "review" { patch["last_pr_review_at"] = Value::Null; }
-    let updated = supabase::update_task_if_status_not_held(&config, &id, latest["status"].as_str().unwrap_or("approved"), &patch)
+    let updated = supabase::update_task_if_snapshot_not_held(&config, &latest, &patch)
         .await.ok().and_then(|v| v.as_array().map(|a| !a.is_empty())).unwrap_or(false);
     if updated {
         agent_comment(&config, &id, &note).await;
-        if status == "done" { notify_callback(&config, &id, "done", Some(pr), None); }
+        if status == "done" {
+            let outcome_pr = superseded.as_ref().map(|successor| successor.url.as_str()).unwrap_or(pr);
+            notify_callback(&config, &id, "done", Some(outcome_pr), None);
+        }
+        if status == "failed" { notify_callback(&config, &id, "failed", Some(pr), Some(&note)); }
     }
 }
 
@@ -19522,7 +19569,7 @@ pub async fn sweep_pr_merged_cards(config: &SupabaseConfig) {
                 continue;
             }
         }
-        let waiting_for_closeout = matches!(status, "approved" | "review" | "fixes_needed");
+        let waiting_for_closeout = matches!(status, "approved" | "review" | "fixes_needed") || closed_pr_failure(task);
         if !waiting_for_closeout && !stale_in_progress_pr_card_for_reconcile(task) {
             continue;
         }
@@ -19556,6 +19603,11 @@ pub async fn sweep_pr_merged_cards(config: &SupabaseConfig) {
             .get("mergedAt")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+
+        if status == "failed" && (gh_state != "CLOSED" || !merged_at.is_empty()) {
+            mark_closure_checked(config, task).await;
+            continue;
+        }
 
         if gh_state == "MERGED" || !merged_at.is_empty() {
             let md_status = task
@@ -19613,32 +19665,44 @@ pub async fn sweep_pr_merged_cards(config: &SupabaseConfig) {
         }
 
         if gh_state == "CLOSED" {
-            // PR was closed without merging. This is NOT done — the code
-            // never landed on main. Route to failed so Matt can triage
-            // instead of silently marking it complete.
-            let _ = supabase::update_task(
-                config,
-                task_id,
-                &terminal_task_patch(serde_json::json!({
-                    "status": "failed",
-                    "failure_reason": "PR was closed without merging. The code never landed on main.",
-                    "updated_at": chrono::Utc::now().to_rfc3339(),
-                })),
-            )
-            .await;
-            notify_callback(
-                config,
-                task_id,
-                "failed",
-                Some(pr_url),
-                Some("PR closed without merging"),
-            );
-            agent_comment(
-                config,
-                task_id,
-                "PR was closed without merging. The code never landed on main. Moving to Failed so this doesn't silently disappear.",
-            )
-            .await;
+            let successor = match super::pr_closure::superseding_pr(pr_url).await {
+                Ok(successor) => successor,
+                Err(error) => { log::warn!("[pr-close] task {}: {}", task_id, error); continue; }
+            };
+            let mut context = task_context_object(task);
+            context.insert("closure_checked_at".into(), serde_json::json!(chrono::Utc::now().to_rfc3339()));
+            if status == "failed" && successor.is_none() {
+                let _ = supabase::update_task_if_snapshot_not_held(config, task,
+                    &serde_json::json!({"context":context,"updated_at":chrono::Utc::now().to_rfc3339()})).await;
+                continue;
+            }
+            let (next_status, note) = if let Some(successor) = &successor {
+                context.insert("superseded_by".into(), successor.receipt());
+                context.remove(MERGE_DEPLOY_STATUS_KEY);
+                context.insert(REVIEW_MERGE_STATUS_KEY.into(), serde_json::json!("superseded"));
+                ("done", successor.note())
+            } else {
+                ("failed", "PR was closed without merging and no verified successor was found. Moving to Failed so this doesn't silently disappear.".into())
+            };
+            let patch = terminal_task_patch(serde_json::json!({
+                "status": next_status, "context": context,
+                "failure_reason": if successor.is_some() { Value::Null } else { serde_json::json!(note) },
+                "completed_at": if successor.is_some() { serde_json::json!(chrono::Utc::now().to_rfc3339()) } else { Value::Null },
+                "updated_at": chrono::Utc::now().to_rfc3339(),
+                "worker_id": Value::Null, "claimed_at": Value::Null,
+            }));
+            let changed = supabase::update_task_if_snapshot_not_held(config, task, &patch).await
+                .ok().and_then(|v| v.as_array().map(|rows| !rows.is_empty())).unwrap_or(false);
+            if changed {
+                // A superseded close sends a normal done callback with the
+                // successor URL. It never sends the old blocker-style failure.
+                if let Some(successor) = &successor {
+                    notify_callback(config, task_id, "done", Some(&successor.url), None);
+                } else {
+                    notify_callback(config, task_id, "failed", Some(pr_url), Some(&note));
+                }
+                agent_comment(config, task_id, &note).await;
+            }
             continue;
         }
         // OPEN / anything else: leave alone.

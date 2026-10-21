@@ -6,6 +6,7 @@ pub mod files;
 pub mod git;
 pub mod health;
 pub mod hello;
+pub mod pr_closure;
 pub mod review;
 pub mod settings;
 pub mod supabase;

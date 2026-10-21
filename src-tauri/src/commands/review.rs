@@ -1411,6 +1411,18 @@ async fn external_reviewer_token() -> Result<String, String> {
     Ok(token)
 }
 
+pub async fn external_unmerged_closed(pr_url: &str) -> Result<bool, String> {
+    let token = external_reviewer_token().await?;
+    super::pr_closure::is_unmerged_closed_with_token(pr_url, &token).await
+}
+
+pub async fn external_superseding_pr(
+    pr_url: &str,
+) -> Result<Option<super::pr_closure::SupersedingPr>, String> {
+    let token = external_reviewer_token().await?;
+    super::pr_closure::superseding_pr_with_token(pr_url, &token).await
+}
+
 /// Submit a real approval against the head that was reviewed, never a newly
 /// pushed head. Use Matt's saved gh account, isolated to these child processes.
 /// An inherited author/bot GH_TOKEN must not silently select the reviewer.
