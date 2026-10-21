@@ -335,7 +335,7 @@ fn is_claude_auth_override(name: &str) -> bool {
 
 const TEAM_CLAUDE_NETWORK_ENV: &[&str] = &[
     "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy",
-    "NODE_EXTRA_CA_CERTS", "NODE_TLS_REJECT_UNAUTHORIZED", "NODE_OPTIONS",
+    "NODE_EXTRA_CA_CERTS", "NODE_TLS_REJECT_UNAUTHORIZED",
     "SSL_CERT_FILE", "SSL_CERT_DIR", "CLAUDE_CODE_CLIENT_CERT", "CLAUDE_CODE_CLIENT_KEY",
     "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE", "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
     "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
@@ -364,6 +364,9 @@ fn team_claude_settings(command: &mut std::process::Command, profile: &std::path
         "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_SIMPLE",
     ] { env.insert(key.to_string(), serde_json::json!("")); }
     for key in TEAM_CLAUDE_NETWORK_ENV { env.insert((*key).to_string(), serde_json::json!("")); }
+    // Keep the worker's build/runtime options, while file settings cannot
+    // inject a Node preload or replace its memory allowance.
+    env.insert("NODE_OPTIONS".into(), serde_json::json!(std::env::var("NODE_OPTIONS").unwrap_or_default()));
     env.insert("NODE_TLS_REJECT_UNAUTHORIZED".into(), serde_json::json!("1"));
     // Empty OpenSSL paths suppress its system trust store in Bash children.
     // Pin Moria's normal OpenSSL defaults while refusing repo CA replacement.
@@ -374,7 +377,8 @@ fn team_claude_settings(command: &mut std::process::Command, profile: &std::path
         .arg(serde_json::json!({
             "env": env, "apiKeyHelper": "", "awsAuthRefresh": "",
             "awsCredentialExport": "", "forceLoginMethod": "claudeai",
-            "disableAllHooks": true, "enableAllProjectMcpServers": false,
+            // Keep Matt's team-profile guards even when a repo disables hooks.
+            "disableAllHooks": false, "enableAllProjectMcpServers": false,
             "otelHeadersHelper": "", "statusLine": { "type": "command", "command": "" },
         }).to_string());
 }
