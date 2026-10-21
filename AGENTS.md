@@ -31,6 +31,7 @@ Dispatch lives in `src-tauri/src/commands/coder.rs`. `run_claude_code_streaming`
 - LiteLLM env is scrubbed from pi spawns (`strip_direct_oauth_blockers_async`) — pi's own `anthropic` provider reads `ANTHROPIC_API_KEY` and would otherwise route back through the proxy.
 - `AUTOSAM_PI_PROVIDER` / `AUTOSAM_PI_MODEL` / `AUTOSAM_PI_THINKING` tune it; `AUTOSAM_PI_NO_EXTENSIONS=1` disables pi extension loading.
 - The Claude coder and independent Opus reviewer always use the approved team subscription. A saved proxy setting cannot change that account.
+- Direct pi `anthropic` authentication is refused because its stored login is outside the team guard. Subscription work uses the guarded Claude coder. Shell `claude` calls use the managed shim described in `docs/team-claude-account.md`.
 
 **Claude account:** On Moria every launch pins `/home/mrchevyceleb/.claude-tardis`, verifies the approved subscription identity, and refuses missing or invalid authentication. AutoSam never copies credentials from `~/.claude` or the retired `~/.config/autosam/claude-config` directory. See `docs/team-claude-account.md` for deployment and refusal checks. Do not restore the old credential-copying binary as a rollback.
 
@@ -77,7 +78,7 @@ npm run check          # Svelte type check
 - **Always rebuild AND deploy after pushing changes.** A build alone is NOT enough — the running production process must be replaced, or the binary stays stale while the source moves on.
   - **Spark "Moria" (primary, Linux) — current reality:** prod runs as `/usr/bin/agent-one` (native Linux binary, built to `src-tauri/target/release/agent-one`), managed by the systemd user service `samwise-agent-one.service`. Deployment:
     1. **Build:** `npx tauri build --no-bundle` from the project root (`--no-bundle` skips the slow .deb/.rpm/AppImage step; assets still embed). This runs `beforeBuildCommand` (npm run build) and properly embeds frontend assets via Tauri's protocol handler. **Do NOT use `cargo build --release` alone** — it skips the asset-embedding step, so the binary has NO frontend and the WebView falls back to `devUrl` (`http://localhost:5890`), showing a blank "Could not connect to localhost: Connection refused" page. The binary is written to `src-tauri/target/release/agent-one`.
-    2. **Deploy:**
+    2. **Deploy:** For the team-account guard rollout, follow `docs/team-claude-account.md`: install the managed shell shim and systemd drop-in as well as the binary, verify the team login, and keep refusal exit 78 from restarting. Max approves activation and Sam owns the queue gap/restart. The historical binary-only steps below are insufficient for that rollout.
        ```bash
        systemctl --user stop samwise-agent-one.service
        sudo cp src-tauri/target/release/agent-one /usr/bin/agent-one

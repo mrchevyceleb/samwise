@@ -2831,6 +2831,12 @@ async fn worker_loop(
                                                         )).await;
                                                     }
                                                 }
+                                                Err(err) if super::claude_code::is_team_auth_blocked(err) => {
+                                                    emit_worker_event(&app_spawn, "task_paused",
+                                                        "Team Claude login needs attention. Work is saved and on hold.", Some(&task_id_spawn));
+                                                    agent_chat(&config_spawn, &format!(
+                                                        "Paused \"{}\": the team Claude login needs attention. Your work is saved and on hold.", task_title_spawn)).await;
+                                                }
                                                 Err(err) => {
                                                     emit_worker_event(
                                                         &app_spawn,
@@ -4519,6 +4525,18 @@ RULES (trusted):
 // ── Task Execution ──────────────────────────────────────────────────
 
 async fn execute_task(
+    app: &tauri::AppHandle,
+    worker_id: &str,
+    config: &supabase::SupabaseConfig,
+    task: Value,
+    process_id_slot: Arc<tokio::sync::Mutex<Option<u32>>>,
+) -> Result<String, String> {
+    let id = task.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    super::claude_code::with_team_auth_task(config, &id,
+        execute_task_inner(app, worker_id, config, task, process_id_slot)).await
+}
+
+async fn execute_task_inner(
     app: &tauri::AppHandle,
     worker_id: &str,
     config: &SupabaseConfig,
@@ -6508,6 +6526,12 @@ from Matt, stop without making changes and explain specifically what you need cl
             }
 
             // 8. Create PR targeting the branch we stacked on (not always main/master).
+            if let Err(error) = super::claude_code::team_auth_task_status() {
+                if let Some(h) = dev_server_handle.take() {
+                    let _ = dev_server::kill_dev_server(h).await;
+                }
+                return Err(error);
+            }
             let pr_result = create_pr(
                 config,
                 &repo_path,
@@ -6777,19 +6801,8 @@ from Matt, stop without making changes and explain specifically what you need cl
                 }
             }
         }
+        Err(e) if super::claude_code::is_team_auth_blocked(&e) => Err(e),
         Err(e) => {
-            if super::claude_code::is_team_auth_blocked(&e) {
-                // Preserve the task and worktree without a model fallback or a
-                // tight requeue loop. The owner can release this hold after login.
-                supabase::update_task(config, &task_id, &serde_json::json!({
-                    "status": "queued", "on_hold": true,
-                    "worker_id": Value::Null, "claimed_at": Value::Null,
-                    "updated_at": chrono::Utc::now().to_rfc3339(),
-                })).await.map_err(|_| "Team auth blocked; could not place task on hold".to_string())?;
-                agent_comment(config, &task_id,
-                    "Paused before Claude launch: the approved team account could not be verified. Work is preserved. Restore team login, then release this hold.").await;
-                return Err(e);
-            }
             // Transient Claude Code failures (exit 1 with a "success" detail)
             // should be re-queued, not hard-failed. The CLI sometimes exits
             // nonzero on rate-limit echoes or credit pauses while its own
@@ -10737,6 +10750,7 @@ pub async fn run_claude_code_streaming(
     process_id_slot: Arc<tokio::sync::Mutex<Option<u32>>>,
     model_override: Option<&str>,
 ) -> Result<String, String> {
+    super::claude_code::with_team_auth_task(config, task_id, async {
     match super::coder::active_backend() {
         super::coder::CoderBackend::Pi => {
             run_pi_streaming_impl(
@@ -10765,6 +10779,7 @@ pub async fn run_claude_code_streaming(
             .await
         }
     }
+    }).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11310,6 +11325,7 @@ async fn run_pi_streaming_impl(
 
     let (exe, prefix_args) = super::coder::find_pi_command();
     let pi_cfg = super::coder::PiConfig::resolve(model_override);
+    super::claude_code::guard_pi_provider(&pi_cfg.provider).await?;
     log::info!(
         "[worker] pi harness: {} {} (provider={} model={} thinking={})",
         exe,
@@ -11648,6 +11664,7 @@ async fn run_pi_opts_impl(
 ) -> Result<String, String> {
     let (exe, prefix_args) = super::coder::find_pi_command();
     let pi_cfg = super::coder::PiConfig::resolve(None);
+    super::claude_code::guard_pi_provider(&pi_cfg.provider).await?;
 
     let mut cmd = async_cmd(&exe);
     for arg in &prefix_args {

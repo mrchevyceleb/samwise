@@ -231,13 +231,79 @@ pub fn find_claude_command() -> (String, Vec<String>) {
     }
     // Last resort: resolve via PATH.
     if let Ok(path) = which::which("claude") {
-        return (path.to_string_lossy().into_owned(), vec![]);
+        // The managed shell shim calls us. Never resolve back to it when the
+        // real CLI disappears, or an auth probe would recursively spawn itself.
+        if path != std::path::Path::new("/home/mrchevyceleb/.local/lib/autosam/bin/claude") {
+            return (path.to_string_lossy().into_owned(), vec![]);
+        }
     }
-    ("claude".to_string(), vec![])
+    ("/home/mrchevyceleb/.local/bin/claude".to_string(), vec![])
 }
 
 /// AutoSam never reads or copies the personal Claude profile. An inherited
 /// override cannot redirect either the auth probe or the actual child.
+tokio::task_local! {
+    static AUTH_TASK: AuthTask;
+}
+
+struct AuthTask {
+    config: super::supabase::SupabaseConfig,
+    id: String,
+    failure: std::sync::Mutex<Option<String>>,
+}
+
+pub fn team_auth_task_status() -> Result<(), String> {
+    match AUTH_TASK.try_with(|task| task.failure.lock().unwrap_or_else(|p| p.into_inner()).clone()).ok().flatten() {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// Secondary calls can be handled by their caller without losing this failure.
+/// The task stays held even if a summary/repair caller uses a fallback result.
+async fn note_team_auth_failure(error: &str) {
+    let context = AUTH_TASK.try_with(|task| {
+        let mut failure = task.failure.lock().unwrap_or_else(|p| p.into_inner());
+        if failure.is_some() { return None; }
+        *failure = Some(error.to_string());
+        Some((task.config.clone(), task.id.clone()))
+    }).ok().flatten();
+    if let Some((config, id)) = context {
+        if super::supabase::update_task(&config, &id, &serde_json::json!({
+            "on_hold": true, "updated_at": chrono::Utc::now().to_rfc3339(),
+        })).await.is_err() {
+            log::error!("[worker] could not save team-auth hold for task {}", id);
+        }
+    }
+}
+
+pub async fn with_team_auth_task<T, F>(config: &super::supabase::SupabaseConfig, id: &str, future: F) -> Result<T, String>
+where F: std::future::Future<Output = Result<T, String>> {
+    if AUTH_TASK.try_with(|task| task.id == id).unwrap_or(false) { return future.await; }
+    AUTH_TASK.scope(AuthTask { config: config.clone(), id: id.to_string(), failure: std::sync::Mutex::new(None) }, async {
+        let result = future.await;
+        let failure = AUTH_TASK.with(|task| task.failure.lock().unwrap_or_else(|p| p.into_inner()).clone());
+        if let Some(error) = failure {
+            super::supabase::update_task(config, id, &serde_json::json!({
+                "status": "queued", "on_hold": true,
+                "worker_id": serde_json::Value::Null, "claimed_at": serde_json::Value::Null,
+                "updated_at": chrono::Utc::now().to_rfc3339(),
+            })).await.map_err(|_| team_auth_error("Work is preserved, but saving its account hold needs attention"))?;
+            return Err(error);
+        }
+        result
+    }).await
+}
+
+pub async fn guard_pi_provider(provider: &str) -> Result<(), String> {
+    if provider.eq_ignore_ascii_case("anthropic") {
+        let error = team_auth_error("Direct pi Anthropic login is disabled; use the guarded Claude coder");
+        note_team_auth_failure(&error).await;
+        return Err(error);
+    }
+    Ok(())
+}
+
 const TEAM_AUTH_BLOCKED: &str = "TEAM_AUTH_BLOCKED";
 const TEAM_ACCOUNT_SHA256: &str = "a0c253a7ea9f80b2e4ba9cd2131e690d5de903a6661ef5bf84da3b27e3dc8723";
 static TEAM_AUTH_CHECK: Mutex<()> = Mutex::new(());
@@ -323,6 +389,8 @@ pub fn initialize_team_claude_account() -> Result<(), String> {
         if is_claude_auth_override(&key.to_string_lossy()) { std::env::remove_var(key); }
     }
     std::env::set_var("CLAUDE_CONFIG_DIR", profile);
+    let current_path = std::env::var("PATH").unwrap_or_default();
+    std::env::set_var("PATH", format!("/home/mrchevyceleb/.local/lib/autosam/bin:{}", current_path));
     Ok(())
 }
 
@@ -334,12 +402,51 @@ pub fn prepare_team_claude(command: &mut std::process::Command) -> Result<(), St
 }
 
 pub async fn prepare_team_claude_async(command: &mut tokio::process::Command) -> Result<(), String> {
+    team_auth_task_status()?;
     let cwd = command.as_std().get_current_dir().map(PathBuf::from);
-    let profile = tokio::task::spawn_blocking(move || checked_team_claude_profile(cwd)).await
-        .map_err(|_| team_auth_error("Team auth check failed"))??;
+    let checked = tokio::task::spawn_blocking(move || checked_team_claude_profile(cwd)).await
+        .map_err(|_| team_auth_error("Team auth check failed")).and_then(|result| result);
+    let profile = match checked {
+        Ok(profile) => profile,
+        Err(error) => { note_team_auth_failure(&error).await; return Err(error); }
+    };
     team_claude_env(command.as_std_mut(), &profile);
     command.args(["--setting-sources", ""]);
     Ok(())
+}
+
+pub fn team_shell_guard_ready() -> Result<(), String> {
+    let path = std::path::Path::new("/home/mrchevyceleb/.local/lib/autosam/bin/claude");
+    let valid = std::fs::symlink_metadata(path).map(|m| {
+        #[cfg(unix)]
+        { use std::os::unix::fs::PermissionsExt; m.is_file() && m.permissions().mode() & 0o111 != 0 }
+        #[cfg(not(unix))]
+        { m.is_file() }
+    }).unwrap_or(false);
+    if !valid || std::fs::read_to_string(path).ok().as_deref() != Some(include_str!("../../../ops/bin/claude")) {
+        return Err(team_auth_error("Team Claude shell launcher is missing or changed"));
+    }
+    Ok(())
+}
+
+/// Entry point used by the shell shim. It cannot load project auth overrides.
+pub fn run_team_claude_shell(args: Vec<std::ffi::OsString>) -> ! {
+    if args.iter().filter_map(|a| a.to_str()).any(|a| matches!(a.split('=').next(), Some("--settings" | "--setting-sources"))) {
+        eprintln!("{}", team_auth_error("Shell arguments cannot override account settings"));
+        std::process::exit(78);
+    }
+    let (exe, prefix) = find_claude_command();
+    let mut command = cmd(&exe);
+    command.args(prefix).args(args);
+    if let Err(error) = prepare_team_claude(&mut command) {
+        eprintln!("{}", error); std::process::exit(78);
+    }
+    #[cfg(unix)]
+    { use std::os::unix::process::CommandExt; let _ = command.exec(); }
+    #[cfg(not(unix))]
+    if let Ok(status) = command.status() { std::process::exit(status.code().unwrap_or(1)); }
+    eprintln!("{}", team_auth_error("Cannot launch the verified team Claude CLI"));
+    std::process::exit(78);
 }
 
 // ── Commands ─────────────────────────────────────────────────────────

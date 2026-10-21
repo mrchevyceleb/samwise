@@ -970,7 +970,9 @@ async fn run_opus_review(
     // --strict-mcp-config with no --mcp-config loads zero MCP servers, so
     // this is a pure text-in/JSON-out pass, same as Codex's read-only
     // sandbox + never-approve policy did.
-    let mut cmd = async_cmd("claude");
+    let (claude_exe, claude_prefix) = super::claude_code::find_claude_command();
+    let mut cmd = async_cmd(&claude_exe);
+    cmd.args(claude_prefix);
     cmd.args([
         "-p",
         "--model",
