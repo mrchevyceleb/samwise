@@ -10599,6 +10599,32 @@ pub async fn run_claude_code_streaming(
     }).await
 }
 
+async fn write_review_prompt(child: &mut tokio::process::Child, prompt: &str) -> Result<(), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(error) = stdin.write_all(prompt.as_bytes()).await {
+            drop(stdin);
+            // Startup refusals can close stdin before we write. Keep their real
+            // reason, and bound cleanup if a process closed input but stayed alive.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
+            let _ = child.start_kill();
+            let mut stderr = Vec::new();
+            if let Some(reader) = child.stderr.take() {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2),
+                    reader.take(4096).read_to_end(&mut stderr)).await;
+            }
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
+            let detail = String::from_utf8_lossy(&stderr);
+            return Err(if detail.trim().is_empty() {
+                format!("Review process stopped before accepting the request: {}", error)
+            } else {
+                format!("Review process could not start: {}", detail.trim())
+            });
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_claude_code_streaming_impl(
     cwd: &str,
@@ -10623,7 +10649,7 @@ async fn run_claude_code_streaming_impl(
     // agent skips its own post-task review pass; the worker runs the one review.
     cmd.env("AUTOSAM_REVIEW_BY_WORKER", "1");
     if model_override == Some(safety::REVIEW_MODEL) {
-        // Restricted review has no tools and rejects bypass-permissions flags.
+        // Restricted review rejects bypass-permissions flags.
         cmd.arg("--restricted").arg("--strict-mcp-config");
     } else {
         cmd.arg("--dangerously-skip-permissions");
@@ -10661,10 +10687,7 @@ async fn run_claude_code_streaming_impl(
         .map_err(|e| format!("Failed to run Claude Code: {}", e))?;
 
     if model_override == Some(safety::REVIEW_MODEL) {
-        if let Some(mut stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            stdin.write_all(prompt.as_bytes()).await.map_err(|e| format!("Review input failed: {}", e))?;
-        }
+        write_review_prompt(&mut child, prompt).await?;
     }
 
     // Store PID so the process can be killed externally via stop_current_task
