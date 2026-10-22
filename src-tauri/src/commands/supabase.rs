@@ -597,6 +597,21 @@ pub async fn update_task_if_snapshot_not_held(
     handle_response(build_client(config)?.patch(url).json(updates).send().await.map_err(|e| e.to_string())?).await
 }
 
+/// Patch exactly the row observed by the caller. Recovery must never overwrite
+/// a concurrent completion, cancellation, claim or checkpoint.
+pub async fn update_task_if_snapshot(config: &SupabaseConfig, task: &Value, updates: &Value) -> Result<Value, String> {
+    let mut url = format!("{}?", rest_url(config, "ae_tasks"));
+    for field in ["id", "status", "updated_at", "worker_id", "claimed_at"] {
+        let filter = match task.get(field).and_then(Value::as_str) {
+            Some(value) => format!("eq.{}", urlencoding::encode(value)),
+            None if matches!(field, "worker_id" | "claimed_at") => "is.null".to_string(),
+            None => return Err(format!("Missing task snapshot {}", field)),
+        };
+        url.push_str(&format!("{}={}&", field, filter));
+    }
+    handle_response(build_client(config)?.patch(url).json(updates).send().await.map_err(|e| e.to_string())?).await
+}
+
 pub async fn claim_task(
     config: &SupabaseConfig,
     task_id: &str,
