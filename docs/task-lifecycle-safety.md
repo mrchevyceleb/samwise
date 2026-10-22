@@ -16,7 +16,7 @@ The independent reviewer is pinned to Opus5.5 at medium effort. A timeout, proce
 
 Max approved a brief admission drain, not a rolling worker replacement. Samwise coordinates the queue.
 
-1. Use Automation > Stop Worker in the running desktop. This stops new claims while existing task runners finish. Do not use Stop Task, quit the app or stop its service while runners remain. Keep the window open to avoid frontend autostart. Check active database rows, process children and the desktop pool; do not infer a drain from an old heartbeat.
+1. Stop admissions with the existing native `worker_stop` command in the running desktop (the current Settings UI does not expose the worker Stop control). This stops new claims while existing task runners finish. Do not use Stop Task, quit the app or stop its service while runners remain. Keep the window open to avoid frontend autostart. Check active database rows, process children and the desktop pool; do not infer a drain from an old heartbeat.
 2. When there are zero live task runners, stop samwise-agent-one.service. Keep the approved team-account shim and systemd drop-in. Never restore an older unguarded binary.
 3. Apply supabase/migrations/20261022093000_preserve_task_lifecycle.sql to the existing AutoSam project (meqtadfevxguishrlxyx). Verify the guard trigger precedes the live inbound normalizer. No data rows are reset or requeued.
 4. Install this exact full Tauri release binary. Check embedded frontend assets and --check-claude-account before starting. Preserve refusal exit78, hooks, global/project/local rules, Node options and normal TLS.

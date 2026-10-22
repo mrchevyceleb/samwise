@@ -11,7 +11,18 @@ declare
     or (new.source = 'slack' and new.title like 'Review PR%'), false);
 begin
   -- Compact snapshot guards also catch manual edits that omit updated_at.
-  if tg_op = 'UPDATE' then new.updated_at := clock_timestamp(); end if;
+  if tg_op = 'UPDATE' then
+    new.updated_at := clock_timestamp();
+    -- Re-entering Review requests a fresh review. Metadata/heartbeat writes
+    -- remain snapshot-safe without changing the separate review retry clock.
+    if new.status = 'review' and old.status <> 'review' then new.last_pr_review_at := null; end if;
+    if old.status in ('in_progress','testing') and new.status not in ('in_progress','testing') then
+      new.context := coalesce(new.context,'{}'::jsonb) - 'samwise_continuation_machine';
+      if new.context->>'samwise_auto_fix_status' = 'running' then
+        new.context := jsonb_set(new.context,'{samwise_auto_fix_status}','"stopped"'::jsonb);
+      end if;
+    end if;
+  end if;
   if tg_op = 'UPDATE' and old.status in ('approved', 'done', 'cancelled')
      and new.status in ('queued', 'in_progress', 'testing')
      -- An explicit retry of a cancelled, never-started card has no work to replay.
@@ -65,10 +76,8 @@ begin
          and exists (select 1 from jsonb_array_elements(case when jsonb_typeof(new.subtasks)='array' then new.subtasks else '[]'::jsonb end) s where not coalesce((s->>'done')::boolean,false))
        ), false))
      ) then
-    new.status := 'failed';
-    new.worker_id := null;
-    new.claimed_at := null;
-    new.failure_reason := 'This task already has saved work. Resume that work or start a follow-up on its PR.';
+    -- Reject the attempted transition. Never mutate a healthy review/PR card.
+    raise exception 'This task already has saved work. Resume that work or start a follow-up on its PR.';
   end if;
   return new;
 end;

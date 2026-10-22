@@ -463,6 +463,9 @@ pub async fn requeue_review_without_pr(
         "no_pr_requeued_at".to_string(),
         Value::String(chrono::Utc::now().to_rfc3339()),
     );
+    if context.contains_key("worker_checkpoint") || context.contains_key("recovery_required") {
+        context.insert("resume_saved_work".to_string(), Value::Bool(true));
+    }
     let client = build_client(config)?;
     let url = format!(
         "{}?id=eq.{}&status=eq.review&updated_at=eq.{}&pr_number=is.null&or=(pr_url.is.null,pr_url.eq.)&on_hold=eq.false",
