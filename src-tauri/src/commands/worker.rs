@@ -10621,10 +10621,13 @@ async fn run_claude_code_streaming_impl(
 
     // Same single-review contract as the pi harness (card-febb8d): the spawned
     // agent skips its own post-task review pass; the worker runs the one review.
+    cmd.env("AUTOSAM_REVIEW_BY_WORKER", "1");
     if model_override == Some(safety::REVIEW_MODEL) {
-        cmd.env("AUTOSAM_REVIEW_BY_WORKER", "1");
+        // Restricted review has no tools and rejects bypass-permissions flags.
         cmd.arg("--restricted").arg("--strict-mcp-config");
-    } else { cmd.env("AUTOSAM_REVIEW_BY_WORKER", "1"); }
+    } else {
+        cmd.arg("--dangerously-skip-permissions");
+    }
 
     cmd.arg("-p");
     if model_override == Some(safety::REVIEW_MODEL) {
@@ -10633,7 +10636,6 @@ async fn run_claude_code_streaming_impl(
     cmd.arg("--output-format")
         .arg("stream-json")
         .arg("--verbose")
-        .arg("--dangerously-skip-permissions")
         .arg("--model")
         .arg(model)
         .arg("--effort")
