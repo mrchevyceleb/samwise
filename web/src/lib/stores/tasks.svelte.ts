@@ -168,21 +168,47 @@ class TasksStore {
     if (ok && status === 'done') void this.closeOriginTicket(task);
   }
 
-  /**
-   * Force a stuck card back into `queued` and clear every field a stale
-   * worker claim leaves behind. Mirrors the desktop store's requeueTask;
-   * the worker treats rows with a populated `worker_id` as still claimed,
-   * so a plain status flip can leave the card invisible to the queue.
-   */
+  /** All retry buttons request a continuation and use the server's actual row. */
   async requeueTask(taskId: string) {
     const task = this.tasks.find((t) => t.id === taskId);
     if (!task) return false;
-    return this.updateTask(taskId, {
-      status: 'queued',
-      worker_id: null,
-      claimed_at: null,
-      failure_reason: null,
-    } as Partial<AeTask>);
+    if (task.status === 'in_progress' || task.status === 'testing') {
+      this.error = 'This task is still running. Stop the task before retrying it.';
+      return false;
+    }
+    const context = { ...(task.context ?? {}) };
+    const status = String(task.status);
+    const unstarted = status === 'cancelled'
+      && ![task.pr_url, task.branch, task.claimed_at, task.completed_at].some((v) => !!v?.trim())
+      && !['worker_checkpoint', 'recovery_required', 'start_commit'].some((key) => key in context)
+      && context.push_to_existing_branch !== true
+      && !task.subtasks?.some((step) => step.done);
+    const reviewOnly = task.task_type === 'qa-verify'
+      || context.slack_review_workflow === true || context.full_pr_review_automation === true
+      || context.plant_full_pr_review === true || task.source === 'github-kim-pr-review'
+      || (task.source === 'slack' && task.title.startsWith('Review PR'));
+    const published = !reviewOnly && (!!task.pr_url?.trim() || !!task.completed_at);
+    if (published || status === 'approved' || status === 'done' || (status === 'cancelled' && !unstarted)) {
+      this.error = task.pr_url?.trim()
+        ? 'This task has finished or stopped. Continue with a follow-up on its linked PR; its saved work stays here.'
+        : 'This task has finished or stopped after starting work. Create a follow-up using its saved branch or checkpoint; its work stays here.';
+      return false;
+    }
+    if (context.worker_checkpoint || context.recovery_required || unstarted) {
+      context.resume_saved_work = true;
+    }
+    const { data, error } = await supabase.from('ae_tasks').update({
+      status: 'queued', context, worker_id: null, claimed_at: null, failure_reason: null,
+      updated_at: new Date().toISOString()
+    }).eq('id', taskId).eq('status', task.status).eq('updated_at', task.updated_at)
+      .select('*').maybeSingle();
+    if (error || !data) {
+      this.error = error?.message ?? 'This task changed. Refresh it before trying again.';
+      return false;
+    }
+    this.tasks = this.tasks.map((t) => t.id === taskId ? data as AeTask : t);
+    this.error = data.status === 'queued' ? null : data.failure_reason ?? 'This task needs attention before it can resume.';
+    return data.status === 'queued';
   }
 
   async stopTask(taskId: string) {
@@ -194,20 +220,9 @@ class TasksStore {
     } as Partial<AeTask>);
   }
 
-  /**
-   * Restart a failed task: kick it back to queued and clear the stale claim
-   * so the worker re-picks it up. Semantically the same write as requeueTask
-   * but expressed as a distinct action for the failed-card "Restart" button.
-   */
+  /** Restart and Requeue share the same saved-work continuation. */
   async restartTask(taskId: string) {
-    const task = this.tasks.find((t) => t.id === taskId);
-    if (!task) return false;
-    return this.updateTask(taskId, {
-      status: 'queued',
-      worker_id: null,
-      claimed_at: null,
-      failure_reason: null,
-    } as Partial<AeTask>);
+    return this.requeueTask(taskId);
   }
 
   /**

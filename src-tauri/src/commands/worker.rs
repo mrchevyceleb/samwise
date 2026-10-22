@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tauri::{Emitter, Manager};
 
 use super::dev_server;
+#[path = "worker_safety.rs"]
+mod safety;
 use super::review;
 use super::supabase::{self, SupabaseConfig, SupabaseState};
 use base64::engine::general_purpose::STANDARD;
@@ -157,6 +159,18 @@ fn task_repo_serial_keys(task: &Value) -> Vec<String> {
             }
         }
     }
+    let branch = if task["context"]["push_to_existing_branch"] == true {
+        task["context"]["start_branch"].as_str().map(str::to_owned)
+    } else {
+        task["branch"].as_str().map(str::to_owned).or_else(|| task["id"].as_str().map(|id| format!("sam/{}",short_task_id(id))))
+    };
+    if let Some(branch) = branch {
+        for field in ["repo_url", "repo_path"] {
+            if let Some(repo) = task[field].as_str().and_then(normalize_repo_serial_value) {
+                keys.push(format!("target_branch:{}:{}:{}",field,repo,branch));
+            }
+        }
+    }
     keys
 }
 
@@ -215,28 +229,11 @@ fn pr_review_should_run_now(task: &Value) -> bool {
         30
     };
 
-    let updated_at = task
-        .get("updated_at")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    match pr_review_last_review_at(task) {
+    match pr_review_last_review_at(task).filter(|last| !last.is_empty()) {
         None => true,
-        Some(last) if !last.is_empty() => {
-            match (
-                chrono::DateTime::parse_from_rfc3339(updated_at),
-                chrono::DateTime::parse_from_rfc3339(last),
-            ) {
-                (Ok(updated), Ok(reviewed)) => {
-                    updated > reviewed
-                        || chrono::Utc::now()
-                            .signed_duration_since(reviewed.with_timezone(&chrono::Utc))
-                            > chrono::Duration::minutes(inconclusive_retry_mins)
-                }
-                _ => true,
-            }
-        }
-        _ => true,
+        Some(last) => chrono::DateTime::parse_from_rfc3339(last).map(|reviewed|
+            chrono::Utc::now().signed_duration_since(reviewed.with_timezone(&chrono::Utc))
+                > chrono::Duration::minutes(inconclusive_retry_mins)).unwrap_or(true),
     }
 }
 
@@ -1563,23 +1560,13 @@ async fn create_task_worktree(
                 .await
                 .is_err()
             {
-                // Local branch is gone (e.g. cleaned up after a prior closeout) but the
-                // worktree dir survived. Recreate the branch from the fresh base so the
-                // agent isn't left stranded on a stale/foreign branch (wrong-refspec
-                // pushes otherwise strand the card in review).
-                let origin_ref = format!("origin/{}", base_branch);
-                run_git(
-                    &["checkout", "-b", &task_branch, &origin_ref],
-                    &worktree_str,
-                )
-                .await?;
+                return Err(format!("Saved workspace {} is not on its owned branch {}; preserved for recovery", worktree_str, task_branch));
             }
             let _ = run_git(&["fetch", "origin", "--prune"], &worktree_str).await;
             seed_worktree_env_files(main_repo_path, &worktree_str).await;
             return Ok((worktree_str, base_branch, task_branch));
         }
-        // Directory is there but it isn't a worktree (stale junk). Blow it away.
-        let _ = tokio::fs::remove_dir_all(&worktree_path).await;
+        return Err(format!("Existing directory {} is not a valid worktree; preserved for recovery", worktree_str));
     }
 
     // Create a fresh worktree off origin/<base>. Using `--force` lets us recover from
@@ -2341,16 +2328,27 @@ pub async fn restart_task(
     sb_state: tauri::State<'_, SupabaseState>,
 ) -> Result<(), String> {
     let config = sb_state.get_config().await;
-    let _ = supabase::update_task(
-        &config,
-        &task_id,
-        &serde_json::json!({
-            "status": "queued",
-            "updated_at": chrono::Utc::now().to_rfc3339(),
-        }),
-    )
-    .await;
-    agent_comment(&config, &task_id, "Task restarted. Back in the queue.").await;
+    let task = supabase::fetch_task(&config,&task_id).await?.ok_or("Task not found")?;
+    let unstarted = safety::unstarted_cancelled(&task);
+    if safety::execution_status(&task) || safety::run_is_active(&task_id) {
+        return Err("This task is still running. Stop the task before retrying it.".to_string());
+    }
+    if safety::published_task_requeued(&task) || matches!(task["status"].as_str(),Some("approved"|"done")) || (task["status"] == "cancelled" && !unstarted) {
+        return Err(if task["pr_url"].as_str().is_some_and(|s| !s.is_empty()) {
+            "This task has finished or stopped. Continue with a follow-up on its linked PR; its saved work stays here."
+        } else {
+            "This task has finished or stopped after starting work. Create a follow-up using its saved branch or checkpoint; its work stays here."
+        }.to_string());
+    }
+    let mut context = task_context_object(&task);
+    let saved = context.contains_key("worker_checkpoint") || context.contains_key("recovery_required");
+    if saved || unstarted { context.insert("resume_saved_work".to_string(),serde_json::json!(true)); }
+    let changed=supabase::update_task_if_snapshot(&config,&task,&serde_json::json!({
+        "status":"queued","context":context,"worker_id":null,"claimed_at":null,"failure_reason":null,
+        "updated_at":chrono::Utc::now().to_rfc3339()
+    })).await?;
+    if !changed.as_array().is_some_and(|rows| rows.iter().any(|row| row["status"] == "queued")) { return Err("This task could not resume. Refresh it to see what needs attention.".to_string()); }
+    agent_comment(&config,&task_id,if saved { "Saved work queued for continuation. The original implementation will not be repeated." } else { "Task queued. It had no saved implementation to repeat." }).await;
     Ok(())
 }
 
@@ -2397,48 +2395,9 @@ async fn supervise_worker_loop(
                     restarts, join_err
                 );
 
-                // Clear the active pool so we don't think we're still running
-                // whatever crashed; the orphaned ae_tasks rows are recovered by
-                // `recover_stuck_tasks` when worker_loop respawns. Also drop the
-                // exclusive lock so a stale non-isolated task can't wedge the
-                // worker after a panic.
-                //
-                // Subtlety: execute_task instances are launched with detached
-                // `tokio::spawn` and we don't hold their JoinHandles. A panic
-                // in worker_loop unwinds the loop's stack but does NOT kill
-                // those detached tokio tasks, so the original Claude/codex
-                // subprocesses can keep committing, pushing, opening PRs, or
-                // deploying while the restarted worker_loop re-claims the same
-                // ae_tasks rows. Before clearing the pool we SIGKILL every
-                // recorded child PID; the 5s backoff below then gives them time
-                // to actually exit. recover_stuck_tasks downstream still has a
-                // narrow window where execute_task is between phases (no live
-                // child to kill) and may proceed briefly with the next phase,
-                // but the next subprocess spawn or status check will fail/exit
-                // because the row will be queued and reclaimed by a fresh
-                // worker. Tracking JoinHandles for full structural ownership is
-                // the proper fix; this is the targeted mitigation.
-                {
-                    let mut pool = active.lock().await;
-                    for (id, pid_slot) in pool.iter() {
-                        let pid_opt = { *pid_slot.lock().await };
-                        if let Some(pid) = pid_opt {
-                            if pid > 0 {
-                                #[cfg(unix)]
-                                unsafe {
-                                    libc::kill(pid as i32, libc::SIGKILL);
-                                }
-                                log::warn!(
-                                    "[worker-supervisor] SIGKILL pid {} for detached task {}",
-                                    pid,
-                                    id
-                                );
-                            }
-                        }
-                    }
-                    pool.clear();
-                }
-                EXCLUSIVE_TASK_ACTIVE.store(false, Ordering::Relaxed);
+                // A poll-loop panic does not cancel independently running tasks.
+                // Keep their slots and futures. Startup recovery excludes these owners.
+                safety::prune_finished_runs();
 
                 // Tell Matt the worker crashed and is auto-recovering.
                 let config = sb_config_arc.read().await.clone();
@@ -2497,18 +2456,17 @@ async fn worker_loop(
         .await;
     }
 
-    // Recover tasks stuck in `in_progress` from a prior crash. The pool is
-    // empty at startup (worker_loop just spawned), so any in_progress row is
-    // orphaned from a previous run and safe to re-queue.
+    // Recover only this machine's stopped pipelines. A live runner survives
+    // a poll-loop restart; a genuinely stopped pipeline fails with work saved.
     {
         let config = sb_config_arc.read().await.clone();
-        let recovered = recover_stuck_tasks(&config).await;
+        let recovered = recover_stuck_tasks(&config, &machine_name).await;
         if recovered > 0 {
             log::info!("[worker] startup recovered {} stuck task(s)", recovered);
             agent_chat(
                 &config,
                 &format!(
-                "Picked up {} task{} that got stuck mid-run before I came back online. Re-queued.",
+                "{} task{} stopped before finishing. Marked failed with saved work preserved; no original task will rerun automatically.",
                 recovered, if recovered == 1 { "" } else { "s" }
             ),
             )
@@ -2656,7 +2614,7 @@ async fn worker_loop(
                             if let Some(key) =
                                 repo_keys
                                     .iter()
-                                    .find(|key| active_repo_counts.get(*key).copied().unwrap_or(0) >= max_tasks_per_repo())
+                                    .find(|key| active_repo_counts.get(*key).copied().unwrap_or(0) >= if key.starts_with("target_branch:") { 1 } else { max_tasks_per_repo() })
                             {
                                 log::info!(
                                     "[worker] delaying queued task {} because repo {} already has active work",
@@ -2701,7 +2659,8 @@ async fn worker_loop(
                                     }
                                 }
                                 match supabase::claim_task(&config, &task_id, &machine_name).await {
-                                    Ok(_) => {
+                                    Ok(claimed) => {
+                                        let task = claimed.as_array().and_then(|rows| rows.first()).unwrap_or(task);
                                         idle_ticks = 0; // Reset idle counter
                                         if !isolated {
                                             EXCLUSIVE_TASK_ACTIVE.store(true, Ordering::Relaxed);
@@ -2744,15 +2703,24 @@ async fn worker_loop(
                                         let task_title_spawn = task_title.clone();
                                         let task_id_spawn = task_id.clone();
                                         let was_exclusive = !isolated;
-                                        tokio::spawn(async move {
-                                            let result = execute_task(
-                                                &app_spawn,
-                                                &machine_name_spawn,
-                                                &config_spawn,
+                                        let run = tokio::spawn(async move {
+                                            let inner_app = app_spawn.clone();
+                                            let inner_config = config_spawn.clone();
+                                            let inner_machine = machine_name_spawn.clone();
+                                            let owner_snapshot = task_spawn.clone();
+                                            let inner = tokio::spawn(async move { execute_task(
+                                                &inner_app,
+                                                &inner_machine,
+                                                &inner_config,
                                                 task_spawn,
                                                 pid_slot_spawn,
-                                            )
-                                            .await;
+                                            ).await });
+                                            let result = match inner.await {
+                                                Ok(result) => result,
+                                                Err(error) => Err(format!("Task runner stopped: {}", error)),
+                                            };
+                                            // Preserve an orphaned checkpoint rather than repeating the coding prompt.
+                                            safety::park_owned(&config_spawn, &task_id_spawn, "Task runner exited before completing its pipeline", Some(&owner_snapshot)).await;
 
                                             // Release this task's slot so the pool frees up.
                                             {
@@ -2852,6 +2820,7 @@ async fn worker_loop(
                                                 }
                                             }
                                         });
+                                        safety::register_run(task_id.clone(), run.abort_handle());
 
                                         // A non-isolated task now owns the
                                         // worker; stop claiming this pass.
@@ -4532,6 +4501,10 @@ async fn execute_task(
     process_id_slot: Arc<tokio::sync::Mutex<Option<u32>>>,
 ) -> Result<String, String> {
     let id = task.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    if safety::published_task_requeued(&task) {
+        safety::park_if_active(config, &id, "This task already owns published or completed work. Review that work; the original prompt will not run again.").await;
+        return Ok("Existing work preserved; original task was not repeated".to_string());
+    }
     super::claude_code::with_team_auth_task(config, &id,
         execute_task_inner(app, worker_id, config, task, process_id_slot)).await
 }
@@ -4993,8 +4966,14 @@ async fn execute_task_inner(
             .map(|s| s.trim())
             .filter(|s| !s.is_empty());
 
-        match create_task_worktree(&main_repo_path, &task_id, base_override).await {
+        let workspace = match safety::existing_pr_request(&task) {
+            Ok(Some(request)) => safety::prepare_existing_pr(&main_repo_path, &task_id, &request).await,
+            Ok(None) => create_task_worktree(&main_repo_path, &task_id, base_override).await,
+            Err(error) => Err(error),
+        };
+        match workspace {
             Ok((worktree_path, base_branch, task_branch)) => {
+                safety::save_checkpoint(config, &task_id, &worktree_path, "coding").await?;
                 agent_comment(
                     config,
                     &task_id,
@@ -5320,6 +5299,7 @@ from Matt, stop without making changes and explain specifically what you need cl
         ));
     }
 
+    safety::append_resume_prompt(&mut prompt_parts, &task, &repo_path, resolved_base_branch.as_deref()).await;
     let prompt = prompt_parts.join("\n");
 
     // Coding-pass timeout (default 2h, tunable via AUTOSAM_TASK_TIMEOUT_SECS),
@@ -5711,7 +5691,7 @@ from Matt, stop without making changes and explain specifically what you need cl
 
             // Review, tests and the PR all key off the task branch; if the coder
             // committed on its own branch, bring the task branch onto that work now.
-            if let Some(ref task_branch) = branch {
+            if let Some(task_branch) = branch.as_ref().filter(|_| task["context"]["push_to_existing_branch"] != true) {
                 match adopt_coder_head_onto_task_branch(&repo_path, task_branch).await {
                     Ok(true) => {
                         agent_comment(
@@ -5760,135 +5740,19 @@ from Matt, stop without making changes and explain specifically what you need cl
                 }
             }
 
-            // 5b. Run /opus-fix in the worktree to get a Claude Opus 5.5 review of the diff and
-            // auto-apply any must-fix/should-fix edits. Sam's coder runs on GPT-6.1 Sol, so an
-            // independent-model reviewer (not Codex/GPT again) actually catches something the
-            // coder would miss. Runs BEFORE screenshots + QA so QA validates the final state.
-            // Any edits opus-fix makes are committed separately so the PR shows a clear
-            // "task commit" + "opus-fix commit" history.
-
-            // Cancellation check before starting another long phase.
-            if !task_is_live(config, &task_id).await {
-                log::info!(
-                    "[worker] Task {} cancelled before opus-fix; stopping",
-                    task_id
-                );
-                if let Some(h) = dev_server_handle.take() {
-                    let _ = dev_server::kill_dev_server(h).await;
+            // A timeout is incomplete work, never a review pass. Save the coding
+            // checkpoint before invoking the independently pinned reviewer.
+            safety::save_checkpoint(config, &task_id, &repo_path, "review_pending").await?;
+            let mut reviewed_head = match safety::review_work(
+                config, &task_id, &repo_path, resolved_base_branch.as_deref(), process_id_slot.clone()
+            ).await {
+                Ok(head) => head,
+                Err(error) => {
+                    safety::park_if_active(config, &task_id, &format!("Cross-model review incomplete: {}", error)).await;
+                    if let Some(h) = dev_server_handle.take() { let _ = dev_server::kill_dev_server(h).await; }
+                    return Err(error);
                 }
-                return Ok("Task was cancelled".to_string());
-            }
-
-            // Pin opus-fix's review scope to *this task's* diff. Without explicit
-            // flags the slash command's auto-detection misfires inside a headless
-            // Claude Code session (no chat context to anchor "session start") and
-            // can review commits well outside the ticket. We compute the merge-base
-            // with origin/<base> ourselves and hand it to opus-fix, which honors
-            // --base/--scope verbatim and skips its own scope inference.
-            let opus_base_arg = match resolved_base_branch.as_deref() {
-                Some(base) => {
-                    match run_git(
-                        &["merge-base", "HEAD", &format!("origin/{}", base)],
-                        &repo_path,
-                    )
-                    .await
-                    {
-                        Ok(sha) => {
-                            let sha = sha.trim().to_string();
-                            if sha.is_empty() {
-                                None
-                            } else {
-                                Some(sha)
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!("[worker] opus-fix merge-base lookup failed: {}", e);
-                            None
-                        }
-                    }
-                }
-                None => None,
             };
-            let opus_prompt = match &opus_base_arg {
-                Some(sha) => format!("/opus-fix --base {} --scope branch", sha),
-                None => "/opus-fix".to_string(),
-            };
-            agent_comment(
-                config,
-                &task_id,
-                "Running /opus-fix for a review pass before QA...",
-            )
-            .await;
-            // 1800s: large diffs on slow backends regularly exceed 1200s; the timeout
-            // path already degrades gracefully (proceed to QA with a comment).
-            let opus_result = run_claude_code_streaming(
-                &repo_path,
-                &opus_prompt,
-                0,
-                1800,
-                config,
-                &task_id,
-                process_id_slot.clone(), None
-            )
-            .await;
-            {
-                let mut pid = process_id_slot.lock().await;
-                *pid = None;
-            }
-            // If opus-fix itself was cancelled mid-run, bail out.
-            if matches!(&opus_result, Err(e) if e == "TASK_CANCELLED") {
-                log::info!(
-                    "[worker] Task {} cancelled during opus-fix; stopping",
-                    task_id
-                );
-                if let Some(h) = dev_server_handle.take() {
-                    let _ = dev_server::kill_dev_server(h).await;
-                }
-                return Ok("Task was cancelled".to_string());
-            }
-            match opus_result {
-                Ok(_) => {
-                    let porcelain = run_git(&["status", "--porcelain"], &repo_path)
-                        .await
-                        .unwrap_or_default();
-                    if porcelain.trim().is_empty() {
-                        agent_comment(config, &task_id, "opus-fix found nothing to change.").await;
-                    } else {
-                        let _ = run_git(&["add", "-A"], &repo_path).await;
-                        match run_git(
-                            &["commit", "-m", "opus-fix: apply review feedback"],
-                            &repo_path,
-                        )
-                        .await
-                        {
-                            Ok(_) => {
-                                agent_comment(
-                                    config,
-                                    &task_id,
-                                    "Applied opus-fix suggestions in a follow-up commit.",
-                                )
-                                .await;
-                            }
-                            Err(e) => {
-                                log::warn!("[worker] opus-fix commit failed: {}", e);
-                                agent_comment(config, &task_id, &format!("opus-fix edited files but the commit failed ({}). Changes still staged.", e)).await;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::warn!("[worker] /opus-fix failed: {}", e);
-                    agent_comment(
-                        config,
-                        &task_id,
-                        &format!(
-                            "opus-fix didn't complete cleanly ({}). Proceeding to QA.",
-                            e
-                        ),
-                    )
-                    .await;
-                }
-            }
 
             // 5c. Build check. Runs the project's build command (npm run build / cargo
             // build, auto-detected) so logic bugs that break compilation or the bundle
@@ -6525,6 +6389,20 @@ from Matt, stop without making changes and explain specifically what you need cl
                 return Ok("Task was cancelled".to_string());
             }
 
+            let final_head = run_git(&["rev-parse", "HEAD"], &repo_path).await?;
+            if final_head != reviewed_head || !run_git(&["status", "--porcelain"], &repo_path).await?.is_empty() {
+                reviewed_head = match safety::review_work(config, &task_id, &repo_path,
+                    resolved_base_branch.as_deref(), process_id_slot.clone()).await {
+                    Ok(head) => head,
+                    Err(error) => {
+                        safety::park_if_active(config, &task_id, &format!("Final review incomplete: {}", error)).await;
+                        if let Some(h) = dev_server_handle.take() { let _ = dev_server::kill_dev_server(h).await; }
+                        return Err(error);
+                    }
+                };
+                run_build_check(&repo_path).await.map_err(|(cmd, tail)| format!("Final reviewed build failed ({}): {}", cmd, tail))?;
+            }
+
             // 8. Create PR targeting the branch we stacked on (not always main/master).
             if let Err(error) = super::claude_code::team_auth_task_status() {
                 if let Some(h) = dev_server_handle.take() {
@@ -6541,6 +6419,8 @@ from Matt, stop without making changes and explain specifically what you need cl
                 &branch,
                 resolved_base_branch.as_deref(),
                 include_customer_success,
+                safety::existing_pr_request(&task)?.as_ref(),
+                &reviewed_head,
             )
             .await;
 
@@ -6566,7 +6446,7 @@ from Matt, stop without making changes and explain specifically what you need cl
                         pr_updates["worker_id"] = serde_json::Value::Null;
                         pr_updates["claimed_at"] = serde_json::Value::Null;
                     }
-                    let _ = supabase::update_task(config, &task_id, &pr_updates).await;
+                    safety::record_publication(config,&task_id,&repo_path,&pr_url,&reviewed_head,&pr_updates).await?;
                     notify_callback(
                         config,
                         &task_id,
@@ -6779,12 +6659,12 @@ from Matt, stop without making changes and explain specifically what you need cl
                         config,
                         &task_id,
                         &serde_json::json!({
-                            "status": "review",
+                            "status": "failed",
                             "updated_at": chrono::Utc::now().to_rfc3339(),
                         }),
                     )
                     .await;
-                    notify_callback(config, &task_id, "review", None, None);
+                    notify_callback(config, &task_id, "failed", None, Some(&e));
                     agent_comment(config, &task_id, &format!("Code changes are done but PR creation failed: {}. You can push manually.", e)).await;
                     if notify_task_completed_code {
                         send_telegram(
@@ -6797,7 +6677,9 @@ from Matt, stop without making changes and explain specifically what you need cl
                         )
                         .await;
                     }
-                    Ok("Code changes complete (no PR)".to_string())
+                    // Review success is not publication success. Keep this failure visible.
+                    let _ = safety::park_if_active(config, &task_id, &format!("PR publication failed: {}", e)).await;
+                    Err(format!("PR publication failed; saved work preserved: {}", e))
                 }
             }
         }
@@ -6838,6 +6720,7 @@ from Matt, stop without making changes and explain specifically what you need cl
                     let mut context = task_row
                         .map(|t| task_context_object(&t))
                         .unwrap_or_default();
+                    context.insert("resume_saved_work".to_string(),serde_json::json!(true));
                     context.insert(
                         TRANSIENT_RETRY_COUNT_KEY.to_string(),
                         Value::Number(serde_json::Number::from(retry_count + 1)),
@@ -7448,6 +7331,7 @@ async fn run_build_check(repo_path: &str) -> Result<Option<String>, (String, Str
 
     // 15-minute cap so a wedged build can't freeze the whole worker.
     let child = async_cmd(prog)
+        .kill_on_drop(true)
         .args(&args)
         .current_dir(repo_path)
         .stdout(std::process::Stdio::piped())
@@ -7515,19 +7399,9 @@ fn worker_has_alive_descendants() -> bool {
     }
 }
 
-async fn recover_stuck_tasks(config: &SupabaseConfig) -> usize {
-    // Defense in depth against panic-recovery duplicating live work. The
-    // supervisor SIGKILLs known child PIDs before clearing the pool, but
-    // between phases execute_task may have no live child to kill; the
-    // detached tokio task can still proceed to spawn a fresh subprocess in
-    // the next phase, racing with whatever worker re-claims this row.
-    // pgrep-detected descendants here means recovery has to wait.
-    if worker_has_alive_descendants() {
-        log::warn!(
-            "[worker] deferring recover_stuck_tasks: live child processes still attached to this worker (likely detached execute_task continuing after a panic). Recovery will retry on the next supervisor restart."
-        );
-        return 0;
-    }
+async fn recover_stuck_tasks(config: &SupabaseConfig, machine_name: &str) -> usize {
+    // Do not touch unknown descendants left during a supervisor recovery.
+    if worker_has_alive_descendants() { return 0; }
 
     let mut recovered = 0usize;
     for status in ["in_progress", "testing"] {
@@ -7538,15 +7412,12 @@ async fn recover_stuck_tasks(config: &SupabaseConfig) -> usize {
             continue;
         };
         for task in arr {
+            if (task["worker_id"].as_str() != Some(machine_name) && !safety::continuation_owned_here(task)) || is_full_pr_review_owned(task) { continue; }
             let Some(id) = task.get("id").and_then(|v| v.as_str()) else {
                 continue;
             };
-            let updates = serde_json::json!({
-                "status": "queued",
-                "worker_id": serde_json::Value::Null,
-                "claimed_at": serde_json::Value::Null,
-            });
-            if supabase::update_task(config, id, &updates).await.is_ok() {
+            if safety::run_is_active(id) { continue; }
+            if safety::park_if_active(config, id, "Worker restarted with an unfinished pipeline; saved work preserved for recovery").await {
                 recovered += 1;
             }
         }
@@ -10097,19 +9968,9 @@ const WEDGE_TESTING_MIN: i64 = 45;
 const WEDGE_REVIEW_MIN: i64 = 45;
 const WEDGE_PR_CHECK_STUCK_MIN: i64 = 30;
 
-/// Periodic sweep that catches cards stuck in a non-terminal status with no
-/// progress for too long. Three classes:
-///   - `in_progress` > 60 min: worker is wedged between phases or its child
-///     process died without unwinding. Kill any recorded child PIDs, drop the
-///     pool slot, and route back to `queued` for a fresh attempt.
-///   - `testing` > 45 min: same treatment as in_progress; /browse + repair
-///     loop should never legitimately take this long.
-///   - `review` > 45 min: the card has a PR open and the merge sweep is
-///     polling it. If the PR has a check-run that's been in_progress/queued
-///     for > 30 min, the upstream CI is wedged (not Sam). Post a clear
-///     comment, clear `worker_id` so the review sweep stops polling, and
-///     leave the card in review for human triage. Don't touch the card if
-///     PR checks look healthy — codex review just takes a while sometimes.
+/// Live task futures own their bounded phase timers. Database timestamps and
+/// heartbeat comments never prove a job is hung. Completed owners fail visibly
+/// with their checkpoints preserved; review CI keeps its separate stale gate.
 async fn sweep_wedged_cards(config: &SupabaseConfig, active: &ActiveTasks) {
     let tasks = match supabase::fetch_tasks(config, None).await {
         Ok(t) => t,
@@ -10143,11 +10004,11 @@ async fn sweep_wedged_cards(config: &SupabaseConfig, active: &ActiveTasks) {
         let age_min = (now - updated.with_timezone(&chrono::Utc)).num_minutes();
 
         match status {
-            "in_progress" if age_min >= WEDGE_IN_PROGRESS_MIN => {
+            "in_progress" if age_min >= WEDGE_IN_PROGRESS_MIN || safety::owner_missing(task, active).await => {
                 handle_wedged_active_card(config, active, &task_id, "in_progress", age_min)
                     .await;
             }
-            "testing" if age_min >= WEDGE_TESTING_MIN => {
+            "testing" if age_min >= WEDGE_TESTING_MIN || safety::owner_missing(task, active).await => {
                 handle_wedged_active_card(config, active, &task_id, "testing", age_min).await;
             }
             "review" if age_min >= WEDGE_REVIEW_MIN => {
@@ -10158,9 +10019,7 @@ async fn sweep_wedged_cards(config: &SupabaseConfig, active: &ActiveTasks) {
     }
 }
 
-/// Force-kill any recorded child PID for this task, drop the active pool
-/// slot, and route the card back to `queued`. Used by the wedge sweep for
-/// `in_progress` and `testing` rows that haven't moved in too long.
+/// Recover a stopped execution without re-running its original request.
 async fn handle_wedged_active_card(
     config: &SupabaseConfig,
     active: &ActiveTasks,
@@ -10168,59 +10027,16 @@ async fn handle_wedged_active_card(
     status: &str,
     age_min: i64,
 ) {
-    log::warn!(
-        "[wedge-sweep] {} task {} stale for {} min; killing children and requeuing",
-        status,
-        task_id,
-        age_min
-    );
-
-    {
-        let pool = active.lock().await;
-        if let Some(pid_slot) = pool.get(task_id) {
-            let pid_opt = { *pid_slot.lock().await };
-            if let Some(pid) = pid_opt {
-                if pid > 0 {
-                    #[cfg(unix)]
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGKILL);
-                    }
-                    log::warn!(
-                        "[wedge-sweep] SIGKILL pid {} for wedged {} task {}",
-                        pid,
-                        status,
-                        task_id
-                    );
-                }
-            }
-        }
+    let Ok(Some(task)) = supabase::fetch_task(config, task_id).await else { return; };
+    if !safety::owner_missing(&task, active).await { return; }
+    if safety::run_is_active(task_id) {
+        log::info!("[wedge-sweep] {} has a live task owner; its phase timeout remains responsible", task_id);
+        return;
     }
-    {
-        let mut pool = active.lock().await;
-        pool.remove(task_id);
-    }
-
-    agent_comment(
-        config,
-        task_id,
-        &format!(
-            "Card stalled in `{}` for {} min with no progress. Killing the worker and re-queuing so a fresh attempt can pick it up.",
-            status, age_min
-        ),
-    )
-    .await;
-
-    let _ = supabase::update_task(
-        config,
-        task_id,
-        &serde_json::json!({
-            "status": "queued",
-            "worker_id": serde_json::Value::Null,
-            "claimed_at": serde_json::Value::Null,
-            "updated_at": chrono::Utc::now().to_rfc3339(),
-        }),
-    )
-    .await;
+    // No live task owns this row. Preserve commits and stop its pipeline using
+    // an exact snapshot update; a racing completion/cancellation wins.
+    safety::park_if_active(config, task_id,
+        &format!("No live task runner after {} min in {}; work preserved", age_min, status)).await;
 }
 
 /// Inspect a stale `review` card. If its PR has a check-run hung for more
@@ -10267,14 +10083,14 @@ async fn handle_wedged_review_card(
         )
         .await
         {
-            Ok(rows) if rows.as_array().is_some_and(|rows| !rows.is_empty()) => {
+            Ok(rows) if rows.as_array().is_some_and(|rows| rows.iter().any(|row|row["status"] == "queued")) => {
                 log::warn!(
                     "[wedge-sweep] review task {} stale {} min with no PR; requeued",
                     task_id,
                     age_min
                 );
                 agent_comment(config, task_id, &format!(
-                    "Card stalled in `review` for {} min without a PR. Returned it to `queued` with its old claim cleared so a fresh worker can finish it.", age_min
+                    "Card stalled in `review` for {} min without a PR. Queued a continuation with its old claim cleared. Saved work and the original instructions are retained.", age_min
                 )).await;
             }
             Err(error) => log::warn!(
@@ -10750,6 +10566,7 @@ pub async fn run_claude_code_streaming(
     process_id_slot: Arc<tokio::sync::Mutex<Option<u32>>>,
     model_override: Option<&str>,
 ) -> Result<String, String> {
+    if !task_is_live(config, task_id).await { return Err("TASK_CANCELLED".to_string()); }
     super::claude_code::with_team_auth_task(config, task_id, async {
     match super::coder::active_backend() {
         super::coder::CoderBackend::Pi => {
@@ -10804,18 +10621,23 @@ async fn run_claude_code_streaming_impl(
 
     // Same single-review contract as the pi harness (card-febb8d): the spawned
     // agent skips its own post-task review pass; the worker runs the one review.
-    cmd.env("AUTOSAM_REVIEW_BY_WORKER", "1");
+    if model_override == Some(safety::REVIEW_MODEL) {
+        cmd.env("AUTOSAM_REVIEW_BY_WORKER", "1");
+        cmd.arg("--restricted").arg("--strict-mcp-config");
+    } else { cmd.env("AUTOSAM_REVIEW_BY_WORKER", "1"); }
 
-    cmd.arg("-p")
-        .arg(prompt)
-        .arg("--output-format")
+    cmd.arg("-p");
+    if model_override == Some(safety::REVIEW_MODEL) {
+        cmd.stdin(std::process::Stdio::piped());
+    } else { cmd.arg(prompt); }
+    cmd.arg("--output-format")
         .arg("stream-json")
         .arg("--verbose")
         .arg("--dangerously-skip-permissions")
         .arg("--model")
         .arg(model)
         .arg("--effort")
-        .arg(super::claude_code::CLAUDE_EFFORT);
+        .arg(if model_override == Some(safety::REVIEW_MODEL) { "medium" } else { super::claude_code::CLAUDE_EFFORT });
 
     if max_turns > 0 {
         cmd.arg("--max-turns").arg(max_turns.to_string());
@@ -10832,8 +10654,16 @@ async fn run_claude_code_streaming_impl(
     super::claude_code::prepare_team_claude_async(&mut cmd).await?;
 
     let mut child = cmd
+        .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("Failed to run Claude Code: {}", e))?;
+
+    if model_override == Some(safety::REVIEW_MODEL) {
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin.write_all(prompt.as_bytes()).await.map_err(|e| format!("Review input failed: {}", e))?;
+        }
+    }
 
     // Store PID so the process can be killed externally via stop_current_task
     {
@@ -10908,7 +10738,7 @@ async fn run_claude_code_streaming_impl(
                     && last_hb_post.elapsed() >= std::time::Duration::from_secs(120)
                 {
                     let mins = task_started_at.elapsed().as_secs() / 60;
-                    let msg = format!("Still working. {} min in, nothing's hung.", mins);
+                    let msg = format!("Worker is connected. {} min in; waiting for the current phase to finish.", mins);
                     agent_comment(&config_hb, &task_id_hb, &msg).await;
                     last_hb_post = std::time::Instant::now();
                 }
@@ -11163,8 +10993,8 @@ async fn run_claude_code_streaming_impl(
         return Err("TASK_CANCELLED".to_string());
     }
 
-    let (result_text, raw_tail, error_summary) = stdout_handle.await.unwrap_or_default();
-    let stderr_text = stderr_handle.await.unwrap_or_default();
+    let (result_text, raw_tail, error_summary) = safety::drain_output(stdout_handle).await?;
+    let stderr_text = safety::drain_output(stderr_handle).await?;
 
     if !status.success() {
         let stderr = stderr_text.trim();
@@ -11426,7 +11256,7 @@ async fn run_pi_streaming_impl(
                     agent_comment(
                         &config_hb,
                         &task_id_hb,
-                        &format!("Still working. {} min in, nothing's hung.", mins),
+                        &format!("Worker is connected. {} min in; waiting for the current phase to finish.", mins),
                     )
                     .await;
                     last_hb_post = std::time::Instant::now();
@@ -11611,8 +11441,8 @@ async fn run_pi_streaming_impl(
         return Err("TASK_CANCELLED".to_string());
     }
 
-    let (result_text, raw_tail, error_summary) = stdout_handle.await.unwrap_or_default();
-    let stderr_text = stderr_handle.await.unwrap_or_default();
+    let (result_text, raw_tail, error_summary) = safety::drain_output(stdout_handle).await?;
+    let stderr_text = safety::drain_output(stderr_handle).await?;
 
     if !status.success() {
         let stderr = stderr_text.trim();
@@ -11813,7 +11643,8 @@ async fn task_is_live(config: &SupabaseConfig, task_id: &str) -> bool {
         return false;
     } // row deleted
     let status = arr[0].get("status").and_then(|v| v.as_str()).unwrap_or("");
-    !matches!(status, "cancelled")
+    if safety::run_is_active(task_id) { matches!(status, "in_progress" | "testing") }
+    else { status != "cancelled" }
 }
 
 /// Detect the default branch for a repo (main, master, etc.)
@@ -12855,16 +12686,18 @@ async fn start_merge_conflict_fix_task(config: &SupabaseConfig, task: Value) {
         Value::String(chrono::Utc::now().to_rfc3339()),
     );
     context.insert(MERGE_CONFLICT_FIX_ERROR_KEY.to_string(), Value::Null);
-    let _ = supabase::update_task(
-        config,
-        &task_id,
-        &serde_json::json!({
-            "status": "in_progress",
-            "context": Value::Object(context),
-            "updated_at": chrono::Utc::now().to_rfc3339(),
-        }),
-    )
-    .await;
+    context.insert("samwise_continuation_machine".to_string(), serde_json::json!(safety::machine_name()));
+    // Only the exact requested repair may start. A rejected or racing claim
+    // must never launch a second writer against this PR branch.
+    let claimed = supabase::update_task_if_snapshot(config, &task, &serde_json::json!({
+        "status": "in_progress", "context": Value::Object(context),
+        "updated_at": chrono::Utc::now().to_rfc3339(),
+    })).await;
+    if !claimed.ok().and_then(|v| v.as_array().map(|rows| !rows.is_empty())).unwrap_or(false) {
+        log::warn!("[merge-conflict-fix] request {} changed or could not be claimed; no repair started", task_id);
+        return;
+    }
+    let continuation_owner = safety::continuation_owner(&task_id);
     notify_callback(config, &task_id, "in_progress", Some(&pr_url), None);
     agent_comment(
         config,
@@ -12875,6 +12708,7 @@ async fn start_merge_conflict_fix_task(config: &SupabaseConfig, task: Value) {
 
     let config_clone = config.clone();
     tokio::spawn(async move {
+        let _continuation_owner = continuation_owner;
         match run_merge_conflict_fix_workflow(&config_clone, &task).await {
             Ok(summary) => {
                 let latest_task = supabase::fetch_task(&config_clone, &task_id)
@@ -13017,6 +12851,7 @@ async fn run_merge_conflict_fix_workflow(
 
     let (repo_path, head_branch, base_branch) =
         prepare_conflict_fix_worktree(main_repo_path, task, pr_url).await?;
+    safety::save_checkpoint(config, task_id, &repo_path, "merge_conflict_fix").await?;
     let origin_base = format!("origin/{}", base_branch);
     agent_comment(
         config,
@@ -21284,14 +21119,16 @@ pub fn spawn_auto_fix_task(
     tokio::spawn(async move {
         let new_cycle = prev_cycle_count + 1;
 
-        let claimed = supabase::update_task_if_status_not_held(
-            &config,
-            &task_id,
-            "fixes_needed",
-            &serde_json::json!({
-                "status": "in_progress",
-                "review_cycle_count": new_cycle,
-                "failure_reason": serde_json::Value::Null,
+        let Ok(Some(task_row)) = supabase::fetch_task(&config, &task_id).await else { return; };
+        if task_row["status"] != "fixes_needed" || task_is_on_hold(&task_row) { return; }
+        let mut context = task_context_object(&task_row);
+        context.insert("samwise_continuation_machine".to_string(), serde_json::json!(safety::machine_name()));
+        context.insert("samwise_auto_fix_status".to_string(), serde_json::json!("running"));
+        context.insert("samwise_auto_fix_started_at".to_string(), serde_json::json!(chrono::Utc::now().to_rfc3339()));
+        let claimed = supabase::update_task_if_snapshot(
+            &config, &task_row, &serde_json::json!({
+                "status": "in_progress", "context": context, "worker_id": Value::Null, "claimed_at": Value::Null,
+                "review_cycle_count": new_cycle, "failure_reason": Value::Null,
                 "updated_at": chrono::Utc::now().to_rfc3339(),
             }),
         )
@@ -21301,6 +21138,11 @@ pub fn spawn_auto_fix_task(
         .unwrap_or(false);
         if !claimed {
             log::info!("[auto-fix] task {} moved out of fixes_needed before claim; respecting manual state", task_id);
+            return;
+        }
+        let _continuation_owner = safety::continuation_owner(&task_id);
+        if let Err(error) = safety::save_checkpoint(&config, &task_id, &repo_path, "auto_fix").await {
+            safety::park_if_active(&config, &task_id, &error).await;
             return;
         }
         notify_callback(&config, &task_id, "in_progress", Some(&pr_url), None);
@@ -22185,7 +22027,7 @@ pub async fn sweep_pr_review_queue(
             }
             continue;
         }
-        // Fire if never reviewed, OR updated_at > last_pr_review_at (card moved back in),
+        // Explicit requests clear the review receipt; metadata writes do not reset its retry interval.
         // OR the last review was long enough ago to retry an inconclusive Codex
         // decision. This keeps cards from sitting in Review forever when host
         // checks were merely pending during the first pass.
@@ -22475,6 +22317,7 @@ fn spawn_review_merge_task(
             Value::String(chrono::Utc::now().to_rfc3339()),
         );
         claim_ctx.insert(REVIEW_MERGE_ERROR_KEY.to_string(), Value::Null);
+        claim_ctx.insert("samwise_continuation_machine".to_string(), serde_json::json!(safety::machine_name()));
         let claimed = supabase::update_task_if_status_not_held(
             &config,
             &task_id,
@@ -22494,6 +22337,11 @@ fn spawn_review_merge_task(
                 "[review-merge] task {} not in approved at claim time; skipping",
                 task_id
             );
+            return;
+        }
+        let _continuation_owner = safety::continuation_owner(&task_id);
+        if let Err(error) = safety::save_checkpoint(&config, &task_id, &repo_path, "review_merge").await {
+            safety::park_if_active(&config, &task_id, &error).await;
             return;
         }
         notify_callback(&config, &task_id, "in_progress", Some(&pr_url), None);
@@ -23510,6 +23358,8 @@ async fn create_pr(
     branch: &Option<String>,
     base_branch_override: Option<&str>,
     include_customer_success: bool,
+    existing: Option<&safety::ExistingPrRequest>,
+    reviewed_head: &str,
 ) -> Result<String, String> {
     // Branch should already be resolved by execute_task, but fallback just in case
     let branch_name = branch
@@ -23524,11 +23374,11 @@ async fn create_pr(
     // committed on a branch of its own, move branch_name onto that work (a
     // fast-forward only) rather than checking out branch_name and leaving the
     // work behind; a diverged pair fails loudly.
-    if branch.is_some() {
+    if branch.is_some() && existing.is_none() {
         adopt_coder_head_onto_task_branch(repo_path, &branch_name)
             .await
             .map_err(|e| format!("could not put the work on {}: {}", branch_name, e))?;
-    } else {
+    } else if existing.is_none() {
         let _ = async_cmd("git")
             .args(["checkout", &branch_name])
             .current_dir(repo_path)
@@ -23536,104 +23386,38 @@ async fn create_pr(
             .await;
     }
 
-    // Add .agent-one to .gitignore if not already there
-    let gitignore_path = join_path(repo_path, ".gitignore");
-    if let Ok(contents) = tokio::fs::read_to_string(&gitignore_path).await {
-        if !contents.contains(".agent-one") {
-            let _ = tokio::fs::write(
-                &gitignore_path,
-                format!("{}\n.agent-one/\n", contents.trim_end()),
-            )
-            .await;
-        }
+    if run_git(&["rev-parse", "HEAD"], repo_path).await? != reviewed_head
+        || !run_git(&["status", "--porcelain"], repo_path).await?.is_empty() {
+        return Err("Publication stopped: the work changed after its completed review".to_string());
     }
-
-    // A seeded env file the branch no longer ignores would be swept up by
-    // `git add -A`; it is only a local build helper, so drop it first. A path
-    // the branch tracks is the branch's own file (a reset put it there), so
-    // leave it alone, exactly as strip_seeded_env_files does.
-    for rel in seeded_env_paths(repo_path).await? {
-        if seeded_path_tracked(repo_path, &rel).await
-            || !seeded_parent_inside_checkout(repo_path, &rel).await
-        {
-            continue;
-        }
-        if run_git(&["check-ignore", "-q", "--", &rel], repo_path).await.is_err() {
-            let _ = tokio::fs::remove_file(Path::new(repo_path).join(&rel)).await;
-        }
-    }
-
-    // Stage anything Claude left uncommitted (usually nothing; the prompt asks him to commit).
-    let stage = async_cmd("git")
-        .args(["add", "-A"])
-        .current_dir(repo_path)
-        .output()
-        .await
-        .map_err(|e| format!("git add failed: {}", e))?;
-    if !stage.status.success() {
-        return Err("git add failed".to_string());
-    }
-
-    let has_staged = !async_cmd("git")
-        .args(["diff", "--cached", "--quiet"])
-        .current_dir(repo_path)
-        .output()
-        .await
-        .map_err(|e| format!("git diff check failed: {}", e))?
-        .status
-        .success();
-
-    let commits_ahead: u32 = async_cmd("git")
-        .args([
-            "rev-list",
-            "--count",
-            &format!("origin/{}..HEAD", base_branch),
-        ])
-        .current_dir(repo_path)
-        .output()
-        .await
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                String::from_utf8(o.stdout).ok()
-            } else {
-                None
-            }
-        })
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0);
-
-    if has_staged {
-        // Claude didn't commit (or left leftovers); commit them for him.
-        let commit_msg = format!("samwise: {}", title);
-        let commit = async_cmd("git")
-            .args(["commit", "-m", &commit_msg])
-            .current_dir(repo_path)
-            .output()
-            .await
-            .map_err(|e| format!("git commit failed: {}", e))?;
-        if !commit.status.success() {
-            let stderr = String::from_utf8_lossy(&commit.stderr);
-            return Err(format!("git commit failed: {}", stderr));
-        }
-    } else if commits_ahead == 0 {
-        // Nothing staged AND no new commits vs base -> genuinely no work done.
-        return Err("No changes on branch vs base".to_string());
-    }
-    // else: Claude already committed, nothing staged -> just push what's on the branch.
+    let existing_target = match existing {
+        Some(request) => Some(safety::verify_existing_pr(repo_path, request).await?),
+        None => None,
+    };
 
     ensure_no_seeded_env_committed(repo_path, &format!("origin/{}", base_branch)).await?;
 
-    // Push
-    let push = async_cmd("git")
-        .args(["push", "-u", "origin", &branch_name])
-        .current_dir(repo_path)
-        .output()
-        .await
+    if !task_is_live(_config, _task_id).await { return Err("TASK_CANCELLED".to_string()); }
+    // Fast-forward only. A concurrent writer makes this fail with saved work.
+    let mut push_cmd = async_cmd("git");
+    push_cmd.args(["push", "-u", "origin", &format!("HEAD:refs/heads/{}",branch_name)])
+        .current_dir(repo_path).kill_on_drop(true);
+    let push = tokio::time::timeout(std::time::Duration::from_secs(120), push_cmd.output())
+        .await.map_err(|_| "git push timed out; verify the assigned PR head before resuming".to_string())?
         .map_err(|e| format!("git push failed: {}", e))?;
     if !push.status.success() {
         let stderr = String::from_utf8_lossy(&push.stderr);
         return Err(format!("git push failed: {}", stderr));
+    }
+
+    if let Some(target) = existing_target {
+        // This round owns an existing PR. It may never open a replacement.
+        let verified = safety::verify_existing_pr(repo_path, existing.unwrap()).await?;
+        // Git's ref is authoritative immediately; the GitHub PR cache can lag.
+        let remote=run_git(&["ls-remote","origin",&format!("refs/heads/{}",existing.unwrap().branch)],repo_path).await?;
+        if remote.split_whitespace().next()!=Some(reviewed_head) { return Err("Assigned branch changed after push; work and PR preserved".to_string()); }
+        let _=verified;
+        return Ok(target.url);
     }
 
     // Build PR body with Supabase Storage URLs instead of repo-relative paths
