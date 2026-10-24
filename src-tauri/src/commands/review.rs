@@ -21,7 +21,7 @@ const REVIEW_PROMPT: &str = include_str!("../../prompts/review.md");
 /// Primary review model: local Codex CLI / ChatGPT plan (`~/.codex/auth.json`).
 /// Matches the host `~/.codex/config.toml` default so AutoSam reviews use the
 /// same account as interactive `codex` and `/codex-fix`.
-pub const CODEX_MODEL: &str = "gpt-5.5";
+pub const CODEX_MODEL: &str = "gpt-5.6-sol";
 /// OpenRouter fallback slug. Needs the `openai/` prefix; a bare `gpt-5.6-sol`
 /// is not a valid OpenRouter id.
 pub const CODEX_OPENROUTER_MODEL: &str = "openai/gpt-5.6-sol";
