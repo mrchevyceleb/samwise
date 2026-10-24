@@ -19695,7 +19695,7 @@ fn is_plant_full_pr_review_task(task: &Value) -> bool {
         .and_then(|c| c.get("plant_full_pr_review"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
-        || existing_pr_review_target(task).is_some()
+        || (status == "queued" && existing_pr_review_target(task).is_some())
 }
 
 /// Matt, Oct 24 2026: never split a job into two PRs. A request to review,
@@ -19724,13 +19724,48 @@ fn existing_pr_review_target(task: &Value) -> Option<String> {
     if !review_intent && !repair_intent {
         return None;
     }
-    let first_pr_url = |text: &str| -> Option<String> {
+    let pr_urls = |text: &str| -> Vec<String> {
         text.split(|c: char| c.is_whitespace() || c == '(' || c == ')' || c == '<' || c == '>')
             .map(|tok| tok.trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '`' | '"' | '\'')))
-            .find(|tok| tok.starts_with("https://github.com/") && tok.contains("/pull/") && review::is_safe_pr_url(tok))
+            .filter(|tok| tok.starts_with("https://github.com/") && tok.contains("/pull/") && review::is_safe_pr_url(tok))
             .map(str::to_string)
+            .collect()
     };
-    let target = first_pr_url(description).or_else(|| first_pr_url(title))?;
+    // The PR the request names, never just any PR mentioned in its notes:
+    // "Full PR review: owner/repo#N" in the title, else the URL right after
+    // the review command on the first line, else for "PR #N: ..." repairs the
+    // description URL whose number is N.
+    let title_ref = title
+        .trim()
+        .split_once(':')
+        .map(|(_, rest)| rest.trim())
+        .filter(|_| t.starts_with("full pr review"))
+        .and_then(|r| r.split_whitespace().next())
+        .and_then(|r| r.split_once('#'))
+        .and_then(|(repo, num)| {
+            let num: String = num.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if repo.matches('/').count() == 1 && !num.is_empty() {
+                Some(format!("https://github.com/{}/pull/{}", repo, num))
+            } else {
+                None
+            }
+        })
+        .filter(|u| review::is_safe_pr_url(u));
+    let title_number: Option<String> = t
+        .strip_prefix("pr #")
+        .map(|rest| rest.chars().take_while(|c| c.is_ascii_digit()).collect::<String>())
+        .filter(|n| !n.is_empty());
+    let target = if let Some(u) = title_ref {
+        u
+    } else if review_intent {
+        let first_line = description.trim_start().lines().next().unwrap_or("");
+        pr_urls(first_line).into_iter().next()?
+    } else {
+        let n = title_number?;
+        pr_urls(description)
+            .into_iter()
+            .find(|u| pr_number_from_url(u).map(|x| x.to_string()) == Some(n.clone()))?
+    };
     // A repair follow-up already attached to that same PR keeps its builder.
     if repair_intent && !review_intent && !current_pr.is_empty()
         && normalize_pr_url(current_pr) == normalize_pr_url(&target)
@@ -19772,7 +19807,7 @@ fn is_full_pr_review_owned(task: &Value) -> bool {
         .unwrap_or(false)
         || {
             let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("");
-            matches!(status, "queued" | "in_progress") && existing_pr_review_target(task).is_some()
+            status == "queued" && existing_pr_review_target(task).is_some()
         }
 }
 
@@ -19857,6 +19892,7 @@ pub async fn sweep_plant_full_pr_review_queue(config: &SupabaseConfig) {
         }
     }
 
+    let mut projects_cache: Option<Value> = None;
     for task in arr {
         if !is_plant_full_pr_review_task(task) {
             continue;
@@ -19867,11 +19903,24 @@ pub async fn sweep_plant_full_pr_review_queue(config: &SupabaseConfig) {
             .unwrap_or("")
             .to_string();
         let pr_url = full_pr_review_pr_url(task);
-        let repo_path = task
+        let mut repo_path = task
             .get("repo_path")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        // Board and webhook hand-offs may only name the project; resolve its
+        // checkout like a normal coding task would.
+        if repo_path.is_empty() {
+            if projects_cache.is_none() {
+                projects_cache = Some(supabase::fetch_projects(config).await.unwrap_or(serde_json::json!([])));
+            }
+            let project = task.get("project").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(found) = projects_cache.as_ref().and_then(|p| p.as_array()).and_then(|arr| {
+                arr.iter().find(|p| p.get("name").and_then(|v| v.as_str()) == Some(project))
+            }) {
+                repo_path = found.get("repo_path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            }
+        }
         let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("");
         let repo_keys = task_repo_serial_keys(task);
 
@@ -20081,10 +20130,16 @@ pub async fn sweep_plant_full_pr_review_queue(config: &SupabaseConfig) {
 
         // Point the row at the original PR so the board, Kip and every sweep
         // see the one PR for this job.
+        let mut ctx = task_context_object(task);
+        ctx.insert("plant_full_pr_review".to_string(), Value::Bool(true));
         let _ = supabase::update_task(
             config,
             &task_id,
-            &serde_json::json!({ "pr_url": pr_url.clone() }),
+            &serde_json::json!({
+                "pr_url": pr_url.clone(),
+                "repo_path": repo_path.clone(),
+                "context": Value::Object(ctx),
+            }),
         )
         .await;
         spawn_full_pr_review_task(config.clone(), task_id, pr_url, repo_path);

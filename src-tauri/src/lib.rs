@@ -65,19 +65,34 @@ fn install_one_pr_guard() {
         if std::fs::create_dir_all(&dir).is_err() {
             return;
         }
-        let gh = r#"#!/bin/bash
+        // Resolve the real gh before our folder is on PATH, so the wrapper
+        // execs the same binary every platform would have used.
+        let Ok(real_gh) = which::which("gh") else {
+            return;
+        };
+        let real_gh = real_gh.to_string_lossy().into_owned();
+        if real_gh.starts_with(&dir.to_string_lossy().into_owned()) {
+            return;
+        }
+        let gh = format!(
+            r#"#!/bin/sh
 # AutoSam one-PR-per-job guard (written by agent-one at startup).
-REAL=/usr/bin/gh
-[ -x "$REAL" ] || REAL=/bin/gh
-if [ "$AUTOSAM_NO_NEW_PR" = 1 ] && [[ " $* " == *" pr create "* ]]; then
+if [ "$AUTOSAM_NO_NEW_PR" = 1 ] && [ "$1" = pr ] && [ "$2" = create ]; then
   echo "AutoSam guard: never open a second PR for this job. Push the fix to the original PR's own branch." >&2
   exit 1
 fi
-exec "$REAL" "$@"
-"#;
+exec '{}' "$@"
+"#,
+            real_gh.replace('\'', "'\\''")
+        );
         let p = dir.join("gh");
-        if std::fs::write(&p, gh).is_ok() {
-            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755));
+        if std::fs::read_to_string(&p).ok().as_deref() != Some(gh.as_str()) {
+            // Write then rename so a concurrent gh call never runs a half-written script.
+            let tmp = dir.join(format!(".gh.{}", std::process::id()));
+            if std::fs::write(&tmp, &gh).is_ok() {
+                let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
+                let _ = std::fs::rename(&tmp, &p);
+            }
         }
         let _ = std::fs::remove_file(dir.join("git"));
         let d = dir.to_string_lossy().into_owned();
