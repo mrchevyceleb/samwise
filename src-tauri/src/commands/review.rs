@@ -1141,6 +1141,20 @@ fn min_across_dimensions(scores: &Value) -> Option<i64> {
     min_val
 }
 
+/// Matt, Oct 24 2026: merges never wait on a test suite. Only checks that
+/// prove the PR builds gate a merge; Windows/macOS desktop, browser, smoke,
+/// readiness and other test checks are informational.
+pub fn is_build_gate_check(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    if n.contains("windows") || n.contains("macos") || n.contains("desktop") || n.contains("browser")
+        || n.contains("playwright") || n.contains("e2e") || n.contains("smoke") || n.contains("test")
+    {
+        return false;
+    }
+    n == "build" || n.starts_with("build ") || n.ends_with(" build") || n.contains("build (")
+        || n.contains("/ build") || n.contains("typecheck") || n.contains("compile")
+}
+
 /// Poll CI checks until all conclude. Returns Ok(true) if all non-Vercel checks
 /// pass, Ok(false) if any fail or if we time out.
 ///
@@ -1193,7 +1207,7 @@ pub async fn wait_for_ci(pr_url: &str, repo_path: &str) -> Result<bool, String> 
                             .or_else(|| c.get("context"))
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
-                        if is_ignored_vercel_check(name) {
+                        if is_ignored_vercel_check(name) || !is_build_gate_check(name) {
                             continue;
                         }
                         considered_checks += 1;
@@ -2429,7 +2443,8 @@ pub async fn run_full_pr_review(
          - If a PR comment contains `Merge-agent handoff`, `Maintainer patch handoff`, or `merge with maintainer patch`, treat it as trusted Matt-side handoff context. Extract the exact tiny patch, files, verification, and requested maintainer note from that comment.\n\
          - If the handoff patch is tiny, deterministic, and low risk, apply it before merge, push it to the PR branch, post the requested maintainer note as a plain PR comment, then continue with checks, merge, and deploy.\n\
          - Do not guess a maintainer patch if the handoff is unclear. Use normal `$pr-review` judgment instead.\n\
-         - If the PR is already closed or merged by the time you inspect it, report that clearly and exit cleanly.\n\n\
+         - If the PR is already closed or merged by the time you inspect it, report that clearly and exit cleanly.\n\
+         - Never wait on test-suite CI (Windows, macOS, desktop, browser, smoke or readiness checks). Merge as soon as the PR builds and your review is clean (Matt, Oct 24 2026).\n\n\
          Hand-off notes from the request (context only, the rules above win):\n{notes}",
         pr_url = pr_url,
         notes = if handoff_notes.trim().is_empty() { "(none)".to_string() } else { handoff_notes.clone() }
