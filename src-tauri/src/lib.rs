@@ -49,9 +49,49 @@ fn normalize_path_env() {
     }
 }
 
+/// Matt, Oct 24 2026: one PR per job. A full `$pr-review` run works on the
+/// developer's own PR, so its processes (AUTOSAM_NO_NEW_PR=1) find this `gh`
+/// wrapper first on PATH and cannot `gh pr create` a second PR. Every other
+/// gh call, and every other process, passes straight through.
+fn install_one_pr_guard() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let home = std::env::var("HOME").unwrap_or_default();
+        if home.is_empty() {
+            return;
+        }
+        let dir = std::path::PathBuf::from(&home).join(".local/share/autosam/guard-bin");
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let gh = r#"#!/bin/bash
+# AutoSam one-PR-per-job guard (written by agent-one at startup).
+REAL=/usr/bin/gh
+[ -x "$REAL" ] || REAL=/bin/gh
+if [ "$AUTOSAM_NO_NEW_PR" = 1 ] && [[ " $* " == *" pr create "* ]]; then
+  echo "AutoSam guard: never open a second PR for this job. Push the fix to the original PR's own branch." >&2
+  exit 1
+fi
+exec "$REAL" "$@"
+"#;
+        let p = dir.join("gh");
+        if std::fs::write(&p, gh).is_ok() {
+            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755));
+        }
+        let _ = std::fs::remove_file(dir.join("git"));
+        let d = dir.to_string_lossy().into_owned();
+        let current = std::env::var("PATH").unwrap_or_default();
+        if !current.split(':').any(|x| x == d) {
+            std::env::set_var("PATH", format!("{}:{}", d, current));
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     normalize_path_env();
+    install_one_pr_guard();
     let mut args = std::env::args_os().skip(1);
     if args.next().as_deref() == Some(std::ffi::OsStr::new("--team-claude-subprocess")) {
         commands::claude_code::run_team_claude_shell(args.collect());
