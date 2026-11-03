@@ -49,9 +49,73 @@ fn normalize_path_env() {
     }
 }
 
+/// Agents never merge or push to main themselves, and AutoSam never opens a
+/// second PR for a job. Only the worker merges, after a clean full PR review,
+/// through the real gh binary (review::gh_merge, Matt Nov 3 2026). Every process the worker spawns
+/// (review agents, coding agents, scripts) finds these wrappers first on PATH:
+/// `gh pr merge`, merge API calls and pushes to main/master are refused, and
+/// review-only runs (AUTOSAM_REVIEW_ONLY=1) also cannot `gh pr create`.
+fn install_merge_guard() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let home = std::env::var("HOME").unwrap_or_default();
+        if home.is_empty() {
+            return;
+        }
+        let dir = std::path::PathBuf::from(&home).join(".local/share/autosam/guard-bin");
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let gh = r#"#!/bin/bash
+# AutoSam merge guard (written by agent-one at startup).
+REAL=/usr/bin/gh
+[ -x "$REAL" ] || REAL=/bin/gh
+for a in "$@"; do
+  case "$a" in
+    merge) if [ "$1" = pr ] || [[ " $* " == *" pr merge "* ]]; then echo "AutoSam guard: agents never merge. Push fixes to the PR's own branch and report the clean head; the worker merges it." >&2; exit 1; fi ;;
+  esac
+done
+if [[ " $* " == *" pr create "* ]] && [ "$AUTOSAM_REVIEW_ONLY" = 1 ]; then
+  echo "AutoSam guard: never open a second PR. Push the fix to the original PR's branch." >&2; exit 1
+fi
+if [ "$1" = api ]; then
+  for a in "$@"; do case "$a" in */merge|*/merge\?*|*/merges|*/merges\?*) echo "AutoSam guard: agents never merge; the worker merges a clean review." >&2; exit 1;; esac; done
+fi
+exec "$REAL" "$@"
+"#;
+        let git = r#"#!/bin/bash
+# AutoSam merge guard (written by agent-one at startup).
+REAL=/usr/bin/git
+[ -x "$REAL" ] || REAL=/bin/git
+if [[ " $* " == *" push "* ]]; then
+  for a in "$@"; do
+    case "$a" in
+      main|master|+main|+master|*:main|*:master|*:refs/heads/main|*:refs/heads/master|refs/heads/main|refs/heads/master)
+        echo "AutoSam guard: never push to main or master. The worker merges a clean review." >&2; exit 1 ;;
+    esac
+  done
+fi
+exec "$REAL" "$@"
+"#;
+        for (name, body) in [("gh", gh), ("git", git)] {
+            let p = dir.join(name);
+            if std::fs::write(&p, body).is_ok() {
+                let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+        let d = dir.to_string_lossy().into_owned();
+        let current = std::env::var("PATH").unwrap_or_default();
+        if !current.split(':').any(|x| x == d) {
+            std::env::set_var("PATH", format!("{}:{}", d, current));
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     normalize_path_env();
+    install_merge_guard();
 
     // ── Crash-loop guard ──────────────────────────────────────────────
     // When systemd restarts this process after a SIGKILL (force close),

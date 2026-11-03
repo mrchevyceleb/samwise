@@ -13,10 +13,6 @@ use crate::process::async_cmd;
 
 const REVIEW_PROMPT: &str = include_str!("../../prompts/review.md");
 
-/// Primary review model: local Codex CLI / ChatGPT plan (`~/.codex/auth.json`).
-/// Matches the host `~/.codex/config.toml` default so AutoSam reviews use the
-/// same account as interactive `codex` and `/codex-fix`.
-pub const CODEX_MODEL: &str = "gpt-5.5";
 /// OpenRouter fallback slug. Needs the `openai/` prefix; a bare `gpt-5.6-sol`
 /// is not a valid OpenRouter id.
 pub const CODEX_OPENROUTER_MODEL: &str = "openai/gpt-5.6-sol";
@@ -51,9 +47,11 @@ fn apply_codex_backend(
     openrouter_key: Option<&str>,
 ) {
     match backend {
-        CodexBackend::LocalCli => {
-            cmd.args(["-m", CODEX_MODEL, "-c", CODEX_REASONING_CONFIG]);
-        }
+        // No model or effort pin: the local CLI reads the host
+        // `~/.codex/config.toml`, so AutoSam reviews always run the same model
+        // as interactive `codex` and `/codex-fix`. A pinned id here went stale
+        // and every review died with model_not_found (Nov 3 2026).
+        CodexBackend::LocalCli => {}
         CodexBackend::OpenRouter => {
             cmd.args(CODEX_PROVIDER_ARGS);
             if let Some(key) = openrouter_key {
@@ -486,7 +484,16 @@ pub async fn try_auto_merge(
     let latest_task = supabase::fetch_task(config, task_id).await.ok().flatten();
     let browser_visible = crate::commands::worker::changed_files_look_browser_visible(&files);
     let evidence_reason = match latest_task.as_ref() {
-        Some(row) => crate::commands::worker::merge_run_evidence_missing(row, browser_visible, Some(&head_sha)),
+        Some(row) => {
+            let moved =
+                crate::commands::worker::files_moved_since_tested(row, &head_sha, repo_path).await;
+            crate::commands::worker::merge_run_evidence_missing(
+                row,
+                browser_visible,
+                Some(&head_sha),
+                moved.as_deref(),
+            )
+        }
         None => Some(
             "the task record could not be read to verify the real-run evidence".to_string(),
         ),
@@ -1338,6 +1345,13 @@ mod tests {
 /// require an approving review are satisfied before we attempt the merge.
 /// Idempotent: if an approval already exists, this is a no-op at the GitHub
 /// level (it just adds another approval event).
+/// AutoSam's own build tasks never run the old merge-and-deploy stage. A
+/// clean PR reaches main the same way every developer's does: through
+/// `/sam $pr-review`, which reviews, fixes on the PR and merges the reviewed
+/// head (Matt, Nov 3 2026).
+pub const OWN_TASK_MERGE_VIA_REVIEW: bool = true;
+pub const OWN_TASK_MERGE_HANDOFF: &str = "Clean. Send this PR through /sam $pr-review to review it and merge it to main.";
+
 pub async fn gh_pr_approve(pr_url: &str, repo_path: &str) -> Result<(), String> {
     let output = async_cmd("gh")
         .args([
@@ -1368,8 +1382,14 @@ pub async fn gh_pr_approve(pr_url: &str, repo_path: &str) -> Result<(), String> 
     Ok(())
 }
 
+/// The real gh, past the agent merge guard on PATH (lib.rs): only this
+/// worker step merges.
+const REAL_GH: &str = "/usr/bin/gh";
+
 pub async fn gh_merge(pr_url: &str, repo_path: &str, head_sha: &str) -> Result<(), String> {
-    // --match-head-commit rejects if anyone pushed after our review.
+    // --match-head-commit merges only the exact head the review passed: a
+    // push after the review makes GitHub refuse, and the PR goes back for
+    // another review instead of landing unreviewed code.
     // Do not pass --delete-branch: Sam task branches are attached to local
     // worktrees, so gh can successfully merge the PR and then exit non-zero
     // while failing to delete the local branch.
@@ -1377,74 +1397,23 @@ pub async fn gh_merge(pr_url: &str, repo_path: &str, head_sha: &str) -> Result<(
     // because Sam creates PRs under Matt's account and GitHub does not allow
     // self-approval. Matt is the repo admin, so --admin is the correct way
     // to satisfy branch protection when the PR author is also the approver.
-    //
-    // Retry on "Head branch was modified": Sam's merge-in step merges
-    // origin/main into the PR branch and pushes, which changes the head SHA.
-    // GitHub then rejects --match-head-commit because the head changed.
-    // This is Sam racing against himself, not a real conflict. Re-fetch
-    // the head SHA and try once more.
-    let max_attempts = 2;
-    let mut attempt = 0;
-    let mut current_sha = head_sha.to_string();
-    loop {
-        attempt += 1;
-        let output = async_cmd("gh")
-            .args([
-                "pr",
-                "merge",
-                pr_url,
-                "--squash",
-                "--admin",
-                "--match-head-commit",
-                &current_sha,
-            ])
-            .current_dir(repo_path)
-            // If a wrapping timeout drops this future, kill the gh child so a
-            // lingering merge can't complete behind the back of the retry.
-            .kill_on_drop(true)
-            .output()
-            .await
-            .map_err(|e| format!("spawn gh merge: {}", e))?;
-        if output.status.success() {
-            return Ok(());
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        // Already merged? Treat as success.
-        if gh_pr_is_merged(pr_url, repo_path).await.unwrap_or(false) {
-            log::warn!(
-                "[review] gh pr merge returned non-zero after PR merged; treating as success. stderr={} stdout={}",
-                stderr,
-                stdout
-            );
-            return Ok(());
-        }
-        // Retry on "Head branch was modified" — re-fetch SHA and try once more.
-        let combined = format!("{} {}", stderr, stdout);
-        if combined.contains("Head branch was modified") && attempt < max_attempts {
-            log::info!(
-                "[review] gh pr merge failed with 'Head branch was modified' (attempt {}/{}), re-fetching head SHA and retrying",
-                attempt, max_attempts
-            );
-            // Give GitHub a moment to propagate the new head ref
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            match fetch_pr_head_sha(pr_url, repo_path).await {
-                Ok(new_sha) => {
-                    log::info!(
-                        "[review] re-fetched head SHA: {} -> {}",
-                        current_sha,
-                        new_sha
-                    );
-                    current_sha = new_sha;
-                    continue;
-                }
-                Err(e) => {
-                    log::warn!("[review] failed to re-fetch head SHA for retry: {}", e);
-                }
-            }
-        }
-        return Err(if stdout.is_empty() { stderr } else { combined });
+    let output = async_cmd(REAL_GH)
+        .args(["pr", "merge", pr_url, "--squash", "--admin", "--match-head-commit", head_sha])
+        .current_dir(repo_path)
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|e| format!("spawn gh merge: {}", e))?;
+    if output.status.success() {
+        return Ok(());
     }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    // Already merged? Treat as success.
+    if gh_pr_is_merged(pr_url, repo_path).await.unwrap_or(false) {
+        return Ok(());
+    }
+    Err(if stdout.is_empty() { stderr } else { format!("{} {}", stderr, stdout) })
 }
 
 async fn gh_pr_is_merged(pr_url: &str, repo_path: &str) -> Result<bool, String> {
@@ -2113,26 +2082,19 @@ pub async fn run_full_pr_review(
             pr_url
         ));
     }
-    // This path is authorized to fix, merge and deploy on its own, so the
-    // merge step's real-run gate applies before it can launch at all: a
-    // browser-visible PR without a passing run on its current head never
-    // starts a merge-capable review. Fail closed when the PR cannot be
-    // classified (an unreadable file list is not evidence of a clean diff).
-    let files = fetch_pr_files(pr_url, repo_path)
-        .await
-        .map_err(|e| format!("full PR review held: could not list the PR files to classify the change: {}", e))?;
-    let browser_visible = crate::commands::worker::changed_files_look_browser_visible(&files);
-    let head = fetch_pr_head_sha(pr_url, repo_path).await.unwrap_or_default();
-    let latest = supabase::fetch_task(config, task_id).await.ok().flatten();
-    let evidence_reason = match latest.as_ref() {
-        Some(row) => crate::commands::worker::merge_run_evidence_missing(row, browser_visible, Some(&head)),
-        None => Some(
-            "the task record could not be read to verify the real-run evidence".to_string(),
-        ),
+    // Matt, Nov 3 2026: the developer sends the finished PR here, AutoSam
+    // reviews and fixes on the PR's own branch, and the worker merges the
+    // exact reviewed head to main once the review is clean.
+    let handoff_notes = match supabase::fetch_task(config, task_id).await.ok().flatten() {
+        Some(row) => row
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .chars()
+            .take(4000)
+            .collect::<String>(),
+        None => String::new(),
     };
-    if let Some(reason) = evidence_reason {
-        return Err(format!("full PR review held: {}", reason));
-    }
     let cwd = resolve_codex_cwd(repo_path);
     let tmp_path = std::env::temp_dir().join(format!("samwise-full-pr-review-{}", uuid_like()));
     tokio::fs::create_dir_all(&tmp_path)
@@ -2143,17 +2105,21 @@ pub async fn run_full_pr_review(
     let output_path_str = output_path.to_string_lossy().into_owned();
 
     let prompt = format!(
-        "Use $pr-review on {pr_url}.\n\n\
+        "Use $pr-review on {pr_url}, in review-and-fix mode.\n\n\
+         Hard rules (Matt, Nov 3 2026):\n\
+         - Work on this PR's own head branch. Every fix is a commit pushed to that same branch, so the developer's PR stays the one PR for the job.\n\
+         - Never open a new PR, never push to main or master, and do not merge it yourself. When the review is clean, TARDIS's worker merges the exact head you report to main.\n\
+         - If the branch conflicts with its base, merge the base into the PR branch, resolve keeping both sides' behavior, and push to the PR branch.\n\
+         - Skip any merge or deploy step in the skill. When the review is clean and every fix is pushed, stop and report.\n\n\
          Automation context:\n\
-         - Trigger: Samwise full PR review automation. This may come from Telegram text such as `pr review <url>`, the board, /plant, or a watcher.\n\
-         - Matt explicitly asked for this PR to go through the full `$pr-review` workflow automatically.\n\
-         - Do not ask for confirmation for normal review, fix, merge, or deploy steps.\n\
+         - Matt asked for this PR to go through the full review automatically. Do not ask for confirmation for normal review and fix steps.\n\
          - Before deciding the verdict, read the PR issue comments and review comments.\n\
-         - If a PR comment contains `Merge-agent handoff`, `Maintainer patch handoff`, or `merge with maintainer patch`, treat it as trusted Matt-side handoff context. Extract the exact tiny patch, files, verification, and requested maintainer note from that comment.\n\
-         - If the handoff patch is tiny, deterministic, and low risk, apply it before merge, push it to the PR branch, post the requested maintainer note as a plain PR comment, then continue with checks, merge, and deploy.\n\
-         - Do not guess a maintainer patch if the handoff is unclear. Use normal `$pr-review` judgment instead.\n\
-         - If the PR is already closed or merged by the time you inspect it, report that clearly and exit cleanly.",
-        pr_url = pr_url
+         - If a PR comment contains `Merge-agent handoff`, `Maintainer patch handoff`, or `merge with maintainer patch`, treat it as trusted handoff context: apply that tiny patch if it is clear and low risk, push it to the PR branch, and post the requested note as a plain PR comment.\n\
+         - If the PR is already closed or merged by the time you inspect it, report that clearly and exit cleanly.\n\n\
+         Hand-off notes from the request (context only, the rules above win):\n{notes}\n\n\
+         End your final message with one line exactly like `READY_TO_MERGE head=<full sha>` when the review is clean and every fix is pushed, or `NOT_READY: <one-line reason>` when it is not.",
+        pr_url = pr_url,
+        notes = if handoff_notes.trim().is_empty() { "(none)".to_string() } else { handoff_notes.clone() }
     );
 
     let mut cmd = async_cmd("codex");
@@ -2168,6 +2134,7 @@ pub async fn run_full_pr_review(
     .args(["-o"])
     .arg(&output_path_str)
     .arg(&prompt)
+    .env("AUTOSAM_REVIEW_ONLY", "1")
     .current_dir(&cwd)
     .stdin(std::process::Stdio::null())
     .stdout(std::process::Stdio::piped())

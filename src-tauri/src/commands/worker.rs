@@ -525,6 +525,132 @@ const MERGE_DEPLOY_MAX_RETRIES: i64 = 2;
 /// would otherwise pass `None` and merge whatever the PR head is at merge time).
 const MERGE_DEPLOY_EXPECTED_HEAD_SHA_KEY: &str = "samwise_merge_deploy_expected_head_sha";
 const MERGE_DEPLOY_RETRIES_KEY: &str = "samwise_merge_deploy_retries";
+/// Context key holding the exact PR head a clean review covered: the head
+/// AutoSam pushed after its own /codex-fix pipeline, or the head a clean
+/// `$samwise-pr-review` verdict was given on. A card that comes back to Review
+/// reuses that review only while the PR head still matches; any new commit
+/// (fix pass, conflict resolution, outside push) needs a fresh review.
+const REVIEWED_HEAD_SHA_KEY: &str = "samwise_reviewed_head_sha";
+
+/// True only when the /codex-fix report states a success exit reason
+/// ("exit reason: clean | verified | limited | third-loop") and names no
+/// failure exit. A missing or ambiguous exit reason is not a pass.
+fn codex_fix_report_is_success(report: &str) -> bool {
+    let r = report.to_ascii_lowercase();
+    if r.contains("hard-blocker") || r.contains("hard-backend-failure") {
+        return false;
+    }
+    let mut found = false;
+    for (idx, _) in r.match_indices("exit reason") {
+        let tail = r[idx + "exit reason".len()..]
+            .trim_start_matches(|c: char| c == ':' || c == '*' || c == '`' || c.is_whitespace());
+        let word: String = tail
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
+        match word.as_str() {
+            "clean" | "verified" | "limited" | "third-loop" => found = true,
+            _ => return false,
+        }
+    }
+    found
+}
+
+fn reviewed_head_covers(task: &Value, current_head: Option<&str>) -> bool {
+    let reviewed = task
+        .get("context")
+        .and_then(|c| c.get(REVIEWED_HEAD_SHA_KEY))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    match current_head {
+        Some(head) => !reviewed.is_empty() && reviewed == head,
+        None => false,
+    }
+}
+
+/// Context-only PATCH recording the head a clean review covered. Reads the
+/// row fresh so it never clobbers context written since the caller's copy.
+async fn record_reviewed_head(config: &SupabaseConfig, task_id: &str, head: &str) -> bool {
+    let Some(latest) = supabase::fetch_task(config, task_id).await.ok().flatten() else {
+        return false;
+    };
+    let mut context = task_context_object(&latest);
+    context.insert(
+        REVIEWED_HEAD_SHA_KEY.to_string(),
+        Value::String(head.to_string()),
+    );
+    // The latest review is the truth: a clean pass retires older findings.
+    context.remove(REVIEW_EVIDENCE_KEY);
+    if let Err(e) = supabase::update_task(
+        config,
+        task_id,
+        &serde_json::json!({ "context": Value::Object(context) }),
+    )
+    .await
+    {
+        log::warn!("[worker] failed to record reviewed head for task {}: {}", task_id, e);
+        return false;
+    }
+    true
+}
+
+/// Context key holding the findings of the latest non-clean review together
+/// with the exact head it reviewed: `{ head_sha, markdown, recorded_at }`.
+/// The stale fixes_needed sweep feeds the fix loop from this, never from the
+/// card's comment stream, where progress chatter can bury the real blockers.
+const REVIEW_EVIDENCE_KEY: &str = "samwise_review_evidence";
+
+/// The recorded review findings, only when they were written for `head`.
+/// None means there is no review of the current code yet.
+fn review_evidence_for_head(task: &Value, head: &str) -> Option<String> {
+    let evidence = task.get("context")?.get(REVIEW_EVIDENCE_KEY)?;
+    let reviewed = evidence.get("head_sha")?.as_str()?;
+    if head.is_empty() || head == "unknown" || reviewed != head {
+        return None;
+    }
+    Some(
+        evidence
+            .get("markdown")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+    )
+}
+
+/// Context-only PATCH recording a non-clean review's findings for the head
+/// it looked at. Reads the row fresh so it never clobbers newer context.
+async fn record_review_evidence(
+    config: &SupabaseConfig,
+    task_id: &str,
+    head: &str,
+    markdown: &str,
+) -> bool {
+    let Some(latest) = supabase::fetch_task(config, task_id).await.ok().flatten() else {
+        return false;
+    };
+    let mut context = task_context_object(&latest);
+    context.insert(
+        REVIEW_EVIDENCE_KEY.to_string(),
+        serde_json::json!({
+            "head_sha": head,
+            "markdown": markdown,
+            "recorded_at": chrono::Utc::now().to_rfc3339(),
+        }),
+    );
+    // And findings retire any earlier clean pass.
+    context.remove(REVIEWED_HEAD_SHA_KEY);
+    if let Err(e) = supabase::update_task(
+        config,
+        task_id,
+        &serde_json::json!({ "context": Value::Object(context) }),
+    )
+    .await
+    {
+        log::warn!("[worker] failed to record review evidence for task {}: {}", task_id, e);
+        return false;
+    }
+    true
+}
 
 /// Wall-clock budget for a single auto-fix Claude Code run (the pass that
 /// addresses Codex blockers on a PR). The old hardcoded 900s was too tight
@@ -5342,6 +5468,16 @@ from Matt, stop without making changes and explain specifically what you need cl
                 }
                 return Ok("Task was cancelled".to_string());
             }
+            // The commit a clean /codex-fix pass left behind. Only this exact
+            // head may skip the PR review; any later commit (build repair,
+            // Testing repair, generated files) needs a real review.
+            let mut codex_fix_head: Option<String> = None;
+            // The skill finishes normally even on its failure exits, so a clean
+            // pass needs its reported exit reason to be a success exit.
+            let codex_fix_clean = match &codex_result {
+                Ok(report) => codex_fix_report_is_success(report),
+                Err(_) => false,
+            };
             match codex_result {
                 Ok(_) => {
                     let porcelain = run_git(&["status", "--porcelain"], &repo_path)
@@ -5349,6 +5485,11 @@ from Matt, stop without making changes and explain specifically what you need cl
                         .unwrap_or_default();
                     if porcelain.trim().is_empty() {
                         agent_comment(config, &task_id, "codex-fix found nothing to change.").await;
+                        codex_fix_head = run_git(&["rev-parse", "HEAD"], &repo_path)
+                            .await
+                            .ok()
+                            .map(|h| h.trim().to_string())
+                            .filter(|h| !h.is_empty());
                     } else {
                         let _ = run_git(&["add", "-A"], &repo_path).await;
                         match run_git(
@@ -5364,6 +5505,11 @@ from Matt, stop without making changes and explain specifically what you need cl
                                     "Applied codex-fix suggestions in a follow-up commit.",
                                 )
                                 .await;
+                                codex_fix_head = run_git(&["rev-parse", "HEAD"], &repo_path)
+                                    .await
+                                    .ok()
+                                    .map(|h| h.trim().to_string())
+                                    .filter(|h| !h.is_empty());
                             }
                             Err(e) => {
                                 log::warn!("[worker] codex-fix commit failed: {}", e);
@@ -6050,12 +6196,26 @@ from Matt, stop without making changes and explain specifically what you need cl
                 Ok(pr_url) => {
                     let pr_review_required = task_requires_pr_review(&task);
                     let external_review = task_is_external_pr_review_request(&task);
+                    // Skip the PR review only when the pushed head is exactly
+                    // the commit a clean /codex-fix pass covered. A failed
+                    // pass, or any commit added after it, lands in Review.
+                    let pushed_head = review::fetch_pr_head_sha(&pr_url, &repo_path).await.ok();
+                    // Approval without a saved reviewed head could never be
+                    // invalidated by a later push, so a failed save lands in Review.
+                    let self_reviewed = !external_review
+                        && codex_fix_clean
+                        && pushed_head.is_some()
+                        && pushed_head == codex_fix_head
+                        && match pushed_head.as_deref() {
+                            Some(head) => record_reviewed_head(config, &task_id, head).await,
+                            None => false,
+                        };
                     // Auto-merge is never on. AutoSam-coded tickets already ran
                     // /codex-fix before this PR opened, so a second OpenRouter
                     // $samwise-pr-review is a dead gate that parks every card.
                     // Send those straight to Ready to Merge. Slack #review cards
                     // never coded here, so they still need the review pass.
-                    let land_in_review = pr_review_required && external_review;
+                    let land_in_review = pr_review_required && !self_reviewed;
                     let mut pr_updates = serde_json::json!({
                         "status": if land_in_review { "review" } else { "approved" },
                         "pr_url": pr_url,
@@ -6107,7 +6267,7 @@ from Matt, stop without making changes and explain specifically what you need cl
                         .and_then(|v| v.as_bool())
                         .unwrap_or(true);
                     let has_downstream = auto_merge_on_for_telegram
-                        || (pr_review_on_for_telegram && pr_review_required && external_review);
+                        || (pr_review_on_for_telegram && land_in_review);
                     if notify_task_completed_code && !has_downstream {
                         send_telegram(
                             config,
@@ -6259,7 +6419,7 @@ from Matt, stop without making changes and explain specifically what you need cl
                         .and_then(|s| s.get("autoPrReviewEnabled"))
                         .and_then(|v| v.as_bool())
                         .unwrap_or(true);
-                    if !auto_merge_on && auto_pr_review_on && pr_review_required && external_review {
+                    if !auto_merge_on && auto_pr_review_on && land_in_review {
                         spawn_pr_review_task(
                             config.clone(),
                             task_id.clone(),
@@ -11834,6 +11994,17 @@ pub fn spawn_pr_review_task(
             );
             return;
         }
+        // The head this review looks at. A clean verdict only counts for it,
+        // so don't pay for a review whose head can't be pinned; the sweep
+        // retries on its normal timer.
+        let mut launch_head = match review::fetch_pr_head_sha(&pr_url, &repo_path).await {
+            Ok(head) => Some(head),
+            Err(e) => {
+                log::warn!("[pr-review] task {}: cannot read PR head before review: {}", task_id, e);
+                mark_pr_review_finished(&config, &task_id, Some("could not read the PR head before review")).await;
+                return;
+            }
+        };
 
         // Pi-style delta verify: a card arriving here straight out of an
         // auto-fix push gets a scoped verify of just the fix delta, not a
@@ -11972,6 +12143,11 @@ pub fn spawn_pr_review_task(
                     "Running $samwise-pr-review on this PR — hang tight, Codex takes a minute.",
                 )
                 .await;
+                // The full review looks at the head as it is now, which may be
+                // newer than the one pinned before a delta verify.
+                if let Ok(head) = review::fetch_pr_head_sha(&pr_url, &repo_path).await {
+                    launch_head = Some(head);
+                }
                 match review::run_samwise_pr_review(&pr_url, &repo_path).await {
                     Ok(r) => r,
                     Err(e) => {
@@ -12010,6 +12186,48 @@ pub fn spawn_pr_review_task(
         // One-line headline so Matt can see the verdict at a glance without
         // scrolling or reading the whole markdown body. Post BEFORE the body
         // so it appears at the top of the review section in the activity log.
+        // A clean verdict only counts for the head it reviewed. Check before
+        // any approval signal goes out (board, GitHub, samcheck stamp): if the
+        // PR moved while the review ran, or the head can't be read, keep the
+        // card in Review and mark it changed so the sweep reviews the current
+        // head instead of approving a stale pass.
+        let mut clean_reviewed_head: Option<String> = None;
+        if matches!(result.verdict, review::PrReviewVerdict::MergeNow) {
+            let head_now = review::fetch_pr_head_sha(&pr_url, &repo_path).await.ok();
+            match (launch_head.as_deref(), head_now.as_deref()) {
+                (Some(a), Some(b)) if a == b && record_reviewed_head(&config, &task_id, a).await => {
+                    clean_reviewed_head = Some(a.to_string())
+                }
+                _ => {
+                    mark_pr_review_finished(&config, &task_id, None).await;
+                    let _ = supabase::update_task_if_status(
+                        &config,
+                        &task_id,
+                        "review",
+                        &serde_json::json!({
+                            "updated_at": (chrono::Utc::now() + chrono::Duration::seconds(1)).to_rfc3339(),
+                        }),
+                    )
+                    .await;
+                    agent_comment(
+                        &config,
+                        &task_id,
+                        "The review came back clean, but the PR changed while it ran, so I am reviewing the new head before this goes to Ready to Merge.",
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+
+        // A non-clean verdict's findings are stored with the head they cover,
+        // so the fix loop reads the real blockers from the card itself.
+        if !matches!(result.verdict, review::PrReviewVerdict::MergeNow) {
+            if let Some(head) = launch_head.as_deref() {
+                record_review_evidence(&config, &task_id, head, &result.markdown).await;
+            }
+        }
+
         let headline = match result.verdict {
             review::PrReviewVerdict::MergeNow => {
                 "Codex says: **MERGE**. Moving to Ready to Merge.".to_string()
@@ -12123,6 +12341,7 @@ pub fn spawn_pr_review_task(
         match result.verdict {
             review::PrReviewVerdict::MergeNow => {
                 mark_pr_review_finished(&config, &task_id, None).await;
+                let _ = clean_reviewed_head;
                 let updated = supabase::update_task_if_status_not_held(
                     &config,
                     &task_id,
@@ -12478,18 +12697,35 @@ pub fn spawn_full_pr_review_task(
         match result {
             Ok(report) => {
                 let capped = truncate(&report, 6000);
+                // Matt, Nov 3 2026: a clean review merges the exact reviewed
+                // head to main. --match-head-commit refuses if anyone pushed
+                // after the review, so nothing unreviewed can land.
+                let clean_head = report
+                    .lines()
+                    .rev()
+                    .find_map(|line| line.trim().strip_prefix("READY_TO_MERGE head="))
+                    .map(|sha| sha.trim().to_string())
+                    .filter(|sha| sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()));
+                let merge = match clean_head.as_deref() {
+                    Some(sha) => Some(review::gh_merge(&pr_url, &repo_path, sha).await),
+                    None => None,
+                };
+                let (note, status) = match &merge {
+                    Some(Ok(())) => ("Clean, merged to main.".to_string(), "done"),
+                    Some(Err(e)) => (format!("Clean, but the merge failed: {}", truncate(e, 600)), "fixes_needed"),
+                    None => ("Not clean yet, see the report.".to_string(), "fixes_needed"),
+                };
                 agent_comment(
                     &config,
                     &task_id,
-                    &format!("Full `$pr-review` completed.\n\n{}", capped),
+                    &format!("Review and fixes are on the original PR. {}\n\n{}", note, capped),
                 )
                 .await;
                 let _ = supabase::update_task(
                     &config,
                     &task_id,
                     &serde_json::json!({
-                        "status": "done",
-                        "completed_at": chrono::Utc::now().to_rfc3339(),
+                        "status": status,
                         "worker_id": serde_json::Value::Null,
                         "claimed_at": serde_json::Value::Null,
                         "updated_at": chrono::Utc::now().to_rfc3339(),
@@ -12500,8 +12736,9 @@ pub fn spawn_full_pr_review_task(
                 send_telegram(
                     &config,
                     &format!(
-                        "Full `$pr-review` completed for Kim PR: {}",
+                        "Full `$pr-review` completed for Kim PR: {} ({})",
                         escape_markdown_v2(&pr_url),
+                        escape_markdown_v2(&note),
                     ),
                 )
                 .await;
@@ -14086,6 +14323,37 @@ async fn start_merge_deploy_task(
         .unwrap_or("")
         .to_string();
     if task_id.is_empty() || pr_url.is_empty() {
+        return;
+    }
+
+    // The merge and deploy stage never runs here; a clean PR merges through
+    // the full PR review instead (review::OWN_TASK_MERGE_HANDOFF).
+    if review::OWN_TASK_MERGE_VIA_REVIEW {
+        let _ = (should_merge_if_open, start_comment);
+        if merge_deploy_context_status(&task) == Some("handed_to_kip") {
+            return;
+        }
+        let mut context = task_context_object(&task);
+        context.insert(
+            MERGE_DEPLOY_STATUS_KEY.to_string(),
+            Value::String("handed_to_kip".to_string()),
+        );
+        if let Some(sha) = expected_head_sha.as_deref() {
+            context.insert(
+                MERGE_DEPLOY_EXPECTED_HEAD_SHA_KEY.to_string(),
+                Value::String(sha.to_string()),
+            );
+        }
+        let _ = supabase::update_task(
+            config,
+            &task_id,
+            &serde_json::json!({
+                "context": Value::Object(context),
+                "updated_at": chrono::Utc::now().to_rfc3339(),
+            }),
+        )
+        .await;
+        agent_comment(config, &task_id, review::OWN_TASK_MERGE_HANDOFF).await;
         return;
     }
 
@@ -18830,6 +19098,57 @@ fn is_plant_full_pr_review_task(task: &Value) -> bool {
         .and_then(|c| c.get("plant_full_pr_review"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
+        || existing_pr_review_target(task).is_some()
+}
+
+/// Matt, Oct 24 2026: never split a job into two PRs. A request to review,
+/// fix, or bring an existing PR onto main (`$pr-review <url>`, "Full PR
+/// review: ...", "PR #N: bring onto main", conflict or failing-check
+/// follow-ups that are not already attached to that PR) runs on the
+/// developer's own PR through the review-and-fix flow, never as a fresh
+/// coding task on a new `sam/<id>` branch with its own PR.
+fn existing_pr_review_target(task: &Value) -> Option<String> {
+    let title = task.get("title").and_then(|v| v.as_str()).unwrap_or("");
+    let description = task.get("description").and_then(|v| v.as_str()).unwrap_or("");
+    let current_pr = task.get("pr_url").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let t = title.trim().to_ascii_lowercase();
+    let d = description.to_ascii_lowercase();
+    let review_intent = t.starts_with("full pr review")
+        || d.contains("$pr-review")
+        || d.contains("/pr-review");
+    let repair_intent = t.starts_with("pr #")
+        && (t.contains("bring onto main")
+            || t.contains("conflict")
+            || t.contains("failing check")
+            || t.contains("so it can merge"));
+    if !review_intent && !repair_intent {
+        return None;
+    }
+    let first_pr_url = |text: &str| -> Option<String> {
+        text.split(|c: char| c.is_whitespace() || c == '(' || c == ')' || c == '<' || c == '>')
+            .map(|tok| tok.trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '`' | '"' | '\'')))
+            .find(|tok| tok.starts_with("https://github.com/") && tok.contains("/pull/") && review::is_safe_pr_url(tok))
+            .map(str::to_string)
+    };
+    let target = first_pr_url(description).or_else(|| first_pr_url(title))?;
+    // A repair follow-up already attached to that same PR keeps its builder.
+    if repair_intent && !review_intent && !current_pr.is_empty()
+        && normalize_pr_url(current_pr) == normalize_pr_url(&target)
+    {
+        return None;
+    }
+    let allowed = github_pull_ref_from_url(&target)
+        .map(|r| plant_repo_is_allowed(&r.owner, &r.repo))
+        .unwrap_or(false);
+    if allowed { Some(target) } else { None }
+}
+
+/// The PR a full review row works on: the original PR it targets, else the
+/// row's own pr_url.
+fn full_pr_review_pr_url(task: &Value) -> String {
+    existing_pr_review_target(task).unwrap_or_else(|| {
+        task.get("pr_url").and_then(|v| v.as_str()).unwrap_or("").to_string()
+    })
 }
 
 /// True for any audit row owned by the full `$pr-review` lifecycle (Kim
@@ -18851,6 +19170,10 @@ fn is_full_pr_review_owned(task: &Value) -> bool {
                     .unwrap_or(false)
         })
         .unwrap_or(false)
+        || {
+            let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            matches!(status, "queued" | "in_progress") && existing_pr_review_target(task).is_some()
+        }
 }
 
 /// Repos `/plant` is allowed to drive through the full merge/deploy
@@ -18927,10 +19250,9 @@ pub async fn sweep_plant_full_pr_review_queue(config: &SupabaseConfig) {
         }
         let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("");
         if status == "in_progress" && !full_pr_review_task_is_stale(task) {
-            if let Some(pr) = task.get("pr_url").and_then(|v| v.as_str()) {
-                if !pr.is_empty() {
-                    handled_prs.insert(normalize_pr_url(pr));
-                }
+            let pr = full_pr_review_pr_url(task);
+            if !pr.is_empty() {
+                handled_prs.insert(normalize_pr_url(&pr));
             }
         }
     }
@@ -18944,11 +19266,7 @@ pub async fn sweep_plant_full_pr_review_queue(config: &SupabaseConfig) {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let pr_url = task
-            .get("pr_url")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        let pr_url = full_pr_review_pr_url(task);
         let repo_path = task
             .get("repo_path")
             .and_then(|v| v.as_str())
@@ -19148,7 +19466,7 @@ pub async fn sweep_plant_full_pr_review_queue(config: &SupabaseConfig) {
             config,
             &task_id,
             &format!(
-                "Picking up your /plant hand-off. Running the full Codex `$pr-review` (review, fix, merge, deploy) on {} now.",
+                "Picking this up. Reviewing and fixing on the original PR {} itself (no second PR, no merge; Kip merges).",
                 pr_url
             ),
         ).await;
@@ -19161,6 +19479,14 @@ pub async fn sweep_plant_full_pr_review_queue(config: &SupabaseConfig) {
         )
         .await;
 
+        // Point the row at the original PR so the board, Kip and every sweep
+        // see the one PR for this job.
+        let _ = supabase::update_task(
+            config,
+            &task_id,
+            &serde_json::json!({ "pr_url": pr_url.clone() }),
+        )
+        .await;
         spawn_full_pr_review_task(config.clone(), task_id, pr_url, repo_path);
     }
 }
@@ -20842,12 +21168,6 @@ async fn sweep_stale_fixes_needed_cards(
             ));
             continue;
         }
-        // Recover the review blockers markdown from the most recent Codex
-        // review comment on this card so we can feed it to the fix prompt.
-        let review_markdown = supabase::fetch_latest_codex_review_markdown(config, &task_id)
-            .await
-            .unwrap_or_default();
-
         let expected_branch = task_branch_name(&short_task_id(&task_id));
         // Run the fix in the card's own worktree, not the main checkout.
         // spawn_auto_fix_task's pre-flight does `git checkout <expected_branch>`
@@ -20877,6 +21197,58 @@ async fn sweep_stale_fixes_needed_cards(
         let failure_reason = task
             .get("failure_reason")
             .and_then(|v| v.as_str());
+
+        // The blockers come from the review recorded for this exact head.
+        // An unreadable head proves nothing, so wait for the next tick.
+        if current_head == "unknown" {
+            continue;
+        }
+        let review_markdown = match review_evidence_for_head(task, &current_head) {
+            Some(markdown) => markdown,
+            // The latest review of this head was clean: it has no blockers.
+            None if reviewed_head_covers(task, Some(&current_head)) => String::new(),
+            // A card whose policy skips PR review can't get evidence from
+            // Review, so it parks here for a human as before.
+            None if !task_requires_pr_review(task) => String::new(),
+            None => {
+                // Delta-verify parks are handled below on their own marker.
+                if delta_verify_capped_parked_head(failure_reason).is_none() {
+                    // No review covers the current code: never read that as
+                    // "no blockers". Send it back for a review of this head,
+                    // which records the evidence the fix loop needs.
+                    let reopened = supabase::update_task_if_status_and_failure_reason(
+                        config,
+                        &task_id,
+                        "fixes_needed",
+                        failure_reason,
+                        &serde_json::json!({
+                            "status": "review",
+                            "failure_reason": serde_json::Value::Null,
+                            "updated_at": chrono::Utc::now().to_rfc3339(),
+                        }),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|v| v.as_array().map(|arr| !arr.is_empty()))
+                    .unwrap_or(false);
+                    if reopened {
+                        log::info!(
+                            "[auto-fix-sweep] task {} has no review evidence for head {}; re-opening for review",
+                            task_id,
+                            current_head
+                        );
+                        agent_comment(
+                            config,
+                            &task_id,
+                            "No review on record covers the current PR head, so this is back in Review for a fresh look before any fix runs.",
+                        )
+                        .await;
+                    }
+                    continue;
+                }
+                String::new()
+            }
+        };
 
         // 1. The previous cycle already no-op'd against this exact head and
         //    review. Nothing has changed, so the retry has the same nothing to
@@ -21026,6 +21398,57 @@ pub async fn sweep_pr_review_queue(
     config: &SupabaseConfig,
     cached_settings: &Option<serde_json::Value>,
 ) {
+    // Ready to Merge only holds while the PR head is the one that was
+    // reviewed. A card whose PR moved after its clean review (an outside
+    // push, a fix commit) goes back to Review for the new head.
+    if let Ok(approved) = supabase::fetch_tasks(config, Some("approved")).await {
+        for task in approved.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+            let reviewed = task
+                .get("context")
+                .and_then(|c| c.get(REVIEWED_HEAD_SHA_KEY))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let pr = task.get("pr_url").and_then(|v| v.as_str()).unwrap_or("");
+            let rp = task.get("repo_path").and_then(|v| v.as_str()).unwrap_or("");
+            let id = task.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            if reviewed.is_empty() || pr.is_empty() || rp.is_empty() || id.is_empty() {
+                continue;
+            }
+            let Ok(head) = review::fetch_pr_head_sha(pr, rp).await else { continue };
+            if head == reviewed {
+                continue;
+            }
+            // Clear the hand-to-Kip stamp too, so the next clean review of the
+            // new head hands it over again.
+            let mut context = task_context_object(task);
+            context.remove(MERGE_DEPLOY_STATUS_KEY);
+            context.remove(MERGE_DEPLOY_EXPECTED_HEAD_SHA_KEY);
+            let moved = supabase::update_task_if_status(
+                config,
+                id,
+                "approved",
+                &serde_json::json!({
+                    "status": "review",
+                    "context": Value::Object(context),
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                }),
+            )
+            .await
+            .ok()
+            .and_then(|v| v.as_array().map(|arr| !arr.is_empty()))
+            .unwrap_or(false);
+            if moved {
+                agent_comment(
+                    config,
+                    id,
+                    "New commits landed on this PR after its clean review, so it is back in Review for the current head.",
+                )
+                .await;
+                notify_callback(config, id, "review", Some(pr), None);
+            }
+        }
+    }
+
     let auto_pr_review_on = cached_settings
         .as_ref()
         .and_then(|s| s.get("autoPrReviewEnabled"))
@@ -21129,9 +21552,12 @@ pub async fn sweep_pr_review_queue(
         if main_repo_path.is_empty() || !task_requires_pr_review(task) {
             continue;
         }
-        // AutoSam-coded tickets already ran /codex-fix. Do not drag them back
-        // into the OpenRouter $samwise-pr-review gate if they land in Review.
-        if !task_is_external_pr_review_request(task) {
+        // A card whose current PR head already has a clean review (AutoSam's
+        // own /codex-fix pipeline, or an earlier clean verdict on this exact
+        // head) goes back to Ready to Merge without paying for a second
+        // review. Anything with new commits since falls through to a real one.
+        let current_head = review::fetch_pr_head_sha(&pr_url, &main_repo_path).await.ok();
+        if reviewed_head_covers(task, current_head.as_deref()) {
             let moved = supabase::update_task_if_status(
                 config,
                 &task_id,
@@ -21151,7 +21577,7 @@ pub async fn sweep_pr_review_queue(
                 agent_comment(
                     config,
                     &task_id,
-                    "This ticket already ran /codex-fix before the PR opened, so I am sending it to Ready to Merge instead of a second review gate.",
+                    "This exact PR head already has a clean review, so I am sending it back to Ready to Merge without a second review.",
                 )
                 .await;
                 notify_callback(config, &task_id, "approved", Some(&pr_url), None);
@@ -21564,6 +21990,31 @@ fn spawn_review_merge_task(
                     REVIEW_MERGE_STATUS_KEY.to_string(),
                     Value::String("blocked".to_string()),
                 );
+                // This review is now the latest word on the PR: its findings
+                // replace any earlier clean pass, so the card can't slip back
+                // to Ready to Merge on a pass this review overturned.
+                ctx.remove(REVIEWED_HEAD_SHA_KEY);
+                ctx.remove(REVIEW_EVIDENCE_KEY);
+                // Stamp the commit this review actually read. If the PR has
+                // moved past it, the sweep sees a mismatch and re-reviews.
+                let reviewed_local = async_cmd("git")
+                    .args(["-C", &repo_path, "rev-parse", "HEAD"])
+                    .output()
+                    .await
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .filter(|s| !s.is_empty());
+                if let Some(head) = reviewed_local {
+                    ctx.insert(
+                        REVIEW_EVIDENCE_KEY.to_string(),
+                        serde_json::json!({
+                            "head_sha": head,
+                            "markdown": output,
+                            "recorded_at": chrono::Utc::now().to_rfc3339(),
+                        }),
+                    );
+                }
                 let updated = supabase::update_task_if_status(
                     &config,
                     &task_id,

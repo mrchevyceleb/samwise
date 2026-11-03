@@ -90,15 +90,33 @@ pub async fn fetch_tasks(
     config: &SupabaseConfig,
     status_filter: Option<&str>,
 ) -> Result<Value, String> {
+    // PostgREST caps every reply at 1000 rows. ae_tasks is past that, so a
+    // single request silently dropped the newest rows (oldest-first order)
+    // and every sweep that scans "all tasks" never saw new work. Page until
+    // the table is exhausted; `id` breaks ties so pages never overlap.
+    const PAGE: usize = 1000;
     let client = build_client(config)?;
-    let mut url = format!(
-        "{}?order=priority.asc,created_at.asc",
+    let mut base = format!(
+        "{}?order=priority.asc,created_at.asc,id.asc",
         rest_url(config, "ae_tasks")
     );
     if let Some(status) = status_filter {
-        url.push_str(&format!("&status=eq.{}", status));
+        base.push_str(&format!("&status=eq.{}", status));
     }
-    handle_response(client.get(&url).send().await.map_err(|e| e.to_string())?).await
+    let mut rows: Vec<Value> = Vec::new();
+    loop {
+        let url = format!("{}&limit={}&offset={}", base, PAGE, rows.len());
+        let page = handle_response(client.get(&url).send().await.map_err(|e| e.to_string())?).await?;
+        let Value::Array(mut batch) = page else {
+            return Err("Supabase returned a non-array task list".to_string());
+        };
+        let n = batch.len();
+        rows.append(&mut batch);
+        if n < PAGE {
+            break;
+        }
+    }
+    Ok(Value::Array(rows))
 }
 
 pub async fn fetch_board_tasks(config: &SupabaseConfig) -> Result<Value, String> {
@@ -157,40 +175,6 @@ pub async fn fetch_task(config: &SupabaseConfig, id: &str) -> Result<Option<Valu
     let val: Value =
         handle_response(client.get(&url).send().await.map_err(|e| e.to_string())?).await?;
     Ok(val.as_array().and_then(|a| a.first().cloned()))
-}
-
-/// Fetch the most recent Codex review markdown body posted as a comment on
-/// a task. Used by `sweep_stale_fixes_needed_cards` to recover the blockers
-/// text so it can be fed back into the auto-fix prompt without re-running
-/// the full review.
-///
-/// Looks for the last comment whose content starts with "## Summary" (the
-/// structure emitted by `$samwise-pr-review`). Falls back to an empty string
-/// so callers can still spawn the fix with a generic prompt.
-pub async fn fetch_latest_codex_review_markdown(
-    config: &SupabaseConfig,
-    task_id: &str,
-) -> Result<String, String> {
-    let client = build_client(config)?;
-    let url = format!(
-        "{}?task_id=eq.{}&order=created_at.desc&limit=20&select=content",
-        rest_url(config, "ae_comments"),
-        task_id,
-    );
-    let val: Value =
-        handle_response(client.get(&url).send().await.map_err(|e| e.to_string())?).await?;
-    let markdown = val
-        .as_array()
-        .and_then(|rows| {
-            rows.iter()
-                .filter_map(|r| r.get("content").and_then(|v| v.as_str()))
-                .find(|content| {
-                    content.contains("## Blockers") || content.contains("## Summary")
-                })
-                .map(str::to_string)
-        })
-        .unwrap_or_default();
-    Ok(markdown)
 }
 
 pub async fn create_task(config: &SupabaseConfig, task: &Value) -> Result<Value, String> {
