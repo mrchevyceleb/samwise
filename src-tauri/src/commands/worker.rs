@@ -14326,10 +14326,37 @@ async fn start_merge_deploy_task(
         return;
     }
 
-    // The merge and deploy stage never runs here; a clean PR merges through
-    // the full PR review instead (review::OWN_TASK_MERGE_HANDOFF).
+    // The merge and deploy stage never runs here. A review that passed an
+    // exact head merges that head to main (Matt, Nov 3 2026: the old handoff
+    // went to Kip, who is gone, so approved cards sat unmerged). Without a
+    // reviewed head there is nothing proven to merge, so the card waits for
+    // a full PR review (review::OWN_TASK_MERGE_HANDOFF).
     if review::OWN_TASK_MERGE_VIA_REVIEW {
         let _ = (should_merge_if_open, start_comment);
+        let repo_path = task.get("repo_path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if let (Some(sha), false) = (expected_head_sha.as_deref(), repo_path.is_empty()) {
+            let (note, status) = match review::gh_merge(&pr_url, &repo_path, sha).await {
+                Ok(()) => ("Clean, merged to main.".to_string(), "done"),
+                Err(e) => (format!("Clean, but the merge failed: {}", truncate(&e, 600)), "fixes_needed"),
+            };
+            let mut context = task_context_object(&task);
+            context.insert(MERGE_DEPLOY_STATUS_KEY.to_string(), Value::String(if status == "done" { "merged" } else { "failed" }.to_string()));
+            context.insert(MERGE_DEPLOY_EXPECTED_HEAD_SHA_KEY.to_string(), Value::String(sha.to_string()));
+            let _ = supabase::update_task(
+                config,
+                &task_id,
+                &serde_json::json!({
+                    "status": status,
+                    "context": Value::Object(context),
+                    "worker_id": Value::Null,
+                    "claimed_at": Value::Null,
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                }),
+            )
+            .await;
+            agent_comment(config, &task_id, &note).await;
+            return;
+        }
         if merge_deploy_context_status(&task) == Some("handed_to_kip") {
             return;
         }
