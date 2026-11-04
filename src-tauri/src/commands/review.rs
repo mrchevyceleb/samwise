@@ -1266,6 +1266,24 @@ pub(crate) fn gh_checks_no_checks_reported(stderr: &str) -> bool {
 mod tests {
     use super::{gh_checks_no_checks_reported, should_fallback_to_openrouter};
 
+    /// Real `codex exec --json` lines (codex-cli 0.159). Before Nov 4 2026 only
+    /// `turn.started` counted as progress, so a working review was quiet-killed
+    /// at 45 min no matter how many commands and edits it made.
+    #[test]
+    fn codex_exec_items_count_as_progress() {
+        let ev = |s: &str| super::classify_codex_exec_event(&serde_json::from_str(s).unwrap());
+        let thread = ev(r#"{"type":"thread.started","thread_id":"01a1a8d2-cfdc-7b30-875e-07a4c5d6cc08"}"#);
+        assert!(thread.progress);
+        assert_eq!(thread.thread_id.as_deref(), Some("01a1a8d2-cfdc-7b30-875e-07a4c5d6cc08"));
+        let cmd = ev(r#"{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/bash -lc 'npx playwright test'","aggregated_output":"","exit_code":null,"status":"in_progress"}}"#);
+        assert!(cmd.progress);
+        assert!(cmd.comment.unwrap().starts_with("Running: "));
+        let edit = ev(r#"{"type":"item.completed","item":{"id":"item_2","type":"file_change","changes":[{"path":"/w/server/lib/a.ts","kind":"update"}],"status":"completed"}}"#);
+        assert!(edit.progress);
+        assert!(ev(r#"{"type":"item.completed","item":{"id":"item_3","type":"reasoning","text":"x"}}"#).progress);
+        assert!(!ev(r#"{"type":"error","message":"stream disconnected"}"#).progress);
+    }
+
     #[test]
     fn detects_gh_no_checks_reported_error() {
         assert!(gh_checks_no_checks_reported(
@@ -2082,20 +2100,307 @@ pub async fn run_full_pr_review(
             pr_url
         ));
     }
+    // Retried once so a Supabase blip doesn't hide a saved session and
+    // start the review over.
+    let row = match supabase::fetch_task(config, task_id).await {
+        Ok(row) => row,
+        Err(_) => {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            supabase::fetch_task(config, task_id).await.ok().flatten()
+        }
+    };
     // Matt, Nov 3 2026: the developer sends the finished PR here, AutoSam
     // reviews and fixes on the PR's own branch, and the worker merges the
     // exact reviewed head to main once the review is clean.
-    let handoff_notes = match supabase::fetch_task(config, task_id).await.ok().flatten() {
-        Some(row) => row
-            .get("description")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .chars()
-            .take(4000)
-            .collect::<String>(),
-        None => String::new(),
-    };
+    let handoff_notes = row
+        .as_ref()
+        .and_then(|r| r.get("description"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .chars()
+        .take(4000)
+        .collect::<String>();
+    let ctx = row.as_ref().and_then(|r| r.get("context"));
+    let prior_thread = ctx.and_then(|c| saved_full_pr_review_thread(c, pr_url));
+    let interrupted_before = prior_thread.is_some()
+        || ctx
+            .map(|c| {
+                ["quiet_kill_count", FULL_PR_REVIEW_BUDGET_RESUME_COUNT_KEY]
+                    .iter()
+                    .any(|k| c.get(*k).and_then(|v| v.as_i64()).unwrap_or(0) > 0)
+            })
+            .unwrap_or(false);
     let cwd = resolve_codex_cwd(repo_path);
+
+    let rules = "Hard rules (Matt, Nov 3 2026):\n\
+         - Work on this PR's own head branch. Every fix is a commit pushed to that same branch, so the developer's PR stays the one PR for the job.\n\
+         - Never open a new PR, never push to main or master, and do not merge it yourself. When the review is clean, TARDIS's worker merges the exact head you report to main.\n\
+         - If the branch conflicts with its base, merge the base into the PR branch, resolve keeping both sides' behavior, and push to the PR branch.\n\
+         - Skip any merge or deploy step in the skill. When the review is clean and every fix is pushed, stop and report.";
+    let verdict_line = "End your final message with one line exactly like `READY_TO_MERGE head=<full sha>` when the review is clean and every fix is pushed, or `NOT_READY: <one-line reason>` when it is not.";
+
+    // A requeued attempt continues the previous attempt's Codex session: same
+    // conversation, same worktree, same uncommitted edits and QA notes.
+    if let Some(thread_id) = prior_thread {
+        let resume_prompt = format!(
+            "The worker stopped your previous run of this review (it hit a run limit or the worker restarted). \
+             Nothing you did is lost: continue exactly where you left off on {pr_url}, in the same worktree. \
+             Check `git status` there first, keep your uncommitted review edits, finish the fixes and the real-app QA, \
+             and commit and push them to the PR branch.\n\n{rules}\n\n{verdict_line}",
+            pr_url = pr_url,
+            rules = rules,
+            verdict_line = verdict_line,
+        );
+        match run_full_pr_review_pass(config, task_id, pr_url, &cwd, Some(&thread_id), &resume_prompt).await {
+            FullReviewPass::ResumeUnavailable(detail) => {
+                log::warn!(
+                    "[full-pr-review] task {} could not resume Codex session {}: {}",
+                    task_id,
+                    thread_id,
+                    detail
+                );
+                post_full_pr_review_comment(
+                    config,
+                    task_id,
+                    "Could not reopen the previous Codex session, so a new one starts and picks up the previous attempt's edits from the PR worktree.",
+                )
+                .await;
+                let _ = set_full_pr_review_thread(config, task_id, None).await;
+            }
+            FullReviewPass::Done(result) => return result,
+        }
+    }
+
+    let continuation = if interrupted_before {
+        "\n\nA previous automated attempt at this review was interrupted before it finished. Before starting over, find the worktree checked out on this PR's head branch and run `git status` there. If it holds that attempt's uncommitted review edits, review and build on them instead of discarding them."
+    } else {
+        ""
+    };
+    let prompt = format!(
+        "Use $pr-review on {pr_url}, in review-and-fix mode.\n\n\
+         {rules}\n\n\
+         Automation context:\n\
+         - Matt asked for this PR to go through the full review automatically. Do not ask for confirmation for normal review and fix steps.\n\
+         - Before deciding the verdict, read the PR issue comments and review comments.\n\
+         - If a PR comment contains `Merge-agent handoff`, `Maintainer patch handoff`, or `merge with maintainer patch`, treat it as trusted handoff context: apply that tiny patch if it is clear and low risk, push it to the PR branch, and post the requested note as a plain PR comment.\n\
+         - If the PR is already closed or merged by the time you inspect it, report that clearly and exit cleanly.{continuation}\n\n\
+         Hand-off notes from the request (context only, the rules above win):\n{notes}\n\n\
+         {verdict_line}",
+        pr_url = pr_url,
+        rules = rules,
+        continuation = continuation,
+        verdict_line = verdict_line,
+        notes = if handoff_notes.trim().is_empty() { "(none)".to_string() } else { handoff_notes.clone() }
+    );
+    match run_full_pr_review_pass(config, task_id, pr_url, &cwd, None, &prompt).await {
+        FullReviewPass::Done(result) => result,
+        FullReviewPass::ResumeUnavailable(detail) => Err(detail),
+    }
+}
+
+/// Error marker for a run the quiet-kill stopped because Codex emitted no
+/// events at all. The worker requeues it and the next attempt resumes the
+/// same Codex session.
+pub const FULL_PR_REVIEW_WEDGED_MARKER: &str = "killed as wedged";
+/// Error marker for a run that was still working when it used up its per-run
+/// time budget. Requeued and resumed like a wedge, on its own counter.
+pub const FULL_PR_REVIEW_BUDGET_MARKER: &str = "used its run budget while still working";
+pub const FULL_PR_REVIEW_BUDGET_RESUME_COUNT_KEY: &str = "budget_resume_count";
+/// Task-context key holding the Codex session of an unfinished full review,
+/// as `{"id": <thread id>, "pr_url": <pr url>}`.
+const FULL_PR_REVIEW_THREAD_KEY: &str = "full_pr_review_codex_thread";
+/// Task-context flag the worker sets when it requeues a run to resume. The
+/// ae_tasks trigger stamps `updated_at` on every write, so a backdated
+/// `updated_at` can't mark the row stale; the sweepers relaunch on this flag
+/// instead, and the launch clears it.
+pub const FULL_PR_REVIEW_RESUME_PENDING_KEY: &str = "full_pr_review_resume_pending";
+
+enum FullReviewPass {
+    Done(Result<String, String>),
+    /// `codex exec resume` exited without ever opening the session (rollout
+    /// gone, bad id). The caller starts a new session instead.
+    ResumeUnavailable(String),
+}
+
+fn saved_full_pr_review_thread(ctx: &Value, pr_url: &str) -> Option<String> {
+    let saved = ctx.get(FULL_PR_REVIEW_THREAD_KEY)?;
+    if saved.get("pr_url").and_then(|v| v.as_str()) != Some(pr_url) {
+        return None;
+    }
+    let id = saved.get("id").and_then(|v| v.as_str())?.trim();
+    let well_formed = !id.is_empty()
+        && id.len() <= 64
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    well_formed.then(|| id.to_string())
+}
+
+/// Save (Some) or clear (None) the Codex session of this task's full review.
+async fn set_full_pr_review_thread(config: &SupabaseConfig, task_id: &str, saved: Option<Value>) -> bool {
+    edit_full_pr_review_context(config, task_id, |ctx| match &saved {
+        Some(v) => {
+            ctx.insert(FULL_PR_REVIEW_THREAD_KEY.to_string(), v.clone());
+            true
+        }
+        None => ctx.remove(FULL_PR_REVIEW_THREAD_KEY).is_some(),
+    })
+    .await
+}
+
+/// The review reached an end the worker will not resume (verdict, hard
+/// failure, retries exhausted, cancel), so a later request starts clean:
+/// no session to resume and a full set of resumes.
+pub async fn forget_full_pr_review_session(config: &SupabaseConfig, task_id: &str) {
+    edit_full_pr_review_context(config, task_id, |ctx| {
+        [
+            FULL_PR_REVIEW_THREAD_KEY,
+            FULL_PR_REVIEW_RESUME_PENDING_KEY,
+            "quiet_kill_count",
+            FULL_PR_REVIEW_BUDGET_RESUME_COUNT_KEY,
+        ]
+            .iter()
+            .fold(false, |changed, k| ctx.remove(*k).is_some() || changed)
+    })
+    .await;
+}
+
+/// Out of automatic resumes: keep the saved session so a manual re-queue of
+/// the card resumes it, but give that re-queue a full set of resumes.
+pub async fn reset_full_pr_review_resumes(config: &SupabaseConfig, task_id: &str) {
+    edit_full_pr_review_context(config, task_id, |ctx| {
+        [
+            FULL_PR_REVIEW_RESUME_PENDING_KEY,
+            "quiet_kill_count",
+            FULL_PR_REVIEW_BUDGET_RESUME_COUNT_KEY,
+        ]
+        .iter()
+        .fold(false, |changed, k| ctx.remove(*k).is_some() || changed)
+    })
+    .await;
+}
+
+
+/// Fetch-modify-write of the task context; `edit` returns whether it changed.
+/// A lost write here loses the session a retry would resume, so a transient
+/// Supabase error is retried (re-reading the row each time). Returns false
+/// only when the row could not be read or written; a row that never comes
+/// back readable is never overwritten with a blank context.
+async fn edit_full_pr_review_context(
+    config: &SupabaseConfig,
+    task_id: &str,
+    edit: impl Fn(&mut serde_json::Map<String, Value>) -> bool,
+) -> bool {
+    edit_full_pr_review_row(config, task_id, &serde_json::Map::new(), edit).await
+}
+
+/// `edit_full_pr_review_context`, also writing `fields` (other columns) in
+/// the same PATCH when the context changes.
+async fn edit_full_pr_review_row(
+    config: &SupabaseConfig,
+    task_id: &str,
+    fields: &serde_json::Map<String, Value>,
+    edit: impl Fn(&mut serde_json::Map<String, Value>) -> bool,
+) -> bool {
+    for attempt in 0..3u64 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_secs(2 * attempt)).await;
+        }
+        let row = match supabase::fetch_task(config, task_id).await {
+            Ok(Some(row)) => row,
+            Ok(None) => return false,
+            Err(e) => {
+                log::warn!("[full-pr-review] context read for {} failed: {}", task_id, e);
+                continue;
+            }
+        };
+        let mut ctx = row
+            .get("context")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        if !edit(&mut ctx) {
+            return true;
+        }
+        let mut body = fields.clone();
+        body.insert("context".to_string(), Value::Object(ctx));
+        match supabase::update_task(config, task_id, &Value::Object(body)).await {
+            Ok(_) => return true,
+            Err(e) => log::warn!("[full-pr-review] context write for {} failed: {}", task_id, e),
+        }
+    }
+    false
+}
+
+pub enum ResumeRequest {
+    /// Counter bumped and resume-pending set; carries the new count.
+    Requeued(i64),
+    /// No automatic resumes left.
+    Exhausted,
+    /// The row could not be read or written. Nothing was changed; the stale
+    /// sweep restarts (and resumes) the run once its heartbeat has aged out.
+    Unavailable,
+}
+
+/// Bump `count_key` and flag the row for an immediate resume, unless it is
+/// already at `max`. The flag and the requeued status fields land in one
+/// PATCH, so nothing this worker writes can follow the hand-off and clobber
+/// the run that picks it up.
+pub async fn request_full_pr_review_resume(
+    config: &SupabaseConfig,
+    task_id: &str,
+    count_key: &str,
+    max: i64,
+) -> ResumeRequest {
+    let next = std::sync::atomic::AtomicI64::new(0);
+    let requeued = serde_json::json!({
+        "status": "in_progress",
+        "worker_id": Value::Null,
+        "claimed_at": Value::Null,
+        "failure_reason": Value::Null,
+    });
+    let fields = requeued.as_object().cloned().unwrap_or_default();
+    let written = edit_full_pr_review_row(config, task_id, &fields, |ctx| {
+        let n = ctx.get(count_key).and_then(|v| v.as_i64()).unwrap_or(0) + 1;
+        if n > max {
+            next.store(0, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
+        ctx.insert(count_key.to_string(), serde_json::json!(n));
+        ctx.insert(FULL_PR_REVIEW_RESUME_PENDING_KEY.to_string(), serde_json::json!(true));
+        next.store(n, std::sync::atomic::Ordering::Relaxed);
+        true
+    })
+    .await;
+    match (written, next.load(std::sync::atomic::Ordering::Relaxed)) {
+        (false, _) => ResumeRequest::Unavailable,
+        (true, 0) => ResumeRequest::Exhausted,
+        (true, n) => ResumeRequest::Requeued(n),
+    }
+}
+
+/// One Codex process for a full review: a new session, or `resume_thread`
+/// continued with `prompt`.
+async fn run_full_pr_review_pass(
+    config: &SupabaseConfig,
+    task_id: &str,
+    pr_url: &str,
+    cwd: &str,
+    resume_thread: Option<&str>,
+    prompt: &str,
+) -> FullReviewPass {
+    match run_full_pr_review_pass_inner(config, task_id, pr_url, cwd, resume_thread, prompt).await {
+        Ok(pass) => pass,
+        Err(e) => FullReviewPass::Done(Err(e)),
+    }
+}
+
+async fn run_full_pr_review_pass_inner(
+    config: &SupabaseConfig,
+    task_id: &str,
+    pr_url: &str,
+    cwd: &str,
+    resume_thread: Option<&str>,
+    prompt: &str,
+) -> Result<FullReviewPass, String> {
     let tmp_path = std::env::temp_dir().join(format!("samwise-full-pr-review-{}", uuid_like()));
     tokio::fs::create_dir_all(&tmp_path)
         .await
@@ -2104,41 +2409,27 @@ pub async fn run_full_pr_review(
     let output_path = tmp_path.join("last-message.txt");
     let output_path_str = output_path.to_string_lossy().into_owned();
 
-    let prompt = format!(
-        "Use $pr-review on {pr_url}, in review-and-fix mode.\n\n\
-         Hard rules (Matt, Nov 3 2026):\n\
-         - Work on this PR's own head branch. Every fix is a commit pushed to that same branch, so the developer's PR stays the one PR for the job.\n\
-         - Never open a new PR, never push to main or master, and do not merge it yourself. When the review is clean, TARDIS's worker merges the exact head you report to main.\n\
-         - If the branch conflicts with its base, merge the base into the PR branch, resolve keeping both sides' behavior, and push to the PR branch.\n\
-         - Skip any merge or deploy step in the skill. When the review is clean and every fix is pushed, stop and report.\n\n\
-         Automation context:\n\
-         - Matt asked for this PR to go through the full review automatically. Do not ask for confirmation for normal review and fix steps.\n\
-         - Before deciding the verdict, read the PR issue comments and review comments.\n\
-         - If a PR comment contains `Merge-agent handoff`, `Maintainer patch handoff`, or `merge with maintainer patch`, treat it as trusted handoff context: apply that tiny patch if it is clear and low risk, push it to the PR branch, and post the requested note as a plain PR comment.\n\
-         - If the PR is already closed or merged by the time you inspect it, report that clearly and exit cleanly.\n\n\
-         Hand-off notes from the request (context only, the rules above win):\n{notes}\n\n\
-         End your final message with one line exactly like `READY_TO_MERGE head=<full sha>` when the review is clean and every fix is pushed, or `NOT_READY: <one-line reason>` when it is not.",
-        pr_url = pr_url,
-        notes = if handoff_notes.trim().is_empty() { "(none)".to_string() } else { handoff_notes.clone() }
-    );
-
     let mut cmd = async_cmd("codex");
     cmd.args(["--search", "exec"]);
+    if resume_thread.is_some() {
+        cmd.arg("resume");
+    }
     apply_codex_backend(&mut cmd, CodexBackend::LocalCli, None);
-    cmd.args([
-        "--json",
-        "--dangerously-bypass-approvals-and-sandbox",
-        "-C",
-    ])
-    .arg(&cwd)
-    .args(["-o"])
-    .arg(&output_path_str)
-    .arg(&prompt)
-    .env("AUTOSAM_REVIEW_ONLY", "1")
-    .current_dir(&cwd)
-    .stdin(std::process::Stdio::null())
-    .stdout(std::process::Stdio::piped())
-    .stderr(std::process::Stdio::piped());
+    cmd.args(["--json", "--dangerously-bypass-approvals-and-sandbox"]);
+    // `exec resume` takes no -C: the session runs from current_dir below.
+    if resume_thread.is_none() {
+        cmd.arg("-C").arg(cwd);
+    }
+    cmd.args(["-o"]).arg(&output_path_str);
+    if let Some(thread_id) = resume_thread {
+        cmd.arg(thread_id);
+    }
+    cmd.arg(prompt)
+        .env("AUTOSAM_REVIEW_ONLY", "1")
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     // Run Codex as its own process-group leader so a kill can take down the
     // whole tree (gh, npm, deploy scripts it spawns), not just the Codex CLI.
     // Otherwise a quiet-kill/cancel could leave an orphan still mutating the
@@ -2153,10 +2444,13 @@ pub async fn run_full_pr_review(
     post_full_pr_review_comment(
         config,
         task_id,
-        &format!(
-            "Codex `$pr-review` process started for this PR (pid {}).",
-            child_pid
-        ),
+        &match resume_thread {
+            Some(thread_id) => format!(
+                "Codex `$pr-review` resumed its previous session {} for this PR (pid {}).",
+                thread_id, child_pid
+            ),
+            None => format!("Codex `$pr-review` process started for this PR (pid {}).", child_pid),
+        },
     )
     .await;
 
@@ -2164,6 +2458,7 @@ pub async fn run_full_pr_review(
     let heartbeat_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let quiet_killed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let session_opened = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let started_at = Instant::now();
 
     {
@@ -2240,7 +2535,7 @@ pub async fn run_full_pr_review(
                     post_full_pr_review_comment(
                         &config_hb,
                         &task_id_hb,
-                        &format!("Codex `$pr-review` produced no progress for {} min. Treating it as wedged and killing it so it can be retried fresh.", mins),
+                        &format!("Codex `$pr-review` produced no events for {} min. Treating it as wedged and stopping it; the next attempt resumes the same session.", mins),
                     ).await;
                     quiet_killed_hb.store(true, Ordering::Relaxed);
                     if child_pid > 0 {
@@ -2284,12 +2579,17 @@ pub async fn run_full_pr_review(
     let stdout = child.stdout.take();
     let config_stdout = config.clone();
     let task_id_stdout = task_id.to_string();
+    let pr_url_stdout = pr_url.to_string();
+    let resumed_thread = resume_thread.map(|s| s.to_string());
     let last_activity_stdout = last_activity.clone();
+    let session_opened_stdout = session_opened.clone();
     let stdout_handle = tokio::spawn(async move {
         const RAW_TAIL_CAP: usize = 6000;
         const MIN_COMMENT_INTERVAL: Duration = Duration::from_secs(15);
         let mut raw_tail = String::new();
         let mut last_comment_time = Instant::now() - MIN_COMMENT_INTERVAL;
+        let mut unsaved_thread: Option<String> = None;
+        let mut last_save_try: Option<Instant> = None;
 
         if let Some(reader) = stdout {
             use tokio::io::{AsyncBufReadExt, BufReader};
@@ -2305,18 +2605,44 @@ pub async fn run_full_pr_review(
                 let Ok(parsed) = serde_json::from_str::<Value>(&line) else {
                     continue;
                 };
-                let Some(progress) = summarize_codex_exec_event(&parsed) else {
-                    continue;
-                };
-                // Any real Codex event is progress for wedge detection, even
-                // if the user-facing comment is throttled. This is what keeps
-                // `updated_at` advancing (via the heartbeat) for a healthy run.
-                if let Ok(mut guard) = last_activity_stdout.lock() {
-                    *guard = Instant::now();
+                let signal = classify_codex_exec_event(&parsed);
+                // Every tool call, file edit, browser/QA command, message and
+                // reasoning step is progress for wedge detection, even when
+                // the card comment is throttled. This keeps `updated_at`
+                // advancing (via the heartbeat) for a working run.
+                if signal.progress {
+                    if let Ok(mut guard) = last_activity_stdout.lock() {
+                        *guard = Instant::now();
+                    }
                 }
-                if last_comment_time.elapsed() >= MIN_COMMENT_INTERVAL {
-                    post_full_pr_review_comment(&config_stdout, &task_id_stdout, &progress).await;
-                    last_comment_time = Instant::now();
+                if let Some(thread_id) = signal.thread_id {
+                    session_opened_stdout.store(true, std::sync::atomic::Ordering::Relaxed);
+                    if resumed_thread.as_deref() != Some(thread_id.as_str()) {
+                        unsaved_thread = Some(thread_id);
+                    }
+                }
+                // Save the session id so a retry can resume it. If Supabase is
+                // down, keep retrying on later events (at most once a minute)
+                // until it lands.
+                if let Some(thread_id) = unsaved_thread.clone() {
+                    if last_save_try.map_or(true, |t| t.elapsed() >= Duration::from_secs(60)) {
+                        last_save_try = Some(Instant::now());
+                        if set_full_pr_review_thread(
+                            &config_stdout,
+                            &task_id_stdout,
+                            Some(serde_json::json!({ "id": thread_id, "pr_url": pr_url_stdout })),
+                        )
+                        .await
+                        {
+                            unsaved_thread = None;
+                        }
+                    }
+                }
+                if let Some(comment) = signal.comment {
+                    if last_comment_time.elapsed() >= MIN_COMMENT_INTERVAL {
+                        post_full_pr_review_comment(&config_stdout, &task_id_stdout, &comment).await;
+                        last_comment_time = Instant::now();
+                    }
                 }
             }
         }
@@ -2354,13 +2680,15 @@ pub async fn run_full_pr_review(
                 }
             }
             let _ = child.kill().await;
-            let stdout = stdout_handle.await.unwrap_or_default();
-            let stderr = stderr_handle.await.unwrap_or_default();
+            let _ = stdout_handle.await;
+            let _ = stderr_handle.await;
+            // The quiet-kill did not fire, so Codex was still emitting events:
+            // this is a working run that needs more time, not a wedge. The
+            // worker requeues it and the next pass resumes the same session.
             return Err(format!(
-                "codex timed out after {}s. Stderr tail: {} Stdout tail: {}",
-                FULL_PR_REVIEW_TIMEOUT_SECS,
-                trim_to(stderr.trim(), 1000),
-                trim_to(stdout.trim(), 1000),
+                "Codex $pr-review {} ({} min); it will resume.",
+                FULL_PR_REVIEW_BUDGET_MARKER,
+                FULL_PR_REVIEW_TIMEOUT_SECS / 60
             ));
         }
     };
@@ -2371,8 +2699,9 @@ pub async fn run_full_pr_review(
     //  1. cancelled (Matt deleted the card): honor regardless of exit code.
     //  2. genuine success: if Codex actually finished, a quiet-kill that lost
     //     the race must NOT requeue a duplicate run that already merged/deployed.
-    //  3. quiet-kill: only now treat it as the retryable wedge.
-    //  4. any other non-zero exit: hard failure.
+    //  3. a resume that never opened its session: start a new one instead.
+    //  4. quiet-kill: only now treat it as the retryable wedge.
+    //  5. any other non-zero exit: hard failure.
     if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
         return Err("TASK_CANCELLED".to_string());
     }
@@ -2390,18 +2719,27 @@ pub async fn run_full_pr_review(
 
     if status.success() {
         if response.trim().is_empty() {
-            return Ok(
+            return Ok(FullReviewPass::Done(Ok(
                 "Codex completed `$pr-review`, but did not return a final message.".to_string(),
-            );
+            )));
         }
-        return Ok(response);
+        return Ok(FullReviewPass::Done(Ok(response)));
+    }
+
+    if resume_thread.is_some() && !session_opened.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(FullReviewPass::ResumeUnavailable(format!(
+            "codex exec resume exited with {}: {}",
+            status,
+            trim_to(stderr.trim(), 600)
+        )));
     }
 
     if quiet_killed.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err(
-            "Codex $pr-review made no progress and was killed as wedged; it will be retried fresh."
-                .to_string(),
-        );
+        return Err(format!(
+            "Codex $pr-review emitted no events for {} min and was {}; it will resume.",
+            FULL_PR_REVIEW_QUIET_KILL_SECS / 60,
+            FULL_PR_REVIEW_WEDGED_MARKER
+        ));
     }
 
     Err(format!(
@@ -2449,149 +2787,93 @@ fn push_tail(tail: &mut String, line: &str, cap: usize) {
     tail.drain(..drop);
 }
 
-fn summarize_codex_exec_event(event: &Value) -> Option<String> {
-    let payload = event.get("payload").unwrap_or(event);
-    let event_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    let lower_type = event_type.to_ascii_lowercase();
-
-    if event_type == "function_call" {
-        let tool_name = payload
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("tool");
-        let args = payload
-            .get("arguments")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if tool_name == "exec_command" {
-            if let Ok(parsed_args) = serde_json::from_str::<Value>(args) {
-                if let Some(cmd) = parsed_args.get("cmd").and_then(|v| v.as_str()) {
-                    return Some(format!("Running: {}", short_one_line(cmd, 120)));
-                }
-            }
-            return Some("Running a shell command.".to_string());
-        }
-        if tool_name == "apply_patch" {
-            return Some("Applying code changes.".to_string());
-        }
-        if tool_name == "write_stdin" {
-            return Some("Checking command output.".to_string());
-        }
-        return Some(format!("Using tool: {}", short_one_line(tool_name, 80)));
-    }
-
-    if event_type == "function_call_output" {
-        let output = payload.get("output").and_then(|v| v.as_str()).unwrap_or("");
-        if output.contains("Process exited with code 0") {
-            return Some("Command finished successfully.".to_string());
-        }
-        if output.contains("Process exited with code") {
-            return Some("Command finished with a non-zero exit.".to_string());
-        }
-        if output.contains("Process running with session ID") {
-            return Some("Command is still running.".to_string());
-        }
-    }
-
-    if lower_type.contains("exec") || lower_type.contains("command") {
-        if lower_type.contains("end")
-            || lower_type.contains("complete")
-            || lower_type.contains("completed")
-        {
-            let code = payload
-                .get("exit_code")
-                .or_else(|| event.pointer("/item/exit_code"))
-                .or_else(|| payload.pointer("/item/exit_code"))
-                .or_else(|| event.pointer("/output/exit_code"))
-                .or_else(|| payload.pointer("/output/exit_code"))
-                .and_then(|v| v.as_i64());
-            return Some(match code {
-                Some(code) => format!("Command finished with exit code {}.", code),
-                None => "Command finished.".to_string(),
-            });
-        }
-        if let Some(command) = first_command_string(
-            payload,
-            &[
-                "/command",
-                "/cmd",
-                "/item/command",
-                "/item/cmd",
-                "/item/input/command",
-                "/item/args/command",
-                "/call/command",
-                "/call/args/command",
-                "/message/command",
-            ],
-        ) {
-            return Some(format!("Running: {}", short_one_line(&command, 120)));
-        }
-        return Some("Running a shell command.".to_string());
-    }
-
-    if lower_type.contains("patch") && (lower_type.contains("apply") || lower_type.contains("edit"))
-    {
-        return Some("Applying code changes.".to_string());
-    }
-
-    if lower_type.contains("web_search") || lower_type.contains("web-search") {
-        return Some("Searching the web.".to_string());
-    }
-
-    if lower_type.contains("mcp") {
-        if let Some(name) = first_string(
-            payload,
-            &["/name", "/tool_name", "/item/name", "/call/name"],
-        ) {
-            return Some(format!("Using MCP tool: {}", short_one_line(name, 80)));
-        }
-        return Some("Using an MCP tool.".to_string());
-    }
-
-    if lower_type.contains("tool") {
-        if let Some(name) = first_string(
-            payload,
-            &["/name", "/tool_name", "/item/name", "/call/name"],
-        ) {
-            return Some(format!("Using tool: {}", short_one_line(name, 80)));
-        }
-    }
-
-    if lower_type.contains("turn") && lower_type.contains("start") {
-        return Some("Codex started a new review step.".to_string());
-    }
-
-    if lower_type.contains("error") {
-        if let Some(message) = first_string(payload, &["/message", "/error", "/item/message"]) {
-            return Some(format!("Codex reported: {}", short_one_line(message, 140)));
-        }
-    }
-
-    None
+/// What one line of `codex exec --json` means for the watchdog and the card.
+#[derive(Debug, Default, PartialEq)]
+struct CodexEventSignal {
+    /// Codex is doing real work (counts against the quiet-kill).
+    progress: bool,
+    /// The session id from `thread.started`, so a requeue can resume it.
+    thread_id: Option<String>,
+    /// Optional one-line card comment.
+    comment: Option<String>,
 }
 
-fn first_string<'a>(value: &'a Value, pointers: &[&str]) -> Option<&'a str> {
-    pointers
-        .iter()
-        .find_map(|p| value.pointer(p).and_then(|v| v.as_str()))
-}
-
-fn first_command_string(value: &Value, pointers: &[&str]) -> Option<String> {
-    for pointer in pointers {
-        let Some(v) = value.pointer(pointer) else {
-            continue;
-        };
-        if let Some(s) = v.as_str() {
-            return Some(s.to_string());
-        }
-        if let Some(arr) = v.as_array() {
-            let parts: Vec<&str> = arr.iter().filter_map(|item| item.as_str()).collect();
-            if !parts.is_empty() {
-                return Some(parts.join(" "));
+/// `codex exec --json` emits `thread.started`, `turn.started`, then
+/// `item.started` / `item.updated` / `item.completed` for every unit of work,
+/// with the kind in `item.type` (command_execution, file_change,
+/// mcp_tool_call, web_search, agent_message, reasoning, todo_list, ...), and
+/// `turn.completed` / `turn.failed` / `error` at the end.
+fn classify_codex_exec_event(event: &Value) -> CodexEventSignal {
+    let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    match event_type {
+        "thread.started" => CodexEventSignal {
+            progress: true,
+            thread_id: event
+                .get("thread_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            comment: None,
+        },
+        "turn.started" => CodexEventSignal {
+            progress: true,
+            comment: Some("Codex started a new review step.".to_string()),
+            ..Default::default()
+        },
+        "turn.completed" => CodexEventSignal {
+            progress: true,
+            ..Default::default()
+        },
+        "item.started" | "item.updated" | "item.completed" => CodexEventSignal {
+            progress: true,
+            comment: (event_type == "item.started")
+                .then(|| event.get("item").and_then(describe_codex_item))
+                .flatten(),
+            ..Default::default()
+        },
+        "turn.failed" | "error" => {
+            let message = event
+                .pointer("/error/message")
+                .or_else(|| event.get("message"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("an error");
+            CodexEventSignal {
+                comment: Some(format!("Codex reported: {}", short_one_line(message, 140))),
+                ..Default::default()
             }
         }
+        _ => CodexEventSignal::default(),
     }
-    None
+}
+
+fn describe_codex_item(item: &Value) -> Option<String> {
+    let str_at = |key: &str| item.get(key).and_then(|v| v.as_str()).unwrap_or("");
+    match str_at("type") {
+        "command_execution" => Some(format!("Running: {}", short_one_line(str_at("command"), 120))),
+        "file_change" => {
+            let paths: Vec<&str> = item
+                .get("changes")
+                .and_then(|v| v.as_array())
+                .map(|changes| {
+                    changes
+                        .iter()
+                        .filter_map(|c| c.get("path").and_then(|p| p.as_str()))
+                        .map(|p| p.rsplit('/').next().unwrap_or(p))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if paths.is_empty() {
+                Some("Applying code changes.".to_string())
+            } else {
+                Some(format!("Editing: {}", short_one_line(&paths.join(", "), 120)))
+            }
+        }
+        "mcp_tool_call" => Some(format!(
+            "Using MCP tool: {}",
+            short_one_line(&format!("{}.{}", str_at("server"), str_at("tool")), 80)
+        )),
+        "web_search" => Some(format!("Searching the web: {}", short_one_line(str_at("query"), 100))),
+        _ => None,
+    }
 }
 
 fn short_one_line(s: &str, max_chars: usize) -> String {

@@ -468,15 +468,19 @@ const KIM_FULL_PR_REVIEW_AUTHOR: &str = "kgenterprisesbiz";
 const KIM_FULL_PR_REVIEW_REPO: &str = "R-Link-LLC/r-link-studio-rebuild";
 const KIM_FULL_PR_REVIEW_FALLBACK_REPO_PATH: &str =
     "/Users/mjohnst/samwise/KG-Apps/r-link-studio-rebuild";
-// The full-pr-review heartbeat now refreshes `updated_at` ONLY while Codex is
-// actively emitting events (see FULL_PR_REVIEW_FRESH_GUARD_SECS), so a stale
-// `updated_at` genuinely means "no real progress." Kept just above the
+// The full-pr-review heartbeat refreshes `updated_at` ONLY while Codex is
+// emitting `codex exec --json` events (every tool call, file edit, QA command,
+// message and reasoning step; see review::classify_codex_exec_event), so a
+// stale `updated_at` genuinely means "no events at all." Kept just above the
 // in-process quiet-kill (45 min) so that killer is first responder and this
 // sweep is the cross-host / app-restart backstop.
 const FULL_PR_REVIEW_NO_PROGRESS_STALE_SECS: i64 = 50 * 60;
 // How many times a wedged (quiet-killed) full review may be auto-retried
 // before the card is left failed for a human. Total attempts = this + 1.
 const FULL_PR_REVIEW_MAX_QUIET_RETRIES: i64 = 2;
+// How many times a full review that was still working when it used its
+// per-run time budget (review.rs FULL_PR_REVIEW_TIMEOUT_SECS) is resumed.
+const FULL_PR_REVIEW_MAX_BUDGET_RESUMES: i64 = 3;
 const MERGED_PR_IN_PROGRESS_RECONCILE_SECS: i64 = 30 * 60;
 const KIM_FULL_PR_REVIEW_CATCH_UP_SECS: i64 = 6 * 60 * 60;
 const FULL_PR_REVIEW_MAX_CONCURRENT: usize = 3;
@@ -12739,6 +12743,7 @@ pub fn spawn_full_pr_review_task(
         let result = review::run_full_pr_review(&config, &task_id, &pr_url, &repo_path).await;
         match result {
             Ok(report) => {
+                review::forget_full_pr_review_session(&config, &task_id).await;
                 let capped = truncate(&report, 6000);
                 // Matt, Nov 3 2026: a clean review merges the exact reviewed
                 // head to main. --match-head-commit refuses if anyone pushed
@@ -12789,75 +12794,78 @@ pub fn spawn_full_pr_review_task(
             Err(e) => {
                 let reason = truncate(&e, 1800);
 
-                // A wedge (no-progress quiet-kill) is retryable, not terminal.
-                // Re-queue by backdating updated_at so full_pr_review_task_is_stale
-                // fires on the next tick and the Kim/plant sweepers relaunch it.
-                // Bounded so a permanently-wedging PR can't loop forever.
-                if e.contains("killed as wedged") {
-                    let mut ctx = match supabase::fetch_task(&config, &task_id).await {
-                        Ok(Some(t)) => t
-                            .get("context")
-                            .and_then(|v| v.as_object())
-                            .cloned()
-                            .unwrap_or_default(),
-                        _ => serde_json::Map::new(),
-                    };
-                    let prior = ctx
-                        .get("quiet_kill_count")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
-                    let next = prior + 1;
-                    if next <= FULL_PR_REVIEW_MAX_QUIET_RETRIES {
-                        ctx.insert("quiet_kill_count".to_string(), serde_json::json!(next));
-                        let backdated = (chrono::Utc::now()
-                            - chrono::Duration::seconds(
-                                FULL_PR_REVIEW_NO_PROGRESS_STALE_SECS + 300,
-                            ))
-                        .to_rfc3339();
-                        agent_comment(
-                            &config,
-                            &task_id,
-                            &format!(
-                                "Codex `$pr-review` was wedged (no progress). Re-queuing a fresh automated run (attempt {} of {}).",
-                                next + 1,
-                                FULL_PR_REVIEW_MAX_QUIET_RETRIES + 1
-                            ),
-                        ).await;
-                        let _ = supabase::update_task(
-                            &config,
-                            &task_id,
-                            &serde_json::json!({
-                                "status": "in_progress",
-                                "worker_id": serde_json::Value::Null,
-                                "claimed_at": serde_json::Value::Null,
-                                "updated_at": backdated,
-                                "failure_reason": serde_json::Value::Null,
-                                "context": serde_json::Value::Object(ctx),
-                            }),
-                        )
-                        .await;
-                        send_telegram(
-                            &config,
-                            &format!(
-                                "Re-queuing wedged `$pr-review` for PR: {}",
-                                escape_markdown_v2(&pr_url),
-                            ),
-                        )
-                        .await;
-                        return;
+                // A wedge (no Codex events at all) or a run that used its time
+                // budget while still working is resumable, not terminal.
+                // Re-queue with the resume-pending flag so full_pr_review_task_is_stale
+                // fires on the next tick and the Kim/plant sweepers relaunch it
+                // (a backdated updated_at never stuck: the ae_tasks trigger
+                // re-stamps it, so retries used to sit idle ~50 min). The
+                // relaunch resumes the same Codex session (saved in the task
+                // context), so its worktree edits and QA carry over. Bounded so a
+                // permanently-wedging PR can't loop forever.
+                let resumable = if e.contains(review::FULL_PR_REVIEW_WEDGED_MARKER) {
+                    Some(("quiet_kill_count", FULL_PR_REVIEW_MAX_QUIET_RETRIES, "was wedged (no events)"))
+                } else if e.contains(review::FULL_PR_REVIEW_BUDGET_MARKER) {
+                    Some((
+                        review::FULL_PR_REVIEW_BUDGET_RESUME_COUNT_KEY,
+                        FULL_PR_REVIEW_MAX_BUDGET_RESUMES,
+                        "used its run budget while still working",
+                    ))
+                } else {
+                    None
+                };
+                if let Some((count_key, max_resumes, why)) = resumable {
+                    match review::request_full_pr_review_resume(&config, &task_id, count_key, max_resumes).await {
+                        review::ResumeRequest::Requeued(next) => {
+                            agent_comment(
+                                &config,
+                                &task_id,
+                                &format!(
+                                    "Codex `$pr-review` {}. Re-queuing it; the next run resumes the same Codex session and keeps its edits ({} of {} resumes).",
+                                    why,
+                                    next,
+                                    max_resumes
+                                ),
+                            ).await;
+                            send_telegram(
+                                &config,
+                                &format!(
+                                    "Re-queuing `$pr-review` to resume for PR: {}",
+                                    escape_markdown_v2(&pr_url),
+                                ),
+                            )
+                            .await;
+                            return;
+                        }
+                        // Supabase is unreachable: change nothing. The row stays
+                        // in_progress with its saved session, and once its
+                        // heartbeat ages out the stale sweep restarts and
+                        // resumes it.
+                        review::ResumeRequest::Unavailable => {
+                            log::warn!(
+                                "[full-pr-review] task {} {} but its row is unreachable; leaving it for the stale sweep to resume",
+                                task_id,
+                                why
+                            );
+                            return;
+                        }
+                        // Retries exhausted: fall through to a real failure.
+                        review::ResumeRequest::Exhausted => {}
                     }
-                    // Retries exhausted: fall through to a real failure.
                 }
+                // Out of automatic resumes, the card fails but the work is
+                // kept: the Codex session stays saved (counters reset), so
+                // re-queuing the card resumes it where it stopped. Any other
+                // terminal failure forgets the session.
+                let note = if resumable.is_some() {
+                    review::reset_full_pr_review_resumes(&config, &task_id).await;
+                    "Full `$pr-review` was still unfinished after its automatic resumes, so I stopped it. Its Codex session and edits are kept: move the card back to Queued and it picks up exactly where it stopped."
+                } else {
+                    review::forget_full_pr_review_session(&config, &task_id).await;
+                    "Full `$pr-review` failed. Leaving the audit card failed."
+                };
 
-                agent_comment(
-                    &config,
-                    &task_id,
-                    &format!(
-                        "Full `$pr-review` failed. Leaving the audit card failed.\n\n{}",
-                        reason
-                    ),
-                )
-                .await;
+                agent_comment(&config, &task_id, &format!("{}\n\n{}", note, reason)).await;
                 let _ = supabase::update_task(
                     &config,
                     &task_id,
@@ -19085,6 +19093,14 @@ fn full_pr_review_task_is_stale(task: &Value) -> bool {
     if status != "in_progress" {
         return false;
     }
+    // The worker requeued this run to resume (wedge or run budget).
+    if task
+        .pointer(&format!("/context/{}", review::FULL_PR_REVIEW_RESUME_PENDING_KEY))
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
+        return true;
+    }
     // `updated_at` is only refreshed while Codex is actively emitting events
     // (the heartbeat stops touching it once the run goes quiet), so a stale
     // `updated_at` on an in_progress row genuinely means no real progress.
@@ -19093,6 +19109,53 @@ fn full_pr_review_task_is_stale(task: &Value) -> bool {
     };
     chrono::Utc::now().signed_duration_since(updated)
         > chrono::Duration::seconds(FULL_PR_REVIEW_NO_PROGRESS_STALE_SECS)
+}
+
+/// Take ownership of restarting a stale full review before spawning it. A run
+/// the worker requeued to resume is claimed by atomically clearing its
+/// resume-pending flag (only the writer that still sees the flag wins, so two
+/// sweeps or hosts never resume the same Codex session at once); a plain stale
+/// row just gets its clock refreshed as before. False means don't launch.
+async fn claim_stale_full_pr_review_restart(config: &SupabaseConfig, task: &Value) -> bool {
+    let Some(task_id) = task.get("id").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let mut ctx = task
+        .get("context")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let resume_pending = ctx.remove(review::FULL_PR_REVIEW_RESUME_PENDING_KEY).is_some();
+    if !resume_pending {
+        let _ = supabase::update_task(
+            config,
+            task_id,
+            &serde_json::json!({
+                "updated_at": chrono::Utc::now().to_rfc3339(),
+                "failure_reason": serde_json::Value::Null,
+            }),
+        )
+        .await;
+        return true;
+    }
+    match supabase::update_task_if_context_flag(
+        config,
+        task_id,
+        review::FULL_PR_REVIEW_RESUME_PENDING_KEY,
+        "true",
+        &serde_json::json!({
+            "context": serde_json::Value::Object(ctx),
+            "failure_reason": serde_json::Value::Null,
+        }),
+    )
+    .await
+    {
+        Ok(v) => v.as_array().map(|a| !a.is_empty()).unwrap_or(false),
+        Err(e) => {
+            log::warn!("[full-pr-review] resume claim for {} failed, retrying next sweep: {}", task_id, e);
+            false
+        }
+    }
 }
 
 fn kim_pr_github_state(pr: &Value) -> String {
@@ -19521,16 +19584,9 @@ pub async fn sweep_plant_full_pr_review_queue(config: &SupabaseConfig) {
                 }
             }
             "in_progress" => {
-                if full_pr_review_task_is_stale(task) {
-                    let _ = supabase::update_task(
-                        config,
-                        &task_id,
-                        &serde_json::json!({
-                            "updated_at": chrono::Utc::now().to_rfc3339(),
-                            "failure_reason": serde_json::Value::Null,
-                        }),
-                    )
-                    .await;
+                if full_pr_review_task_is_stale(task)
+                    && claim_stale_full_pr_review_restart(config, task).await
+                {
                     agent_comment(
                         config,
                         &task_id,
@@ -19731,16 +19787,9 @@ pub async fn sweep_kim_full_pr_review_queue(config: &SupabaseConfig) {
                         continue;
                     }
 
-                    let now = chrono::Utc::now().to_rfc3339();
-                    let _ = supabase::update_task(
-                        config,
-                        task_id,
-                        &serde_json::json!({
-                            "updated_at": now,
-                            "failure_reason": serde_json::Value::Null,
-                        }),
-                    )
-                    .await;
+                    if !claim_stale_full_pr_review_restart(config, existing).await {
+                        continue;
+                    }
                     agent_comment(
                         config,
                         task_id,
