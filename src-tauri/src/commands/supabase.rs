@@ -307,6 +307,27 @@ pub async fn update_task_if_status(
     .await
 }
 
+/// Update only while the row still has the status and `updated_at` the
+/// caller read (optimistic lock; the ae_tasks trigger bumps `updated_at` on
+/// every write). Returns an empty array when the row moved on.
+pub async fn update_task_if_unchanged(
+    config: &SupabaseConfig,
+    id: &str,
+    expected_status: &str,
+    expected_updated_at: &str,
+    updates: &Value,
+) -> Result<Value, String> {
+    let client = build_client(config)?;
+    let url = format!(
+        "{}?id=eq.{}&status=eq.{}&updated_at=eq.{}",
+        rest_url(config, "ae_tasks"),
+        id,
+        expected_status,
+        urlencoding::encode(expected_updated_at)
+    );
+    handle_response(client.patch(&url).json(updates).send().await.map_err(|e| e.to_string())?).await
+}
+
 /// Update only while a context flag still holds a given value at the
 /// database. Context updates are fetch-modify-replace over the whole JSON
 /// document, so an unconditional write can clobber a concurrent stamp that

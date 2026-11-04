@@ -10142,11 +10142,11 @@ async fn sweep_wedged_cards(config: &SupabaseConfig, active: &ActiveTasks) {
 
         match status {
             "in_progress" if age_min >= WEDGE_IN_PROGRESS_MIN => {
-                handle_wedged_active_card(config, active, &task_id, "in_progress", age_min)
+                handle_wedged_active_card(config, active, task, &task_id, "in_progress", age_min)
                     .await;
             }
             "testing" if age_min >= WEDGE_TESTING_MIN => {
-                handle_wedged_active_card(config, active, &task_id, "testing", age_min).await;
+                handle_wedged_active_card(config, active, task, &task_id, "testing", age_min).await;
             }
             "review" if age_min >= WEDGE_REVIEW_MIN => {
                 handle_wedged_review_card(config, task, &task_id, age_min).await;
@@ -10162,6 +10162,7 @@ async fn sweep_wedged_cards(config: &SupabaseConfig, active: &ActiveTasks) {
 async fn handle_wedged_active_card(
     config: &SupabaseConfig,
     active: &ActiveTasks,
+    task: &Value,
     task_id: &str,
     status: &str,
     age_min: i64,
@@ -10208,17 +10209,53 @@ async fn handle_wedged_active_card(
     )
     .await;
 
-    let _ = supabase::update_task(
+    let mut requeue = serde_json::json!({
+        "status": "queued",
+        "worker_id": serde_json::Value::Null,
+        "claimed_at": serde_json::Value::Null,
+    });
+    // The worker reads any card with a PR target as a review; the database
+    // guard only lets a card with a PR return to queued when it is marked as
+    // one. Assert our own classification so a review sent without the marker
+    // can be requeued (Nov 4 2026: one unmarked review held the Operly repo
+    // for over an hour while every requeue was refused). The write only lands
+    // on the exact row we read, so the merged context never overwrites a newer
+    // one.
+    if is_full_pr_review_owned(task) {
+        let mut context = task.get("context").cloned().filter(|c| c.is_object()).unwrap_or_else(|| serde_json::json!({}));
+        context["full_pr_review_automation"] = serde_json::Value::Bool(true);
+        requeue["context"] = context;
+    }
+    let snapshot = task.get("updated_at").and_then(|v| v.as_str()).unwrap_or("");
+    let refused = match supabase::update_task_if_unchanged(config, task_id, status, snapshot, &requeue).await {
+        Ok(_) => return, // requeued, or the row moved on and the next sweep sees it fresh
+        Err(e) if e.starts_with("Supabase error (4") => e,
+        Err(e) => {
+            // Ambiguous (timeout, parse): the write may have landed. Leave it
+            // for the next sweep rather than failing a card that may be queued.
+            log::warn!("[wedge-sweep] requeue of {} task {} uncertain: {}", status, task_id, e);
+            return;
+        }
+    };
+    // The database refused the requeue. A card that cannot be requeued must
+    // never keep its repo locked: fail it visibly so the queue behind it moves.
+    log::error!("[wedge-sweep] requeue of {} task {} refused: {}; failing it", status, task_id, refused);
+    let failed = supabase::update_task_if_unchanged(
         config,
         task_id,
+        status,
+        snapshot,
         &serde_json::json!({
-            "status": "queued",
+            "status": "failed",
             "worker_id": serde_json::Value::Null,
             "claimed_at": serde_json::Value::Null,
-            "updated_at": chrono::Utc::now().to_rfc3339(),
+            "failure_reason": format!("Stalled in {} for {} min and could not be requeued: {}", status, age_min, refused),
         }),
     )
     .await;
+    if let Err(e) = failed {
+        log::error!("[wedge-sweep] could not fail wedged task {} either: {}", task_id, e);
+    }
 }
 
 /// Inspect a stale `review` card. If its PR has a check-run hung for more
