@@ -7470,7 +7470,11 @@ async fn sweep_worktrees_inner(config: Option<&SupabaseConfig>) -> (usize, usize
     };
     while let Ok(Some(repo_entry)) = repos.next_entry().await {
         let repo_dir = repo_entry.path();
-        if !repo_dir.is_dir() {
+        // Only <root>/<repo>/<task> is ours. A directory that is itself a
+        // checkout is another agent's flat worktree (e.g. worktrees/operly-theo-x);
+        // its subfolders resolve to a git repo too, so walking into it deleted
+        // their server/, docs/ and node_modules (Nov 4 2026).
+        if !repo_dir.is_dir() || repo_dir.join(".git").exists() {
             continue;
         }
         let Ok(mut wts) = tokio::fs::read_dir(&repo_dir).await else {
@@ -7478,7 +7482,9 @@ async fn sweep_worktrees_inner(config: Option<&SupabaseConfig>) -> (usize, usize
         };
         while let Ok(Some(wt_entry)) = wts.next_entry().await {
             let wt_path = wt_entry.path();
-            if !wt_path.is_dir() {
+            // A worktree root always has its own .git file; anything else is
+            // a folder inside someone's checkout and is never ours to remove.
+            if !wt_path.is_dir() || !wt_path.join(".git").exists() {
                 continue;
             }
             let wt_str = wt_path.to_string_lossy().into_owned();
