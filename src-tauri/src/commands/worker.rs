@@ -19321,7 +19321,25 @@ pub async fn sweep_plant_full_pr_review_queue(config: &SupabaseConfig) {
         }
     }
 
-    for task in arr {
+    // Claim in priority order, oldest first within a priority, so a critical
+    // hotfix review never waits behind older high ones for the repo's slots
+    // (Nov 4 2026: a critical checkout fix sat 40 min behind three reviews).
+    let rank = |t: &Value| match t.get("priority").and_then(|v| v.as_str()).unwrap_or("") {
+        "critical" => 0u8,
+        "high" => 1,
+        "medium" => 2,
+        "low" => 3,
+        _ => 4,
+    };
+    let mut ordered: Vec<&Value> = arr.iter().collect();
+    ordered.sort_by(|a, b| {
+        rank(a).cmp(&rank(b)).then_with(|| {
+            let created = |t: &Value| t.get("created_at").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            created(a).cmp(&created(b))
+        })
+    });
+
+    for task in ordered {
         if !is_plant_full_pr_review_task(task) {
             continue;
         }
