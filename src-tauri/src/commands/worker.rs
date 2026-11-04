@@ -21230,6 +21230,29 @@ async fn sweep_stale_fixes_needed_cards(
         if current_head == "unknown" {
             continue;
         }
+        // A PR merged outside this card's own flow leaves nothing to fix or
+        // review. Close the card instead of re-opening it, or the review
+        // sweep loops on a worktree it can never prepare for a merged branch.
+        if gh_pr_is_merged(&pr_url, &fix_repo_path).await.unwrap_or(false) {
+            let closed = supabase::update_task_if_status_and_failure_reason(
+                config,
+                &task_id,
+                "fixes_needed",
+                failure_reason,
+                &serde_json::json!({
+                    "status": "done",
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                }),
+            )
+            .await
+            .ok()
+            .and_then(|v| v.as_array().map(|arr| !arr.is_empty()))
+            .unwrap_or(false);
+            if closed {
+                log::info!("[auto-fix-sweep] task {} PR already merged; closed", task_id);
+            }
+            continue;
+        }
         let review_markdown = match review_evidence_for_head(task, &current_head) {
             Some(markdown) => markdown,
             // The latest review of this head was clean: it has no blockers.
@@ -21637,6 +21660,21 @@ pub async fn sweep_pr_review_queue(
         // recovered cards have a new task id but the original PR branch and
         // worktree key in context.orphan_short_id, so resolve through the task
         // context and recreate the PR worktree from origin if it was pruned.
+        // A PR that already merged has nothing left to review; its branch
+        // may be gone, so the worktree below could never be prepared.
+        if gh_pr_is_merged(&pr_url, &main_repo_path).await.unwrap_or(false) {
+            let _ = supabase::update_task(
+                config,
+                &task_id,
+                &serde_json::json!({
+                    "status": "done",
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                }),
+            )
+            .await;
+            log::info!("[pr-review-sweep] task {} PR already merged; closed", task_id);
+            continue;
+        }
         let repo_path = match ensure_pr_review_worktree(&main_repo_path, &task_id, &pr_url, task)
             .await
         {
