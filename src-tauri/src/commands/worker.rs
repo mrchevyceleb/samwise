@@ -479,7 +479,7 @@ const FULL_PR_REVIEW_NO_PROGRESS_STALE_SECS: i64 = 50 * 60;
 const FULL_PR_REVIEW_MAX_QUIET_RETRIES: i64 = 2;
 const MERGED_PR_IN_PROGRESS_RECONCILE_SECS: i64 = 30 * 60;
 const KIM_FULL_PR_REVIEW_CATCH_UP_SECS: i64 = 6 * 60 * 60;
-const FULL_PR_REVIEW_MAX_CONCURRENT: usize = 1;
+const FULL_PR_REVIEW_MAX_CONCURRENT: usize = 3;
 
 /// External edge function that closes the upstream ticket (Operly triage,
 /// Banana triage, Sentry issue) after Sam ships and the deploy is green.
