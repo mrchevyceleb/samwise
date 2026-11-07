@@ -1339,6 +1339,85 @@ mod tests {
         assert!(body.contains("## Blockers"));
         assert!(super::has_substantive_blocker(&body));
     }
+
+    /// Real end-to-end proofs for `gh_merge` (Operly #3587): run manually,
+    /// never in CI. Each needs gh auth plus fresh PRs on a scratch repo:
+    /// AUTOSAM_SCRATCH_REPO=<checkout> AUTOSAM_DRAFT_PR=<url>
+    /// AUTOSAM_READY_PR=<url> AUTOSAM_STALE_PR=<url>
+    /// cargo test --lib -- --ignored gh_merge_
+    /// The draft and ready proofs merge their PRs; the stale-head proof
+    /// leaves its PR open, so every run needs fresh PRs.
+
+    fn scratch_env(name: &str) -> String {
+        std::env::var(name).unwrap_or_else(|_| panic!("set {} to run the gh_merge proofs", name))
+    }
+
+    fn pr_view(pr_url: &str, repo_path: &str, fields: &str) -> serde_json::Value {
+        let output = std::process::Command::new("gh")
+            .args(["pr", "view", pr_url, "--json", fields])
+            .current_dir(repo_path)
+            .output()
+            .expect("spawn gh pr view");
+        assert!(
+            output.status.success(),
+            "gh pr view failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("parse gh pr view")
+    }
+
+    #[tokio::test]
+    #[ignore = "needs gh auth + a fresh draft PR (AUTOSAM_DRAFT_PR) and the scratch checkout (AUTOSAM_SCRATCH_REPO)"]
+    async fn gh_merge_marks_a_draft_pr_ready_and_merges_it() {
+        let pr_url = scratch_env("AUTOSAM_DRAFT_PR");
+        let repo_path = scratch_env("AUTOSAM_SCRATCH_REPO");
+        let before = pr_view(&pr_url, &repo_path, "isDraft,headRefOid");
+        assert_eq!(before["isDraft"], true, "the proof must start from a genuine draft PR");
+        let head_sha = before["headRefOid"].as_str().expect("headRefOid").to_string();
+        super::gh_merge(&pr_url, &repo_path, &head_sha)
+            .await
+            .expect("mark ready + merge in one pass");
+        let after = pr_view(&pr_url, &repo_path, "state,isDraft");
+        assert_eq!(after["state"], "MERGED");
+        assert_eq!(after["isDraft"], false);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs gh auth + a fresh non-draft PR (AUTOSAM_READY_PR) and the scratch checkout (AUTOSAM_SCRATCH_REPO)"]
+    async fn gh_merge_still_merges_a_ready_pr() {
+        let pr_url = scratch_env("AUTOSAM_READY_PR");
+        let repo_path = scratch_env("AUTOSAM_SCRATCH_REPO");
+        let before = pr_view(&pr_url, &repo_path, "isDraft,headRefOid");
+        assert_eq!(before["isDraft"], false, "this proof must start from a non-draft PR");
+        let head_sha = before["headRefOid"].as_str().expect("headRefOid").to_string();
+        super::gh_merge(&pr_url, &repo_path, &head_sha)
+            .await
+            .expect("the normal merge path must keep working");
+        assert_eq!(pr_view(&pr_url, &repo_path, "state")["state"], "MERGED");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs gh auth + a fresh open PR (AUTOSAM_STALE_PR) and the scratch checkout (AUTOSAM_SCRATCH_REPO)"]
+    async fn gh_merge_still_refuses_a_stale_head() {
+        let pr_url = scratch_env("AUTOSAM_STALE_PR");
+        let repo_path = scratch_env("AUTOSAM_SCRATCH_REPO");
+        let head_sha = pr_view(&pr_url, &repo_path, "headRefOid")["headRefOid"]
+            .as_str()
+            .expect("headRefOid")
+            .to_string();
+        // Corrupt the last hex char so the "reviewed head" no longer matches.
+        let last = if head_sha.ends_with('0') { "1" } else { "0" };
+        let stale = format!("{}{}", &head_sha[..head_sha.len() - 1], last);
+        let err = super::gh_merge(&pr_url, &repo_path, &stale)
+            .await
+            .expect_err("a stale reviewed head must be refused");
+        assert!(!err.is_empty());
+        assert_eq!(
+            pr_view(&pr_url, &repo_path, "state")["state"], "OPEN",
+            "the PR must stay open (err was: {})",
+            err
+        );
+    }
 }
 
 /// Post an APPROVED review on the PR so that branch-protection rules that
@@ -1387,6 +1466,17 @@ pub async fn gh_pr_approve(pr_url: &str, repo_path: &str) -> Result<(), String> 
 const REAL_GH: &str = "/usr/bin/gh";
 
 pub async fn gh_merge(pr_url: &str, repo_path: &str, head_sha: &str) -> Result<(), String> {
+    // A draft PR can never merge, and every caller of this function has
+    // already decided the PR should land (clean review or an explicit merge
+    // request), so a lingering draft is an oversight, not a verdict. Clear
+    // it here so the merge below is one pass instead of a "Pull Request is
+    // still a draft" failure that parks a clean card for a human
+    // (Operly #3587, Nov 6 2026).
+    if let Err(e) = gh_pr_ensure_ready(pr_url, repo_path).await {
+        // Non-fatal: if the draft truly blocks it, the merge below reports
+        // the real error exactly as it did before this check existed.
+        log::warn!("[review] could not clear draft status before merge (continuing): {}", e);
+    }
     // --match-head-commit merges only the exact head the review passed: a
     // push after the review makes GitHub refuse, and the PR goes back for
     // another review instead of landing unreviewed code.
@@ -1414,6 +1504,39 @@ pub async fn gh_merge(pr_url: &str, repo_path: &str, head_sha: &str) -> Result<(
         return Ok(());
     }
     Err(if stdout.is_empty() { stderr } else { format!("{} {}", stderr, stdout) })
+}
+
+/// If the PR is still a draft, mark it ready for review. `gh_merge` calls
+/// this in the same pass as the merge, because anything AutoSam merges went
+/// through a review that came back clean — the draft flag is the only thing
+/// left between that verdict and main. Non-drafts cost one `gh pr view`.
+/// Returns Ok(true) if the PR was a draft and was flipped ready.
+async fn gh_pr_ensure_ready(pr_url: &str, repo_path: &str) -> Result<bool, String> {
+    let output = async_cmd("gh")
+        .args(["pr", "view", pr_url, "--json", "isDraft"])
+        .current_dir(repo_path)
+        .output()
+        .await
+        .map_err(|e| format!("spawn gh pr view: {}", e))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let parsed: Value =
+        serde_json::from_slice(&output.stdout).map_err(|e| format!("parse gh pr view: {}", e))?;
+    if !parsed.get("isDraft").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return Ok(false);
+    }
+    let output = async_cmd("gh")
+        .args(["pr", "ready", pr_url])
+        .current_dir(repo_path)
+        .output()
+        .await
+        .map_err(|e| format!("spawn gh pr ready: {}", e))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    log::info!("[review] {} was a draft; marked ready for review before merging", pr_url);
+    Ok(true)
 }
 
 async fn gh_pr_is_merged(pr_url: &str, repo_path: &str) -> Result<bool, String> {
