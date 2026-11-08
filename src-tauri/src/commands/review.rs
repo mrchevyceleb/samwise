@@ -2407,7 +2407,7 @@ pub async fn reset_full_pr_review_resumes(config: &SupabaseConfig, task_id: &str
 /// Supabase error is retried (re-reading the row each time). Returns false
 /// only when the row could not be read or written; a row that never comes
 /// back readable is never overwritten with a blank context.
-async fn edit_full_pr_review_context(
+pub async fn edit_full_pr_review_context(
     config: &SupabaseConfig,
     task_id: &str,
     edit: impl Fn(&mut serde_json::Map<String, Value>) -> bool,

@@ -715,6 +715,16 @@ const AUTO_FIX_NOOP_PREFIX: &str = "auto_fix_noop";
 /// Bounds the park comment to once per pair.
 const AUTO_FIX_NO_BLOCKERS_PREFIX: &str = "auto_fix_no_blockers";
 
+/// Task-context counter for fresh full `$pr-review` runs re-queued after a
+/// no-blockers park (see `maybe_requeue_fresh_full_pr_review`).
+const NO_BLOCKERS_FRESH_REVIEW_COUNT_KEY: &str = "no_blockers_fresh_review_count";
+/// At most this many fresh full reviews per card. A review that keeps coming
+/// back blocker-less parks for a human instead of looping forever.
+const NO_BLOCKERS_FRESH_REVIEWS_MAX: i64 = 2;
+/// Seconds a no-blockers park must age before a fresh review is re-queued:
+/// an immediate re-run hits the same model mood that produced the waffle.
+const NO_BLOCKERS_FRESH_REVIEW_DELAY_SECS: i64 = 180;
+
 /// True when `failure_reason` holds nothing a human needs, so automation may
 /// overwrite it with dedupe state: empty, or a marker this module wrote itself.
 /// A real diagnostic (pre-flight checkout failure, coder crash, push rejection)
@@ -902,6 +912,122 @@ async fn park_auto_fix_without_blockers(
         "The review left nothing to fix, so no cycle was spent. Your call.",
     )
     .await;
+}
+
+/// A card parked with no actionable blockers used to sit until a human pushed
+/// or re-reviewed by hand, because nothing ever produced the "fresh review"
+/// the park was waiting for (Studio PRs #2753/#2754, Nov 8 2026: parked all
+/// afternoon while a re-review would have merged them). This is the missing
+/// producer: a few minutes after the park, re-queue one more full
+/// `$pr-review` run on the same card. The completion handler forgets the
+/// Codex session at verdict time, so the relaunched run is a genuinely fresh
+/// review, not a resume. A clean verdict merges (Matt, Nov 3 2026); a real
+/// verdict finally gives the fix funnel blockers to act on; only a review
+/// that stays blocker-less re-parks, and after
+/// `NO_BLOCKERS_FRESH_REVIEWS_MAX` fresh reviews the card parks for good.
+async fn maybe_requeue_fresh_full_pr_review(
+    config: &SupabaseConfig,
+    task: &Value,
+    task_id: &str,
+    pr_url: &str,
+    repo_path: &str,
+) {
+    let count = task
+        .pointer(&format!("/context/{}", NO_BLOCKERS_FRESH_REVIEW_COUNT_KEY))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    if count >= NO_BLOCKERS_FRESH_REVIEWS_MAX {
+        log::info!(
+            "[auto-fix-sweep] task {} parked with no blockers after {} fresh reviews; leaving it for a human",
+            task_id,
+            count
+        );
+        return;
+    }
+    // `updated_at` is the park write (comments and telegrams are separate
+    // tables), so its age is how long the card has been parked.
+    let Some(updated) = task_time_field(task, "updated_at") else {
+        return;
+    };
+    if chrono::Utc::now().signed_duration_since(updated)
+        < chrono::Duration::seconds(NO_BLOCKERS_FRESH_REVIEW_DELAY_SECS)
+    {
+        return;
+    }
+    // The fresh review works the same repo checkout, so respect the per-repo
+    // concurrency the other launch paths enforce. This sweep only fetched
+    // fixes_needed rows, so judge conflicts against the full task list.
+    if let Ok(tasks) = supabase::fetch_tasks(config, None).await {
+        if let Some(key) = active_repo_conflict_for_keys(
+            tasks.as_array().map(|a| a.as_slice()).unwrap_or(&[]),
+            &task_repo_serial_keys(task),
+            Some(task_id),
+            max_tasks_per_repo(),
+        ) {
+            log::info!(
+                "[auto-fix-sweep] delaying fresh review for parked task {} because repo {} already has active work",
+                task_id,
+                key
+            );
+            return;
+        }
+    }
+    // Claim atomically (still parked at the same marker) so two sweep ticks
+    // or two hosts can never double-fire the fresh review.
+    let failure_reason = task.get("failure_reason").and_then(|v| v.as_str());
+    let claimed = supabase::update_task_if_status_and_failure_reason(
+        config,
+        task_id,
+        "fixes_needed",
+        failure_reason,
+        &serde_json::json!({
+            "status": "in_progress",
+            "claimed_at": serde_json::Value::Null,
+            "worker_id": serde_json::Value::Null,
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+            "failure_reason": serde_json::Value::Null,
+        }),
+    )
+    .await
+    .ok()
+    .and_then(|v| v.as_array().map(|arr| !arr.is_empty()))
+    .unwrap_or(false);
+    if !claimed {
+        return;
+    }
+    // Count after the claim: a lost count write costs at most one extra
+    // review, where the reverse order could strand an in_progress row with
+    // no runner if the claim then lost the race.
+    review::edit_full_pr_review_context(config, task_id, |ctx| {
+        ctx.insert(
+            NO_BLOCKERS_FRESH_REVIEW_COUNT_KEY.to_string(),
+            serde_json::json!(count + 1),
+        );
+        true
+    })
+    .await;
+    log::info!(
+        "[auto-fix-sweep] re-queuing fresh full $pr-review for parked task {} ({} of {})",
+        task_id,
+        count + 1,
+        NO_BLOCKERS_FRESH_REVIEWS_MAX
+    );
+    agent_comment(
+        config,
+        task_id,
+        &format!(
+            "Still nothing actionable after the re-check, so I'm running a fresh full `$pr-review` ({} of {}). A clean one merges; real blockers finally give me something to fix.",
+            count + 1,
+            NO_BLOCKERS_FRESH_REVIEWS_MAX
+        ),
+    )
+    .await;
+    spawn_full_pr_review_task(
+        config.clone(),
+        task_id.to_string(),
+        pr_url.to_string(),
+        repo_path.to_string(),
+    );
 }
 
 fn auto_fix_max_review_cycles(settings: Option<&Value>) -> i64 {
@@ -21521,6 +21647,23 @@ async fn sweep_stale_fixes_needed_cards(
                     )
                     .await;
                 }
+                continue;
+            }
+            // Already parked at this head with nothing to fix: a fresh full
+            // review a few minutes later is the only move that can end the
+            // park on its own. Deliberately NOT the ping-pong a status flip
+            // back to `review` caused (see the note above): the re-queue is
+            // bounded by its own counter, so a review that keeps coming back
+            // blocker-less parks for a human after the last attempt.
+            if auto_fix_no_blockers_recorded(failure_reason, &current_head, &review_markdown) {
+                maybe_requeue_fresh_full_pr_review(
+                    config,
+                    task,
+                    &task_id,
+                    &pr_url,
+                    &fix_repo_path,
+                )
+                .await;
                 continue;
             }
             park_auto_fix_without_blockers(
