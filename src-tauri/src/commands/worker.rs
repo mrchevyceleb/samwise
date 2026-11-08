@@ -12814,6 +12814,16 @@ pub fn spawn_full_pr_review_task(
                             Ok(None) => return,
                             Err(_) => {}
                         }
+                        // The launch paths only announce a review in card
+                        // comments; the journal got one line and then silence
+                        // (check 2 of the no-blockers requeue, Nov 8 2026).
+                        // Say it here too, where a fresh session actually
+                        // starts, so an operator tailing the log can follow.
+                        log::info!(
+                            "[full-pr-review] starting Codex review for task {} ({})",
+                            task_id,
+                            pr_url
+                        );
                         let acquired_at = chrono::Utc::now().to_rfc3339();
                         let _ = supabase::update_task(
                             &config,
