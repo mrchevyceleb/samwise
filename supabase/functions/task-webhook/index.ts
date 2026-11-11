@@ -41,6 +41,9 @@ type Body = {
   task_type?: "code" | "research" | "qa-verify";
   source?: string;
   repo_url?: string;
+  pr_url?: string;
+  pr_number?: number;
+  context?: Record<string, unknown>;
   // qa-verify QA target selection. `environment` picks the project's staging
   // (preview_url, default) or production (production_url) URL. An explicit
   // `preview_url` always overrides both.
@@ -397,6 +400,27 @@ Deno.serve(async (req) => {
   if (!title) return json(400, { error: "title is required" });
   if (!description) return json(400, { error: "description is required" });
 
+  // Keep review intent and its original target; do not accept unrelated
+  // worker control fields from an inbound context object.
+  const reviewContext: Record<string, unknown> = {};
+  for (const key of ["simple_full_pr_review", "full_pr_review_task", "full_pr_review_automation", "plant_full_pr_review"]) {
+    if (typeof body.context?.[key] === "boolean") reviewContext[key] = body.context[key];
+  }
+  // Use the existing database lifecycle marker as well as the sender's flags.
+  if (Object.values(reviewContext).some((flag) => flag === true)) reviewContext.full_pr_review_automation = true;
+  const rawPrUrl = body.pr_url ?? body.context?.pr_url;
+  const prUrl = typeof rawPrUrl === "string" ? rawPrUrl.trim() : "";
+  if (rawPrUrl !== undefined && !/^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/[1-9]\d*$/.test(prUrl)) {
+    return json(400, { error: "pr_url must be a GitHub pull request URL" });
+  }
+  if (Object.values(reviewContext).some((flag) => flag === true) && !prUrl) {
+    return json(400, { error: "A full PR review requires pr_url" });
+  }
+  if (prUrl && body.context?.pr_url !== undefined && body.context.pr_url !== prUrl) {
+    return json(400, { error: "pr_url and context.pr_url must identify the same PR" });
+  }
+  if (prUrl) reviewContext.pr_url = prUrl;
+
   const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
   const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
   const sb = createClient(supabaseUrl, serviceKey);
@@ -410,7 +434,7 @@ Deno.serve(async (req) => {
   }
 
   let project = (body.project ?? "").trim();
-  const repoUrl = (body.repo_url ?? "").trim();
+  const repoUrl = prUrl ? prUrl.split("/pull/")[0] : (body.repo_url ?? "").trim();
   const resolution = resolveProject(project, repoUrl, title, description, projects ?? []);
   if (resolution) project = resolution.row.name;
 
@@ -421,6 +445,7 @@ Deno.serve(async (req) => {
     priority: body.priority ?? "medium",
     task_type: body.task_type ?? "code",
     source,
+    ...(prUrl ? { pr_url: prUrl, pr_number: Number(prUrl.split("/pull/")[1]) } : {}),
   };
 
   // QA target environment: explicit preview_url wins; otherwise the project's
@@ -454,6 +479,7 @@ Deno.serve(async (req) => {
   // Record the QA environment so the card/UI shows which target was used.
   task.context = {
     ...(task.context && typeof task.context === "object" ? task.context : {}),
+    ...reviewContext,
     qa_environment: environment,
   };
 
