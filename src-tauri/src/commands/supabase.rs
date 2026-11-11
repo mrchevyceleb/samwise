@@ -603,6 +603,14 @@ pub async fn update_task_if_snapshot_not_held(
 /// Patch exactly the row observed by the caller. Recovery must never overwrite
 /// a concurrent completion, cancellation, claim or checkpoint.
 pub async fn update_task_if_snapshot(config: &SupabaseConfig, task: &Value, updates: &Value) -> Result<Value, String> {
+    update_owned_snapshot(config, task, updates, false).await
+}
+
+pub async fn update_unheld_task_if_snapshot(config: &SupabaseConfig, task: &Value, updates: &Value) -> Result<Value, String> {
+    update_owned_snapshot(config, task, updates, true).await
+}
+
+async fn update_owned_snapshot(config: &SupabaseConfig, task: &Value, updates: &Value, require_unheld: bool) -> Result<Value, String> {
     let mut url = format!("{}?", rest_url(config, "ae_tasks"));
     for field in ["id", "status", "updated_at", "worker_id", "claimed_at"] {
         let filter = match task.get(field).and_then(Value::as_str) {
@@ -612,6 +620,7 @@ pub async fn update_task_if_snapshot(config: &SupabaseConfig, task: &Value, upda
         };
         url.push_str(&format!("{}={}&", field, filter));
     }
+    if require_unheld { url.push_str("on_hold=eq.false"); }
     handle_response(build_client(config)?.patch(url).json(updates).send().await.map_err(|e| e.to_string())?).await
 }
 

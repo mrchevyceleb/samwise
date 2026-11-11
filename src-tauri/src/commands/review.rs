@@ -1865,6 +1865,8 @@ async fn run_codex_exec_once(
         result = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()) => result,
         stopped = super::pr_closure::wait_until_not_open(pr_url) => {
             if let Some(pid) = child.id() {
+                // Keep the leader owned until group cleanup finishes so its
+                // PID cannot be reused during the bounded grace period.
                 crate::process::stop_process_group(pid).await;
             }
             let _ = child.kill().await;

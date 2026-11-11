@@ -146,7 +146,7 @@ pub(super) async fn park_if_active(config: &SupabaseConfig, id: &str, reason: &s
 pub(super) async fn park_owned(config: &SupabaseConfig, id: &str, reason: &str, expected: Option<&Value>) -> bool {
     let Ok(Some(task)) = supabase::fetch_task(config, id).await else { return false; };
     if expected.is_some_and(|owner| task["worker_id"] != owner["worker_id"] || task["claimed_at"] != owner["claimed_at"]) { return false; }
-    if !execution_status(&task) { return false; }
+    if !execution_status(&task) || task_is_on_hold(&task) { return false; }
     if task["worker_id"].as_str().is_some_and(|owner| !owner.is_empty() && owner != machine_name()) { return false; }
     let mut context = task["context"].as_object().cloned().unwrap_or_default();
     let checkpoint = context.get("worker_checkpoint").cloned().unwrap_or(Value::Null);
@@ -166,7 +166,7 @@ pub(super) async fn park_owned(config: &SupabaseConfig, id: &str, reason: &str, 
     }
     let patch = serde_json::json!({"status":"failed", "worker_id":null,"claimed_at":null,
         "failure_reason":reason,"context":context,"updated_at":chrono::Utc::now().to_rfc3339()});
-    let changed = supabase::update_task_if_snapshot(config, &task, &patch).await
+    let changed = supabase::update_unheld_task_if_snapshot(config, &task, &patch).await
         .ok().and_then(|v| v.as_array().map(|rows| !rows.is_empty())).unwrap_or(false);
     if changed { agent_comment(config, id, &format!("{}\nSaved work is retained. Resume its checkpoint or create an explicit follow-up; this task will not restart itself.", reason)).await; }
     changed

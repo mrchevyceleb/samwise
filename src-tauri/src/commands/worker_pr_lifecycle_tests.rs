@@ -1,5 +1,6 @@
 //! Opt-in end-to-end check: the real worker, local Postgres/PostgREST and
-//! read-only GitHub PRs. Never connects to the production task database.
+//! real GitHub PRs (one explicitly owned draft may be closed and reopened).
+//! Never connects to the production task database.
 use super::*;
 
 #[tokio::test]
@@ -33,11 +34,13 @@ async fn live_pr_lifecycle() {
         ("unavailable", missing, "fixes_needed", 1, serde_json::json!({})),
         ("active repair", merged, "in_progress", 2, serde_json::json!({"samwise_auto_fix_status":"running"})),
         ("closed unmerged", unmerged, "fixes_needed", 2, serde_json::json!({})),
+        ("parked unknown state", merged, "failed", 2, serde_json::json!({"recovery_required":{"reason":"PR state is unavailable after retries."}})),
     ] {
         let id = uuid::Uuid::new_v4().to_string();
         let row = serde_json::json!({"id":id,"title":format!("Lifecycle QA: {}",label),
             "status":status,"source":"manual","pr_url":pr,"repo_path":repo,
             "repo_url":"https://github.com/mrchevyceleb/TARDIS","context":context,
+            "failure_reason":if label == "parked unknown state" {serde_json::json!("PR state is unavailable after retries.")} else {Value::Null},
             "review_cycle_count":cycles,"on_hold":false});
         let response = client.post(format!("{}/rest/v1/ae_tasks",config.url)).json(&row).send().await.unwrap();
         assert!(response.status().is_success(), "seed {}: {}",label,response.text().await.unwrap());
@@ -82,6 +85,30 @@ async fn live_pr_lifecycle() {
         }
     }
     assert!(pr_closure::require_open(&open_pr).await.is_ok());
+    // Fresh audits can close without replaying deployment. Interrupted audits
+    // require the existing successful deploy receipt before claiming Done.
+    for (started, claimed, deployed, expected) in [
+        (Some(false), false, false, "done"), (Some(true), true, false, "failed"),
+        (Some(true), true, true, "done"), (None, false, false, "done"), (None, true, false, "failed")
+    ] {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut context = serde_json::json!({"full_pr_review_automation":true});
+        if let Some(started) = started { context["full_pr_review_execution_started"] = serde_json::json!(started); }
+        if deployed { context[MERGE_DEPLOY_STATUS_KEY] = serde_json::json!("succeeded"); }
+        let response = client.post(format!("{}/rest/v1/ae_tasks",config.url)).json(&serde_json::json!({
+            "id":id,"title":"Full review closeout QA","source":"manual","status":"in_progress",
+            "claimed_at":if claimed {serde_json::json!(chrono::Utc::now().to_rfc3339())} else {Value::Null},
+            "pr_url":merged,"repo_path":repo,"context":context,"on_hold":false})).send().await.unwrap();
+        assert!(response.status().is_success());
+        let task = supabase::fetch_task(&config,&id).await.unwrap().unwrap();
+        assert!(!full_review_pr_is_open(&config,&task).await);
+        let task = supabase::fetch_task(&config,&id).await.unwrap().unwrap();
+        assert_eq!(task["status"],expected);
+        assert_ne!(task["context"][MERGE_DEPLOY_STATUS_KEY],"requested");
+        assert_ne!(task["context"][MERGE_DEPLOY_STATUS_KEY],"running");
+        println!("PASS full audit started={:?}, claimed={}, deploy_verified={}: {} without new work",started,claimed,deployed,expected);
+        client.delete(format!("{}/rest/v1/ae_tasks?id=eq.{}",config.url,id)).send().await.unwrap();
+    }
     println!("PASS open PR remains eligible; terminal repeats spend no cycles; local rows/worktrees removed");
 }
 
@@ -119,8 +146,11 @@ async fn live_repair_cancellation() {
     let cfg = config.clone(); let tid = id.clone(); let slot = pid_slot.clone();
     let child = tokio::spawn(async move {
         run_claude_code_streaming(&repo,
-            "This is a cancellation lifecycle check. Do not change files, commit, push, use network tools, or run reviewers. Execute sleep 90 in the foreground and wait for cancellation.",
-            2, 120, &cfg, &tid, slot, Some("claude-opus-5-5")).await
+            "In this disposable checkout, implement lifecycle-demo.mjs: a small Node command-line arithmetic calculator with a recursive-descent parser for parentheses, +, -, *, /, right-associative exponentiation and unary minus, without eval. Add a few embedded self-checks and run it with Node. Only create that file; do not commit, push, use network tools or run reviewers. This is native coder cancellation QA, so the worker may stop you before completion.",
+            // Exercise a real coding task: the command guard correctly blocks
+            // artificial foreground sleeps. REVIEW_MODEL instead selects the
+            // restricted reviewer, which cannot perform this coding task.
+            0, 120, &cfg, &tid, slot, Some("claude-sonnet-5-5")).await
     });
     let result = std::panic::AssertUnwindSafe(async {
         let mut started = None;
@@ -138,7 +168,7 @@ async fn live_repair_cancellation() {
         let output = tokio::time::timeout(std::time::Duration::from_secs(60), child).await.unwrap().unwrap();
         assert!(matches!(output, Err(ref error) if error == "TASK_CANCELLED"), "native coder did not stop through cancellation");
         assert!(!Path::new(&format!("/proc/{}",pid)).exists(), "coder was not reaped");
-        assert!(!finish_auto_fix_run(&config,&id,&pr,1).await);
+        assert!(!finish_auto_fix_run(&config,&id,&pr,1,None).await);
         let task = supabase::fetch_task(&config,&id).await.unwrap().unwrap();
         assert_eq!(task["status"],"failed");
         assert_eq!(task["review_cycle_count"],1);
