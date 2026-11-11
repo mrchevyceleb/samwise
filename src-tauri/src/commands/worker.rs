@@ -19684,8 +19684,6 @@ fn full_pr_review_requested(task: &Value) -> bool {
     ["simple_full_pr_review", "full_pr_review_task", "full_pr_review_automation", "plant_full_pr_review"]
         .iter().any(|key| task_context_bool(task, key) == Some(true))
         || task["title"].as_str().unwrap_or("").trim().to_ascii_lowercase().starts_with("full pr review")
-        || task["description"].as_str().unwrap_or("").to_ascii_lowercase().contains("$pr-review")
-        || task["description"].as_str().unwrap_or("").to_ascii_lowercase().contains("/pr-review")
 }
 
 #[cfg(test)]
