@@ -10,6 +10,7 @@ use super::dev_server;
 #[path = "worker_safety.rs"]
 mod safety;
 use super::review;
+use super::pr_closure::{self, PrState};
 use super::supabase::{self, SupabaseConfig, SupabaseState};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -2876,9 +2877,15 @@ async fn worker_loop(
             sweep_wedged_cards(&config, &active).await;
         }
 
-        // Sweep the PR-review queue every ~30s (6 ticks). Picks up cards that
-        // just entered review (fresh PRs) and cards you dragged back from
-        // fixes_needed -> review so they get re-reviewed automatically.
+        // Reconcile terminal PRs before launching any review/fix work.
+        // Sweep approved/review/fixes_needed cards whose GitHub PRs got merged
+        // or closed outside Sam's pipeline. Merged PRs run the same post-merge
+        // deploy plan before the card moves to Done. Every ~60s (12 ticks).
+        if tick % 12 == 0 {
+            sweep_pr_merged_cards(&config).await;
+        }
+
+        // Review eligible cards every ~30 seconds.
         if tick % 6 == 0 {
             let settings: Option<serde_json::Value> =
                 if let Ok(data_dir) = app.path().app_data_dir() {
@@ -2923,12 +2930,6 @@ async fn worker_loop(
             sweep_review_merge_requests(&config).await;
         }
 
-        // Sweep approved/review/fixes_needed cards whose GitHub PRs got merged
-        // or closed outside Sam's pipeline. Merged PRs run the same post-merge
-        // deploy plan before the card moves to Done. Every ~60s (12 ticks).
-        if tick % 12 == 0 {
-            sweep_pr_merged_cards(&config).await;
-        }
 
         // Author-based full-review adoption is retired. It bypassed the
         // normal auto-merge switch and let the review subprocess admin-merge
@@ -10680,6 +10681,8 @@ async fn run_claude_code_streaming_impl(
         .stderr(std::process::Stdio::piped());
 
     super::claude_code::prepare_team_claude_async(&mut cmd).await?;
+    #[cfg(unix)]
+    cmd.process_group(0);
 
     let mut child = cmd
         .kill_on_drop(true)
@@ -10744,10 +10747,7 @@ async fn run_claude_code_streaming_impl(
                     let pid_opt = { *pid_slot_hb.lock().await };
                     if let Some(pid) = pid_opt {
                         if pid > 0 {
-                            #[cfg(unix)]
-                            unsafe {
-                                libc::kill(pid as i32, libc::SIGTERM);
-                            }
+                            crate::process::stop_process_group(pid).await;
                         }
                     }
                     alive_hb.store(false, Ordering::Relaxed);
@@ -11010,6 +11010,7 @@ async fn run_claude_code_streaming_impl(
     // Process exited cleanly. Shut the heartbeat down so it doesn't fire a
     // stale "still working" message just as we're reporting success.
     heartbeat_alive.store(false, std::sync::atomic::Ordering::Relaxed);
+    *process_id_slot.lock().await = None;
 
     // If the cancellation watcher killed the subprocess, report that
     // specifically so callers can skip the post-work pipeline (no PR, no
@@ -11212,7 +11213,9 @@ async fn run_pi_streaming_impl(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    let mut child = cmd.spawn().map_err(|e| format!("Failed to run pi: {}", e))?;
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let mut child = cmd.kill_on_drop(true).spawn().map_err(|e| format!("Failed to run pi: {}", e))?;
 
     // Prompt goes on stdin, never argv: task descriptions routinely exceed
     // ARG_MAX and argv is world-readable in the process table.
@@ -11261,10 +11264,7 @@ async fn run_pi_streaming_impl(
                     let pid_opt = { *pid_slot_hb.lock().await };
                     if let Some(pid) = pid_opt {
                         if pid > 0 {
-                            #[cfg(unix)]
-                            unsafe {
-                                libc::kill(pid as i32, libc::SIGTERM);
-                            }
+                            crate::process::stop_process_group(pid).await;
                         }
                     }
                     alive_hb.store(false, Ordering::Relaxed);
@@ -11461,6 +11461,7 @@ async fn run_pi_streaming_impl(
     };
 
     heartbeat_alive.store(false, Ordering::Relaxed);
+    *process_id_slot.lock().await = None;
 
     if cancelled.load(Ordering::Relaxed) {
         return Err("TASK_CANCELLED".to_string());
@@ -11633,7 +11634,7 @@ async fn run_pi_opts_impl(
 /// when Matt deletes/cancels a task from the UI.
 async fn task_is_live(config: &SupabaseConfig, task_id: &str) -> bool {
     let url = format!(
-        "{}/rest/v1/ae_tasks?id=eq.{}&select=status",
+        "{}/rest/v1/ae_tasks?id=eq.{}&select=status,pr_url,context",
         config.url, task_id
     );
     let key = config
@@ -11668,6 +11669,11 @@ async fn task_is_live(config: &SupabaseConfig, task_id: &str) -> bool {
         return false;
     } // row deleted
     let status = arr[0].get("status").and_then(|v| v.as_str()).unwrap_or("");
+    if status == "in_progress" && arr[0]["context"]["samwise_auto_fix_status"] == "running"
+        && arr[0]["context"][MERGE_DEPLOY_STATUS_KEY] != "running" {
+        let pr = arr[0]["pr_url"].as_str().unwrap_or("");
+        if matches!(pr_closure::state(pr).await, Ok(PrState::Merged | PrState::Closed)) { return false; }
+    }
     if safety::run_is_active(task_id) { matches!(status, "in_progress" | "testing") }
     else { status != "cancelled" }
 }
@@ -11853,6 +11859,9 @@ pub fn spawn_pr_review_task(
     repo_path: String,
 ) {
     tokio::spawn(async move {
+        let Ok(Some(task)) = supabase::fetch_task(&config, &task_id).await else { return; };
+        if task["status"] != "review" || task_is_on_hold(&task)
+            || !pr_task_is_open(&config, &task).await { return; }
         // Stamp first so the poll-loop watcher (which also triggers on fixes_needed
         // -> review) doesn't double-fire before the codex run finishes.
         if !mark_pr_review_running(&config, &task_id).await {
@@ -11997,6 +12006,13 @@ pub fn spawn_pr_review_task(
                     }
                 }
                 Err(e) => {
+                    if e.starts_with(pr_closure::PR_WORK_STOPPED) {
+                        mark_pr_review_finished_with_status(&config, &task_id, "stopped", Some(&e)).await;
+                        if let Ok(Some(task)) = supabase::fetch_task(&config, &task_id).await {
+                            pr_task_is_open(&config, &task).await;
+                        }
+                        return;
+                    }
                     log::warn!(
                         "[pr-review] delta verify failed for task {}: {}; falling back to full review",
                         task_id, e
@@ -12026,6 +12042,12 @@ pub fn spawn_pr_review_task(
                     Err(e) => {
                         log::warn!("[pr-review] run failed for task {}: {}", task_id, e);
                         mark_pr_review_finished(&config, &task_id, Some(&e)).await;
+                        if e.starts_with(pr_closure::PR_WORK_STOPPED) {
+                            if let Ok(Some(task)) = supabase::fetch_task(&config, &task_id).await {
+                                pr_task_is_open(&config, &task).await;
+                            }
+                            return;
+                        }
                         agent_comment(
                             &config,
                             &task_id,
@@ -12040,6 +12062,14 @@ pub fn spawn_pr_review_task(
 
         let task_before_verdict = supabase::fetch_task(&config, &task_id)
             .await.ok().flatten();
+        if let Some(task) = task_before_verdict.as_ref() {
+            if let Ok(state @ (PrState::Merged | PrState::Closed)) = pr_closure::state(&pr_url).await {
+                reconcile_terminal_pr(&config, task, state).await;
+                return;
+            }
+            // A failed state read does not erase a completed review. Any
+            // following paid run still has its own positive-OPEN launch gate.
+        }
         let still_in_review = task_before_verdict.as_ref().map(|task| {
                 task.get("status").and_then(|v| v.as_str()) == Some("review")
                     && !task_is_on_hold(&task)
@@ -12360,6 +12390,9 @@ pub fn spawn_full_pr_review_task(
     repo_path: String,
 ) {
     tokio::spawn(async move {
+        let Ok(Some(task)) = supabase::fetch_task(&config, &task_id).await else { return; };
+        if matches!(task["status"].as_str(), Some("done" | "failed" | "cancelled"))
+            || task_is_on_hold(&task) || !full_review_pr_is_open(&config, &task).await { return; }
         let started_at = chrono::Utc::now().to_rfc3339();
         let _ = supabase::update_task(
             &config,
@@ -12484,6 +12517,9 @@ pub fn spawn_full_pr_review_task(
             }
         };
 
+        let Ok(Some(task)) = supabase::fetch_task(&config, &task_id).await else { return; };
+        if task["status"] != "in_progress" || task_is_on_hold(&task)
+            || !full_review_pr_is_open(&config, &task).await { return; }
         let result = review::run_full_pr_review(&config, &task_id, &pr_url, &repo_path).await;
         match result {
             Ok(report) => {
@@ -12523,7 +12559,8 @@ pub fn spawn_full_pr_review_task(
                 // Re-queue by backdating updated_at so full_pr_review_task_is_stale
                 // fires on the next tick and the Kim/plant sweepers relaunch it.
                 // Bounded so a permanently-wedging PR can't loop forever.
-                if e.contains("killed as wedged") {
+                if e.contains("killed as wedged")
+                    && matches!(pr_closure::state(&pr_url).await, Ok(PrState::Open)) {
                     let mut ctx = match supabase::fetch_task(&config, &task_id).await {
                         Ok(Some(t)) => t
                             .get("context")
@@ -14188,15 +14225,16 @@ async fn start_merge_deploy_task(
                         );
                     }
                     context.insert(MERGE_DEPLOY_ERROR_KEY.to_string(), Value::Null);
-                    let _ = supabase::update_task(
+                    let changed = supabase::update_task_if_snapshot_not_held(
                         config,
-                        &task_id,
+                        &task,
                         &serde_json::json!({
                             "context": Value::Object(context),
                             "updated_at": chrono::Utc::now().to_rfc3339(),
                         }),
                     )
-                    .await;
+                    .await.ok().and_then(|v| v.as_array().map(|a| !a.is_empty())).unwrap_or(false);
+                    if !changed { return; }
                     agent_comment(
                         config,
                         &task_id,
@@ -14231,14 +14269,9 @@ async fn start_merge_deploy_task(
             );
         }
         context.insert(MERGE_DEPLOY_ERROR_KEY.to_string(), Value::Null);
-        let expected_status = task
-            .get("status")
-            .and_then(|value| value.as_str())
-            .unwrap_or("approved");
-        let claimed = supabase::update_task_if_status_not_held(
+        let claimed = supabase::update_task_if_snapshot_not_held(
             &config_clone,
-            &task_id,
-            expected_status,
+            &task,
             &serde_json::json!({
                 "context": Value::Object(context),
                 "updated_at": chrono::Utc::now().to_rfc3339(),
@@ -15003,28 +15036,8 @@ async fn run_merge_deploy_workflow(
     Ok(deploy_plan_markdown(&plan))
 }
 
-async fn gh_pr_is_merged(pr_url: &str, repo_path: &str) -> Result<bool, String> {
-    let output = async_cmd("gh")
-        .args(["pr", "view", pr_url, "--json", "state,mergedAt"])
-        .current_dir(repo_path)
-        .output()
-        .await
-        .map_err(|e| format!("spawn gh: {}", e))?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
-    }
-    let parsed: Value =
-        serde_json::from_slice(&output.stdout).map_err(|e| format!("parse gh pr view: {}", e))?;
-    let state = parsed
-        .get("state")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_uppercase();
-    let merged_at = parsed
-        .get("mergedAt")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    Ok(state == "MERGED" || !merged_at.is_empty())
+async fn gh_pr_is_merged(pr_url: &str, _repo_path: &str) -> Result<bool, String> {
+    Ok(pr_closure::state(pr_url).await? == PrState::Merged)
 }
 
 async fn prepare_deploy_checkout(
@@ -19391,181 +19404,194 @@ async fn advance_external_card(config: &SupabaseConfig, id: &str) {
     }
 }
 
-pub async fn sweep_pr_merged_cards(config: &SupabaseConfig) {
-    // Candidate statuses: any state where the card is "waiting on Matt" but
-    // GitHub could have moved on. `review` is in scope for the case where
-    // Matt merges a PR before (or instead of) a Codex verdict landing. Stale
-    // `in_progress` cards are included so a worker crash or manual merge does
-    // not leave a card wedged forever, while fresh active PR reviews are left
-    // alone.
-    let Ok(tasks) = supabase::fetch_tasks(config, None).await else {
-        return;
-    };
-    let Some(arr) = tasks.as_array() else { return };
-
-    for task in arr {
-        // These cards are closed by the read-only staging workflow check above,
-        // never by the generic planner (which can run production deploy commands).
-        if external_staging_task(task) {
-            continue;
-        }
-        let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("");
-        // A full `$pr-review` owns its own merge+deploy and can be quiet for a
-        // long post-merge deploy, so don't let this generic reconciler fire a
-        // second merge/deploy WHILE it is still plausibly alive. But only
-        // shield it while fresh by the full-review clock: once it has been
-        // quiet longer than the full-review no-progress window, its own
-        // quiet-kill + stale-restart has failed to self-heal, and the
-        // idempotent reconciler is the right backstop to close out a merged
-        // PR instead of stranding it.
-        if status == "in_progress" && is_full_pr_review_owned(task) {
-            let still_fresh = task_time_field(task, "updated_at")
-                .map(|u| {
-                    chrono::Utc::now().signed_duration_since(u)
-                        <= chrono::Duration::seconds(FULL_PR_REVIEW_NO_PROGRESS_STALE_SECS)
-                })
-                .unwrap_or(false);
-            if still_fresh {
-                continue;
+/// One eligibility decision before any review, retry, claim or worktree access.
+/// A failed GitHub read never authorizes a paid run. Terminal PRs use the same
+/// closeout as the reconciler, preserving deploy and supersession handling.
+async fn full_review_pr_is_open(config: &SupabaseConfig, task: &Value) -> bool {
+    let pr = task["pr_url"].as_str().unwrap_or("");
+    match pr_closure::state(pr).await {
+        Ok(PrState::Open) => true,
+        Ok(PrState::Merged) => {
+            let changed = supabase::update_task_if_snapshot_not_held(config, task,
+                &terminal_task_patch(serde_json::json!({"status":"done", "worker_id":null,
+                    "claimed_at":null,"completed_at":chrono::Utc::now().to_rfc3339(),"failure_reason":null})))
+                .await.ok().and_then(|v| v.as_array().map(|a| !a.is_empty())).unwrap_or(false);
+            if changed {
+                agent_comment(config, task["id"].as_str().unwrap_or(""),
+                    "This PR was already merged before this review could start. Closing the review task without starting another review or deployment.").await;
             }
+            false
         }
-        let waiting_for_closeout = matches!(status, "approved" | "review" | "fixes_needed") || closed_pr_failure(task);
-        if !waiting_for_closeout && !stale_in_progress_pr_card_for_reconcile(task) {
-            continue;
-        }
+        Ok(state) => { reconcile_terminal_pr(config, task, state).await; false },
+        Err(error) => { log::warn!("[full-pr-review] start paused: {}", error); false },
+    }
+}
 
-        let pr_url = task.get("pr_url").and_then(|v| v.as_str()).unwrap_or("");
-        let task_id = task.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        if pr_url.is_empty() || task_id.is_empty() {
-            continue;
+async fn pr_task_is_open(config: &SupabaseConfig, task: &Value) -> bool {
+    let pr = task["pr_url"].as_str().unwrap_or("");
+    match pr_closure::state(pr).await {
+        Ok(PrState::Open) => {
+            if closed_pr_failure(task) { mark_closure_checked(config, task).await; }
+            true
+        },
+        Ok(state) => {
+            reconcile_terminal_pr(config, task, state).await;
+            false
         }
+        Err(error) => {
+            log::warn!("[pr-lifecycle] task {}: {}", task["id"], error);
+            false
+        }
+    }
+}
 
-        // Ask GitHub. Any failure = skip this tick; we'll retry next poll.
-        let out = async_cmd("gh")
-            .args(["pr", "view", pr_url, "--json", "state,mergedAt"])
-            .output()
-            .await;
-        let Ok(o) = out else { continue };
-        if !o.status.success() {
-            continue;
-        }
-        let body = String::from_utf8_lossy(&o.stdout);
-        let parsed: serde_json::Value = match serde_json::from_str(&body) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let gh_state = parsed
-            .get("state")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_uppercase();
-        let merged_at = parsed
-            .get("mergedAt")
+async fn reconcile_terminal_pr(config: &SupabaseConfig, task: &Value, pr_state: PrState) {
+    if task_is_on_hold(task) { return; }
+    // End the review ownership marker as part of closeout, including when a
+    // verdict races with an external merge. Staging's observer excludes live reviews.
+    let mut task = task.clone();
+    if pr_review_context_status(&task) == Some("running") {
+        let mut context = task_context_object(&task);
+        context.insert(PR_REVIEW_STATUS_KEY.into(), serde_json::json!("stopped"));
+        let rows = supabase::update_task_if_snapshot_not_held(config, &task,
+            &serde_json::json!({"context":context})).await;
+        let Some(latest) = rows.ok().and_then(|v| v.as_array().and_then(|a| a.first()).cloned()) else { return; };
+        task = latest;
+    }
+    let task = &task;
+    let status = task["status"].as_str().unwrap_or("");
+    if matches!(status, "done" | "cancelled") { return; }
+    let pr_url = task["pr_url"].as_str().unwrap_or("");
+    let task_id = task["id"].as_str().unwrap_or("");
+    if pr_url.is_empty() || task_id.is_empty() { return; }
+    // Staging-only cards retain their exact deployment-SHA observer.
+    if external_staging_task(task) {
+        advance_external_card(config, task_id).await;
+        return;
+    }
+    if status == "failed" && pr_state != PrState::Closed {
+        mark_closure_checked(config, task).await;
+        return;
+    }
+
+    if pr_state == PrState::Merged {
+        let md_status = task
+            .get("context")
+            .and_then(|v| v.as_object())
+            .and_then(|c| c.get(MERGE_DEPLOY_STATUS_KEY))
             .and_then(|v| v.as_str())
             .unwrap_or("");
-
-        if status == "failed" && (gh_state != "CLOSED" || !merged_at.is_empty()) {
-            mark_closure_checked(config, task).await;
-            continue;
+        if md_status == "running" || md_status == "failed" {
+            return;
         }
-
-        if gh_state == "MERGED" || !merged_at.is_empty() {
-            let md_status = task
-                .get("context")
-                .and_then(|v| v.as_object())
-                .and_then(|c| c.get(MERGE_DEPLOY_STATUS_KEY))
+        if md_status == "succeeded" {
+            let changed = supabase::update_task_if_snapshot_not_held(
+                config,
+                task,
+                &terminal_task_patch(serde_json::json!({
+                    "status": "done",
+                    "completed_at": chrono::Utc::now().to_rfc3339(),
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                    "worker_id": Value::Null,
+                    "claimed_at": Value::Null,
+                    "failure_reason": Value::Null,
+                })),
+            )
+            .await.ok().and_then(|v| v.as_array().map(|rows| !rows.is_empty())).unwrap_or(false);
+            if !changed { return; }
+            notify_callback(config, task_id, "done", Some(pr_url), None);
+            let origin_system = task
+                .get("origin_system")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if md_status == "running" || md_status == "failed" {
-                continue;
-            }
-            if md_status == "succeeded" {
-                let _ = supabase::update_task(
-                    config,
-                    task_id,
-                    &terminal_task_patch(serde_json::json!({
-                        "status": "done",
-                        "completed_at": chrono::Utc::now().to_rfc3339(),
-                        "updated_at": chrono::Utc::now().to_rfc3339(),
-                        "worker_id": Value::Null,
-                        "claimed_at": Value::Null,
-                    })),
-                )
-                .await;
-                notify_callback(config, task_id, "done", Some(pr_url), None);
-                let origin_system = task
-                    .get("origin_system")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let origin_id = task.get("origin_id").and_then(|v| v.as_str()).unwrap_or("");
-                let task_source = task.get("source").and_then(|v| v.as_str()).unwrap_or("");
-                let callback_url = task
-                    .get("callback_url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                close_origin_ticket(
-                    config,
-                    task_id,
-                    origin_system,
-                    origin_id,
-                    pr_url,
-                    task_source,
-                    callback_url,
-                );
-                continue;
-            }
-            start_merge_deploy_task(
+            let origin_id = task.get("origin_id").and_then(|v| v.as_str()).unwrap_or("");
+            let task_source = task.get("source").and_then(|v| v.as_str()).unwrap_or("");
+            let callback_url = task
+                .get("callback_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            close_origin_ticket(
                 config,
-                task.clone(),
-                false,
-                "PR merged on GitHub. Running post-merge deploy plan before moving the card to Done.",
-                None,
-            ).await;
-            continue;
+                task_id,
+                origin_system,
+                origin_id,
+                pr_url,
+                task_source,
+                callback_url,
+            );
+            return;
         }
+        start_merge_deploy_task(
+            config,
+            task.clone(),
+            false,
+            "PR merged on GitHub. Running post-merge deploy plan before moving the card to Done.",
+            None,
+        ).await;
+        return;
+    }
 
-        if gh_state == "CLOSED" {
-            let successor = match super::pr_closure::superseding_pr(pr_url).await {
-                Ok(successor) => successor,
-                Err(error) => { log::warn!("[pr-close] task {}: {}", task_id, error); continue; }
-            };
-            let mut context = task_context_object(task);
-            context.insert("closure_checked_at".into(), serde_json::json!(chrono::Utc::now().to_rfc3339()));
-            if status == "failed" && successor.is_none() {
-                let _ = supabase::update_task_if_snapshot_not_held(config, task,
-                    &serde_json::json!({"context":context,"updated_at":chrono::Utc::now().to_rfc3339()})).await;
-                continue;
-            }
-            let (next_status, note) = if let Some(successor) = &successor {
-                context.insert("superseded_by".into(), successor.receipt());
-                context.remove(MERGE_DEPLOY_STATUS_KEY);
-                context.insert(REVIEW_MERGE_STATUS_KEY.into(), serde_json::json!("superseded"));
-                ("done", successor.note())
+    if pr_state == PrState::Closed {
+        let successor = match super::pr_closure::superseding_pr(pr_url).await {
+            Ok(successor) => successor,
+            Err(error) => { log::warn!("[pr-close] task {}: {}", task_id, error); return; }
+        };
+        let mut context = task_context_object(task);
+        context.insert("closure_checked_at".into(), serde_json::json!(chrono::Utc::now().to_rfc3339()));
+        if status == "failed" && successor.is_none() {
+            let _ = supabase::update_task_if_snapshot_not_held(config, task,
+                &serde_json::json!({"context":context,"updated_at":chrono::Utc::now().to_rfc3339()})).await;
+            return;
+        }
+        let (next_status, note) = if let Some(successor) = &successor {
+            context.insert("superseded_by".into(), successor.receipt());
+            context.remove(MERGE_DEPLOY_STATUS_KEY);
+            context.insert(REVIEW_MERGE_STATUS_KEY.into(), serde_json::json!("superseded"));
+            ("done", successor.note())
+        } else {
+            ("failed", "PR was closed without merging and no verified successor was found. Moving to Failed so this doesn't silently disappear.".into())
+        };
+        let patch = terminal_task_patch(serde_json::json!({
+            "status": next_status, "context": context,
+            "failure_reason": if successor.is_some() { Value::Null } else { serde_json::json!(note) },
+            "completed_at": if successor.is_some() { serde_json::json!(chrono::Utc::now().to_rfc3339()) } else { Value::Null },
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+            "worker_id": Value::Null, "claimed_at": Value::Null,
+        }));
+        let changed = supabase::update_task_if_snapshot_not_held(config, task, &patch).await
+            .ok().and_then(|v| v.as_array().map(|rows| !rows.is_empty())).unwrap_or(false);
+        if changed {
+            // A superseded close sends a normal done callback with the
+            // successor URL. It never sends the old blocker-style failure.
+            if let Some(successor) = &successor {
+                notify_callback(config, task_id, "done", Some(&successor.url), None);
             } else {
-                ("failed", "PR was closed without merging and no verified successor was found. Moving to Failed so this doesn't silently disappear.".into())
-            };
-            let patch = terminal_task_patch(serde_json::json!({
-                "status": next_status, "context": context,
-                "failure_reason": if successor.is_some() { Value::Null } else { serde_json::json!(note) },
-                "completed_at": if successor.is_some() { serde_json::json!(chrono::Utc::now().to_rfc3339()) } else { Value::Null },
-                "updated_at": chrono::Utc::now().to_rfc3339(),
-                "worker_id": Value::Null, "claimed_at": Value::Null,
-            }));
-            let changed = supabase::update_task_if_snapshot_not_held(config, task, &patch).await
-                .ok().and_then(|v| v.as_array().map(|rows| !rows.is_empty())).unwrap_or(false);
-            if changed {
-                // A superseded close sends a normal done callback with the
-                // successor URL. It never sends the old blocker-style failure.
-                if let Some(successor) = &successor {
-                    notify_callback(config, task_id, "done", Some(&successor.url), None);
-                } else {
-                    notify_callback(config, task_id, "failed", Some(pr_url), Some(&note));
-                }
-                agent_comment(config, task_id, &note).await;
+                notify_callback(config, task_id, "failed", Some(pr_url), Some(&note));
             }
+            agent_comment(config, task_id, &note).await;
+        }
+        return;
+    }
+}
+
+pub async fn sweep_pr_merged_cards(config: &SupabaseConfig) {
+    let Ok(tasks) = supabase::fetch_tasks(config, None).await else { return; };
+    for task in tasks.as_array().map(Vec::as_slice).unwrap_or(&[]) {
+        if task_is_on_hold(task) { continue; }
+        let status = task["status"].as_str().unwrap_or("");
+        // Full reviews own their post-merge deployment until they go stale.
+        if status == "in_progress" && is_full_pr_review_owned(task) {
+            let fresh = task_time_field(task, "updated_at").is_some_and(|at|
+                chrono::Utc::now().signed_duration_since(at)
+                    <= chrono::Duration::seconds(FULL_PR_REVIEW_NO_PROGRESS_STALE_SECS));
+            if fresh { continue; }
+        }
+        if !matches!(status, "approved" | "review" | "fixes_needed")
+            && !closed_pr_failure(task) && !stale_in_progress_pr_card_for_reconcile(task) {
             continue;
         }
-        // OPEN / anything else: leave alone.
+        if task["pr_url"].as_str().is_none_or(str::is_empty) { continue; }
+        pr_task_is_open(config, task).await;
     }
 }
 
@@ -20737,6 +20763,9 @@ async fn maybe_spawn_auto_fix(
     review_markdown: String,
     requires_human: bool,
 ) {
+    let Ok(Some(task)) = supabase::fetch_task(&config, &task_id).await else { return; };
+    if task["status"] != "fixes_needed" || task_is_on_hold(&task)
+        || !pr_task_is_open(&config, &task).await { return; }
     // The REQUIRES_HUMAN early return is qualified by "…and Codex actually
     // named something". `normalize_pr_review_result` rewrites a blocker-less
     // `fix_issues` to Inconclusive with requires_human FORCED true, so an
@@ -21057,17 +21086,10 @@ async fn maybe_spawn_auto_fix(
                     agent_comment(&config, &task_id, "Cap-floor merge gates passed, but the card was moved out of Fixes Needed during the review window, so I am not merging. Respecting the manual change.").await;
                     return;
                 }
-                let merge_task = supabase::fetch_task(&config, &task_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| {
-                        serde_json::json!({
-                            "id": &task_id,
-                            "pr_url": &pr_url,
-                            "repo_path": &repo_path,
-                        })
-                    });
+                let Ok(Some(merge_task)) = supabase::fetch_task(&config, &task_id).await else {
+                    agent_comment(&config, &task_id, "Merge paused: the current task could not be read. Its approval is retained.").await;
+                    return;
+                };
                 notify_callback(&config, &task_id, "approved", Some(&pr_url), None);
                 start_merge_deploy_task(
                     &config,
@@ -21146,6 +21168,7 @@ pub fn spawn_auto_fix_task(
 
         let Ok(Some(task_row)) = supabase::fetch_task(&config, &task_id).await else { return; };
         if task_row["status"] != "fixes_needed" || task_is_on_hold(&task_row) { return; }
+        if !pr_task_is_open(&config, &task_row).await { return; }
         let mut context = task_context_object(&task_row);
         context.insert("samwise_continuation_machine".to_string(), serde_json::json!(safety::machine_name()));
         context.insert("samwise_auto_fix_status".to_string(), serde_json::json!("running"));
@@ -21318,6 +21341,7 @@ making any other changes.",
         )
         .await;
 
+        if !finish_auto_fix_run(&config, &task_id, &pr_url, new_cycle).await { return; }
         match claude_result {
             Ok(_) => {
                 // Push whatever Claude committed. Find the branch first.
@@ -21617,6 +21641,28 @@ making any other changes.",
     });
 }
 
+async fn finish_auto_fix_run(config: &SupabaseConfig, task_id: &str, pr_url: &str, new_cycle: u32) -> bool {
+    // The child has exited: end this repair phase before reconciliation,
+    // error handling or push. Later deployment work is a different phase.
+    let Ok(Some(latest)) = supabase::fetch_task(config, task_id).await else { return false; };
+    if latest["status"] != "in_progress" || latest["review_cycle_count"] != new_cycle { return false; }
+    let mut context = task_context_object(&latest);
+    context.insert("samwise_auto_fix_status".into(), serde_json::json!("stopped"));
+    let rows = supabase::update_task_if_snapshot_not_held(config, &latest,
+        &serde_json::json!({"context":context})).await;
+    let Some(latest) = rows.ok().and_then(|v| v.as_array().and_then(|a| a.first()).cloned()) else { return false; };
+    match pr_closure::state(pr_url).await {
+        Ok(PrState::Open) => {},
+        Ok(state) => { reconcile_terminal_pr(config, &latest, state).await; return false; },
+        Err(_) => {
+            fail_auto_fix(config, task_id, pr_url,
+                "PR state is unavailable. Saved work is retained; publishing is paused.").await;
+            return false;
+        }
+    }
+    true
+}
+
 async fn fail_auto_fix(config: &SupabaseConfig, task_id: &str, pr_url: &str, reason: &str) {
     let updated = supabase::update_task_if_status_not_held(
         config,
@@ -21719,6 +21765,7 @@ async fn sweep_stale_fixes_needed_cards(
         if task_is_external_pr_review_request(task) {
             continue;
         }
+        if !pr_task_is_open(config, task).await { continue; }
         let expected_branch = match auto_fix_pr_branch(&pr_url, &repo_path).await {
             Ok(branch) => branch,
             Err(reason) => {
@@ -22020,9 +22067,11 @@ pub async fn sweep_pr_review_queue(
             }
             continue;
         }
-        if main_repo_path.is_empty() || !task_requires_pr_review(task) {
+        if main_repo_path.is_empty() || !task_requires_pr_review(task)
+            || (task_is_external_pr_review_request(task) && !pr_review_should_run_now(task)) {
             continue;
         }
+        if !pr_task_is_open(config, task).await { continue; }
         // AutoSam-coded tickets already ran a cross-model review. Do not drag them back
         // into the OpenRouter $samwise-pr-review gate if they land in Review.
         if !task_is_external_pr_review_request(task) {
@@ -22056,9 +22105,6 @@ pub async fn sweep_pr_review_queue(
         // OR the last review was long enough ago to retry an inconclusive Codex
         // decision. This keeps cards from sitting in Review forever when host
         // checks were merely pending during the first pass.
-        if !pr_review_should_run_now(task) {
-            continue;
-        }
         let repo_keys = task_repo_serial_keys(task);
         if let Some(key) =
             active_repo_conflict_for_keys(&known_task_rows, &repo_keys, Some(&task_id), max_tasks_per_repo())
@@ -23524,3 +23570,7 @@ async fn create_pr(
 
     Ok(pr_url)
 }
+
+#[cfg(test)]
+#[path = "worker_pr_lifecycle_tests.rs"]
+mod pr_lifecycle_tests;

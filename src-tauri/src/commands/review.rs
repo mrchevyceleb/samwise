@@ -1823,7 +1823,9 @@ async fn run_codex_exec_once(
     prompt: &str,
     cwd: &str,
     timeout_secs: u64,
+    pr_url: &str,
 ) -> Result<CodexExecOutput, String> {
+    super::pr_closure::require_open(pr_url).await?;
     let mut cmd = async_cmd("codex");
     cmd.args(extra_prefix);
     apply_codex_backend(&mut cmd, backend, openrouter_key);
@@ -1834,6 +1836,9 @@ async fn run_codex_exec_once(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
+    cmd.kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to spawn codex: {}", e))?;
@@ -1856,7 +1861,19 @@ async fn run_codex_exec_once(
         output
     });
 
-    let status = match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await {
+    let finished = tokio::select! {
+        result = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()) => result,
+        stopped = super::pr_closure::wait_until_not_open(pr_url) => {
+            if let Some(pid) = child.id() {
+                crate::process::stop_process_group(pid).await;
+            }
+            let _ = child.kill().await;
+            stdout_handle.abort();
+            stderr_handle.abort();
+            return Err(stopped);
+        }
+    };
+    let status = match finished {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err(format!("codex wait failed: {}", e)),
         Err(_) => {
@@ -1956,11 +1973,12 @@ pub async fn run_samwise_pr_review(
         &prompt,
         &cwd,
         SAMWISE_PR_REVIEW_TIMEOUT_SECS,
+        pr_url,
     )
     .await;
     if match &output {
         Ok(o) => should_fallback_to_openrouter(o.success, &o.stdout),
-        Err(_) => true,
+        Err(error) => !error.starts_with(super::pr_closure::PR_WORK_STOPPED),
     } {
         if let Some(key) = openrouter_key.as_deref() {
             log::warn!(
@@ -1974,6 +1992,7 @@ pub async fn run_samwise_pr_review(
                 &prompt,
                 &cwd,
                 SAMWISE_PR_REVIEW_TIMEOUT_SECS,
+                pr_url,
             )
             .await;
         }
@@ -2304,11 +2323,12 @@ VERDICT: clean | regressions | inconclusive\n\n\
         &prompt,
         &cwd,
         DELTA_VERIFY_TIMEOUT_SECS,
+        pr_url,
     )
     .await;
     if match &output {
         Ok(o) => should_fallback_to_openrouter(o.success, &o.stdout),
-        Err(_) => true,
+        Err(error) => !error.starts_with(super::pr_closure::PR_WORK_STOPPED),
     } {
         if let Some(key) = openrouter_key.as_deref() {
             log::warn!("[review] local Codex CLI delta-verify failed; falling back to OpenRouter");
@@ -2320,6 +2340,7 @@ VERDICT: clean | regressions | inconclusive\n\n\
                 &prompt,
                 &cwd,
                 DELTA_VERIFY_TIMEOUT_SECS,
+                pr_url,
             )
             .await;
         }

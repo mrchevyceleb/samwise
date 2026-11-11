@@ -36,6 +36,23 @@ pub fn async_cmd(program: &str) -> tokio::process::Command {
     c
 }
 
+/// Stop an owned process tree. Unix callers must spawn it with process_group(0).
+pub async fn stop_process_group(pid: u32) {
+    if pid == 0 { return; }
+    #[cfg(unix)]
+    {
+        let group = -(pid as i32);
+        if unsafe { libc::kill(group, libc::SIGTERM) } != 0 { return; }
+        for _ in 0..20 {
+            if unsafe { libc::kill(group, 0) } != 0 { return; }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        unsafe { libc::kill(group, libc::SIGKILL); }
+    }
+    #[cfg(windows)]
+    { let _ = async_cmd("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).output().await; }
+}
+
 fn cache() -> &'static Mutex<HashMap<String, Option<String>>> {
     static CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))

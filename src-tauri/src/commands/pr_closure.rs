@@ -6,6 +6,63 @@ use regex::Regex;
 use serde_json::{json, Value};
 use std::time::Duration;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrState { Open, Merged, Closed }
+
+fn parse_state(pr: &Value) -> Result<PrState, String> {
+    match (pr["state"].as_str(), pr["merged"].as_bool()) {
+        (Some("closed"), Some(true)) => Ok(PrState::Merged),
+        (Some("closed"), Some(false)) => Ok(PrState::Closed),
+        (Some("open"), Some(false)) => Ok(PrState::Open),
+        _ => Err("GitHub did not return a valid PR state; work is paused".into()),
+    }
+}
+
+/// The PR URL is authoritative even after its branch/worktree was removed.
+/// Unknown or unavailable is deliberately distinct from OPEN.
+pub async fn state(original: &str) -> Result<PrState, String> {
+    let (repo, number) = pr_identity(original).ok_or("Invalid PR URL")?;
+    let pr = github(&format!("repos/{}/pulls/{}", repo, number), false, None).await?;
+    parse_state(&pr)
+}
+
+pub const PR_WORK_STOPPED: &str = "PR_WORK_STOPPED";
+
+pub async fn require_open(pr: &str) -> Result<(), String> {
+    match state(pr).await {
+        Ok(PrState::Open) => Ok(()),
+        Ok(state) => Err(format!("{}: PR is {:?}", PR_WORK_STOPPED, state)),
+        Err(error) => Err(format!("{}: {}", PR_WORK_STOPPED, error)),
+    }
+}
+
+/// Used only while paid, read-only PR reviews are running, never for the
+/// full review flow that owns the merge and subsequent deployment itself.
+pub async fn wait_until_not_open(pr: &str) -> String {
+    loop {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        if let Ok(state @ (PrState::Merged | PrState::Closed)) = state(pr).await {
+            return format!("{}: PR is {:?}", PR_WORK_STOPPED, state);
+        }
+        // A transport failure is not evidence of closure. Launches still
+        // require positive OPEN, but do not discard already-paid work.
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    #[test]
+    fn github_state_requires_positive_evidence() {
+        assert_eq!(parse_state(&json!({"state":"open","merged":false})), Ok(PrState::Open));
+        assert_eq!(parse_state(&json!({"state":"closed","merged":true})), Ok(PrState::Merged));
+        assert_eq!(parse_state(&json!({"state":"closed","merged":false})), Ok(PrState::Closed));
+        for unknown in [json!({}), json!({"state":"open"}), json!({"state":"open","merged":true})] {
+            assert!(parse_state(&unknown).is_err());
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SupersedingPr {
     pub url: String,
@@ -27,10 +84,11 @@ impl SupersedingPr {
 }
 
 fn pr_identity(raw: &str) -> Option<(String, u64)> {
-    let url = url::Url::parse(raw).ok()?;
-    if url.scheme() != "https" || url.host_str()? != "github.com" { return None; }
-    let parts: Vec<_> = url.path_segments()?.collect();
-    if parts.len() != 4 || parts[2] != "pull" { return None; }
+    let url = url::Url::parse(raw.trim()).ok()?;
+    if url.scheme() != "https" || !matches!(url.host_str()?, "github.com" | "www.github.com") { return None; }
+    let parts: Vec<_> = url.path_segments()?.filter(|part| !part.is_empty()).collect();
+    if parts.len() < 4 || parts[2] != "pull" { return None; }
+    if parts.len() > 4 && !matches!(parts[4], "files" | "commits" | "checks") { return None; }
     Some((format!("{}/{}", parts[0], parts[1]), parts[3].parse().ok()?))
 }
 
