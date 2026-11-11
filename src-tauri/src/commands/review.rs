@@ -2211,12 +2211,17 @@ VERDICT: clean | regressions | inconclusive\n\n\
 /// only reports a merge/fix verdict for board routing, while `$pr-review` is
 /// authorized to fix, merge, and deploy on its own. Use this only for explicit
 /// automations where Matt has asked for the full final-gate workflow.
+pub enum FullPrReviewOutcome {
+    Reviewed(String),
+    Terminal(String),
+}
+
 pub async fn run_full_pr_review(
     config: &SupabaseConfig,
     task_id: &str,
     pr_url: &str,
     repo_path: &str,
-) -> Result<String, String> {
+) -> Result<FullPrReviewOutcome, String> {
     if !is_safe_pr_url(pr_url) {
         return Err(format!(
             "refusing pr_url that doesn't match the github shape: {}",
@@ -2241,7 +2246,7 @@ pub async fn run_full_pr_review(
     match pr["state"].as_str() {
         Some("OPEN") => {},
         Some(state @ ("MERGED" | "CLOSED")) => {
-            return Ok(format!("Original PR {} is already {}. No review was started.", pr_url, state));
+            return Ok(FullPrReviewOutcome::Terminal(format!("Original PR {} is already {}. No review was started.", pr_url, state)));
         }
         _ => return Err("Unknown GitHub PR state; review not started".into()),
     }
@@ -2312,7 +2317,7 @@ pub async fn run_full_pr_review(
                 .await;
                 let _ = set_full_pr_review_thread(config, task_id, None).await;
             }
-            FullReviewPass::Done(result) => return result,
+            FullReviewPass::Done(result) => return result.map(FullPrReviewOutcome::Reviewed),
         }
     }
 
@@ -2338,7 +2343,7 @@ pub async fn run_full_pr_review(
         notes = if handoff_notes.trim().is_empty() { "(none)".to_string() } else { handoff_notes.clone() }
     );
     match run_full_pr_review_pass(config, task_id, pr_url, &cwd, None, &prompt).await {
-        FullReviewPass::Done(result) => result,
+        FullReviewPass::Done(result) => result.map(FullPrReviewOutcome::Reviewed),
         FullReviewPass::ResumeUnavailable(detail) => Err(detail),
     }
 }

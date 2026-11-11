@@ -12880,7 +12880,11 @@ pub fn spawn_full_pr_review_task(
 
         let result = review::run_full_pr_review(&config, &task_id, &pr_url, &repo_path).await;
         match result {
-            Ok(report) => {
+            Ok(outcome) => {
+                let (report, terminal) = match outcome {
+                    review::FullPrReviewOutcome::Reviewed(report) => (report, false),
+                    review::FullPrReviewOutcome::Terminal(report) => (report, true),
+                };
                 review::forget_full_pr_review_session(&config, &task_id).await;
                 let capped = truncate(&report, 6000);
                 // Matt, Nov 3 2026: a clean review merges the exact reviewed
@@ -12891,16 +12895,18 @@ pub fn spawn_full_pr_review_task(
                     .rev()
                     .find_map(|line| line.trim().strip_prefix("READY_TO_MERGE head="))
                     .map(|sha| sha.trim().to_string())
-                    .filter(|sha| sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()));
+                    .filter(|sha| !terminal && sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()));
                 let merge = match clean_head.as_deref() {
                     Some(sha) => Some(review::gh_merge(&pr_url, &repo_path, sha).await),
                     None => None,
                 };
-                let (note, status) = match &merge {
+                let (note, status) = if terminal {
+                    ("Original PR is already closed; no review or merge was started.".to_string(), "done")
+                } else { match &merge {
                     Some(Ok(())) => ("Clean, merged to main.".to_string(), "done"),
                     Some(Err(e)) => (format!("Clean, but the merge failed: {}", truncate(e, 600)), "fixes_needed"),
                     None => ("Not clean yet, see the report.".to_string(), "fixes_needed"),
-                };
+                } };
                 agent_comment(
                     &config,
                     &task_id,
