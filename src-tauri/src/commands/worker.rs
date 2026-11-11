@@ -19354,10 +19354,37 @@ async fn list_kim_ready_prs(repo_path: &str) -> Result<Vec<Value>, String> {
     Ok(parsed.as_array().cloned().unwrap_or_default())
 }
 
-/// True when a task row is a `/plant` full-pr-review hand-off. The marker is
-/// set by the `/plant` command in `context.plant_full_pr_review`. These rows
-/// are owned exclusively by `sweep_plant_full_pr_review_queue`; the normal
-/// coding queue skips them.
+fn full_pr_review_requested(task: &Value) -> bool {
+    ["simple_full_pr_review", "full_pr_review_task", "full_pr_review_automation", "plant_full_pr_review"]
+        .iter().any(|key| task_context_bool(task, key) == Some(true))
+        || task["title"].as_str().unwrap_or("").trim().to_ascii_lowercase().starts_with("full pr review")
+}
+
+#[cfg(test)]
+#[path = "worker_review_handoff_tests.rs"]
+mod review_handoff_tests;
+
+fn full_pr_review_pr_url(task: &Value) -> String {
+    // New handoffs retain the original URL in context. Older webhook rows
+    // lost those fields, so recover the requested PR from their description
+    // before considering a pr_url that the coding pipeline may have replaced.
+    if let Some(original) = task_context_string(task, "pr_url").filter(|url| !url.is_empty()) {
+        return original;
+    }
+    for field in ["description", "title"] {
+        if let Some(url) = task[field].as_str().unwrap_or("")
+            .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '<' | '>'))
+            .map(|token| token.trim_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '`' | '"' | '\'')))
+            .find(|url| review::is_safe_pr_url(url))
+        {
+            return url.to_string();
+        }
+    }
+    task["pr_url"].as_str().unwrap_or("").to_string()
+}
+
+/// Explicit review handoffs use the existing full-review queue. Kim's author
+/// watcher remains separate; neither path enters the normal coding pipeline.
 fn is_plant_full_pr_review_task(task: &Value) -> bool {
     // Skip terminal tasks — they only waste sweep cycles and spam
     // "delaying task" logs for rows that are already done/cancelled/failed.
@@ -19365,61 +19392,8 @@ fn is_plant_full_pr_review_task(task: &Value) -> bool {
     if matches!(status, "done" | "cancelled" | "failed") {
         return false;
     }
-    task.get("context")
-        .and_then(|c| c.get("plant_full_pr_review"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-        || existing_pr_review_target(task).is_some()
-}
-
-/// Matt, Oct 24 2026: never split a job into two PRs. A request to review,
-/// fix, or bring an existing PR onto main (`$pr-review <url>`, "Full PR
-/// review: ...", "PR #N: bring onto main", conflict or failing-check
-/// follow-ups that are not already attached to that PR) runs on the
-/// developer's own PR through the review-and-fix flow, never as a fresh
-/// coding task on a new `sam/<id>` branch with its own PR.
-fn existing_pr_review_target(task: &Value) -> Option<String> {
-    let title = task.get("title").and_then(|v| v.as_str()).unwrap_or("");
-    let description = task.get("description").and_then(|v| v.as_str()).unwrap_or("");
-    let current_pr = task.get("pr_url").and_then(|v| v.as_str()).unwrap_or("").trim();
-    let t = title.trim().to_ascii_lowercase();
-    let d = description.to_ascii_lowercase();
-    let review_intent = t.starts_with("full pr review")
-        || d.contains("$pr-review")
-        || d.contains("/pr-review");
-    let repair_intent = t.starts_with("pr #")
-        && (t.contains("bring onto main")
-            || t.contains("conflict")
-            || t.contains("failing check")
-            || t.contains("so it can merge"));
-    if !review_intent && !repair_intent {
-        return None;
-    }
-    let first_pr_url = |text: &str| -> Option<String> {
-        text.split(|c: char| c.is_whitespace() || c == '(' || c == ')' || c == '<' || c == '>')
-            .map(|tok| tok.trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '`' | '"' | '\'')))
-            .find(|tok| tok.starts_with("https://github.com/") && tok.contains("/pull/") && review::is_safe_pr_url(tok))
-            .map(str::to_string)
-    };
-    let target = first_pr_url(description).or_else(|| first_pr_url(title))?;
-    // A repair follow-up already attached to that same PR keeps its builder.
-    if repair_intent && !review_intent && !current_pr.is_empty()
-        && normalize_pr_url(current_pr) == normalize_pr_url(&target)
-    {
-        return None;
-    }
-    let allowed = github_pull_ref_from_url(&target)
-        .map(|r| plant_repo_is_allowed(&r.owner, &r.repo))
-        .unwrap_or(false);
-    if allowed { Some(target) } else { None }
-}
-
-/// The PR a full review row works on: the original PR it targets, else the
-/// row's own pr_url.
-fn full_pr_review_pr_url(task: &Value) -> String {
-    existing_pr_review_target(task).unwrap_or_else(|| {
-        task.get("pr_url").and_then(|v| v.as_str()).unwrap_or("").to_string()
-    })
+    task["source"].as_str() != Some(KIM_FULL_PR_REVIEW_SOURCE)
+        && full_pr_review_requested(task)
 }
 
 /// True for any audit row owned by the full `$pr-review` lifecycle (Kim
@@ -19431,20 +19405,7 @@ fn is_full_pr_review_owned(task: &Value) -> bool {
     if src == KIM_FULL_PR_REVIEW_SOURCE {
         return true;
     }
-    task.get("context")
-        .map(|c| {
-            c.get("full_pr_review_automation")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-                || c.get("plant_full_pr_review")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-        })
-        .unwrap_or(false)
-        || {
-            let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("");
-            matches!(status, "queued" | "in_progress") && existing_pr_review_target(task).is_some()
-        }
+    full_pr_review_requested(task)
 }
 
 /// Repos `/plant` is allowed to drive through the full merge/deploy
@@ -19491,10 +19452,11 @@ async fn plant_repo_path_origin_matches(repo_path: &str, owner: &str, repo: &str
     url.ends_with(&format!("/{}", needle)) || url.ends_with(&format!(":{}", needle))
 }
 
-/// Adopt PRs Matt explicitly handed off via `/plant` and run the full Codex
+/// Adopt explicit PR review handoffs and run the full Codex
 /// `$pr-review` (review -> fix -> merge -> deploy) on each. Queue-driven (not a
 /// GitHub author poll) but still server-side guarded: every row is checked
-/// against the repo allowlist and its local checkout's origin before launch.
+/// against the project registry and its local checkout's origin before launch.
+/// `/plant` additionally retains its Rally-only repository policy.
 /// A queued row is claimed atomically (conditional queued -> in_progress
 /// PATCH) so two worker hosts can't double-launch; per-pass canonicalization
 /// keeps a stale-restart, a duplicate `/plant`, and a queued row from all
@@ -19509,6 +19471,15 @@ pub async fn sweep_plant_full_pr_review_queue(config: &SupabaseConfig) {
     };
     let Some(arr) = tasks.as_array() else {
         return;
+    };
+
+    if !arr.iter().any(is_plant_full_pr_review_task) { return; }
+    let projects = match supabase::fetch_projects(config).await {
+        Ok(projects) => projects,
+        Err(error) => {
+            log::warn!("[plant-pr-review] project registry unavailable: {}", error);
+            return;
+        }
     };
 
     // One normalized PR may have only one active full review. Seed from rows
@@ -19547,7 +19518,7 @@ pub async fn sweep_plant_full_pr_review_queue(config: &SupabaseConfig) {
     });
 
     for task in ordered {
-        if !is_plant_full_pr_review_task(task) {
+        if !is_plant_full_pr_review_task(task) || task_is_on_hold(task) {
             continue;
         }
         let task_id = task
@@ -19556,24 +19527,18 @@ pub async fn sweep_plant_full_pr_review_queue(config: &SupabaseConfig) {
             .unwrap_or("")
             .to_string();
         let pr_url = full_pr_review_pr_url(task);
-        let repo_path = task
-            .get("repo_path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
         let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("");
-        let repo_keys = task_repo_serial_keys(task);
 
         if task_id.is_empty() {
             continue;
         }
-        if pr_url.is_empty() || repo_path.is_empty() {
+        if pr_url.is_empty() {
             let _ = supabase::update_task(
                 config,
                 &task_id,
                 &serde_json::json!({
                     "status": "failed",
-                    "failure_reason": "plant full-pr-review task is missing pr_url or repo_path",
+                    "failure_reason": "Full PR review handoff is missing its original pr_url",
                     "updated_at": chrono::Utc::now().to_rfc3339(),
                 }),
             )
@@ -19610,7 +19575,8 @@ pub async fn sweep_plant_full_pr_review_queue(config: &SupabaseConfig) {
             .await;
             continue;
         };
-        if !plant_repo_is_allowed(&pref.owner, &pref.repo) {
+        if task_context_bool(task, "plant_full_pr_review") == Some(true)
+            && !plant_repo_is_allowed(&pref.owner, &pref.repo) {
             let _ = supabase::update_task(
                 config,
                 &task_id,
@@ -19631,6 +19597,20 @@ pub async fn sweep_plant_full_pr_review_queue(config: &SupabaseConfig) {
             ).await;
             continue;
         }
+        let repo_url = format!("https://github.com/{}/{}", pref.owner, pref.repo);
+        let registered = projects.as_array().into_iter().flatten().find(|project| {
+            normalize_repo_url(project["repo_url"].as_str().unwrap_or("")) == normalize_repo_url(&repo_url)
+                && project["repo_path"].as_str().is_some_and(|path| !path.trim().is_empty())
+        });
+        let Some(project) = registered else {
+            let _ = supabase::update_task(config, &task_id, &serde_json::json!({
+                "status": "failed",
+                "failure_reason": "The PR repository needs a registered local checkout before full review",
+                "updated_at": chrono::Utc::now().to_rfc3339(),
+            })).await;
+            continue;
+        };
+        let repo_path = project["repo_path"].as_str().unwrap().to_string();
         if !plant_repo_path_origin_matches(&repo_path, &pref.owner, &pref.repo).await {
             let _ = supabase::update_task(
                 config,
@@ -19652,6 +19632,23 @@ pub async fn sweep_plant_full_pr_review_queue(config: &SupabaseConfig) {
             ).await;
             continue;
         }
+
+        let mut target = task.clone();
+        target["repo_path"] = serde_json::json!(repo_path);
+        target["repo_url"] = serde_json::json!(repo_url);
+        target["project"] = project["name"].clone();
+        let repo_keys = task_repo_serial_keys(&target);
+        let mut context = task_context_object(task);
+        context.insert("pr_url".into(), serde_json::json!(pr_url));
+        context.insert("full_pr_review_automation".into(), serde_json::json!(true));
+        // The snapshot claim also clears the live worker's resume request.
+        context.remove(review::FULL_PR_REVIEW_RESUME_PENDING_KEY);
+        let target_patch = serde_json::json!({
+            "pr_url": pr_url, "pr_number": pref.number, "repo_path": repo_path, "repo_url": repo_url,
+            "project": project["name"], "context": context,
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+            "failure_reason": Value::Null,
+        });
 
         let normalized = normalize_pr_url(&pr_url);
 
@@ -19696,17 +19693,13 @@ pub async fn sweep_plant_full_pr_review_queue(config: &SupabaseConfig) {
                 // PATCH actually flips queued -> in_progress proceeds. An empty
                 // result means another worker/tick already claimed it.
                 let now = chrono::Utc::now().to_rfc3339();
-                match supabase::update_task_if_status(
+                let mut claim = target_patch.clone();
+                claim["status"] = serde_json::json!("in_progress");
+                claim["claimed_at"] = serde_json::json!(now);
+                match supabase::update_task_if_snapshot(
                     config,
-                    &task_id,
-                    "queued",
-                    &serde_json::json!({
-                        "status": "in_progress",
-                        "claimed_at": now.clone(),
-                        "on_hold": false,
-                        "failure_reason": serde_json::Value::Null,
-                        "updated_at": now,
-                    }),
+                    task,
+                    &claim,
                 )
                 .await
                 {
@@ -19723,12 +19716,13 @@ pub async fn sweep_plant_full_pr_review_queue(config: &SupabaseConfig) {
             }
             "in_progress" => {
                 if full_pr_review_task_is_stale(task)
-                    && claim_stale_full_pr_review_restart(config, task).await
+                    && supabase::update_task_if_snapshot(config, task, &target_patch).await
+                        .ok().and_then(|rows| rows.as_array().map(|rows| !rows.is_empty())).unwrap_or(false)
                 {
                     agent_comment(
                         config,
                         &task_id,
-                        "The previous full `$pr-review` run for this /plant PR looks stale, so I am restarting it now.",
+                        "The previous full `$pr-review` run looks stale, so I am restarting it on the original PR.",
                     ).await;
                     true
                 } else {
@@ -19748,14 +19742,14 @@ pub async fn sweep_plant_full_pr_review_queue(config: &SupabaseConfig) {
             config,
             &task_id,
             &format!(
-                "Picking this up. Reviewing and fixing on the original PR {} itself (no second PR, no merge; Kip merges).",
+                "Picking up your review handoff on the original PR: {}.",
                 pr_url
             ),
         ).await;
         send_telegram(
             config,
             &format!(
-                "Running full `$pr-review` for /plant PR: {}",
+                "Running full `$pr-review` for PR: {}",
                 escape_markdown_v2(&pr_url),
             ),
         )

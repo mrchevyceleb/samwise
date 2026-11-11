@@ -2223,6 +2223,28 @@ pub async fn run_full_pr_review(
             pr_url
         ));
     }
+    // Check after the worker's concurrency wait, immediately before paid
+    // work. A terminal PR completes through the existing full-review result
+    // path without launching Codex; an unreadable state never permits work.
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        async_cmd("gh").kill_on_drop(true)
+            .args(["pr", "view", pr_url, "--json", "state"])
+            .current_dir(repo_path).output(),
+    ).await.map_err(|_| "PR state check timed out; review not started".to_string())?
+        .map_err(|_| "Could not check PR state; review not started".to_string())?;
+    if !output.status.success() {
+        return Err("GitHub PR state unavailable; review not started".into());
+    }
+    let pr: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| "Invalid GitHub PR state; review not started".to_string())?;
+    match pr["state"].as_str() {
+        Some("OPEN") => {},
+        Some(state @ ("MERGED" | "CLOSED")) => {
+            return Ok(format!("Original PR {} is already {}. No review was started.", pr_url, state));
+        }
+        _ => return Err("Unknown GitHub PR state; review not started".into()),
+    }
     // Retried once so a Supabase blip doesn't hide a saved session and
     // start the review over.
     let row = match supabase::fetch_task(config, task_id).await {
